@@ -351,7 +351,7 @@ plan / arrow-schema / catalog caching with version-ETag invalidation
 ([CHA-120](https://linear.app/chapala/issue/CHA-120), ~15–25 ms);
 the streaming + IPC encode bucket (~60–70 ms — **exonerated on the
 gRPC path** by the CHA-417
-[point-read breakdown](perf-reports/oltp-point-read.md): encode busy is
+point-read breakdown: encode busy is
 ~1 ms/request and the wall was the O(depth) hot dedup, CHA-398; the
 Flight SQL arm still needs its own pass);
 collapsing the multi-hop Flight SQL → query servicer → metadata gRPC
