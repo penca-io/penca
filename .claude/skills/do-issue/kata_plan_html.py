@@ -139,7 +139,7 @@ def build_graph(list_payload: dict, show_payloads: list[dict]) -> list[Task]:
     for data in show_payloads:
         issue = data["issue"]
         short = issue.get("short_id") or ""
-        qid = qid_by_short.get(short, f"fabric#{short}")
+        qid = qid_by_short.get(short, f"penca#{short}")
         labels = label_names(data.get("labels", []))
         tasks[short] = Task(
             qid, short, issue.get("title", ""), issue.get("body", "") or "", labels

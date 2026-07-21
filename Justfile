@@ -221,7 +221,7 @@ init-build-tools:
 # VM rebuild.
 #   - Symlinks kata onto PATH (~/go/bin/kata → ~/.local/bin/kata) when needed.
 #   - Starts the kata daemon if not already running.
-#   - Binds this workspace to the kata `fabric` project.
+#   - Binds this workspace to the kata `penca` project.
 #   - Registers the repo with the roborev daemon + installs the post-commit hook.
 init-agent-tools: init-build-tools
     #!/usr/bin/env bash
@@ -243,9 +243,9 @@ init-agent-tools: init-build-tools
     fi
     # `kata init` is idempotent and gates on the daemon's project DB,
     # not the local `.kata.toml` (which is checked into the repo). A
-    # fresh VM's daemon DB doesn't know about fabric even when
+    # fresh VM's daemon DB doesn't know about penca even when
     # .kata.toml exists, so this must run unconditionally — CHA-334.
-    kata init --project fabric
+    kata init --project penca
     roborev init --agent claude-code
 
     # Optional shared issue-graph client (CHA-447). When a shared kata instance

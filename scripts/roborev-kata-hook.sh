@@ -154,7 +154,7 @@ while IFS= read -r JOB_ID; do
     warn "job $JOB_ID: kata create returned no .issue.short_id; orch extension skipped → $(printf '%s' "$out" | head -c 200)"
     continue
   fi
-  NEW_REF="fabric#${SHORT_ID}"
+  NEW_REF="penca#${SHORT_ID}"
 
   # Only newly-created findings extend orch blockers. A reprocessed (idempotent)
   # finding must NOT re-touch --blocked-by: that would resurrect a blocker a

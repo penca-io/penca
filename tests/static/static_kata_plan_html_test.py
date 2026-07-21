@@ -39,7 +39,7 @@ kph = _load_generator()
 def _list_payload(*shorts: str) -> dict:
     return {
         "kata_api_version": 1,
-        "issues": [{"qualified_id": f"fabric#{s}", "short_id": s} for s in shorts],
+        "issues": [{"qualified_id": f"penca#{s}", "short_id": s} for s in shorts],
     }
 
 
@@ -136,7 +136,7 @@ class TestBuildGraph:
     def test_qid_carried_from_listing(self):
         by_short = {t.short: t for t in self._graph()}
         # qualified_id lives in the listing, not the show payload's issue object
-        assert by_short["aaaa"].qid == "fabric#aaaa"
+        assert by_short["aaaa"].qid == "penca#aaaa"
 
     def test_orch_suborder(self):
         ordered = kph.build_graph(
