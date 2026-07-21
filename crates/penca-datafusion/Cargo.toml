@@ -1,0 +1,26 @@
+[package]
+name = "penca-datafusion"
+description = "DataFusion catalog/schema/table providers for Penca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-proto = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+datafusion = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+async-stream = { workspace = true }
+tracing = { workspace = true }
+tracing-futures = { workspace = true }
+
+[dev-dependencies]
+# `tokio-stream::wrappers::TcpListenerStream` lets the test stub bind a
+# real loopback port and feed accepts straight into `Server::serve_with_incoming`
+# — simpler than rolling a custom `Stream` from `TcpListener::accept`.
+tokio-stream = { version = "0.1", features = ["net"] }

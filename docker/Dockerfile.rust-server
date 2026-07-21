@@ -1,0 +1,128 @@
+# Multi-stage build for the Rust server binaries.
+#
+# Uses cargo-chef so dependency compilation is cached. When only crate
+# sources under crates/ change (but Cargo.lock doesn't), the dependency
+# layer is reused and the rebuild only recompiles penca crates +
+# the two server packages themselves (~30s instead of ~10min).
+#
+# When AWS credentials are provided as BuildKit secrets (see the
+# `secrets:` block in docker/compose.yml), the cook and build steps also
+# route rustc through sccache→S3 (bucket fabric-sccache, us-west-1), so
+# a cook-layer cache miss on a fresh machine pulls compiled deps from S3
+# instead of recompiling them (CHA-439). Without creds both steps
+# degrade to plain compiles.
+#
+# Produces one image carrying all 6 entrypoints:
+# the 3 gRPC microservices (penca-query, penca-write, penca-lifecycle),
+# the Flight SQL server (penca-sql-server),
+# the one-shot bootstrap job (penca-bootstrap; run by the
+# `bootstrap-init` compose service before the servicers bind their
+# ports), and the lifecycle scheduler (penca-lifecycle-scheduler;
+# long-running gRPC client driving the per-table Persist→Snapshot→Purge
+# chain on a tick). docker-compose picks which one to run per
+# container via `command:`.
+#
+# Build: docker build -f docker/Dockerfile.rust-server -t penca-rust-server .
+# Run:   docker run -e DATABASE_URL=... penca-rust-server penca-query
+
+FROM rust:1.94-slim-bookworm AS chef
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler libprotobuf-dev pkg-config libssl-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-chef --locked --version 0.1.71
+
+# sccache→S3 compile cache (CHA-439). Same pinned artifact + sha256 as the
+# host-side `just init-build-tools` recipe — keep the two pins in sync.
+# x86_64-only, matching that recipe's assumption (all project VMs/CI are
+# x86_64); on other arches the binary is skipped and the activation gate
+# below degrades to a plain compile instead of carrying a non-executable
+# download.
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        curl -fsSL -o /tmp/sccache.tar.gz \
+            https://github.com/mozilla/sccache/releases/download/v0.15.0/sccache-v0.15.0-x86_64-unknown-linux-musl.tar.gz \
+        && echo "782d2b5dd7ae0a55ebe368ab258114d0928d019ac2d949ab85d5d02f3926709e  /tmp/sccache.tar.gz" \
+            | sha256sum -c --quiet \
+        && tar xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache' \
+        && rm /tmp/sccache.tar.gz; \
+    fi
+
+# Backend config for sccache; inert unless RUSTC_WRAPPER is exported in a
+# RUN step below (only when that step has non-empty AWS creds mounted).
+ENV SCCACHE_BUCKET=fabric-sccache SCCACHE_REGION=us-west-1
+
+WORKDIR /app
+
+# --- Planner: emits recipe.json from the current sources ---
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY protos/ protos/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- Builder: cooks deps from recipe, then builds our crates on top ---
+FROM chef AS builder
+# Build profile selector (CHA-420). Defaults to `release` so normal
+# `just penca-up` / CI builds are unchanged; `just perf-profile` passes
+# `profiling` (the DWARF profile from Cargo.toml) so samply can symbolicate the
+# containerized binary. cargo's output dir == the profile name for both
+# `release` and a custom profile, so target/${CARGO_PROFILE}/ in the runtime
+# stage is correct for either value.
+ARG CARGO_PROFILE=release
+COPY --from=planner /app/recipe.json recipe.json
+# This layer is cached on recipe.json contents. Dependency graph only
+# changes when Cargo.lock / Cargo.toml changes, so source-only edits
+# hit the cache.
+#
+# Frame pointers can't be set as a Cargo profile key (force-frame-pointers is a
+# rustc -C flag, not a manifest key — Cargo silently ignores it). Force them via
+# RUSTFLAGS for the profiling build only; release is unaffected. Applied
+# identically to both the cook and build steps so RUSTFLAGS stays consistent and
+# the chef dependency-cache layer isn't invalidated between them.
+# The secret mounts feed sccache's standard AWS credential chain (the
+# build runs as root). required=false + the `-s` (non-empty) test make
+# credential-less builds degrade to a plain compile: compose's secret
+# source defaults to /dev/null, which mounts as an EMPTY file — `-f`
+# would see it and activate a credential-less sccache that fails every
+# compile. `sccache --start-server` performs the S3 storage check at
+# startup, so stale/expired creds (or a missing sccache binary on a
+# non-x86_64 arch) also degrade to a plain compile instead of failing
+# every rustc invocation. `sccache --show-stats` is chained with && so
+# a cargo failure still fails the RUN.
+RUN --mount=type=secret,id=aws_credentials,target=/root/.aws/credentials,required=false \
+    --mount=type=secret,id=aws_config,target=/root/.aws/config,required=false \
+    if [ "$CARGO_PROFILE" = "profiling" ]; then export RUSTFLAGS="-Cforce-frame-pointers=yes"; fi; \
+    if [ -s /root/.aws/credentials ] && sccache --start-server >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi; \
+    cargo chef cook --profile ${CARGO_PROFILE} --recipe-path recipe.json \
+    --package penca-server-grpc --package penca-sql-server \
+    --package penca-lifecycle-scheduler \
+    && if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY protos/ protos/
+RUN --mount=type=secret,id=aws_credentials,target=/root/.aws/credentials,required=false \
+    --mount=type=secret,id=aws_config,target=/root/.aws/config,required=false \
+    if [ "$CARGO_PROFILE" = "profiling" ]; then export RUSTFLAGS="-Cforce-frame-pointers=yes"; fi; \
+    if [ -s /root/.aws/credentials ] && sccache --start-server >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi; \
+    cargo build --profile ${CARGO_PROFILE} --package penca-server-grpc --package penca-sql-server \
+    --package penca-lifecycle-scheduler \
+    && if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
+
+# --- Runtime ---
+FROM debian:bookworm-slim
+
+# Re-declared because ARGs don't cross build stages; selects the target/
+# subdir the builder wrote to (target/release or target/profiling).
+ARG CARGO_PROFILE=release
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-query /usr/local/bin/penca-query
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-write /usr/local/bin/penca-write
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-lifecycle /usr/local/bin/penca-lifecycle
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-sql-server /usr/local/bin/penca-sql-server
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-bootstrap /usr/local/bin/penca-bootstrap
+COPY --from=builder /app/target/${CARGO_PROFILE}/penca-lifecycle-scheduler /usr/local/bin/penca-lifecycle-scheduler

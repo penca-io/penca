@@ -1,0 +1,447 @@
+syntax = "proto3";
+
+package penca_proto.external.v1;
+
+import "penca_proto/external/v1/common.proto";
+
+// LifecycleService exposes storage lifecycle operations that move data
+// between tiers and optimize storage layout. These operations are
+// typically run on a schedule or triggered manually by administrators.
+//
+// In the embedded client, these are called directly. In hosted mode,
+// a background scheduler handles them automatically.
+//
+// Identifier shape:
+//   - Persist, Purge, Snapshot, and CompactPersistSegments are all
+//     per-table — one physical user table per call. Schedulers compose
+//     per-table operations across a branch.
+
+// ===========================================================================
+// Persist
+// ===========================================================================
+
+// Persists a single table's committed hot data into cold storage.
+//
+// Internally:
+//   1. Scan committed data for T from hot storage on the branch up to
+//      the clamped watermark.
+//   2. Ingest it into cold storage and wait for durability confirmation.
+//
+// Persist does NOT remove rows from hot storage — they stay queryable
+// until Purge runs. Between Persist(T) and Purge(T), reads continue to
+// serve from hot. Purge is the hot/cold visibility flip.
+//
+// If any step fails, the operation is aborted and hot storage retains
+// the data — no data is lost. This guarantees that data exists in at
+// least one tier at all times.
+message PersistRequest {
+  // --- Schema identifier ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  // --- Table on branch ---
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // --- Domain fields ---
+
+  // Optional upper bound for the persist watermark. The server clamps to
+  // min(target_micros ?? now, oldest_open_began_at(branch) - 1); the
+  // actual watermark is returned in PersistResponse.persisted_at_micros.
+  // Callers cannot advance past an open tx — the clamp enforces the
+  // open-tx invariant unconditionally.
+  optional int64 target_micros = 10;
+}
+
+message PersistResponse {
+  // The watermark this persist advanced to. All mutations on T with
+  // commit_micros <= this value are durable in cold storage.
+  // Unset when the persist was a no-op.
+  optional int64 persisted_at_micros = 1;
+}
+
+// ===========================================================================
+// Catalog-wide branch persist / snapshot (CHA-273)
+// ===========================================================================
+
+// A commit-order position: the fork commit T a *Branch op bounded itself at, or
+// a persist/snapshot watermark. It is a POSITION, not a tx identity —
+// `commit_seq_num` (gapless, monotonic — CHA-400/428) uniquely identifies the
+// commit, and `tx_uuid` is dropped when segments persist to cold (CHA-430). So
+// this struct is reusable as the watermark for the single-table lifecycle ops
+// too. `commit_micros` is the wall-clock companion (the persist bound today;
+// CHA-500 moves it to seq).
+message Watermark {
+  int64 commit_seq_num = 1;
+  int64 commit_micros = 2;
+}
+
+// Scope for a catalog-wide branch op: every table on (catalog, branch).
+message BranchOpRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 3;
+  optional string branch_name = 4;
+  // Optional fork target as a resolved commit-order position. When set, the op
+  // bounds the persist at it; when unset, T = the branch's head commit. The
+  // target is a POSITION, never a tx_uuid — the caller (e.g. the CreateBranch
+  // write path) resolves its fork tx to a Watermark first, which structurally
+  // rejects forking from an uncommitted tx (one has no allocated position).
+  optional Watermark target = 5;
+}
+
+message BranchOpResponse {
+  Watermark watermark = 1;
+}
+
+// ===========================================================================
+// Purge
+// ===========================================================================
+
+// Clears a single table's hot upsert/delete log rows up to the purge
+// fence Pu = W_snap (committed) and the abort frontier Pa (aborted), and
+// reclaims expired-begin garbage (CHA-444 / ADR 0027).
+//
+// No-op on the committed axis when no Snapshot has advanced W_snap past
+// the last purge — including the brand-new "never persisted" case: Purge
+// writes no table_purge_metadata row and PurgeResponse.purged_at_micros
+// (the Pu seq) is unset. Abort and expired-begin cleanup are orthogonal
+// and not reflected in the response.
+message PurgeRequest {
+  // --- Schema identifier ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  // --- Table on branch ---
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+}
+
+message PurgeResponse {
+  // CHA-444 (ADR 0027): the committed purge watermark Pu this purge advanced
+  // to. NOTE: despite the legacy field name, this now carries a commit_seq_num
+  // (the seq-axis purge fence), not micros. All committed mutations on T with
+  // commit_seq_num <= Pu have been cleared from hot and are served from the
+  // snapshot/cold-persist tiers by plan() (Pu is the hot<->cold read fence).
+  // Unset when Purge did not advance Pu (no new snapshot past the last purge).
+  // Abort/expired-begin cleanup is orthogonal and not reflected here.
+  optional int64 purged_at_micros = 1;
+}
+
+// ===========================================================================
+// Compact
+// ===========================================================================
+
+// Compacts log segments for a single table. Purely mechanical file
+// reorganization:
+//   - Merges many small log segment files into fewer, larger files.
+//   - Updates each input segment's metadata row in-place to point at a
+//     `(merged_uri, offset, length)` slice of the new file
+//     (snapshot-segment pattern — per-row visibility is preserved).
+//   - Preserves all row versions and deletes as-is — no semantic
+//     interpretation of the data occurs.
+//
+// Compaction is cheap and safe to run frequently. Idempotent — calling
+// it when there are no uncompacted segments is a no-op.
+message CompactPersistSegmentsRequest {
+  // --- Schema identifier ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  // --- Table on branch ---
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // --- Domain fields ---
+
+  // Optional: restrict compaction to segments whose
+  // `commit_micros` falls within this range. If omitted, every
+  // committed segment for T on the branch is eligible.
+  optional IntegerRange persisted_at = 10;
+}
+
+message CompactPersistSegmentsResponse {
+  // URIs of the merged files this compact wrote — one per
+  // `(table_uuid, log_kind)` merge group on T that actually merged.
+  // Empty when no group had ≥ 2 inputs.
+  repeated string merged_object_uris = 1;
+}
+
+// ===========================================================================
+// Snapshot
+// ===========================================================================
+
+// Creates a read-optimized, point-in-time snapshot of a table in cold
+// storage. Unlike compaction (which is purely mechanical), snapshotting
+// is the semantic operation that reasons about row identity:
+//   - Applies deletes: removes soft-deleted rows from the output.
+//   - Collapses superseded versions: keeps the resolved (current)
+//     version of each row as of the snapshot watermark.
+//   - Produces clean, query-ready files that contain no tombstones
+//     or superseded versions.
+//
+// Snapshots are heavier than compaction and typically run less
+// frequently. They are idempotent — re-snapshotting at the same
+// point in time produces the same result.
+message SnapshotRequest {
+  // --- Schema identifier ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  // --- Table on branch ---
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // --- Domain fields ---
+
+  // Point-in-time for the snapshot, as a microsecond-precision Unix
+  // timestamp. The snapshot reflects all mutations with committed_at <=
+  // this timestamp. If omitted, the current time is used (latest
+  // consistent view).
+  optional int64 snapshotted_at_micros = 10;
+}
+
+message SnapshotResponse {
+  // The watermark this snapshot advanced to. All mutations on T with
+  // commit_micros <= this value are reflected in the snapshot
+  // row written for T in table_snapshot_metadata. Unset when Snapshot
+  // no-ops because there is no committed persist newer than the last
+  // snapshot — the existing snapshot already covers every persisted
+  // row for T.
+  optional int64 snapshotted_at_micros = 1;
+}
+
+// ===========================================================================
+// PurgeTxLog
+// ===========================================================================
+
+// PurgeTxLog GCs the four hot tx-log family tables for a branch
+// (commit_tx_log / tx_table_log / abort_tx_log / begin_tx_log). Branch-
+// scoped, independent of any per-table op — the scheduler invokes it
+// once per `tick_branch` after the per-table Purge loop (CHA-154).
+//
+// Algorithm (CHA-444, ADR 0027 — seq-axis re-axis of CHA-221):
+//   1. Capture `cleanup_started_at_micros = clock_timestamp()`.
+//   2. Read S = distinct tables in tx_table_log[B] whose writer tx is
+//      settled (committed in commit_tx_log[B] OR aborted in abort_tx_log[B],
+//      `<= cleanup_started_at`), left-joined with each table's seq
+//      watermarks `MAX(last_purged_commit_seq_num)` (Pu) and
+//      `MAX(last_purged_aborted_seq_num)` (Pa) *as of*
+//      `cleanup_started_at` (load-bearing as-of filter on phase-2
+//      `commit_micros`; it makes a Purge committing mid-pass
+//      invisible to the cutoffs).
+//   3. Compute the branch-min seq cutoffs `Pu = MIN(Pu over S)` and
+//      `Pa = MIN(Pa over S)`; either is `None` when any active table is
+//      unpurged on that axis (an unpurged table blocks GC on it).
+//   4. Single composite `WITH eligible AS (...)` DELETE over four
+//      disjoint branches, run unconditionally:
+//        - committed:           `commit_seq_num <= Pu` in commit_tx_log[B].
+//        - aborted-with-writes: `aborted_at_seq_num < Pa` in
+//          abort_tx_log[B] (Purge owns aborted hot-row cleanup on the
+//          Pa axis, ADR 0027).
+//        - pure-begin+abort:    `aborted_at_micros <= cleanup_started_at`
+//          AND `NOT EXISTS in tx_table_log[B]`.
+//        - expired-begin:       `expires_at_micros < cleanup_started_at -
+//          max(purge_sweep_interval, hot_grace)` AND no commit_tx_log/abort row
+//          (the expired/pure branches fire even when both seq cutoffs are
+//          `None`).
+//      PG's WITH-DELETE snapshot semantics let the four sub-DELETEs match
+//      the same pre-statement view; in-flight open txs (not in commit_tx_log or
+//      abort_tx_log at statement start) are never in `eligible`, so their
+//      `begin_tx_log` / `tx_table_log` state is preserved unconditionally.
+//
+// MUST read the stored seq watermarks (`last_purged_commit_seq_num` /
+// `last_purged_aborted_seq_num`); MUST NOT derive a substitute from
+// `table_persist_metadata` (a persisted-but-unpurged tx is still live in
+// hot — GC trails purge, not persist; ADR 0027 §5).
+//
+// Branch-scoped advisory lock: `purge_tx_log:{branch_uuid}` — at
+// most one pass per branch at a time, orthogonal to per-table
+// Persist / Snapshot / Purge keys.
+message PurgeTxLogRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+}
+
+// Empty: PurgeTxLog GC spans two independent seq axes (committed Pu,
+// aborted Pa) plus a wall-clock expired-begin branch, so there is no
+// single watermark to report. Callers observe the GC through the
+// tx-log-family row counts, not the response.
+message PurgeTxLogResponse {}
+
+// ===========================================================================
+// SweepSegments
+// ===========================================================================
+
+// SweepSegments physically deletes cold segment files queued for
+// removal by past CompactPersistSegments waves. Compaction's merge
+// tx enqueues each replaced URI as a
+// `segment_delete_set` row atomically with the URI swap on the
+// segment metadata; SweepSegments reads rows whose
+// `written_at_micros + query_timeout < now` and removes the cold
+// file then the set row.
+//
+// Per-branch scope. Idempotent — calling with no eligible rows is a
+// no-op. A transient cold-storage failure leaves the corresponding
+// row in place for the next sweep to retry. ADR 0019 §"Four-part
+// mechanism" item 3 covers the design.
+message SweepSegmentsRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+}
+
+message SweepSegmentsResponse {}
+
+// ===========================================================================
+// ListModifiedTables / ListPersistedTables
+// ===========================================================================
+//
+// Scheduler dirty-set discovery RPCs. CHA-445 rehomed these off the deleted
+// StorageMetadataService onto LifecycleService — "what's dirty / what's
+// persisted" is lifecycle enumeration, and the scheduler already holds a
+// LifecycleServiceClient.
+
+// Enumerate `table_uuid`s touched by committed transactions on
+// `(catalog_uuid, branch_uuid)` whose `commit_tx_log.commit_micros` falls in
+// the half-open window `modified_at`. Joins `commit_tx_log` ▷ `tx_table_log` so
+// aborted-tx writes are structurally excluded (only committed txs have a
+// `commit_tx_log` row). Drives the scheduler's per-tick dirty-table discovery.
+message ListModifiedTablesRequest {
+  // Catalog whose `(commit_tx_log, tx_table_log)` partition pair is scanned.
+  string catalog_uuid = 1;
+
+  // Branch within the catalog (both logs are `(catalog, branch)`-partitioned).
+  string branch_uuid = 2;
+
+  // Half-open `[min, max)` window on
+  // `commit_tx_log.commit_micros`. Both bounds optional.
+  optional IntegerRange modified_at = 3;
+
+  // Page size + opaque page token (same shape as the other listing RPCs).
+  optional PaginationRequest pagination = 4;
+}
+
+message ListModifiedTablesResponse {
+  // Distinct `table_uuid`s in the window, ordered by
+  // `MAX(commit_micros) ASC` with `table_uuid ASC` tiebreak.
+  repeated string table_uuids = 1;
+
+  // Present when more pages remain.
+  optional string next_page_token = 2;
+}
+
+// Enumerate `table_uuid`s on `(catalog_uuid, branch_uuid)` whose
+// `table_persist_metadata.commit_micros` falls in the half-open window
+// `persisted_at`. The `commit_micros IS NOT NULL` filter excludes
+// uncommitted persists. Drives the scheduler's per-tick Purge enumeration.
+message ListPersistedTablesRequest {
+  // Catalog owning the `{catalog_uuid}_table_persist_metadata` parent.
+  string catalog_uuid = 1;
+
+  // Branch (`table_persist_metadata` is `branch_uuid`-partitioned).
+  string branch_uuid = 2;
+
+  // Half-open `[min, max)` window on
+  // `table_persist_metadata.commit_micros`. Both bounds optional.
+  optional IntegerRange persisted_at = 3;
+
+  // Page size + opaque page token.
+  optional PaginationRequest pagination = 4;
+}
+
+message ListPersistedTablesResponse {
+  // Distinct `table_uuid`s with a committed persist in the window, ordered by
+  // `MAX(commit_micros) ASC` with `table_uuid ASC` tiebreak.
+  repeated string table_uuids = 1;
+
+  // Present when more pages remain.
+  optional string next_page_token = 2;
+}
+
+// ===========================================================================
+// Service
+// ===========================================================================
+
+service LifecycleService {
+  // Persists a single table's committed hot data into cold storage.
+  // Server-side watermark is clamped to
+  // min(target_micros ?? now, oldest_open_began_at(branch) - 1).
+  // Persist does NOT remove hot rows — Purge does.
+  rpc Persist(PersistRequest) returns (PersistResponse);
+
+  // Removes a single table's hot upsert/delete log rows up to that
+  // table's persist watermark, and advances purged_at_micros — the
+  // hot/cold visibility cutoff used by plan(). No-ops (does not
+  // write metadata, does not advance the watermark) when there is
+  // no committed persist newer than the last purge: advancing the
+  // watermark past unpersisted hot rows would hide them from
+  // plan()/plan_audit().
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
+
+  // Compacts log segments for a single table. Merges
+  // `(table_uuid, log_kind)` groups independently. Idempotent.
+  rpc CompactPersistSegments(CompactPersistSegmentsRequest) returns (CompactPersistSegmentsResponse);
+
+  // Creates a read-optimized, point-in-time snapshot of a table.
+  // Applies deletes and materializes the resolved current version of
+  // each row. No-ops (does not write metadata, does not redo the cold
+  // merge-read) when there is no committed persist newer than the
+  // last snapshot — the existing snapshot already covers every
+  // persisted row for T.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Physically deletes cold segment files queued for removal by past
+  // compact waves. Per-branch scope; gated on the universal grace
+  // window (ADR 0019).
+  rpc SweepSegments(SweepSegmentsRequest) returns (SweepSegmentsResponse);
+
+  // GCs the four hot tx-log family tables (commit_tx_log / tx_table_log /
+  // abort_tx_log / begin_tx_log) for a branch. Reads each table's
+  // stored `table_purge_metadata.purged_at_micros` to compute a
+  // branch-wide min watermark; runs the four DELETEs under one PG
+  // tx clamped to a captured `cleanup_started_at_micros`. Empty-set
+  // fast-path leaves `purged_at_micros` unset.
+  rpc PurgeTxLog(PurgeTxLogRequest) returns (PurgeTxLogResponse);
+
+  // Enumerates `table_uuid`s touched by committed transactions on a branch
+  // within a `modified_at` window — the scheduler's per-tick dirty-table
+  // discovery (CHA-445; formerly on StorageMetadataService).
+  rpc ListModifiedTables(ListModifiedTablesRequest) returns (ListModifiedTablesResponse);
+
+  // Enumerates `table_uuid`s with a committed `table_persist_metadata` row in
+  // a `persisted_at` window — drives the scheduler's per-tick Purge
+  // enumeration (CHA-445).
+  rpc ListPersistedTables(ListPersistedTablesRequest) returns (ListPersistedTablesResponse);
+
+  // CHA-273: catalog-wide persist/snapshot over every table on a branch,
+  // returning the fork Watermark T (the caller-supplied `target` position, else
+  // the branch head).
+  // PersistBranch/SnapshotBranch are the persist-only / snapshot-only variants;
+  // PersistAndSnapshotBranch loops both per table (non-atomic). The scheduler
+  // drives PersistAndSnapshotBranch; CreateBranch (and merge, CHA-493) drive
+  // PersistBranch. Enumerate MODIFIED tables — already-persisted tables are
+  // already durable.
+  rpc PersistBranch(BranchOpRequest) returns (BranchOpResponse);
+  rpc SnapshotBranch(BranchOpRequest) returns (BranchOpResponse);
+  rpc PersistAndSnapshotBranch(BranchOpRequest) returns (BranchOpResponse);
+}

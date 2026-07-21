@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "linear-server": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    },
+    "language-server": {
+      "command": "mcp-language-server",
+      "args": ["--workspace", ".", "--lsp", "rust-analyzer"]
+    }
+  }
+}

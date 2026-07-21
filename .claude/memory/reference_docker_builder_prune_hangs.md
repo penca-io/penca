@@ -1,0 +1,14 @@
+---
+name: reference_docker_builder_prune_hangs
+description: "`docker builder prune -af` (buildx, `-a`=all) can hang indefinitely on this VM; the plain `docker builder prune -f` variant is safe (cleared 8.4G in seconds). Never chain the `-af` form before a build."
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: 279d2837-6736-45c1-9d10-0841cb37fccb
+---
+
+`docker builder prune -af` invokes `docker-buildx buildx prune -af`, which can hang indefinitely on this VM — observed stuck 45+ min, never exiting, even though it had already cleared the cache to 0B. When chained before a build (`docker builder prune -af && ... && just integration-test > LOG`), the whole command stalls on the prune: the build never starts and the redirect LOG file is never even created (empty/missing), which looks like a silently-failed run.
+
+**Don't** run `docker builder prune -af` to reclaim disk before a Docker/`just integration-test` build — it forces a slow cold *Docker* rebuild anyway, so it's lose-lose for that path. For dangling-image headroom use `docker image prune -f` (quick, safe). If an `-af` prune is already hung: `TaskStop` the bg task, `pkill -f 'buildx prune'`, confirm `docker system df` shows the cache gone and no running containers, then relaunch the build alone.
+
+**The `-f` (without `-a`) variant never hangs, but it is the WRONG lever before an integration-test run** (CHA-405): it deletes the cargo-chef dependency layer that `docker/Dockerfile.rust-server` relies on, so the next `just integration-test` pays a ~90-minute from-scratch rebuild of every Rust dep inside Docker. When disk-blocked before a *Docker* build, free space with `rm -rf target/debug target/release` on the host instead (48G+, rebuildable incrementally, doesn't touch the Docker cache). Reserve `docker builder prune -f` for when a host-side `cargo`/`just check` build is disk-blocked (not a Docker build). CHA-418: the 50G root disk hit 100% during `cargo test --workspace`'s debug test-link; `timeout 180 docker builder prune -f` completed in seconds, did **not** hang, and reclaimed 8.4G of *unused* build cache — enough headroom to finish the gate. It prunes only unused cache (the 8.4G "reclaimable" in `docker system df`), doesn't touch tagged images, and — crucially — does **not** force a `cargo` rebuild (build cache is for `docker build`, orthogonal to `target/`). Note `docker image prune -a -f` (remove unused *tagged* images, ~8.7G) is auto-mode-classifier-denied as a shared-VM destructive action — get explicit user authorization. Order of safe cargo-disk reclaim: `rm -rf target/debug/incremental` + `target/release` (own artifacts, rebuildable) → `docker builder prune -f` (with user ok) → ask before image prune. Related: [[feedback_capture_test_output_once]], [[feedback_bg_task_signal_reliability]].

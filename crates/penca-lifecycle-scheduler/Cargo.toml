@@ -1,0 +1,31 @@
+[package]
+name = "penca-lifecycle-scheduler"
+description = "v0 single-replica tick-loop microservice driving per-table Persist→Snapshot→Purge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-observability = { workspace = true }
+penca-proto = { workspace = true }
+
+# gRPC transport: scheduler is a pure gRPC client of query and
+# lifecycle. No Postgres dependency by design.
+tonic = { workspace = true }
+tokio = { workspace = true }
+
+# Error plumbing — keeps the scheduler-surface error type independent of
+# the transport layer so future non-RPC errors (config validation,
+# durable-watermark serialization, etc.) can join without re-wrapping
+# everything as `tonic::Status`.
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "penca-lifecycle-scheduler"
+path = "src/main.rs"

@@ -1,0 +1,13 @@
+[package]
+name = "penca-core"
+description = "Core types, identity system, and shared utilities for Penca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+xxhash-rust = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "penca-storage-cold"
+description = "Cold storage client for S3-backed columnar segment tier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-format = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures-core = { workspace = true }
+async-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  # Per-PR signal (CHA-458). The pull_request event tests refs/pull/N/merge —
+  # the PR already merged onto its base — so a green run means the *merge
+  # result* compiles and passes the light checks, not just the branch in
+  # isolation. Re-enabled after being disabled for Actions budget; per-PR cost
+  # stays bounded because the Docker-heavy `integration` job is held back to the
+  # merge queue (see its `if:` below).
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Merge queue (CHA-458). GitHub builds the prospective merge commit (this PR
+  # rebased onto the latest main) and runs CI on it — including the full
+  # integration suite — before merging. This is the gate that catches the
+  # concurrent-PR break (the CHA-429 rename vs CHA-406 use that text-merged
+  # clean but didn't compile): the queue re-tests each PR against *current*
+  # main, serialized, so a green PR can't merge stale.
+  merge_group:
+  # Post-merge signal on main. With the merge queue the merged commit is the
+  # one the queue already tested, so this is a canonical safety net (e.g. for an
+  # admin-bypass merge); the `changes` paths-filter scopes the heavy jobs.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel an in-flight merge-queue run. Each queue entry already gets a
+  # unique ref (gh-readonly-queue/…) so entries won't cancel each other, but
+  # cancelling a merge_group run can eject the PR from the queue — so be
+  # explicit rather than relying on the ref scheme.
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: Detect changed paths
+    # Scopes whether the heavy integration job runs, on both events that can
+    # actually merge code: the post-merge `push` to main and the `merge_group`
+    # queue build. PRs skip integration unconditionally (queue-only), so this is
+    # not consumed there. In the queue the prospective-merge commit is diffed
+    # against the branch it's merging onto (merge_group base..head), so a
+    # docs-only merge can skip the suite instead of always running it.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so paths-filter can reliably diff the merge_group
+          # base..head (two arbitrary commits) as well as the push before-sha.
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # In the queue, diff the prospective-merge commit against the base the
+          # queue is merging onto; on push, leave unset for paths-filter's
+          # default (the push before-sha).
+          base: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || '' }}
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'protos/**'
+              - 'docker/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'packages/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/ci.yml'
+              - 'Justfile'
+              - 'tests/integration/**'
+
+  python-lint:
+    name: Python lint + format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages
+      - run: uv run ruff check packages/penca-client/src/penca_client/
+      - run: uv run ruff format --check packages/
+      - run: python scripts/check_blank_lines.py
+
+  python-unit:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages
+      - run: uv run pytest packages/penca-client/tests/unit/ -x -q
+
+  rust-check:
+    name: Rust clippy + fmt + test
+    runs-on: ubuntu-latest
+    # Trim debuginfo to line tables only. The full-DWARF object files for
+    # the datafusion/arrow-heavy crates overflow the runner's disk during
+    # the parallel test-link, so `ld` dies mmapping its output with
+    # `signal 7 [Bus error]` (the ENOSPC-via-mmap signature, distinct from
+    # a RAM-OOM SIGKILL). `line-tables-only` keeps file/line for panic
+    # backtraces while dropping the bulk type/variable DWARF; it covers
+    # `dev` (dependency rlibs, which dominate the linked size) and `test`
+    # (the test binaries themselves). Belt-and-suspenders next lever if this
+    # proves insufficient: free ~20-30GB by removing the preinstalled
+    # .NET/GHC/Android SDKs at job start (e.g. jlumbroso/free-disk-space).
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
+
+  integration:
+    name: Integration tests (Rust backend)
+    needs: changes
+    # Queue-only (CHA-458). The Docker-heavy suite is the merge gate: it runs on
+    # the merge queue's prospective-merge commit and on the post-merge push to
+    # main, but NOT on pull_request, keeping per-PR minutes bounded. Both the
+    # queue and push are path-scoped via `changes`, so a docs-only change skips
+    # the suite. Fail-safe in the queue: run UNLESS `changes` positively reported
+    # no Rust paths (`!= 'false'`) — any `changes` hiccup leaves the output empty
+    # and still runs the gate rather than letting code merge unverified.
+    # `always()` lets it fire even when `changes` is skipped/failed.
+    if: >-
+      always() &&
+      ( (github.event_name == 'merge_group' && needs.changes.outputs.rust != 'false') ||
+        (github.event_name == 'push' && needs.changes.outputs.rust == 'true') )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: extractions/setup-just@v2
+      - uses: docker/setup-buildx-action@v3
+      # JDK 21 + the flight-sql-jdbc-driver JAR are both required by
+      # `TestFlightSqlJdbcProbe` (CHA-249). Without them the test
+      # skips with an actionable message — which is fine for local
+      # dev but would silently degrade CI coverage of the JDBC GUI
+      # path, so we install + fetch unconditionally here.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: just fetch-jdbc-driver
+      - run: uv sync --all-packages
+      # Pre-build the Rust servicer image with BuildKit GHA cache.
+      # cargo-chef layering means the cook-deps layer survives across
+      # runs when Cargo.lock is unchanged; `mode=max` caches every
+      # intermediate stage, not just the final one. `cache-from` lists
+      # the branch scope first, then falls back to main for new
+      # branches that start cold.
+      - name: Pre-build penca-rust-server image (with GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rust-server
+          tags: penca-rust-server:latest
+          load: true
+          cache-from: |
+            type=gha
+            type=gha,scope=main
+          cache-to: type=gha,mode=max
+          # Route the cook/build RUN steps through sccache→S3 when the
+          # repo AWS secrets are present (CHA-440). The secret id matches
+          # the Dockerfile's required=false aws_credentials mount; bucket
+          # and region come from the image's SCCACHE_* env, so aws_config
+          # is unnecessary here. Absent on fork PRs (repo secrets don't
+          # flow), where the build degrades cleanly to a plain compile.
+          secrets: |
+            "aws_credentials=[default]
+            aws_access_key_id=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+            aws_secret_access_key=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
+      - name: Run integration suite
+        env:
+          PENCA_SKIP_BUILD: "1"
+        run: just integration-test
+      - name: Print servicer logs on failure
+        if: failure()
+        run: |
+          for f in /tmp/penca-logs-*/*.log; do
+            [ -f "$f" ] || continue
+            printf '\n========== %s ==========\n' "$f"
+            cat "$f"
+          done
+      - name: Upload servicer logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-servicer-logs
+          path: /tmp/penca-logs-*/*.log
+          if-no-files-found: ignore
+
+  # Single required status check for branch protection and the merge queue
+  # (CHA-458). Requiring the conditional `integration` job directly would hang a
+  # PR forever whenever paths-filter skips it (a skipped required check stays
+  # pending); gating on this always()-job instead lets a skip count as a pass
+  # while any real failure or cancellation fails the gate. Add `integration`'s
+  # required-ness here, not in branch-protection settings.
+  ci-success:
+    name: CI success
+    # Include `changes`: if it fails on a push, `integration`'s `if` reads its
+    # output as '' and silently skips, losing the post-merge net with no signal
+    # — so fail the gate instead. Its `skipped` result on PR/merge_group is
+    # tolerated by the success|skipped case below.
+    needs: [changes, python-lint, python-unit, rust-check, integration]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no required job failed
+        run: |
+          echo "changes=${{ needs.changes.result }}"
+          echo "python-lint=${{ needs.python-lint.result }}"
+          echo "python-unit=${{ needs.python-unit.result }}"
+          echo "rust-check=${{ needs.rust-check.result }}"
+          echo "integration=${{ needs.integration.result }}"
+          for result in \
+            "${{ needs.changes.result }}" \
+            "${{ needs.python-lint.result }}" \
+            "${{ needs.python-unit.result }}" \
+            "${{ needs.rust-check.result }}" \
+            "${{ needs.integration.result }}"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::a required job did not pass (result=$result)"; exit 1 ;;
+            esac
+          done
+          echo "All required jobs passed or were intentionally skipped."

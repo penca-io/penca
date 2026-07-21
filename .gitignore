@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# TDD development tests (not committed — see docs/development-methodology-guide.md)
+tests/tdd/
+
+# Perf-results store: SQLite history + transient JSONL + trend graphs (CHA-419)
+# and samply CPU profiles from `just perf-test --profile` (CHA-420)
+.perf/
+
+# Generated Penca env files (created by Justfile after Docker starts)
+docker/.client.env
+docker/.baseline.env
+
+# Rust build artifacts
+target/
+
+# Claude work artifacts
+.claude/scheduled_tasks.lock
+# transient per-ticket agent worktrees (laptop-only fallback; never committed)
+.claude/worktrees/
+# roborev snapshots
+/.roborev/
+.kata.local.toml
+*-tracker.html

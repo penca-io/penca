@@ -1,0 +1,570 @@
+syntax = "proto3";
+
+package penca_proto.external.v1;
+
+import "penca_proto/external/v1/common.proto";
+
+// QueryService provides read access to Penca data and metadata. It
+// exposes catalog/schema/table read RPCs, programmatic table reads
+// (ReadData), audit trail access (AuditData), and read-only access to
+// branches and transactions.
+//
+// All data responses return Arrow IPC byte streams.
+//
+// All request messages accept flexible identifiers: callers may provide
+// UUIDs or human-readable names (or a mix). The server resolves names to
+// UUIDs via DB lookup on catalog_store / branch_store /
+// __penca_system__ rows. See common.proto for the full resolution
+// rules.
+
+// ===========================================================================
+// Catalog (read-only)
+// ===========================================================================
+
+// Retrieves a single catalog by UUID or name.
+message GetCatalogRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+}
+
+message GetCatalogResponse {
+  Catalog catalog = 1;
+}
+
+// Lists catalogs visible to the caller, with pagination.
+message ListCatalogsRequest {
+  optional string owner = 1; // Optional filter to list only catalogs owned by a specific identity.
+
+  PaginationRequest pagination = 2;
+}
+
+message ListCatalogsResponse {
+  repeated Catalog catalogs = 1;
+
+  // Token to pass in the next ListCatalogsRequest. Absent when there
+  // are no more results.
+  optional string next_page_token = 2;
+}
+
+// ===========================================================================
+// Branch (read-only)
+// ===========================================================================
+
+// Retrieves a branch by UUID or name.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + branch_uuid
+//   - schema_uuid + branch_name
+//   - catalog_uuid + schema_name + branch_uuid
+//   - catalog_uuid + schema_name + branch_name
+//   - catalog_name + schema_name + branch_uuid
+//   - catalog_name + schema_name + branch_name
+message GetBranchRequest {
+  // --- Identifier block (schema + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+}
+
+message GetBranchResponse {
+  penca_proto.external.v1.Branch branch = 1;
+}
+
+// Lists branches within a schema.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid
+//   - catalog_uuid + schema_name
+//   - catalog_name + schema_name
+message ListBranchesRequest {
+  // --- Identifier block (schema) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  PaginationRequest pagination = 5;
+}
+
+message ListBranchesResponse {
+  repeated penca_proto.external.v1.Branch branches = 1;
+
+  // Token to pass in the next ListBranchesRequest. Absent when there
+  // are no more results.
+  optional string next_page_token = 2;
+}
+
+// ===========================================================================
+// Schema (read-only)
+// ===========================================================================
+//
+// CHA-177: schemas are branch-scoped — `__penca_system__.schemas` is a
+// regular Penca Table partitioned per branch. Identify the target
+// branch by uuid OR name (defaults to "main" when both omitted).
+
+// Retrieves a single schema by UUID or name-based identifiers.
+message GetSchemaRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+
+  // CHA-164: when set, the resolve includes uncommitted rows from this
+  // open tx so callers see their own in-flight DDL (read-your-own-writes).
+  // Mirrors the data-path RYOW plumbing from CHA-165.
+  // Mutually exclusive with `as_of_micros`.
+  optional string open_tx_uuid = 5;
+
+  // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
+  optional string branch_uuid = 6;
+  optional string branch_name = 7;
+
+  // CHA-236: point-in-time name resolution. When set, name → UUID
+  // resolution honors this snapshot — a `foo → bar` rename at T=200
+  // still finds the row by `foo` when as_of_micros=150. Mutually
+  // exclusive with `open_tx_uuid`; INVALID_ARGUMENT if both set.
+  optional int64 as_of_micros = 8;
+
+  // CHA-460: point-in-time name resolution on the commit_seq_num (commit-order
+  // serial) axis — resolves names as of `commit_seq_num <= as_of_seq`. The seq
+  // sibling of `as_of_micros`, so the SQL session pin can resolve identifiers
+  // on the same seq axis as its data read. Mutually exclusive with
+  // `as_of_micros` / `open_tx_uuid` (resolver precedence: open_tx, then
+  // micros, then seq).
+  optional int64 as_of_seq = 9;
+}
+
+message GetSchemaResponse {
+  Schema schema = 1;
+}
+
+// Lists schemas within a catalog, with pagination.
+message ListSchemasRequest {
+  // Identify the parent catalog whose schemas to list. Pass either
+  // catalog_uuid or catalog_name — matches the standard within-catalog
+  // identifier block (see GetSchemaRequest, ListTablesRequest, etc.).
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+
+  PaginationRequest pagination = 3;
+
+  // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
+  // Mutually exclusive with `as_of_micros`.
+  optional string open_tx_uuid = 4;
+
+  // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+
+  // CHA-236: point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_micros`.
+  optional int64 as_of_micros = 7;
+
+  // CHA-460: seq-axis point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_seq`.
+  optional int64 as_of_seq = 8;
+}
+
+message ListSchemasResponse {
+  repeated Schema schemas = 1;
+
+  // Token to pass in the next ListSchemasRequest. Absent when there
+  // are no more results.
+  optional string next_page_token = 2;
+}
+
+// ===========================================================================
+// Table (read-only)
+// ===========================================================================
+//
+// Each branch maintains independent per-branch physical data tables
+// (CHA-177), so the same table name can have different schemas on
+// different branches without conflict.
+
+// Retrieves a single table, scoped to a schema and branch.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + table_uuid (+ optional branch_uuid/branch_name)
+//   - schema_uuid + table_name (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name + table_name (+ optional branch)
+//   - catalog_name + schema_name + table_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message GetTableRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
+  // Mutually exclusive with `as_of_micros`.
+  optional string open_tx_uuid = 9;
+
+  // CHA-236: point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_micros`.
+  optional int64 as_of_micros = 10;
+
+  // CHA-460: seq-axis point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_seq`.
+  optional int64 as_of_seq = 11;
+}
+
+message GetTableResponse {
+  Table table = 1;
+}
+
+// Lists tables within a schema on a branch, with pagination.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name (+ optional branch)
+//   - catalog_name + schema_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message ListTablesRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+
+  PaginationRequest pagination = 7;
+
+  // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
+  // Mutually exclusive with `as_of_micros`.
+  optional string open_tx_uuid = 8;
+
+  // CHA-236: point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_micros`.
+  optional int64 as_of_micros = 9;
+
+  // CHA-460: seq-axis point-in-time name resolution. See
+  // `GetSchemaRequest.as_of_seq`.
+  optional int64 as_of_seq = 10;
+}
+
+message ListTablesResponse {
+  repeated Table tables = 1;
+
+  // Token to pass in the next ListTablesRequest. Absent when there
+  // are no more results.
+  optional string next_page_token = 2;
+}
+
+// ===========================================================================
+// Index metadata — CHA-455
+// ===========================================================================
+//
+// Reads against the auditable `index_metadata` store, time-travelling via
+// the same open_tx_uuid / as_of_micros pin pair as the other auditable
+// stores. Index DDL (Create/Update/Delete) lives in write.proto.
+
+message GetIndexRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  // Owning table (by uuid or name) — index_name is unique only within it.
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+  // Target index, by uuid or name.
+  optional string index_uuid = 9;
+  optional string index_name = 10;
+
+  // CHA-164: RYOW. Mutually exclusive with `as_of_micros`. (Pin pair at
+  // 11/12 — fields 9/10 are the index identifier, fixing the draft's
+  // field-number collision.)
+  optional string open_tx_uuid = 11;
+  // CHA-236: point-in-time resolution. See GetTableRequest.as_of_micros.
+  optional int64 as_of_micros = 12;
+}
+message GetIndexResponse {
+  Index index = 1;
+}
+
+message ListIndexesRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  // List indexes on this table (by uuid or name).
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // Mutually exclusive pin pair (see GetIndexRequest).
+  optional string open_tx_uuid = 9;
+  optional int64 as_of_micros = 10;
+}
+message ListIndexesResponse {
+  repeated Index indexes = 1;
+}
+
+// ===========================================================================
+// ReadData
+// ===========================================================================
+
+// Column projection for `ReadDataRequest`. See the field-level comment
+// on `ReadDataRequest.projection` for the three-state semantics.
+message Projection {
+  repeated string columns = 1;
+}
+
+// Reads data from a table. Resolves the table by UUID or name within
+// a schema, optionally scoped to a branch and/or a point in time.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + table_uuid (+ optional branch_uuid/branch_name)
+//   - schema_uuid + table_name (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name + table_name (+ optional branch)
+//   - catalog_name + schema_name + table_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message ReadDataRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // --- Visibility (mutually exclusive within the block) ---
+
+  // Point-in-time read on either commit axis (mutually exclusive arms).
+  // If the whole oneof is omitted, returns the latest committed state.
+  // Mutually exclusive with `open_tx_uuid`.
+  oneof as_of {
+    // As-of a commit timestamp (microseconds since the Unix epoch):
+    // rows from txs committed at or before this instant.
+    int64 commit_micros = 9;
+
+    // As-of a commit-order serial: rows from txs whose commit_seq_num (the
+    // gapless per-branch commit-order serial) is at or before this value.
+    int64 commit_seq_num = 14;
+  }
+
+  // Read-your-own-writes for an open transaction. When set, the read
+  // is anchored at the tx's BEGIN frontier and layered with that tx's
+  // own uncommitted writes. Visibility predicate:
+  //   (commit_seq_num < began_at_seq_num) OR (tx_uuid = open_tx_uuid)
+  // The strict `<` gives snapshot isolation: rows committed by other
+  // txs after this one's BEGIN are not visible. The OR clause picks up
+  // this tx's own uncommitted upserts/deletes from the data logs.
+  //
+  // The server resolves `open_tx_uuid` against `begin_tx_log` once per
+  // request; missing/aborted/expired/wrong-branch → error
+  // (NOT_FOUND / FAILED_PRECONDITION). The tx must be on the same
+  // branch as the request.
+  //
+  // Mutually exclusive with the `as_of` oneof (`commit_micros` /
+  // `commit_seq_num`). Setting both is an INVALID_ARGUMENT — RYOW only
+  // makes sense at the tx's own begin-time anchor; pinning to a
+  // different point-in-time would let writes layer onto a snapshot
+  // where the table or schema may not even exist.
+  optional string open_tx_uuid = 10;
+
+  // --- Projection / pushdown ---
+
+  // Column projection. Three states:
+  //   - Unset: return all user columns (the default).
+  //   - Set with `columns` empty: return 0-column batches whose
+  //     `num_rows` reflects the matched-row count. Required for
+  //     `SELECT COUNT(*)` shaped queries where the planner needs row
+  //     cardinality but no user data.
+  //   - Set with `columns` non-empty: return only the named user
+  //     columns in the given order.
+  // Wrapped in a message so proto3 presence (`Option<Projection>` in
+  // prost) disambiguates "unset" from "explicitly empty" — a bare
+  // `repeated string` cannot. System columns (e.g. `row_uuid`) are
+  // handled internally regardless.
+  Projection projection = 11;
+
+  // SQL WHERE clause fragment for predicate pushdown (e.g.,
+  // "id < 1000 AND status = 'active'"). Supports basic comparisons
+  // with AND/OR. When omitted, no filter is applied.
+  optional string filter = 12;
+
+  // Point-lookup restriction: an Arrow IPC record batch of exactly
+  // the table's declared primary-key columns, in the table's declared
+  // `primary_keys` order — the same batch shape as `Change.deletes`
+  // on WriteData. The read returns only rows whose primary key
+  // matches a batch row; keys with no matching row are silently
+  // absent. Composes by AND with `filter`, `projection`, and the
+  // visibility fields. Empty bytes = no restriction; a batch with
+  // zero rows is INVALID_ARGUMENT (omit the field instead). A batch
+  // whose schema deviates from the declared primary keys is
+  // INVALID_ARGUMENT.
+  bytes ids = 13;
+
+  // Structured secondary-index seek restriction (CHA-492): an Arrow IPC
+  // record batch of index-key columns carrying the equality values to seek —
+  // the secondary-index sibling of `ids` (which restricts by primary key). Each
+  // column must belong to some DEFINED index (`Table.indexes`); the batch may
+  // carry the UNION of several covering indexes' key columns, and the server
+  // selects every index whose full key set is present. Column ORDER is not
+  // significant — the server binds values by column name and probes each index
+  // in that index's own declared key order. A column naming no defined index is
+  // rejected with INVALID_ARGUMENT before planning. A materialized index seeks
+  // its per-segment sidecar (and, when the seek set fully covers the request on
+  // a snapshot-only read, takes the DataFusion-free bypass); a
+  // defined-but-unmaterialized index falls back to a merge scan with the
+  // equality as a residual. Composes by AND with `filter` / `projection` /
+  // `ids` / visibility. Empty bytes = no restriction.
+  bytes indexes = 15;
+}
+
+message ReadDataResponse {
+  // One Arrow IPC batch of table data. The server streams multiple
+  // responses, each containing a RecordBatch. Concatenating all
+  // batches produces the full result.
+  bytes data = 1;
+}
+
+// ===========================================================================
+// AuditData
+// ===========================================================================
+
+// Reads the audit trail for a table: every committed version of every
+// row, annotated with transaction metadata (begin/commit timestamps,
+// comment, author). Useful for compliance, debugging, and change tracking.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + table_uuid (+ optional branch_uuid/branch_name)
+//   - schema_uuid + table_name (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name + table_name (+ optional branch)
+//   - catalog_name + schema_name + table_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message AuditDataRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // Half-open commit window restricting the audit stream, on either
+  // commit axis (mutually exclusive arms). Omit for the full audit
+  // horizon. The "changes since N" cursor is the degenerate
+  // `committed { commit_seq_num: IntegerRange { min: N+1 } }`.
+  //
+  // CHA-236: name resolution uses the window's max bound (if set, else
+  // Latest), so an audit query against a renamed table finds it by its
+  // historical name within the requested window.
+  oneof committed {
+    // Window on commit timestamps (microseconds since the Unix epoch).
+    IntegerRange commit_micros = 9;
+
+    // Window on the commit-order serial (commit_seq_num).
+    IntegerRange commit_seq_num = 11;
+  }
+
+  // Point-lookup restriction: an Arrow IPC record batch of exactly
+  // the table's declared primary-key columns, in the table's declared
+  // `primary_keys` order — the same batch shape as `Change.deletes`
+  // on WriteData. The audit stream returns only the named rows'
+  // versions (upserts and tombstones), composing with the
+  // `committed_at` window. Empty bytes = no restriction; a batch with
+  // zero rows is INVALID_ARGUMENT (omit the field instead). A batch
+  // whose schema deviates from the declared primary keys is
+  // INVALID_ARGUMENT.
+  bytes ids = 10;
+
+  // When true, each row carries the per-tx `author` / `comment`,
+  // resolved by joining the commit tx log on `commit_seq_num`. When
+  // false (default) those two columns are omitted — a pay-for-what-you-use
+  // gate, since author/comment are stored once in the tx log rather than
+  // on every data row. The other tx-metadata columns (began_at_micros,
+  // commit_micros, write_seq_num, commit_seq_num) are present regardless.
+  bool include_tx_metadata = 12;
+}
+
+message AuditDataResponse {
+  // One Arrow IPC batch of upsert rows with tx metadata (began_at_micros,
+  // commit_micros, write_seq_num, commit_seq_num); `author` / `comment` are
+  // additionally present when the request set `include_tx_metadata`. The
+  // server streams multiple responses, each containing a RecordBatch. Either
+  // or both of `upserts`/`deletes` may be set on a single response — clients
+  // tolerate empty fields.
+  bytes upserts = 1;
+  // One Arrow IPC batch of delete tombstones with the same tx-metadata
+  // columns as `upserts` (`author` / `comment` gated on `include_tx_metadata`).
+  // Carries the deleted PKs + tx columns; user data columns are absent.
+  bytes deletes = 2;
+}
+
+// CHA-460: capture a branch's max commit_seq_num — the inclusive seq
+// frontier the SQL session pin captures at GetFlightInfo (the seq sibling of
+// NowMicros). Per-(catalog, branch), unlike the global NowMicros clock.
+message GetMaxCommitSeqNumRequest {
+  optional string catalog_uuid = 1;
+  optional string branch_uuid = 2;
+}
+
+message GetMaxCommitSeqNumResponse {
+  // The branch's last commit_seq_num (the gapless commit-order serial):
+  // the INCLUSIVE upper bound for an `AsOfSeq` read (`commit_seq_num <= this`), NOT
+  // the next-to-allocate counter. `-1` on a branch with no committed tx.
+  int64 max_commit_seq_num = 1;
+}
+
+// ===========================================================================
+// Service
+// ===========================================================================
+
+// QueryService exposes every Penca read: catalog/schema/table metadata,
+// branches, transactions, ReadData, AuditData. Mutations are on
+// WriteService.
+//
+// NOTE: DataFusion SQL query execution is intentionally absent from this
+// service. SQL goes over an ADBC Flight SQL endpoint (CHA-124).
+service QueryService {
+  // Catalog metadata
+  rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
+  rpc ListCatalogs(ListCatalogsRequest) returns (ListCatalogsResponse);
+
+  // Branch metadata
+  rpc GetBranch(GetBranchRequest) returns (GetBranchResponse);
+  rpc ListBranches(ListBranchesRequest) returns (ListBranchesResponse);
+
+  // Schema metadata
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc ListSchemas(ListSchemasRequest) returns (ListSchemasResponse);
+
+  // Table metadata
+  rpc GetTable(GetTableRequest) returns (GetTableResponse);
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+
+  // Index metadata (CHA-455) — reads the auditable index_metadata store.
+  rpc GetIndex(GetIndexRequest) returns (GetIndexResponse);
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Reads data from a single table, optionally with time-travel.
+  // Streams Arrow IPC RecordBatches.
+  rpc ReadData(ReadDataRequest) returns (stream ReadDataResponse);
+
+  // Reads the audit trail for a table within a time range.
+  // Streams Arrow IPC RecordBatches.
+  rpc AuditData(AuditDataRequest) returns (stream AuditDataResponse);
+
+  // Returns a branch's max commit_seq_num (the inclusive seq frontier).
+  rpc GetMaxCommitSeqNum(GetMaxCommitSeqNumRequest)
+      returns (GetMaxCommitSeqNumResponse);
+}

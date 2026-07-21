@@ -1,0 +1,10 @@
+[package]
+name = "penca-observability"
+description = "Shared tracing-subscriber init for Penca binaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing-subscriber = { workspace = true }

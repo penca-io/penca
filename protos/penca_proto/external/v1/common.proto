@@ -1,0 +1,200 @@
+syntax = "proto3";
+
+package penca_proto.external.v1;
+
+// Shared messages used across external Penca services.
+//
+// ===========================================================================
+// Identifier resolution rules
+// ===========================================================================
+//
+// All request messages accept flexible identifiers: callers may provide
+// UUIDs or human-readable names (or a mix). The server resolves names
+// to UUIDs via DB lookup against `catalog_store`, `branch_store`, and
+// the per-branch `__penca_system__.schemas` / `__penca_system__.tables`
+// tables.
+//
+// Resolution rules for the identifier block:
+//   - Catalog: provide catalog_uuid OR catalog_name
+//   - Schema:  provide schema_uuid OR (catalog + schema_name)
+//   - Branch:  provide branch_uuid OR branch_name (defaults to "main")
+//   - Table:   provide table_uuid OR table_name
+//
+// UUIDs are the recommended addressing form for stability across
+// rename (CHA-236) — they identify a resource by its server-minted
+// random UUID, which does not change when the resource is renamed.
+// Names are human convenience scoped to the current state (or to
+// the `as_of_micros` snapshot on read RPCs that support it).
+
+// ===========================================================================
+// Pagination
+// ===========================================================================
+
+// Standard pagination parameters used by all List RPCs.
+message PaginationRequest {
+  // Maximum number of results to return per page. The server may return
+  // fewer. If unset or zero, a server-defined default is used.
+  int32 page_size = 1;
+
+  // Opaque token returned by a previous List response to fetch the next
+  // page. Omit for the first request.
+  string page_token = 2;
+}
+
+// ===========================================================================
+// IntegerRange
+// ===========================================================================
+
+// Half-open int64 interval [min, max) — a generic coordinate range. The
+// carrying field names the unit/axis: a `commit_micros` field is
+// microseconds since the Unix epoch; a `commit_seq_num` field is a
+// commit-order serial.
+//
+// Either bound may be omitted to create an unbounded range:
+//   - omit min: matches everything below max
+//   - omit max: matches everything from min onward
+//   - both set: matches [min, max)
+//   - both omitted: matches everything (use with caution)
+message IntegerRange {
+  // Inclusive lower bound.
+  optional int64 min = 1;
+
+  // Exclusive upper bound.
+  optional int64 max = 2;
+}
+
+// ===========================================================================
+// RetentionConfig
+// ===========================================================================
+
+// Retention policy for a table's history. Defined at catalog (required),
+// schema (optional), and table (optional) levels; the effective policy for
+// a table is coalesce(table, schema, catalog), each field resolved
+// independently. Both knobs are coarse, human-set durations in seconds.
+message RetentionConfig {
+  // Retention window span, in seconds — how far back history is kept.
+  // Absent = inherit from parent; at the catalog level, absent = retain
+  // indefinitely.
+  optional int64 retention_duration_seconds = 1;
+
+  // Spacing between durable snapshot ladder rungs, in seconds. Absent =
+  // inherit from parent. When both are set, must be <=
+  // retention_duration_seconds (at least one rung per window).
+  optional int64 snapshot_density_seconds = 2;
+}
+
+// ===========================================================================
+// Catalog
+// ===========================================================================
+
+// A Catalog is the top-level container for schemas and tables. It serves
+// as the boundary for billing, access control, and resource isolation.
+message Catalog {
+  string catalog_uuid = 1;
+  string catalog_name = 2;
+  string owner = 3;
+  string description = 4;
+  // CHA-433: retention is schema-broadest; the catalog carries no retention
+  // policy (set it on schemas/tables).
+  reserved 5;
+  reserved "default_retention_config";
+}
+
+// ===========================================================================
+// Schema
+// ===========================================================================
+
+// A Schema is a logical grouping of tables within a catalog. It provides
+// a namespace so that table names only need to be unique within their
+// schema, not across the entire catalog.
+message Schema {
+  string schema_uuid = 1;
+  string catalog_uuid = 2;
+  string schema_name = 3;
+  string description = 4;
+  RetentionConfig default_retention_config = 5;
+}
+
+// ===========================================================================
+// Table
+// ===========================================================================
+
+// A Table holds data defined by an Arrow schema. table_uuid is the
+// server-minted random identity of the table; stable across rename
+// and across branches. Per-branch storage location derives server-side
+// from `data_log_prefix(table_uuid, branch_uuid)` (CHA-177); not exposed.
+message Table {
+  string table_uuid = 1;
+  string schema_uuid = 2;
+  string table_name = 3;
+
+  // Column definitions, serialized as an Arrow IPC schema message.
+  bytes arrow_schema = 4;
+  repeated string primary_keys = 5;
+  repeated string partition_keys = 6;
+  repeated string clustering_keys = 7;
+  string description = 8;
+  RetentionConfig retention_config = 9;
+
+  // Owning catalog. Required for callers that need to address per-catalog
+  // metadata (commit_tx_log partitions, branch_store) without an extra lookup.
+  string catalog_uuid = 10;
+
+  // Secondary-index definitions on this table (CHA-492): the DEFINED set from
+  // `__penca_system__.indexes`, so a reader learns a table's indexes in the
+  // same GetTable/ListTables round-trip that carries its schema. The query
+  // path validates a structured `ReadDataRequest.indexes` seek against this
+  // set and classifies materialized (seek) vs defined-only (scan fallback).
+  repeated Index indexes = 11;
+}
+
+// ===========================================================================
+// Index
+// ===========================================================================
+
+// Physical layout of a cold-tier index artifact (CHA-455 / ADR 0026 §6).
+// Honored-or-ignored per storage format (the hand-rolled sorted table is
+// the Parquet path; Lance leans on its native scalar indexes).
+enum IndexType {
+  INDEX_TYPE_UNKNOWN = 0;
+  INDEX_TYPE_SCALAR_BTREE = 1;
+  // INDEX_TYPE_SCALAR_HASH deferred (ADR 0026 out of scope).
+}
+
+// A secondary-index definition on a table (CHA-455). This is the
+// user-facing *definition* held in the auditable `index_metadata` store
+// (`__penca_system__.indexes`); query planning reads the materialized
+// per-segment sidecars (`segment_index_metadata`), never this. There is
+// no `unique` flag — cold read-accelerators cannot enforce a write-time
+// constraint (ADR 0026 §4).
+message Index {
+  string index_uuid = 1;
+  string table_uuid = 2;
+  // Unique only within a table (partitioned branch_uuid -> table_uuid),
+  // not globally.
+  string index_name = 3;
+  // Indexed column(s), in order. Required to build the artifact.
+  repeated string columns = 4;
+  IndexType index_type = 5;
+}
+
+// ===========================================================================
+// Branch
+// ===========================================================================
+
+// A branch within a catalog. Branches are catalog-scope versioning axes
+// (CHA-163): a single branch_uuid spans every schema in its catalog,
+// matching git's "a repo branch covers all directories" model.
+message Branch {
+  string branch_uuid = 1;
+  // Owning catalog. Branches are catalog-scoped post-CHA-163;
+  // catalog_uuid is the only parent identifier on a branch.
+  string catalog_uuid = 2;
+  string branch_name = 3;
+
+  // The source commit-order position this branch forked from — the gapless
+  // commit_seq_num of the fork commit. Determines the branch's initial
+  // point-in-time view of the source branch's data.
+  int64 fork_commit_seq_num = 4;
+}
+
