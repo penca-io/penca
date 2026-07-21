@@ -1,0 +1,25 @@
+[package]
+name = "penca-storage-meta"
+description = "Metadata storage client for catalog, schema, table, and segment metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-db = { workspace = true }
+penca-dl = { workspace = true }
+penca-merge = { workspace = true }
+penca-proto = { workspace = true }
+penca-storage-hot = { workspace = true }
+arrow = { workspace = true }
+futures-util = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+# Observability
+tracing = { workspace = true }

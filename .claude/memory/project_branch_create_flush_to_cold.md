@@ -1,0 +1,35 @@
+---
+name: project-per-branch-isolated-stack
+description: "TARGET architecture: a FULL isolated stack per branch (Flight SQL, Write, Query, Metadata, PG, Lifecycle, Cache); only S3 shared; branches never coordinate. NOTE: shipped code does NOT match yet — branch-create is metadata-copy + base_tx pin in a single shared stack, no flush (see body / CHA-356)."
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: a2944ddb-3a7e-4250-a08a-734547bc31ba
+---
+
+The target architecture (per the whitepaper diagram at fabricdb.io/whitepaper.html) is **one fully isolated stack per branch**, scoped under a catalog. Each branch's stack includes its own Flight SQL Server, Write/Query services, Metadata, Postgres, Lifecycle, and SSD-backed Cache Manager. The **only shared mutable substrate is the S3 object store** (annotated "eventually consistent" in the diagram). Branches never share hot state and never coordinate across stacks.
+
+CreateBranch in this model = flush parent's hot state to object storage, record resulting tx as `base_tx_uuid`, then provision a fresh empty stack (including empty-init PG) bound to that lineage. No `pg_basebackup`, no CSI VolumeSnapshot CoW. Cold-tier lineage via merge-on-read carries ancestor data.
+
+**Current state — verified 2026-05-30 ([[CHA-356]]) — the shipped code does NOT do this yet.** Today `CreateBranch` is a cheap metadata op inside a *single shared stack*: `Write::create_branch` (`crates/penca-api/src/write/mod.rs`) does one `branch_store` INSERT recording `base_tx_uuid`, creates empty per-branch partitions, and copies only catalog metadata via `materialize_metadata_from_source` — which explicitly creates *empty* per-branch data tables. **No flush of the parent, no per-branch stack spawn.**
+
+**CORRECTION (verified 2026-07-08 with a live integration repro): branch reads do NOT fall through to the parent.** An earlier version of this memory claimed reads read-through to the parent's state as-of `base_tx_uuid` — that is FALSE. The read planner (`QueryManager::plan`, `crates/penca-api/src/query/meta_plan.rs`) filters strictly on the child's own `branch_uuid`; a grep for `base_tx|parent_branch|base_branch|fork` across the query + merge crates returns nothing. A forked branch reads **empty** (repro: fork off 3 committed rows on main → child reads 0; after one local write → reads 1). `ensure_fast_forward` is a MERGE-side guard, not a read fallthrough. `base_tx_uuid` is stored but only format-validated and never consulted at read time. This is exactly the [[CHA-178]] bug. So "flush parent to S3 + spawn empty stack" is the [[CHA-129]] / [[CHA-67]] target, NOT present behavior — but the current cheapness does NOT back an "instant branching with inherited data" claim, because inheritance simply doesn't work yet.
+
+**Read-fix design LOCKED + re-scoped 2026-07-08 — and it does NOT need the isolated stack.** The branch-read fix is shippable in today's shared-stack model via three tickets, decoupled from [[CHA-67]]: [[CHA-273]] (synchronous persist-at-fork: flush source hot→cold so the fork point is fully in cold — the `persist` primitive already exists) + [[CHA-487]] (seed the child's `commit_seq_num` from the fork commit's seq, read from the `commit_tx_log` row not the counter; makes parent `≤seed`/child `>seed` disjoint so child shadows parent under existing latest-wins — no lineage tiebreak) → [[CHA-178]] (read/snapshot/persist merge the parent's cold as a *second cold source* via the shared getters `read_persist_segments_for_window` / `read_snapshot_segments_for_table`, with a **per-source seq ceiling** `min(fork_seed, as_of)` on the parent source — distinct from the branch's own-tier `as_of` ceiling, because seeding re-uses the seq space so parent-seq-K ≠ child-seq-K). CHA-178 is now `blocked-by` CHA-487 + CHA-273; CHA-273 was un-parented from CHA-67. Merge-side gaps: [[CHA-493]] (merge reads the source's hot logs directly — a FORBIDDEN cross-branch hot read; fix = persist source→cold then read cold only. **Invariant: no branch operation ever reads another branch's hot tier; all cross-branch data access is cold/S3-only — this is what enables the isolated-stack design**), [[CHA-494]] (base_tx not validated as a real committed tx). Non-FF merge collision-hardening stays with [[CHA-5]].
+
+**Why:** Drops every form of cross-branch coordination as a concern (advisory locks, shared connection pools, branch-aware partitioning inside PG). Drops CSI-driver dependencies for branch creation. Makes the control plane uniform: branch-create = "kubectl apply a namespace of pods"; scale-to-zero = scale the whole namespace.
+
+**How to apply when planning [[CHA-67]] / [[CHA-207]] / [[CHA-178]] / [[CHA-247]] / [[CHA-156]] / related:**
+- [[CHA-67]]'s framing as "per-branch Postgres" is too narrow — the actual unit is the **per-branch full stack**. Its v1 (`pg_basebackup` copy) and v2 (CSI VolumeSnapshot CoW) are both obsolete; the description needs a rewrite around flush-to-S3 + empty-init stack.
+- [[CHA-207]] phase 1 still wants EBS CSI for PVC provisioning, but `VolumeSnapshotClass` is no longer load-bearing — drop from the critical path.
+- [[CHA-178]] (CreateBranch propagate row data) — re-scoped 2026-07-08 and DECOUPLED from CHA-67: it does NOT need the isolated stack. Resolves in the shared-stack model as persist-at-fork ([[CHA-273]]) + seed-child-seq ([[CHA-487]]) + cross-branch cold read-merge (CHA-178 itself). Never a data copy. See the "Read-fix design LOCKED" paragraph above for the full mechanism.
+- [[CHA-247]] ("lift branch out of hot data abstraction") promotes from a future cleanup to a near-prereq for [[CHA-67]] — the diagram IS CHA-247.
+- [[CHA-156]] (`pg_advisory_lock` → `LockServiceClient`) — **stays Low**, not dropped. The cross-branch coordination motivation is moot (nothing locks across branches in the target architecture), but the original ticket's stated motivation (decouple from PG-specific transport, remove the orchestrator-only PG pool from `penca-sql-server`) stands on its own.
+- Ingress is per-stack Flight SQL routing (ALB → per-branch Flight SQL Server pod), not pgbouncer → per-branch PG. The routing key is `(catalog, branch)` resolving to a whole namespace, not a single PG endpoint.
+- KEDA scale-to-zero scales the entire branch namespace, not individual pods inside it.
+- The control plane (`penca-api-server`) provisions and tears down whole stacks per `CreateBranch` / `DeleteBranch`, not individual components.
+- Catalog is the tenancy boundary, branch is the sub-unit; tenant isolation maps to catalog namespacing.
+
+Diagram lives at https://fabric-20260409-resources.s3.us-east-1.amazonaws.com/architecture-2ae97248.svg (referenced from the whitepaper). It's a dvisvgm-generated SVG with no text elements — rasterize to PNG (cairosvg works locally) to read it.
+
+[[CHA-67]] and [[CHA-207]] ticket descriptions still show the old plan as of 2026-05-23 — flag for refresh before either is scheduled.

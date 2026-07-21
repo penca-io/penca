@@ -1,0 +1,339 @@
+# Conventional commit scopes for Penca.
+# Each scope maps 1:1 to a Linear label.
+# This file is the single source of truth — the commit-msg hook,
+# sync-linear script, and documentation all read from here.
+
+[lifecycle]
+description = "Persist, compact, snapshot, prune"
+linear_label_id = "60bdbad6-776b-41a7-bea6-ced7f92084a4"
+keywords = [
+    "persist",
+    "compact",
+    "snapshot",
+    "prune",
+    "lifecycle",
+    "segment",
+    "ingest",
+    "purge",
+    "retention",
+]
+
+[query]
+description = "Read path, merge-on-read, DataFusion"
+linear_label_id = "22eb2027-187a-43df-964a-41c2663e8ed2"
+keywords = [
+    "query",
+    "read path",
+    "read plan",
+    "merge-on-read",
+    "predicate",
+    "pushdown",
+    "projection",
+    "DataFusion",
+]
+
+[write]
+description = "Write path, mutations, transactions"
+linear_label_id = "e2d0cbba-0a0d-4429-af45-2eb361d5a7b9"
+keywords = [
+    "write path",
+    "mutation",
+    "mutate",
+    "transaction",
+    "commit_tx",
+    "rollback",
+    "COPY",
+]
+
+[branch]
+description = "Branching, merge, branch lifecycle"
+linear_label_id = "4ee94a1b-08a7-4c44-8bbe-9f9a1938c3dc"
+keywords = [
+    "branch",
+    "merge",
+    "branching",
+    "branch lifecycle",
+    "protected branch",
+    "TTL",
+]
+
+[meta]
+description = "Metadata stores, catalog, plan"
+linear_label_id = "3ab7934c-e329-46b7-bc18-5353cd7f4925"
+keywords = [
+    "metadata",
+    "catalog",
+    "plan",
+    "auditable",
+    "schema",
+    "table metadata",
+]
+
+[cold]
+description = "Cold storage, Lance/Parquet readers/writers"
+linear_label_id = "c2aa29a3-f853-484a-951b-ab7de9944be3"
+keywords = [
+    "cold storage",
+    "Lance",
+    "Parquet",
+    "object storage",
+    "S3",
+    "cold",
+]
+
+[hot]
+description = "Hot storage, Postgres data tables"
+linear_label_id = "c37e613b-d9f3-4a07-907d-f94b4118930b"
+keywords = [
+    "hot storage",
+    "Postgres",
+    "data table",
+    "materialized view",
+    "hot",
+]
+
+[proto]
+description = "Protobuf definitions"
+linear_label_id = "6fdf2b5a-1780-40fb-be60-a793597c806d"
+keywords = [
+    "proto",
+    "protobuf",
+    "gRPC",
+    "RPC",
+]
+
+[ci]
+description = "CI/CD, GitHub Actions"
+linear_label_id = "2e2a7416-a6f7-45ed-878a-ebf38d26fd8d"
+keywords = [
+    "CI",
+    "CD",
+    "GitHub Actions",
+    "workflow",
+    "autolink",
+]
+
+[deps]
+description = "Dependency updates"
+linear_label_id = "3269c908-66f8-4cbf-b703-a86d61c7197d"
+keywords = [
+    "dependency",
+    "dependencies",
+    "upgrade",
+    "MinIO",
+    "RustFS",
+]
+
+[infra]
+description = "Dev tooling, testing, docs, release coordination"
+linear_label_id = "801d51cf-a96c-4684-af7d-33ff82daaeae"
+keywords = [
+    "tooling",
+    "testing",
+    "documentation",
+    "document",
+    "release",
+    "Docker",
+    "Dockerfile",
+    "Justfile",
+    "pydantic",
+    "config",
+    "Playwright",
+    "performance test",
+    "perf test",
+    "conventional commit",
+]
+
+[hosted]
+description = "Managed deployment, scale-to-zero, wire protocol"
+linear_label_id = "4e5b2f76-e9a7-48da-9fad-c146fd2f5215"
+keywords = [
+    "hosted",
+    "scale-to-zero",
+    "wire protocol",
+    "Arrow Flight",
+    "Ballista",
+    "Cap'n Proto",
+    "Neon",
+    "managed deployment",
+]
+
+[api]
+description = "Manager orchestration layer (penca-api crate)"
+linear_label_id = "fc4c3fbc-734d-4567-adea-732140efedd4"
+keywords = [
+    "manager",
+    "orchestration",
+    "LifecycleManager",
+    "QueryManager",
+    "WriteManager",
+    "AdminManager",
+    "ApiError",
+]
+
+[admin]
+description = "Admin operations (catalog, schema, table CRUD)"
+linear_label_id = "bc6cc32c-fe58-4eb3-88b2-0b69a5e34c0c"
+keywords = [
+    "admin",
+    "catalog",
+    "create_table",
+    "delete_table",
+    "list_tables",
+    "AdminService",
+]
+
+[format]
+description = "Cold storage file formats (Lance, Parquet readers/writers)"
+linear_label_id = "1ab25066-b4d4-4620-8ef8-65f464292f4d"
+keywords = [
+    "format",
+    "Lance",
+    "Parquet",
+    "Vortex",
+    "FormatReader",
+    "FormatWriter",
+    "IPC",
+]
+
+[grpc]
+description = "gRPC servers, services, transport plumbing"
+linear_label_id = "f152c355-23c5-481f-9019-d7eab15c96f4"
+keywords = [
+    "gRPC",
+    "tonic",
+    "grpcio",
+    "service",
+    "servicer",
+    "channel",
+    "stub",
+    "max message size",
+]
+
+[sql]
+description = "Flight SQL server, SQL parsing, ADBC integration"
+linear_label_id = "571ee544-f7c2-4037-b026-8de095fe3d1d"
+keywords = [
+    "Flight SQL",
+    "penca-sql-server",
+    "ADBC",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "session",
+]
+
+[merge]
+description = "Merge-on-read pipeline, branch merge, merge module"
+linear_label_id = "3fc0e318-0b08-4b60-854c-5f969f5a1b44"
+keywords = [
+    "merge",
+    "merge-on-read",
+    "merge_read",
+    "branch merge",
+    "penca-merge",
+]
+
+[schema]
+description = "Arrow / proto / Postgres schema definitions and alignment"
+linear_label_id = "0667a7f9-6df3-48d1-a6a3-048778c67050"
+keywords = [
+    "schema",
+    "Arrow schema",
+    "proto schema",
+    "TX_LOG_SCHEMA",
+    "int64",
+    "uint64",
+]
+
+[storage]
+description = "Cross-tier storage changes (umbrella for hot+cold+meta)"
+linear_label_id = "b2de3709-bd65-4dfd-b8e8-9d47fb30cc98"
+keywords = [
+    "storage",
+    "ColdStorageClient",
+    "HotStorageClient",
+    "stateless",
+    "tier",
+]
+
+[storage-cold]
+description = "Alias of `cold` for penca-storage-cold crate scope"
+linear_label_id = "1a45e838-fd5e-4971-962f-4a00c8990ed9"
+keywords = [
+    "penca-storage-cold",
+    "storage-cold",
+]
+
+[storage-hot]
+description = "Alias of `hot` for penca-storage-hot crate scope"
+linear_label_id = "51a77926-b400-4800-8ddf-a0ad3496031f"
+keywords = [
+    "penca-storage-hot",
+    "storage-hot",
+]
+
+[storage-meta]
+description = "Alias of `meta` for penca-storage-meta crate scope"
+linear_label_id = "b71ac084-05bb-466d-81ce-e83d2a00df84"
+keywords = [
+    "penca-storage-meta",
+    "storage-meta",
+]
+
+[docker]
+description = "Dockerfiles, compose files, container images"
+linear_label_id = "368d4f1d-1465-4d3e-b527-eaa31eb6b081"
+keywords = [
+    "Docker",
+    "Dockerfile",
+    "compose",
+    "cargo-chef",
+    "image",
+]
+
+[perf]
+description = "Performance benchmarks, profiling, optimization"
+linear_label_id = "9adb3a73-c124-4527-a902-96031964e947"
+keywords = [
+    "perf",
+    "performance",
+    "benchmark",
+    "profile",
+    "throughput",
+    "latency",
+]
+
+[db]
+description = "Database drivers, connection pools, SQL dialect"
+linear_label_id = "47f078c5-a8eb-49d7-b8e0-96122ddd0c8d"
+keywords = [
+    "DbDriver",
+    "PgDriver",
+    "PsycopgDriver",
+    "connection pool",
+    "sqlx",
+    "psycopg",
+    "advisory_lock",
+    "SQL dialect",
+]
+
+[agent]
+description = "Claude Code / agent tooling: skills, hooks, settings, memory"
+linear_label_id = "84383535-a735-4500-9a05-2a9fc16df478"
+keywords = [
+    "claude",
+    "claude code",
+    "agent",
+    "subagent",
+    "skill",
+    "hook",
+    "mcp",
+    "memory",
+    "CLAUDE.md",
+    "settings.json",
+]
+

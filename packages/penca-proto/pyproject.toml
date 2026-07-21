@@ -1,0 +1,16 @@
+[project]
+name = "penca-proto"
+version = "0.1.0"
+description = "Protocol Buffer definitions for Penca"
+readme = "README.md"
+authors = [
+    { name = "Nico Bautista Hobin", email = "nico@penca.io" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "protobuf>=6.31.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"

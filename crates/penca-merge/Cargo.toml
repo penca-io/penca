@@ -1,0 +1,54 @@
+[package]
+name = "penca-merge"
+description = "Auditable store merge-on-read algorithm using Arrow compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Benches are listed explicitly so benches/floor_support.rs (a shared
+# #[path]-included helper, not a bench) isn't auto-discovered as a target.
+autobenches = false
+
+[dependencies]
+penca-core = { workspace = true }
+penca-db = { workspace = true }
+penca-dl = { workspace = true }
+penca-sql = { workspace = true }
+penca-storage-hot = { workspace = true }
+arrow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+tracing = { workspace = true }
+tracing-futures = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# CHA-415 hot-MVCC floor test: drives the real catalog/log creation path +
+# table-name helpers; penca-db/arrow/sqlx/uuid are already normal deps.
+penca-core = { workspace = true }
+# CHA-415 #3 merge fan-in floor: drives the real penca-dl scan_snapshot
+# (CHA-411) with an in-memory FormatReader.
+penca-format = { workspace = true }
+criterion = { workspace = true }
+
+# CHA-415 primitive #1 — Postgres-bound hot-MVCC dedup floor (read + write).
+[[bench]]
+name = "hot_mvcc_floor"
+harness = false
+
+# CHA-415 primitive #3 — DataFusion-bound hot+cold merge fan-in floor.
+[[bench]]
+name = "merge_fanin_floor"
+harness = false
+
+# CHA-418 primitive #2b — DataFusion-bound cold point-lookup execution floor.
+[[bench]]
+name = "cold_point_lookup_floor"
+harness = false

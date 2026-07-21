@@ -1,0 +1,40 @@
+[project]
+name = "penca-client"
+version = "0.1.0"
+description = "Python client for Penca — gRPC channels + Flight SQL"
+readme = "README.md"
+authors = [
+    { name = "Nico Bautista Hobin", email = "nico@penca.io" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "adbc-driver-flightsql>=1.1.0",
+    "adbc-driver-manager>=1.1.0",
+    "penca-proto",
+    "grpcio>=1.66.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyarrow>=23.0.0",
+    "xxhash>=3.6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+penca-proto = { workspace = true }
+
+[dependency-groups]
+# `psycopg[binary,pool]` only backs `tests/integration/integration_helpers.py`
+# (white-box PG assertions) — no runtime client code touches it. Living
+# in dev keeps it out of `pip install penca-client` while staying
+# available under `uv sync --all-packages` for `just integration-test`.
+# The `binary` extra is required: without it psycopg falls back to the
+# pure-Python implementation which needs libpq on the system, and
+# `uv sync` leaves the worktree venv unable to even import psycopg.
+dev = [
+    "pandas>=2.3.3",
+    "psycopg[binary,pool]>=3.3.3",
+    "tabulate>=0.10.0",
+]

@@ -1,0 +1,141 @@
+# Linear projects for Penca.
+# Each project is a time-bound initiative with its own backlog.
+# The sync-linear script creates missing projects and assigns issues
+# to them using the keywords defined here.
+
+[lifecycle-engine]
+name = "Lifecycle Engine"
+description = "Building out lifecycle RPCs: persist, compact, snapshot, prune"
+linear_project_id = "5fe2e036-e1d9-4208-837f-6e7a58d64f56"
+keywords = [
+    "persist",
+    "compact",
+    "snapshot",
+    "prune",
+    "lifecycle",
+    "segment",
+    "ingest",
+    "purge",
+    "retention",
+]
+
+[query-engine]
+name = "Query Engine"
+description = "Making the read path fast and robust across hot and cold storage"
+linear_project_id = "76bd052d-0d5e-41d4-97c2-4a0fa98433cd"
+keywords = [
+    "predicate",
+    "pushdown",
+    "projection",
+    "partition pruning",
+    "merge-on-read",
+    "read path",
+    "read plan",
+    "query",
+    "DataFusion",
+    "lance read",
+    "cold storage read",
+]
+
+[branch-model]
+name = "Branch Model"
+description = "Maturing the branching system: merge, conflicts, TTLs, protected branches"
+linear_project_id = "730508da-98b1-4962-b5c2-f93aef21d9ad"
+keywords = [
+    "branch",
+    "merge",
+    "conflict",
+    "protected",
+    "TTL",
+    "read-only branch",
+    "commit allowlist",
+    "rollback",
+    "revert commit",
+]
+
+[scale-to-zero]
+name = "Scale-to-Zero"
+description = "Hosted/serverless: checkpoint metadata, wire protocol, scale-to-zero"
+linear_project_id = "f29c90e9-c5e5-4b82-803d-69b12250893a"
+keywords = [
+    "scale-to-zero",
+    "hosted",
+    "checkpoint metadata",
+    "Cap'n Proto",
+    "Neon",
+    "wire protocol",
+    "Arrow Flight",
+    "Ballista",
+    "managed deployment",
+]
+
+[infrastructure]
+name = "Infrastructure"
+description = "Docker, CI/CD, GitHub Actions, deployment, config management"
+linear_project_id = "51cea5a7-bc32-4029-8175-7636f0037b63"
+keywords = [
+    "CI",
+    "CD",
+    "GitHub Actions",
+    "workflow",
+    "Docker",
+    "Dockerfile",
+    "deployment",
+    "config",
+    "pydantic",
+    "MinIO",
+    "RustFS",
+]
+
+[testing]
+name = "Testing"
+description = "Test framework, integration tests, performance tests"
+linear_project_id = "7d2f3616-79c9-40ce-933c-3ec6ecd54f5f"
+keywords = [
+    "test",
+    "integration test",
+    "performance test",
+    "perf test",
+    "pytest",
+    "Playwright",
+]
+
+[observability]
+name = "Observability"
+description = "Logging, monitoring, tracing, metrics"
+linear_project_id = "a38d28db-9d67-44c9-82b1-c45c76cf922b"
+keywords = [
+    "logging",
+    "monitoring",
+    "tracing",
+    "metrics",
+    "observability",
+]
+
+[ui]
+name = "UI"
+description = "Web UI for Penca: table browsing, SQL queries, natural language query support, schema exploration"
+linear_project_id = "102ada22-48d5-4eb2-b896-af557e0f30c2"
+keywords = [
+    "UI",
+    "frontend",
+    "web app",
+    "dashboard",
+    "natural language",
+    "SQL editor",
+]
+
+[developer-experience]
+name = "Developer Experience"
+description = "Documentation, release coordination, dev tooling (Justfile, scripts)"
+linear_project_id = "2edc651a-dba3-4b93-b052-e36334feb429"
+keywords = [
+    "documentation",
+    "document",
+    "tooling",
+    "conventional commit",
+    "Justfile",
+    "autolink",
+    "release",
+]
+

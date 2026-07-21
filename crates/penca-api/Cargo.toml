@@ -1,0 +1,35 @@
+[package]
+name = "penca-api"
+description = "API orchestration layer composing storage clients and merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-db = { workspace = true }
+penca-dl = { workspace = true }
+penca-format = { workspace = true }
+penca-merge = { workspace = true }
+penca-proto = { workspace = true }
+penca-sql = { workspace = true }
+penca-storage-cold = { workspace = true }
+penca-storage-hot = { workspace = true }
+penca-storage-meta = { workspace = true }
+arrow = { workspace = true }
+async-stream = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+# ADR 0019 §"Four-part mechanism" item 4 — `with_query_timeout` uses
+# `tokio::time::{Instant, sleep_until}` + the `select!` / `pin!`
+# macros to enforce the BatchStream cap.
+tokio = { workspace = true, features = ["macros", "time"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

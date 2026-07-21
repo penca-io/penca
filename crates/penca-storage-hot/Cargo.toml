@@ -1,0 +1,22 @@
+[package]
+name = "penca-storage-hot"
+description = "Hot storage client for Postgres-backed transactional tier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-db = { workspace = true }
+arrow = { workspace = true }
+half = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-futures = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }

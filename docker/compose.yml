@@ -1,0 +1,344 @@
+# Two profiles, layered so deployments can mix and match:
+#
+#   infra           — Postgres + SeaweedFS + the SeaweedFS bucket-init job.
+#                     Self-contained for local dev; skipped when the operator
+#                     points the servicers at an existing Postgres / S3.
+#   penca-backend  — the 3 servicer binaries + the Flight SQL gateway.
+#
+# Bring up the full stack:
+#   docker compose -f docker/compose.yml --profile infra --profile penca-backend up -d
+#
+# Bring up only the servicers, against external Postgres + S3: this file
+# inlines `DATABASE_URL` / `OBJECT_STORAGE_*` for the local stack, so an
+# external deployment needs a `docker-compose.override.yml` that
+# replaces those keys (compose merges on `services.<svc>.environment`)
+# and `--profile penca-backend` only.
+
+# Shared build definition for every penca-rust-server service (CHA-420).
+# All servicers build the same image from one Dockerfile, so this anchor is
+# the single source of truth. CARGO_PROFILE selects the build profile:
+# `release` by default (normal `just penca-up` / CI), `profiling` when
+# `just perf-profile` exports it — producing the DWARF + frame-pointer image
+# samply needs.
+x-rust-build: &rust-build
+  context: ..
+  dockerfile: docker/Dockerfile.rust-server
+  args:
+    CARGO_PROFILE: ${CARGO_PROFILE:-release}
+  # CHA-439: AWS creds for the in-container sccache→S3 compile cache (see
+  # the top-level `secrets:` block). BuildKit excludes secret values from
+  # layer-cache keys, so toggling creds never invalidates cached layers.
+  secrets: [aws_credentials, aws_config]
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: [infra]
+    # CHA-365: preload pg_stat_statements so integration tests can count
+    # per-RPC metadata-merge SQL executions as a white-box assertion seam
+    # (passive collector; no effect on service behavior).
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    environment:
+      POSTGRES_DB: penca
+      POSTGRES_USER: penca
+      POSTGRES_PASSWORD: penca
+    ports:
+      - "${PG_HOST_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U penca -d penca"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    profiles: [infra]
+    command: server -s3 -s3.config=/etc/seaweedfs/s3.json -s3.ip.bind=0.0.0.0 -dir=/data
+    ports:
+      - "${SEAWEEDFS_HOST_PORT}:8333"
+    volumes:
+      - seaweedfsdata:/data
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  seaweedfs-init:
+    image: minio/mc:latest
+    profiles: [infra]
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://seaweedfs:8333 pencaadmin pencaadmin &&
+      mc mb --ignore-existing local/penca &&
+      exit 0
+      "
+
+  # One-shot init job: seeds global Penca tables + the default catalog
+  # row that SQL_SERVER_DEFAULT_CATALOG resolves against. All runtime
+  # servicers `depends_on` it via `service_completed_successfully` so they
+  # never observe a half-bootstrapped database. Standalone deployments
+  # (your own Postgres) run the same binary out of this image — see
+  # README "Standalone deployments".
+  #
+  # `image: penca-rust-server` + the local `build:` block matches every
+  # other servicer in this file; CHA-187 swaps all services to
+  # `ghcr.io/penca-io/penca-rust-server:<tag>` in one go — don't swap
+  # bootstrap-init standalone or BuildKit will rebuild the same layers
+  # twice per `up`.
+  bootstrap-init:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://penca:penca@postgres:5432/penca
+      SQL_SERVER_DEFAULT_CATALOG: "public"
+      # CHA-329: deployment-side default. The `${VAR:-default}` form
+      # lets an operator (or docker/test.env) override per environment
+      # without further code changes; if the env is missing entirely,
+      # penca_observability::init_tracing falls back to the same
+      # directive in-process.
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"
+    command: penca-bootstrap
+
+  query:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+      bootstrap-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://penca:penca@postgres:5432/penca
+      PG_POOL_MIN: "1"
+      PG_POOL_MAX: "4"
+      BIND_ADDR: "0.0.0.0:50052"
+      QUERY_DEFAULT_PAGE_SIZE: "100"
+      QUERY_DEFAULT_STREAM_BATCH_SIZE: "1024"
+      QUERY_SEGMENT_READ_CONCURRENCY: "4"
+      # CHA-353: prune snapshot segments only when planned count exceeds this.
+      QUERY_SNAPSHOT_PRUNE_MIN_SEGMENTS: "${QUERY_SNAPSHOT_PRUNE_MIN_SEGMENTS:-1}"
+      # CHA-485: probe-tuple cartesian cap for covering-index selection;
+      # over-cap skips the index (full scan + residual), 0 disables selection.
+      QUERY_INDEX_SEEK_MAX_PROBE_TUPLES: "${QUERY_INDEX_SEEK_MAX_PROBE_TUPLES:-1024}"
+      QUERY_TIMEOUT_SECONDS: "${QUERY_TIMEOUT_SECONDS:-900}"
+      # CHA-252: in-process snapshot-segment cache byte budget (1 GiB default).
+      QUERY_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES: "${QUERY_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES:-1073741824}"
+      # CHA-441: snapshot-list cache. TTL MUST be <= min(snapshot interval,
+      # QUERY_TIMEOUT_SECONDS grace) so a stale list never outlives the retired
+      # snapshot files it names (the GC grace bound).
+      QUERY_SNAPSHOT_LIST_CACHE_TTL_SECONDS: "${QUERY_SNAPSHOT_LIST_CACHE_TTL_SECONDS:-30}"
+      QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES: "${QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES:-10000}"
+      OBJECT_STORAGE_PROVIDER: s3
+      OBJECT_STORAGE_BUCKET: penca
+      OBJECT_STORAGE_FORMAT: lance
+      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
+      OBJECT_STORAGE_SECRET_KEY: pencaadmin
+      OBJECT_STORAGE_REGION: us-east-1
+      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
+      OBJECT_STORAGE_SCHEME: http
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
+      PENCA_SPAN_TIMING: "${PENCA_SPAN_TIMING:-}"  # CHA-353: opt-in span busy/idle timing
+    command: penca-query
+    ports:
+      - "${QUERY_HOST_PORT}:50052"
+
+  write:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+      bootstrap-init:
+        condition: service_completed_successfully
+      # CHA-273 rework: the write path connects to the lifecycle service at
+      # startup (PersistBranch at CreateBranch), mirroring the scheduler.
+      lifecycle:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://penca:penca@postgres:5432/penca
+      PG_POOL_MIN: "1"
+      PG_POOL_MAX: "4"
+      BIND_ADDR: "0.0.0.0:50053"
+      WRITE_DEFAULT_TX_TIMEOUT_SECONDS: "60"
+      WRITE_MAX_TX_TIMEOUT_SECONDS: "3600"
+      # CHA-472: the write path shares the query path's metadata caches so a hot
+      # autocommit point-write resolves its target identifier from cache. The
+      # TTL is bounded the same way as the query service's (ADR 0019/0028): a
+      # stale snapshot list must not outlive the retired files it names.
+      WRITE_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES: "${WRITE_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES:-1073741824}"
+      WRITE_SNAPSHOT_LIST_CACHE_TTL_SECONDS: "${WRITE_SNAPSHOT_LIST_CACHE_TTL_SECONDS:-30}"
+      WRITE_SNAPSHOT_LIST_CACHE_MAX_ENTRIES: "${WRITE_SNAPSHOT_LIST_CACHE_MAX_ENTRIES:-10000}"
+      # CHA-273 rework: the write path calls PersistBranch on the lifecycle
+      # service to flush the source branch hot→cold at CreateBranch. The persist
+      # loop (and its segment-size knob) lives in the lifecycle pod now.
+      LIFECYCLE_SERVICE_ADDR: http://lifecycle:50054
+      OBJECT_STORAGE_PROVIDER: s3
+      OBJECT_STORAGE_BUCKET: penca
+      OBJECT_STORAGE_FORMAT: lance
+      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
+      OBJECT_STORAGE_SECRET_KEY: pencaadmin
+      OBJECT_STORAGE_REGION: us-east-1
+      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
+      OBJECT_STORAGE_SCHEME: http
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
+      PENCA_SPAN_TIMING: "${PENCA_SPAN_TIMING:-}"  # CHA-353: opt-in span busy/idle timing
+    command: penca-write
+    ports:
+      - "${WRITE_HOST_PORT}:50053"
+
+  lifecycle:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+      bootstrap-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://penca:penca@postgres:5432/penca
+      PG_POOL_MIN: "1"
+      PG_POOL_MAX: "4"
+      BIND_ADDR: "0.0.0.0:50054"
+      LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES: "${LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES:-67108864}"
+      LIFECYCLE_SEGMENT_READ_CONCURRENCY: "4"
+      QUERY_TIMEOUT_SECONDS: "${QUERY_TIMEOUT_SECONDS:-900}"
+      # CHA-444 (ADR 0027): hot-purge grace window. The expired-begin
+      # ledger GC uses max(SCHEDULER_TICK_INTERVAL_SECONDS, this) as its
+      # grace; the tick MUST match the scheduler's value (shared, like
+      # QUERY_TIMEOUT_SECONDS) so the floor reflects the real Purge cadence.
+      HOT_PURGE_GRACE_SECONDS: "${HOT_PURGE_GRACE_SECONDS:-60}"
+      SCHEDULER_TICK_INTERVAL_SECONDS: "${SCHEDULER_TICK_INTERVAL_SECONDS:-5}"
+      OBJECT_STORAGE_PROVIDER: s3
+      OBJECT_STORAGE_BUCKET: penca
+      OBJECT_STORAGE_FORMAT: lance
+      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
+      OBJECT_STORAGE_SECRET_KEY: pencaadmin
+      OBJECT_STORAGE_REGION: us-east-1
+      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
+      OBJECT_STORAGE_SCHEME: http
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
+    command: penca-lifecycle
+    ports:
+      - "${LIFECYCLE_HOST_PORT}:50054"
+
+  lifecycle-scheduler:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      # The scheduler is a pure gRPC client; it only reaches two
+      # services (query + lifecycle). `bootstrap-init` must complete
+      # before the first `ListCatalogs` succeeds.
+      query:
+        condition: service_started
+      lifecycle:
+        condition: service_started
+      bootstrap-init:
+        condition: service_completed_successfully
+    environment:
+      QUERY_SERVICE_ADDR: http://query:50052
+      LIFECYCLE_SERVICE_ADDR: http://lifecycle:50054
+      # Default tick: 5s — keeps the unattended-happy-path latency
+      # bounded without burning cycles. Test profile overrides to 1s
+      # via `docker/test.env` so the integration suite's
+      # "wait 2 ticks" assertions complete in seconds.
+      SCHEDULER_TICK_INTERVAL_SECONDS: "${SCHEDULER_TICK_INTERVAL_SECONDS:-5}"
+      SCHEDULER_LIST_PAGE_SIZE: "${SCHEDULER_LIST_PAGE_SIZE:-100}"
+      # Universal grace window (ADR 0019) — MUST equal the lifecycle
+      # + query servicers' value. The scheduler bounds its
+      # `ListPersistedTables` upper at `now - QUERY_TIMEOUT_SECONDS` so
+      # only tables whose persist has already cleared the server-side
+      # grace gate get a Purge call.
+      QUERY_TIMEOUT_SECONDS: "${QUERY_TIMEOUT_SECONDS:-900}"
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
+    command: penca-lifecycle-scheduler
+    # No `ports:` — the scheduler doesn't listen.
+
+  penca-sql-server:
+    image: penca-rust-server
+    profiles: [penca-backend]
+    build: *rust-build
+    depends_on:
+      query:
+        condition: service_started
+      write:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      bootstrap-init:
+        condition: service_completed_successfully
+    environment:
+      QUERY_SERVICE_ADDR: http://query:50052
+      WRITE_SERVICE_ADDR: http://write:50053
+      BIND_ADDR: "0.0.0.0:50060"
+      # Orchestrator-only Pg pool: serialises strict-INSERT collision check
+      # + write under a per-(branch, table) advisory lock (CHA-121, ADR 0006).
+      DATABASE_URL: postgres://penca:penca@postgres:5432/penca
+      PG_POOL_MIN: "1"
+      PG_POOL_MAX: "4"
+      # Default catalog / schema / branch for the SQL server.
+      # CHA-171's `penca-bootstrap` binary seeds a `public` catalog so
+      # unbound Flight SQL connections land on a real `catalog_store`
+      # row out of the box; `create_catalog_tables` auto-creates a matching
+      # `public` schema and a `main` branch, so unqualified DML
+      # resolves through `public.public.foo` on the `main` branch.
+      # Per-session branch overrides via `SET branch = ...` come with
+      # CHA-119; until then DEFAULT_BRANCH is the only knob (CHA-173).
+      SQL_SERVER_DEFAULT_CATALOG: "public"
+      SQL_SERVER_DEFAULT_SCHEMA: "public"
+      SQL_SERVER_DEFAULT_BRANCH: "main"
+      # CHA-355: per-connection logical-plan cache size. GetFlightInfo stashes
+      # the statement-query plan under a handle; DoGet reuses it instead of
+      # re-planning. 0 disables (every DoGet re-plans).
+      SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY: "${SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY:-128}"
+      RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
+      PENCA_SPAN_TIMING: "${PENCA_SPAN_TIMING:-}"  # CHA-353: opt-in span busy/idle timing
+    command: penca-sql-server
+    ports:
+      - "${PENCA_SQL_HOST_PORT}:50060"
+    # TCP-level liveness — arrow-flight has no dedicated health endpoint,
+    # and grpc_health_probe would need extra server wiring. Bash's /dev/tcp
+    # is built into debian:bookworm-slim.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':</dev/tcp/localhost/50060'"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+      start_period: 3s
+
+volumes:
+  pgdata:
+  seaweedfsdata:
+
+# CHA-439: credentials for the build-time sccache→S3 compile cache.
+# compose hard-fails ("failed to stat") when a secrets `file:` path is
+# missing — even when the Dockerfile mount says required=false — so the
+# default must be a path that always exists. /dev/null mounts as an
+# empty file, which the Dockerfile's `-s` test treats as "no creds →
+# plain compile". `just penca-up` exports the real ~/.aws paths when
+# they exist; direct `docker compose build` users can do the same.
+secrets:
+  aws_credentials:
+    file: ${PENCA_AWS_CREDENTIALS:-/dev/null}
+  aws_config:
+    file: ${PENCA_AWS_CONFIG:-/dev/null}

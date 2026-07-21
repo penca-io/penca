@@ -1,0 +1,75 @@
+[package]
+name = "penca-sql-server"
+description = "Flight SQL server with DataFusion query engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-datafusion = { workspace = true }
+penca-observability = { workspace = true }
+penca-db = { workspace = true }
+penca-proto = { workspace = true }
+# CHA-236: catalog-name → uuid lookup for `SET catalog = '<name>'` and
+# the session-cache's startup catalog resolution.
+penca-storage-meta = { workspace = true }
+
+# Row identity (UUID derivation for DML)
+uuid = { workspace = true }
+
+# Arrow / DataFusion
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+datafusion = { workspace = true }
+
+# Vendored Flight SQL service deps (from datafusion-flight-sql-server v0.4.16).
+# When lance-file supports Arrow 58, bump datafusion/arrow and update the
+# vendored code in src/flight_sql/ to match the latest upstream.
+prost = { workspace = true }
+tokio-stream = "0.1"
+once_cell = "1"
+log = "0.4"
+futures = "0.3"
+async-stream = { workspace = true }
+
+# gRPC / server
+tonic = { workspace = true }
+tokio = { workspace = true }
+
+# Per-TCP-connection session driver (CHA-255). tonic 0.14's
+# `Server::serve` wraps the layered service in `BoxCloneService` that
+# clones per HTTP/2 stream — not per TCP conn — so the per-conn shell
+# can't be a `tower::Layer`. We drive `serve_connection` directly from
+# `hyper-util::server::conn::auto::Builder` instead, with a custom
+# `MakeService<SocketAddr>` that produces a fresh per-conn shell on
+# every `TcpListener::accept`.
+http = "1"
+hyper = { version = "1", features = ["server", "http2"] }
+# `server` enables hyper-util's connection-driver glue; `service` enables
+# the `TowerToHyperService` adapter we use to bridge `tower::Service` →
+# `hyper::service::Service`. gRPC is HTTP/2-only so we deliberately
+# skip the `server-auto` feature (protocol sniffer) and use
+# `hyper::server::conn::http2::Builder` directly.
+hyper-util = { version = "0.1", features = ["server", "service", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+
+# Postgres error type for the dml.rs advisory-lock wrapper. The pool itself
+# comes from penca-db; we only need the error type to satisfy
+# `advisory_lock`'s `E: From<sqlx::Error>` bound.
+sqlx = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-futures = { workspace = true }
+
+[build-dependencies]
+# Compiles the vendored Flight SQL SessionOptions protos under
+# protos/flight_sql/. The generated Rust types are consumed by
+# src/flight_sql/session_options.rs to encode/decode the action bodies
+# behind the standard Flight SQL `SetSessionOptions` / `GetSessionOptions`
+# action types.
+tonic-prost-build = { workspace = true }
+protox = { workspace = true }

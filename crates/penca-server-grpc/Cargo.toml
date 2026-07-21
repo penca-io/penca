@@ -1,0 +1,48 @@
+[package]
+name = "penca-server-grpc"
+description = "gRPC server implementing Penca proto services via tonic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-api = { workspace = true }
+penca-core = { workspace = true }
+penca-observability = { workspace = true }
+penca-db = { workspace = true }
+penca-dl = { workspace = true }
+penca-format = { workspace = true }
+penca-proto = { workspace = true }
+lance-io = { workspace = true }
+penca-storage-hot = { workspace = true }
+penca-storage-meta = { workspace = true }
+arrow = { workspace = true }
+async-stream = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-futures = { workspace = true }
+object_store = { workspace = true }
+uuid = { workspace = true }
+
+[[bin]]
+name = "penca-query"
+path = "src/bin/penca_query.rs"
+
+[[bin]]
+name = "penca-write"
+path = "src/bin/penca_write.rs"
+
+[[bin]]
+name = "penca-lifecycle"
+path = "src/bin/penca_lifecycle.rs"
+
+[[bin]]
+name = "penca-bootstrap"
+path = "src/bin/bootstrap.rs"

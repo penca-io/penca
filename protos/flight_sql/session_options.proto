@@ -1,0 +1,83 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Vendored from Apache Arrow `format/Flight.proto` (session-options subset).
+// Field numbers, types, and oneof tags match upstream verbatim so the bytes
+// on the wire are interchangeable with any Flight SQL client. The package
+// is renamed to penca.flight_sql.v1 to avoid collision with
+// arrow.flight.protocol if arrow-flight upstream ever ships these types
+// in the version of the crate we pin.
+
+syntax = "proto3";
+
+package penca.flight_sql.v1;
+
+// Union of possible value types for a session option.
+//
+// By convention, an attempt to set a valueless SessionOptionValue should
+// attempt to unset or clear the named option value on the server.
+message SessionOptionValue {
+  message StringListValue {
+    repeated string values = 1;
+  }
+
+  oneof option_value {
+    string string_value = 1;
+    bool bool_value = 2;
+    sfixed64 int64_value = 3;
+    double double_value = 4;
+    StringListValue string_list_value = 5;
+  }
+}
+
+// Body for the "SetSessionOptions" action. Each entry mutates the named
+// option on the current server session.
+message SetSessionOptionsRequest {
+  map<string, SessionOptionValue> session_options = 1;
+}
+
+// Result for the "SetSessionOptions" action.
+//
+// Option names appear in `errors` only if they failed to set; absence of
+// an entry implies the option was set successfully.
+message SetSessionOptionsResult {
+  enum ErrorValue {
+    // Protobuf deserialization fallback. Servers should avoid sending this.
+    UNSPECIFIED = 0;
+    // The given session option name is invalid.
+    INVALID_NAME = 1;
+    // The session option value or type is invalid.
+    INVALID_VALUE = 2;
+    // The session option cannot be set.
+    ERROR = 3;
+  }
+
+  message Error {
+    ErrorValue value = 1;
+  }
+
+  map<string, Error> errors = 1;
+}
+
+// Body for the "GetSessionOptions" action.
+message GetSessionOptionsRequest {
+}
+
+// Result for the "GetSessionOptions" action — the current server session's
+// options.
+message GetSessionOptionsResult {
+  map<string, SessionOptionValue> session_options = 1;
+}

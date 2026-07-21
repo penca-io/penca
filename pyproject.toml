@@ -1,0 +1,82 @@
+[project]
+name = "penca-workspace"
+version = "0.1.0"
+description = "Penca workspace root"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.70.0",
+    "ipython>=8.39.0",
+    "matplotlib>=3.10.9",
+    "pandas>=2.3.3",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "ruff>=0.15.0",
+    "streamlit>=1.58.0",
+    "ty>=0.0.15",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+# force-exclude makes the exclusion hold even when paths are passed
+# explicitly (pre-commit and `ruff format <path>` both do), so committed
+# generated stubs stay byte-identical to `just compile-protos-py` output.
+force-exclude = true
+exclude = [
+    "packages/penca-proto/src/penca_proto",
+]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+
+[[tool.ty.overrides]]
+include = ["scripts/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+[[tool.ty.overrides]]
+include = ["packages/penca-proto/src/penca_proto/**"]
+[tool.ty.overrides.rules]
+conflicting-metaclass = "ignore"
+
+# psycopg.sql type narrowing: SQL vs Composed vs Composable, LiteralString,
+# and cursor.execute accepting Composable at runtime despite typed as Query
+[[tool.ty.overrides]]
+include = [
+    "packages/penca-client/src/penca_client/arrow.py",
+    "packages/penca-client/src/penca_client/naming.py",
+    "packages/penca-client/src/penca_client/_time.py",
+    "tests/integration/integration_helpers.py",
+]
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+
+# pydantic_settings populates BaseSettings fields from env vars at
+# runtime, but ty sees the bare class and reports the env-driven fields
+# as missing constructor arguments.
+[[tool.ty.overrides]]
+include = ["packages/penca-client/tests/unit/test_config.py"]
+[tool.ty.overrides.rules]
+missing-argument = "ignore"
+
+# Proto-shape regression tests in this file read ``*Response.DESCRIPTOR.fields``
+# to verify the wire schema. ty can't fully type protobuf reflection
+# (DESCRIPTOR is typed as ``Unknown | None``), so its
+# ``unresolved-attribute`` rule flags every reflection call. The runtime
+# behavior is correct — the static check is just noise here.
+[[tool.ty.overrides]]
+include = ["tests/integration/integration_per_table_lifecycle_test.py"]
+[tool.ty.overrides.rules]
+unresolved-attribute = "ignore"
+
+[tool.pytest.ini_options]
+testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]

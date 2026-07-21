@@ -1,0 +1,7 @@
+# Downloaded by `just fetch-jdbc-driver` from Maven Central. Pinned
+# version + SHA-256 live in the Justfile recipe.
+lib/
+
+# Java 21 single-file mode compiles to a tmp dir, but if anyone runs
+# `javac` here for IDE indexing they may leave class files behind.
+*.class

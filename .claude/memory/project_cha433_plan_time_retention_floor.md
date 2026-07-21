@@ -1,0 +1,22 @@
+---
+name: project_cha433_plan_time_retention_floor
+description: "CHA-433 plan-time retention floor enforcement — PR #317 OPEN, ready for merge 2026-07-13 (kata graph fully drained, 2 review rounds clean); scope-B folds in \"retention is schema-broadest\" (catalog-level retention dropped)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 9145745c-419b-40a4-ace0-816f4f7c39fe
+---
+
+CHA-433 "Plan-time retention floor enforcement (FAILED_PRECONDITION below the durable floor)" — the load-bearing correctness half of the audit-retention epic (①). Enforces `as_of`/audit `from` below the durable-snapshot floor → gRPC `FAILED_PRECONDITION`. Blocker [[project_cha432_durable_substrate]] (CHA-432) merged. **PR #317 OPEN, ready for merge** (2026-07-13) — branch `nhobin219/cha-433-plan-time-retention-floor-enforcement-failed_precondition`. Full kata graph drained (red-tests, impls, orch run-cleanup/open-pr/spawn-review); `just check` green; both `/review-pr` rounds returned zero correctness defects; roborev quiet. NOT merged (queue-only CI runs on enqueue; merge is the user's). Follow-ups: **CHA-511** (by-uuid current-retention resolution) and **CHA-514** (descendant audit-below-fork silent-wrong-data — retention prune/aging strands pre-fork ancestor history a fork's `audit_data` below its fork point needs; CHA-72's `earliest_fork_point_into` clamp only protects AT the fork, not below; sliding-window aging trips it with NO write, so no write-time guard suffices). Driver-parity red-test dropped: floor is gRPC-only (Flight SQL pins the frontier, no client as_of).
+
+**Do-no-harm write guard tightened 2026-07-14 (commit 2ae8277f):** `reject_retention_duration_change` (was `reject_retention_loosening`) in `penca-api/src/write/mod.rs` now makes `retention_duration_seconds` **immutable once set** — rejects shortening (CHA-514 descendant-audit harm) AND loosening/clearing (CHA-511 floor wrongly-rejects); allows only unset→set establish + no-op. Both directions of a retention edit are unsafe; write-time guard is only a partial tripwire (can't catch establish-with-forks, create-time-retention+fork, or natural aging — all CHA-514).
+
+**Scope-B decision (made in planning, folded into this PR):** retention becomes **schema-broadest** — catalog-level `default_retention_config` is DROPPED (Catalog proto field 5 reserved; `coalesce_retention` → `table → schema`). Why: the floor needs effective `retention_duration_seconds` on the read path; narrowing to schema means schema+table retention are already in `ResolvedScope` → **zero extra read-path roundtrips** (no catalog fetch), AND system tables (`__penca_system__` schema, no retention) floor to nothing with no special-case. Low-risk because retention was never enforced yet (catalog retention stored-but-unread, like `retain_max_versions` when CHA-495 dropped it). Narrows CHA-495's surface — epic doc `RetentionPolicy` should note schema-broadest.
+
+**Key mechanism decisions:**
+- Floor COMPARISON+error raised in `read_data`/`plan_audit` (penca-api) as `ApiError::FailedPrecondition` → gRPC via `status.rs:13`. NOT inside `plan()`: it returns `penca_storage_meta::MetadataError` (no FailedPrecondition variant → maps to INTERNAL) and serves internal system-table reads (`meta_resolve.rs:345`, passes `None`).
+- Floor READ rides the existing hot_min query as a LATERAL subquery — read path folds onto `hot_min_and_snapshot_pick` (meta_plan.rs), audit onto `hot_min_commit_micros` (persist.rs — its OWN combined query, NOT the shared `latest_committed_table_persist_watermark` which has 3 callers). `window_start` computed in SQL via `PgDialect::microsecond_epoch()` — no `now_micros` threading; only `duration` bound. Null duration ⇒ no subquery ⇒ null-floor no-op.
+- Boundary: axis = `ReadSnapshot::plan_commit_seq_upper()` — `Some(seq)`→seq (reject `seq < floor.commit_seq_num`), `None`→micros (reject `as_of_micros < floor.snapshotted_at_micros`). Strict `<` (floor exactly accepted). `LatestSeq`/`OpenTx` carry current-ish seq → never fire. Audit unset-lower clamps to floor.
+- Shared SQL fragment `snapshot::retention_floor_select` reused by CHA-432's `retention_floor` helper + both folds (avoids a third copy).
+
+Graph: red-tests nd7p(reshape) yn7k(read) vj9j(audit) g3c9(driver-parity) → impls bey3(reshape/drop catalog) drgs(read floor) 6k6m(audit floor) → orch run-cleanup/open-pr/spawn-review. See [[project_cha432_durable_substrate]], [[feedback_evaluate_ticket_necessity_first_principles]].

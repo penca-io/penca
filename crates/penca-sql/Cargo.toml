@@ -1,0 +1,10 @@
+[package]
+name = "penca-sql"
+description = "Penca SQL dialect trait shared between hot (Postgres) and cold (DataFusion) tiers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uuid = { workspace = true }

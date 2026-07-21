@@ -1,0 +1,122 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/penca-core",
+    "crates/penca-db",
+    "crates/penca-dl",
+    "crates/penca-format",
+    "crates/penca-merge",
+    "crates/penca-proto",
+    "crates/penca-sql",
+    "crates/penca-storage-cold",
+    "crates/penca-storage-hot",
+    "crates/penca-storage-meta",
+    "crates/penca-api",
+    "crates/penca-datafusion",
+    "crates/penca-sql-server",
+    "crates/penca-server-grpc",
+    "crates/penca-lifecycle-scheduler",
+    "crates/penca-observability",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/penca-io/penca"
+
+[workspace.dependencies]
+# Internal crates
+penca-core = { path = "crates/penca-core" }
+penca-db = { path = "crates/penca-db" }
+penca-dl = { path = "crates/penca-dl" }
+penca-format = { path = "crates/penca-format" }
+penca-merge = { path = "crates/penca-merge" }
+penca-proto = { path = "crates/penca-proto" }
+penca-sql = { path = "crates/penca-sql" }
+penca-storage-cold = { path = "crates/penca-storage-cold" }
+penca-storage-hot = { path = "crates/penca-storage-hot" }
+penca-storage-meta = { path = "crates/penca-storage-meta" }
+penca-api = { path = "crates/penca-api" }
+penca-datafusion = { path = "crates/penca-datafusion" }
+penca-observability = { path = "crates/penca-observability" }
+
+# Arrow ecosystem
+# Pinned to arrow 57 for lance-file 4.0.0 compatibility.
+# datafusion 52 also uses arrow 57. When lance-file supports arrow 58,
+# bump arrow, parquet, arrow-flight, and datafusion together.
+arrow = "57"
+arrow-ipc = "57"
+# Half-precision float type backing Arrow's Float16 (re-uses arrow's `half`).
+half = "2"
+parquet = "57"
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
+datafusion = "52"
+object_store = { version = "0.12", features = ["aws"] }
+lance-file = "4"
+lance-io = "4"
+lance-core = "4"
+lance-encoding = "4"
+
+# In-process cache (W-TinyLFU eviction + weighted byte budget)
+moka = { version = "0.12", features = ["sync"] }
+
+# gRPC / proto
+tonic = "0.14"
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+protox = "0.9"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "bigdecimal"] }
+
+# Identity
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Benchmarking (CHA-415 floor suite)
+criterion = { version = "0.5", features = ["html_reports"] }
+futures-core = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace"] }
+# tracing 0.1 only ships `Instrumented<F>: Future`; the `Stream` impl
+# needed to attach a span to a `Stream` (e.g. a tonic streaming
+# response) lives in `tracing-futures` 0.2 behind the `futures-03`
+# feature. tracing-futures is in maintenance mode; CHA-322 tracks
+# removing this dep once tracing 0.2 absorbs Stream support.
+tracing-futures = { version = "0.2", features = ["futures-03"] }
+
+# Bytes
+bytes = "1"
+
+# Opt-in profiling build for `just perf-profile` (CHA-420). Default `release`
+# carries no DWARF, so attaching samply to the containerized binary yields only
+# function-name stacks from `.symtab`. This profile inherits release's
+# optimization level but adds full DWARF (line + inlined frames) so samply
+# symbolicates down to source. Frame pointers — the other half of reliable
+# samply unwinding — can't be set as a Cargo profile key (it's a rustc -C flag,
+# not a manifest key), so they're forced via RUSTFLAGS=-Cforce-frame-pointers=yes
+# in the profiling Docker build step (docker/Dockerfile.rust-server). Built into
+# the perf image via the CARGO_PROFILE build arg; normal builds are unaffected.
+[profile.profiling]
+inherits = "release"
+debug = 2

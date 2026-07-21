@@ -1,0 +1,953 @@
+syntax = "proto3";
+
+package penca_proto.external.v1;
+
+import "penca_proto/external/v1/common.proto";
+
+// WriteService provides the data plane API for mutations: catalog,
+// schema, and table DDL; branching; transactions; and data changes
+// (inserts, updates, deletes).
+//
+// Resource hierarchy is Catalog -> Schema -> Table; create them
+// top-down. Branches are catalog-scoped (CHA-163) — every schema/table
+// mutation specifies a branch (defaults to "main").
+//
+// CHA-164: schema and table DDL are transactional. Each mutation accepts
+// an optional `tx_uuid` to join an open transaction; when omitted, the
+// server auto-commits the DDL as its own tx so callers retain
+// immediate-effect semantics. Catalog mutations are NOT transactional —
+// they bootstrap the per-catalog metadata storage outside any tx.
+//
+// Typical write flow for single-mutation transactions:
+//   1. CreateBranch (or use the default "main" branch)
+//   2. WriteData with tx_uuid unset (single atomic open-append-commit)
+//
+// Multi-statement transactions (data and/or DDL):
+//   1. CreateBranch (or use the default "main" branch)
+//   2. BeginTx on that branch
+//   3. CreateSchema / CreateTable / WriteData (any combination) with
+//      the returned tx_uuid set
+//   4. CommitTx to finalize
+//
+// Open transactions can be ended in two ways:
+//   - AbortTx (explicit) — clients that want immediate rollback (e.g.
+//     SQL ROLLBACK in CHA-122). After AbortTx, a CommitTx on the same
+//     tx_uuid fails with FAILED_PRECONDITION.
+//   - TTL expiry (implicit) — fallback for crashed clients that never
+//     reach AbortTx. The TTL is set at BeginTx; expired transactions
+//     are garbage-collected.
+//
+// Read-only operations on catalogs, schemas, tables, branches, and
+// transactions are defined in query.proto.
+//
+// All request messages accept flexible identifiers: callers may provide
+// UUIDs or human-readable names (or a mix). The server resolves names to
+// UUIDs via DB lookup on catalog_store / branch_store /
+// __penca_system__ rows. See common.proto for the full resolution
+// rules.
+
+// ===========================================================================
+// Catalog
+// ===========================================================================
+//
+// A Catalog is the top-level container for schemas and tables. It serves
+// as the boundary for billing, access control, and resource isolation.
+// Catalog mutations are not tx-tracked: they bootstrap per-catalog
+// metadata storage (the per-catalog `commit_tx_log`, `__penca_system__.schemas`,
+// `__penca_system__.tables`) which the rest of the tx machinery depends
+// on. Author / comment plumbing therefore doesn't apply here.
+//
+// TODO: consider adding authorization metadata (e.g., a list of
+// users/groups with access and their roles: read / write / admin).
+
+// Creates a new catalog.
+message CreateCatalogRequest {
+  // Human-readable name for the catalog. Must be unique within the Penca
+  // instance. Used as the default display name and in resource paths.
+  string catalog_name = 1;
+
+  // Identity of the catalog owner (e.g., email or service account).
+  // The owner is granted full admin permissions on the catalog.
+  string owner = 2;
+
+  // Optional free-text description of the catalog's purpose.
+  string description = 3;
+
+  // CHA-433: retention is schema-broadest; set it on schemas/tables, not the
+  // catalog.
+  reserved 4;
+  reserved "default_retention_config";
+}
+
+message CreateCatalogResponse {
+  // Server-assigned unique identifier for the newly created catalog.
+  string catalog_uuid = 1;
+
+  // Server-minted random UUID for the auto-created "main" branch
+  // (CHA-236). Persist alongside `catalog_uuid` — branch UUIDs are no
+  // longer recomputable client-side.
+  string main_branch_uuid = 2;
+}
+
+// Updates a catalog's mutable fields (owner, description, retention).
+// All fields are replaced — send the full desired state. ``catalog_name``
+// is an identifier — pass it to address the catalog by name without
+// supplying the UUID. UUID is the stable identity across rename.
+message UpdateCatalogRequest {
+  // --- Identifier ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  // CHA-236: when set, renames the catalog. Returns ALREADY_EXISTS if
+  // another catalog already uses this name. UUID is the stable identity
+  // across rename; clients persisting `catalog_uuid` are unaffected.
+  optional string new_catalog_name = 3;
+  // --- Mutable fields ---
+  string owner = 4;
+  string description = 5;
+  // CHA-433: retention is schema-broadest; catalog no longer carries a policy.
+  reserved 6;
+  reserved "default_retention_config";
+}
+
+message UpdateCatalogResponse {
+  Catalog catalog = 1;
+}
+
+// Permanently deletes a catalog and all schemas/tables within it.
+// This is irreversible.
+message DeleteCatalogRequest {
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+}
+
+message DeleteCatalogResponse {
+  string catalog_uuid = 1;
+}
+
+// ===========================================================================
+// Branch
+// ===========================================================================
+
+// Creates a new branch within a catalog. Branches are catalog-scoped
+// (CHA-184) — every schema visible on the source branch is materialized
+// onto the new branch as a single fork tx, so the request takes only
+// the catalog identifier.
+//
+// The fork point is a commit-order position on the source branch. Set the
+// `fork_point` oneof's `commit_seq_num` to fork from an exact commit, or
+// `commit_micros` to fork as of the latest commit at or before a wall-clock
+// time. Leave `fork_point` unset to fork from the source branch head.
+//
+// Sufficient identifier combinations:
+//   - catalog_uuid
+//   - catalog_name
+message CreateBranchRequest {
+  // --- Identifier block (catalog) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+
+  // --- Domain fields ---
+  string branch_name = 3;
+
+  // Client-provided UUID for idempotent creation. If omitted, the
+  // server generates one.
+  optional string branch_uuid = 5;
+
+  // Source branch to fork from. The new branch inherits all tables
+  // visible on the source branch at the fork point. If omitted,
+  // defaults to "main".
+  optional string source_branch_uuid = 6;
+  optional string source_branch_name = 7;
+
+  // --- Tx metadata for the per-branch table-materialization tx ---
+  // CreateBranch always atomically creates one auto-commit tx on the new
+  // branch tagged with the supplied `author` / `comment` (CHA-174 unifies
+  // these across every tx-creating WriteService RPC). Required (non-
+  // optional) — every branch creation is auto-commit, so there is no
+  // mode-switch and no fallback.
+  string comment = 8;
+  string author = 9;
+
+  // The fork point: the source-branch commit-order position the new branch
+  // forks from. `commit_seq_num` names an exact commit (the gapless commit-order
+  // serial) committed on the source branch itself; `commit_micros` selects the
+  // latest commit at or before that microsecond wall-clock time. Leave unset to
+  // fork from the source branch head. A position that names no committed tx on
+  // the source branch (a seq not committed there, or a time before its first
+  // commit) is rejected with INVALID_ARGUMENT.
+  oneof fork_point {
+    int64 commit_seq_num = 10;
+    int64 commit_micros = 11;
+  }
+}
+
+message CreateBranchResponse {
+  penca_proto.external.v1.Branch branch = 1;
+}
+
+// Deletes a branch. Protected branches cannot be deleted. Branches are
+// catalog-scoped (CHA-184) — DeleteBranch cleans cold storage and
+// metadata for every schema's tables on the branch.
+//
+// Sufficient identifier combinations:
+//   - catalog_uuid + branch_uuid
+//   - catalog_uuid + branch_name
+//   - catalog_name + branch_uuid
+//   - catalog_name + branch_name
+message DeleteBranchRequest {
+  // --- Identifier block (catalog + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 3;
+  optional string branch_name = 4;
+}
+
+message DeleteBranchResponse {}
+
+// Merges a source branch into a target branch. Creates a merge
+// transaction on the target branch that incorporates all committed
+// changes from the source branch since their common ancestor.
+// Branches are catalog-scoped (CHA-184) — the merge fans out across
+// every schema's tables.
+//
+// Sufficient identifier combinations (for catalog):
+//   - catalog_uuid
+//   - catalog_name
+// Source and target branches: provide UUID or name for each.
+message MergeBranchRequest {
+  // --- Identifier block (catalog) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+
+  // --- Source branch ---
+  optional string source_branch_uuid = 3;
+  optional string source_branch_name = 4;
+
+  // --- Target branch ---
+  optional string target_branch_uuid = 5;
+  optional string target_branch_name = 6;
+
+  // --- Metadata ---
+  string comment = 7;
+  string author = 8;
+}
+
+message MergeBranchResponse {
+  // Commit timestamp of the merge transaction on the target branch.
+  // Usable as `as_of_micros` for time-travel reads that need to see the
+  // merged state. Audit metadata for the merge (comment, author) lives
+  // on the per-row audit trail (see AuditData on QueryService).
+  int64 commit_micros = 1;
+}
+
+// ===========================================================================
+// UpdateBranch
+// ===========================================================================
+
+// Updates a branch's mutable fields. Currently only `branch_name`
+// (rename, CHA-236). Branches are catalog-scoped (CHA-184); pass the
+// catalog identifier alongside the branch identifier. Not tx-tracked
+// — branch renames update `branch_store` directly, same tier as
+// CreateBranch / DeleteBranch.
+//
+// Sufficient identifier combinations:
+//   - catalog_uuid + branch_uuid
+//   - catalog_uuid + branch_name
+//   - catalog_name + branch_uuid
+//   - catalog_name + branch_name
+message UpdateBranchRequest {
+  // --- Identifier block (catalog + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 3;
+  optional string branch_name = 4;
+
+  // CHA-236: when set, renames the branch. Returns ALREADY_EXISTS if
+  // another branch in the catalog already uses this name. UUID is
+  // the stable identity across rename.
+  optional string new_branch_name = 5;
+}
+
+message UpdateBranchResponse {
+  Branch branch = 1;
+}
+
+// ===========================================================================
+// Schema
+// ===========================================================================
+//
+// A Schema is a logical grouping of tables within a catalog. It provides
+// a namespace so that table names only need to be unique within their
+// schema, not across the entire catalog.
+//
+// CHA-177: schemas are branch-scoped — `__penca_system__.schemas` is a
+// regular Penca Table partitioned per branch. Identify the target
+// branch by uuid OR name (defaults to "main" when both omitted).
+
+// Creates a new schema within a catalog on a branch.
+message CreateSchemaRequest {
+  // Identify the parent catalog. Pass either catalog_uuid or catalog_name —
+  // matches the standard within-catalog identifier block (see
+  // UpdateSchemaRequest, DeleteSchemaRequest, CreateTableRequest, etc.).
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+
+  // Human-readable name for the schema. Must be unique within the catalog.
+  string schema_name = 3;
+
+  // Optional free-text description.
+  string description = 4;
+
+  // Optional retention policy override. Fields set here override the catalog
+  // default for all tables in this schema. Tables can further override.
+  RetentionConfig default_retention_config = 5;
+
+  // CHA-164 mode-switching: present ⇒ join that open tx (writes
+  // invisible until CommitTx); absent ⇒ auto-commit a fresh tx for
+  // this single DDL op.
+  optional string tx_uuid = 6;
+
+  // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
+  optional string branch_uuid = 7;
+  optional string branch_name = 8;
+
+  // Tx metadata — valid only when tx_uuid is absent (auto-commit). When
+  // tx_uuid is set, the open tx already carries its own author/comment
+  // from BeginTx; setting them here returns INVALID_ARGUMENT.
+  optional string author = 9;
+  optional string comment = 10;
+}
+
+message CreateSchemaResponse {
+  // Server-assigned unique identifier for the newly created schema.
+  string schema_uuid = 1;
+}
+
+// Updates a schema's mutable fields (description, retention).
+// All fields are replaced — send the full desired state. ``schema_name``
+// is an identifier — pass it to address the schema by name without
+// supplying the UUID.
+message UpdateSchemaRequest {
+  // --- Identifier block ---
+  optional string schema_uuid = 1;
+  optional string schema_name = 2;
+  // CHA-236: when set, renames the schema. See
+  // `UpdateCatalogRequest.new_catalog_name`.
+  optional string new_schema_name = 3;
+  // --- Mutable fields ---
+  string description = 4;
+  // Full replacement: an update writes this value verbatim, so retention must
+  // be re-sent on every UpdateSchema. CHA-433 makes retention_duration_seconds
+  // immutable once set — omitting it (clears), shortening, or increasing it is
+  // rejected with FAILED_PRECONDITION; only establishing a policy where none
+  // exists is allowed (see CHA-514).
+  RetentionConfig default_retention_config = 5;
+  // Catalog identity is required because the catalog hosts the
+  // `__penca_system__.schemas` table. Pass either catalog_uuid or
+  // catalog_name.
+  optional string catalog_uuid = 6;
+  optional string catalog_name = 7;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 8;
+
+  // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
+  optional string branch_uuid = 9;
+  optional string branch_name = 10;
+
+  // Tx metadata — valid only when tx_uuid is absent. See
+  // CreateSchemaRequest.author / .comment.
+  optional string author = 11;
+  optional string comment = 12;
+}
+
+message UpdateSchemaResponse {
+  Schema schema = 1;
+}
+
+// Permanently deletes a schema and all tables within it.
+// This is irreversible.
+message DeleteSchemaRequest {
+  // Catalog identity is required because the catalog hosts the
+  // `__penca_system__.schemas` table. Pass either catalog_uuid or
+  // catalog_name.
+  optional string catalog_uuid = 2;
+  optional string catalog_name = 3;
+  // Identify the schema by uuid OR name within the catalog.
+  optional string schema_uuid = 1;
+  optional string schema_name = 4;
+  // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
+  optional string branch_uuid = 6;
+  optional string branch_name = 7;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 5;
+
+  // Tx metadata — valid only when tx_uuid is absent. See
+  // CreateSchemaRequest.author / .comment.
+  optional string author = 8;
+  optional string comment = 9;
+}
+
+message DeleteSchemaResponse {
+  string schema_uuid = 1;
+}
+
+// ===========================================================================
+// Table
+// ===========================================================================
+//
+// CHA-164: Table operations participate in MVCC alongside data writes.
+// CreateTable / UpdateTable / DeleteTable rows carry a `tx_uuid` and
+// resolve visibility via JOIN against `commit_tx_log_partition(catalog,
+// branch)`. Each request optionally takes a `tx_uuid` to join an open
+// transaction (changes invisible until CommitTx); when omitted, the
+// server auto-commits a fresh tx for the single DDL op so existing
+// callers keep their immediate-effect semantics.
+//
+// Each branch maintains independent per-branch physical data tables
+// (CHA-177), so the same table name can have different schemas on
+// different branches without conflict.
+//
+// All table request messages accept flexible identifiers — see
+// common.proto for the resolution rules.
+
+// Creates a new table within a schema on a branch.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name (+ optional branch)
+//   - catalog_name + schema_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message CreateTableRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+
+  // --- Domain fields ---
+
+  // Human-readable table name. Must be unique within the schema on this
+  // branch.
+  string table_name = 7;
+
+  // The table's column definitions, serialized as an Arrow IPC schema
+  // message (i.e., the output of schema.serialize()).
+  bytes arrow_schema = 8;
+
+  // Columns that form the table's primary key. Used to compute a
+  // deterministic row_uuid (xxh3 hash of PK values) so the same logical
+  // row has a stable identity across branches and merges. Required.
+  repeated string primary_keys = 9;
+
+  // Columns used to partition the table's data on disk.
+  repeated string partition_keys = 10;
+
+  // Columns used to sort data within each partition.
+  repeated string clustering_keys = 11;
+
+  // Optional free-text description.
+  string description = 12;
+
+  // Optional retention policy override. Fields set here take precedence
+  // over schema and catalog defaults.
+  RetentionConfig retention_config = 13;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 14;
+
+  // Tx metadata — valid only when tx_uuid is absent. See
+  // CreateSchemaRequest.author / .comment.
+  optional string author = 15;
+  optional string comment = 16;
+
+  // CHA-455: index definitions to create inline with the table, in the
+  // same tx. Equivalent to a CreateIndex per entry after the table
+  // lands. (Field 17 — fields 14–16 are tx_uuid/author/comment.)
+  repeated CreateTableIndexDefinition indexes = 17;
+}
+
+message CreateTableResponse {
+  // Server-minted random UUID for the new table. Stable across rename
+  // and branches; persist alongside the table identity.
+  string table_uuid = 1;
+}
+
+// ===========================================================================
+// Index DDL (transactional via CHA-164) — CHA-455
+// ===========================================================================
+//
+// Index definitions live in the auditable `index_metadata` store
+// (`__penca_system__.indexes`), addressed like table DDL: a within-catalog
+// identifier block + the target table (by uuid or name) + the CHA-164
+// tx_uuid mode-switch. Reads (GetIndex/ListIndexes) live in query.proto.
+
+// One inline index definition on CreateTableRequest.indexes.
+message CreateTableIndexDefinition {
+  string index_name = 1;
+  repeated string columns = 2;
+  IndexType index_type = 3;
+}
+
+message CreateIndexRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  // Target table (by uuid or name) — an index cannot exist without its
+  // table.
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // --- Domain fields ---
+  // Index name; unique only within the target table.
+  string index_name = 9;
+  repeated string columns = 10;
+  IndexType index_type = 11;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 12;
+  // Tx metadata — valid only when tx_uuid is absent.
+  optional string author = 13;
+  optional string comment = 14;
+}
+message CreateIndexResponse {
+  string index_uuid = 1;
+}
+
+message UpdateIndexRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+  // Index to rename, by uuid or current name.
+  optional string index_uuid = 9;
+  optional string index_name = 10;
+
+  // Rename-only: changing columns/type is a rebuild (drop + create), not
+  // an in-place update (ADR 0026).
+  string new_index_name = 11;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 12;
+  optional string author = 13;
+  optional string comment = 14;
+}
+message UpdateIndexResponse {
+  string index_uuid = 1;
+}
+
+message DeleteIndexRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+  optional string index_uuid = 9;
+  optional string index_name = 10;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 11;
+  optional string author = 12;
+  optional string comment = 13;
+}
+message DeleteIndexResponse {
+  string index_uuid = 1;
+}
+
+// Updates a table's mutable fields (schema, options, description).
+// All fields are replaced — send the full desired state. Schema changes
+// must be backwards-compatible (e.g., adding nullable columns).
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + table_uuid (+ optional branch_uuid/branch_name)
+//   - schema_uuid + table_name (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name + table_name (+ optional branch)
+//   - catalog_name + schema_name + table_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message UpdateTableRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  // table_name addresses the table by name (UUID is the alternative).
+  optional string table_name = 8;
+  // CHA-236: when set, renames the table. See
+  // `UpdateCatalogRequest.new_catalog_name`.
+  optional string new_table_name = 9;
+
+  // --- Domain fields ---
+  bytes arrow_schema = 10;
+  repeated string primary_keys = 11;
+  repeated string partition_keys = 12;
+  repeated string clustering_keys = 13;
+  string description = 14;
+  // Full replacement: an update writes this value verbatim, so retention must
+  // be re-sent on every UpdateTable. CHA-433 makes retention_duration_seconds
+  // immutable once set — omitting it (clears), shortening, or increasing it is
+  // rejected with FAILED_PRECONDITION; only establishing a policy where none
+  // exists is allowed (see CHA-514).
+  RetentionConfig retention_config = 15;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 16;
+
+  // Tx metadata — valid only when tx_uuid is absent. See
+  // CreateSchemaRequest.author / .comment.
+  optional string author = 17;
+  optional string comment = 18;
+}
+
+message UpdateTableResponse {
+  Table table = 1;
+}
+
+// Deletes a table on a branch.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid + table_uuid (+ optional branch_uuid/branch_name)
+//   - schema_uuid + table_name (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name + table_name (+ optional branch)
+//   - catalog_name + schema_name + table_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message DeleteTableRequest {
+  // --- Identifier block ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  optional string table_uuid = 7;
+  optional string table_name = 8;
+
+  // CHA-164 mode-switching: see CreateSchemaRequest.tx_uuid.
+  optional string tx_uuid = 9;
+
+  // Tx metadata — valid only when tx_uuid is absent. See
+  // CreateSchemaRequest.author / .comment.
+  optional string author = 10;
+  optional string comment = 11;
+}
+
+message DeleteTableResponse {
+  string table_uuid = 1;
+}
+
+// ===========================================================================
+// Transaction
+// ===========================================================================
+
+// Begins a new transaction on a branch.
+//
+// Sufficient identifier combinations:
+//   - schema_uuid (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name (+ optional branch)
+//   - catalog_name + schema_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+message BeginTxRequest {
+  // --- Identifier block (schema + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+
+  // --- Domain fields ---
+
+  // Free-text description of what this transaction does.
+  string comment = 7;
+
+  // Identity of the actor initiating this transaction.
+  string author = 8;
+
+  // Client-provided UUID for idempotent creation. If omitted, the
+  // server generates one.
+  optional string tx_uuid = 9;
+
+  // Timeout in seconds. The transaction is aborted and its mutations
+  // are discarded if not committed within this window. Server uses a
+  // default timeout if omitted. A value above the server max
+  // (`WRITE_MAX_TX_TIMEOUT_SECONDS`), or a non-positive value, is
+  // rejected with INVALID_ARGUMENT.
+  optional int64 timeout_seconds = 10;
+}
+
+message BeginTxResponse {
+  // Server-allocated when BeginTxRequest.tx_uuid is omitted; echoed back
+  // when the caller supplied one (idempotent-retry knob).
+  string tx_uuid = 1;
+  int64 began_at_micros = 2;
+  // Past this timestamp the tx is considered expired and its data
+  // mutations are ignored.
+  int64 expires_at_micros = 3;
+}
+
+// Commits a transaction, making all its mutations visible.
+//
+// Sufficient identifier combinations (catalog + branch):
+//   - catalog_uuid + branch_uuid + tx_uuid
+//   - catalog_uuid + branch_name + tx_uuid
+//   - catalog_name + branch_uuid + tx_uuid
+//   - catalog_name + branch_name + tx_uuid
+//
+// Tx ops are catalog-scoped (CHA-163) — `commit_tx_log`, `begin_tx_log`, and
+// `abort_tx_log` all live at the catalog level (partitioned by branch),
+// so schema is not part of the addressing. `branch_uuid` /
+// `branch_name` are required so the server can target the leaf
+// partitions directly without a parent-table scan. A tx that doesn't
+// belong to the supplied branch surfaces as NOT_FOUND from the
+// leaf-partition lookup.
+message CommitTxRequest {
+  // --- Identifier block (catalog + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 3;
+  optional string branch_name = 4;
+
+  // --- Domain fields ---
+  string tx_uuid = 5;
+}
+
+message CommitTxResponse {
+  // Commit timestamp; usable as `as_of_micros` for time-travel reads
+  // that need to see the just-committed state.
+  int64 commit_micros = 1;
+
+  // The commit's gapless commit-order serial. Usable as a CreateBranch fork
+  // position (the `fork_point` oneof's `commit_seq_num`).
+  int64 commit_seq_num = 2;
+}
+
+// Aborts an open transaction. After AbortTx, any subsequent CommitTx
+// on the same tx_uuid fails with FAILED_PRECONDITION. AbortTx is
+// idempotent — re-aborting the same tx_uuid is a no-op. Aborting an
+// already-committed tx_uuid fails with FAILED_PRECONDITION.
+//
+// No `session_uuid` field — session ↔ tx linkage lives on
+// begin_tx_log (recorded once at tx creation by BeginTx). No
+// `comment` field either — abort is a status transition, not an
+// audit-worthy commit.
+//
+// Sufficient identifier combinations (catalog + branch):
+//   - catalog_uuid + branch_uuid + tx_uuid
+//   - catalog_uuid + branch_name + tx_uuid
+//   - catalog_name + branch_uuid + tx_uuid
+//   - catalog_name + branch_name + tx_uuid
+//
+// Tx ops are catalog-scoped (CHA-163); see `CommitTxRequest` for the
+// addressing rationale. `branch_uuid` / `branch_name` are required
+// (matching CommitTxRequest) so the server can target the leaf
+// `begin_tx_log` / `abort_tx_log` partitions directly. A tx that
+// doesn't belong to the supplied branch surfaces as NOT_FOUND from
+// the leaf-partition lookup.
+message AbortTxRequest {
+  // --- Identifier block (catalog + branch) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string branch_uuid = 3;
+  optional string branch_name = 4;
+
+  // --- Domain fields ---
+  string tx_uuid = 5;
+}
+
+message AbortTxResponse {
+  // Pg-set timestamp from the abort_tx_log row. On the idempotent
+  // already-aborted path, the timestamp from the original abort. On
+  // the idempotent expired path, the BeginTx-time TTL deadline
+  // (expiry is the effective abort moment) — may predate this
+  // AbortTx call.
+  int64 aborted_at_micros = 1;
+}
+
+// ===========================================================================
+// Data Mutations
+// ===========================================================================
+
+// The row payload of a write — any combination of upserts and deletes.
+// The target table is identified at the request level (WriteDataRequest),
+// not here.
+message Change {
+  // Rows to upsert, serialized as an Arrow IPC record batch. Each row
+  // either creates a new row (when no row shares its primary key) or
+  // replaces the existing row sharing its primary key. The batch schema
+  // must match the table's registered Arrow schema (user columns only) —
+  // the write service derives `row_uuid` from the table's primary keys
+  // and mints `version_uuid` itself.
+  //
+  // Storage rationale: see docs/decisions/0001-unified-upsert-log.md.
+  bytes upserts = 3;
+
+  // Rows to soft-delete, serialized as an Arrow IPC record batch of
+  // the table's primary key columns. The batch schema must contain
+  // exactly the table's declared primary keys, in the table's declared
+  // `primary_keys` order — the write service derives `row_uuid` from
+  // those columns and mints `version_uuid` itself.
+  //
+  // Delete contract: tombstones are written unconditionally. Deletes
+  // for rows that don't exist (or are already deleted) succeed
+  // silently (matches SQL `DELETE FROM x WHERE id = ...` returning
+  // zero rows-affected — idempotent and retry-safe).
+  //
+  // This is the DML semantic. DDL deletes (DeleteSchema, DeleteTable)
+  // take the opposite contract: see those RPCs for the precondition
+  // form.
+  bytes deletes = 5;
+}
+
+// Applies mutations against a branch.
+//
+// `tx_uuid` is mode-switching:
+//   - absent  → auto-commit. The server opens a transaction, applies the
+//               changes, and commits — skipping the begin_tx_log and
+//               writing directly to the commit log. Reduces three round
+//               trips (BeginTx + WriteData + CommitTx) to one. The
+//               committed Tx is returned in the response.
+//   - present → append the changes to that already-open transaction.
+//               Caller still needs to call CommitTx to finalize.
+//
+// `author` and `comment` are tx metadata and are valid only when
+// `tx_uuid` is absent. The server returns INVALID_ARGUMENT if either is
+// set with `tx_uuid` present.
+//
+// Use the auto-commit form for the majority of application writes
+// (single-row mutations, small batch inserts) where the total payload
+// fits within the gRPC message size limit.
+//
+// Use the full BeginTx + WriteData* + CommitTx flow for:
+//   - Multi-statement transactions that issue multiple WriteData calls
+//   - Large or long-lived operations (e.g., backfills) whose payload
+//     exceeds the gRPC message size limit
+//   - Workloads that need to hold a transaction open across multiple
+//     client round trips
+//
+// Sufficient identifier combinations:
+//   - schema_uuid (+ optional branch_uuid/branch_name)
+//   - catalog_uuid + schema_name (+ optional branch)
+//   - catalog_name + schema_name (+ optional branch)
+// Branch defaults to "main" when omitted.
+// The target table is identified by table_uuid or table_name at the
+// request level — symmetric with ReadDataRequest. A by-uuid target
+// resolves catalog-wide (the schema identifier is not consulted); a
+// by-name target resolves the schema first.
+message WriteDataRequest {
+  // --- Identifier block (schema + branch + table) ---
+  optional string catalog_uuid = 1;
+  optional string catalog_name = 2;
+  optional string schema_uuid = 3;
+  optional string schema_name = 4;
+  optional string branch_uuid = 5;
+  optional string branch_name = 6;
+  // Target table: provide table_uuid OR table_name.
+  optional string table_uuid = 11;
+  optional string table_name = 12;
+
+  // Mode switch: absent = auto-commit, present = append to this open tx.
+  optional string tx_uuid = 7;
+
+  // Tx metadata — valid only when tx_uuid is absent.
+  optional string author = 8;
+  optional string comment = 9;
+
+  // The row payload (upserts / deletes) to apply atomically.
+  Change change = 10;
+}
+
+message WriteDataResponse {
+  // Set on the auto-commit path (the server just minted the tx, so the
+  // commit timestamp is free to populate). Unset on the append path: the
+  // open tx's metadata already reached the caller from BeginTx, and the
+  // append does not re-read begin_tx_log (that would cost an extra Pg
+  // roundtrip per WriteData). An append against a non-open tx (aborted,
+  // expired, committed, or never begun) is rejected up front at the
+  // servicer boundary, so an unset value here never implies a write that
+  // referenced a lapsed tx_uuid.
+  optional int64 commit_micros = 1;
+}
+
+// ===========================================================================
+// Service
+// ===========================================================================
+
+// WriteService owns every Penca write: catalog/schema/table DDL,
+// branching, transactions, and data mutations. Schema and table DDL
+// are transactional via CHA-164 (each accepts an optional `tx_uuid`
+// to join an open tx, otherwise auto-commits). Catalog DDL is not
+// transactional — it bootstraps per-catalog metadata storage.
+service WriteService {
+  // Catalog DDL (not transactional)
+  rpc CreateCatalog(CreateCatalogRequest) returns (CreateCatalogResponse);
+  rpc UpdateCatalog(UpdateCatalogRequest) returns (UpdateCatalogResponse);
+  rpc DeleteCatalog(DeleteCatalogRequest) returns (DeleteCatalogResponse);
+
+  // Branch management
+  rpc CreateBranch(CreateBranchRequest) returns (CreateBranchResponse);
+  rpc DeleteBranch(DeleteBranchRequest) returns (DeleteBranchResponse);
+  rpc UpdateBranch(UpdateBranchRequest) returns (UpdateBranchResponse);
+  rpc MergeBranch(MergeBranchRequest) returns (MergeBranchResponse);
+
+  // Schema DDL (transactional via CHA-164)
+  rpc CreateSchema(CreateSchemaRequest) returns (CreateSchemaResponse);
+  rpc UpdateSchema(UpdateSchemaRequest) returns (UpdateSchemaResponse);
+  // DDL delete contract: existence at the request's read snapshot is a
+  // precondition. Returns NOT_FOUND if the schema doesn't exist (or is
+  // already tombstoned) at that snapshot. Cascades soft-delete to all
+  // tables in the schema. Distinct from `WriteData` row deletes,
+  // which are idempotent — see `Change.deletes`.
+  rpc DeleteSchema(DeleteSchemaRequest) returns (DeleteSchemaResponse);
+
+  // Table DDL (transactional via CHA-164)
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
+  rpc UpdateTable(UpdateTableRequest) returns (UpdateTableResponse);
+  // DDL delete contract: existence at the request's read snapshot is a
+  // precondition. Returns NOT_FOUND if the table doesn't exist (or is
+  // already tombstoned) at that snapshot. Distinct from `WriteData`
+  // row deletes, which are idempotent — see `Change.deletes`.
+  rpc DeleteTable(DeleteTableRequest) returns (DeleteTableResponse);
+
+  // Index DDL (transactional via CHA-164) — CHA-455. UpdateIndex is
+  // rename-only. DeleteIndex follows the DDL existence-precondition
+  // contract (NOT_FOUND if absent at the read snapshot). Index reads
+  // (GetIndex / ListIndexes) live in query.proto.
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+  rpc UpdateIndex(UpdateIndexRequest) returns (UpdateIndexResponse);
+  rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
+
+  // Transaction lifecycle
+  rpc BeginTx(BeginTxRequest) returns (BeginTxResponse);
+  rpc CommitTx(CommitTxRequest) returns (CommitTxResponse);
+  rpc AbortTx(AbortTxRequest) returns (AbortTxResponse);
+
+  // Data write. tx_uuid mode-switches between auto-commit (absent)
+  // and append-to-open-tx (present); see WriteDataRequest doc.
+  //
+  // DML delete contract (Change.deletes): row tombstones are written
+  // unconditionally. Deletes for non-existent or already-deleted
+  // row_uuids succeed silently (idempotent, retry-safe). Distinct
+  // from DDL deletes (DeleteSchema / DeleteTable) where existence is
+  // a precondition. The asymmetry is by design: DDL operations carry
+  // existence-check semantics; DML operations are idempotent
+  // primitives.
+  rpc WriteData(WriteDataRequest) returns (WriteDataResponse);
+}

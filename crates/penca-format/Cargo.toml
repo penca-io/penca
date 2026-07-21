@@ -1,0 +1,41 @@
+[package]
+name = "penca-format"
+description = "Columnar format readers and writers (Parquet, Lance)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+penca-core = { workspace = true }
+penca-proto = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+lance-file = { workspace = true }
+lance-io = { workspace = true }
+lance-core = { workspace = true }
+lance-encoding = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = "1"
+futures = "0.3"
+
+[dev-dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+lance-io = { workspace = true }
+url = "2"
+criterion = { workspace = true }
+
+# CHA-415 primitive #2a — Lance/object-store cold-segment read floor.
+[[bench]]
+name = "cold_segment_read_floor"
+harness = false
