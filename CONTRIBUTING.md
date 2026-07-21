@@ -14,6 +14,8 @@ be merged.
 This will likely change as the project matures. If you'd like to follow along,
 watch or star the repository for updates.
 
+If you are interested in becoming a maintainer, please email **info@penca.io**.
+
 ## Questions
 
 For questions or to reach the maintainers, email **info@penca.io**.
