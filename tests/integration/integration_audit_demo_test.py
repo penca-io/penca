@@ -46,6 +46,9 @@ def test_audit_demo_runs_the_documented_walkthrough():
         "--- Full audit trail (audit_data) ---",
         "--- Audit trail (after TX 1 only) ---",
         "--- Time-travel: state as of TX 1 ---",
+        # The upsert/delete split key the slices below use, checked here for the
+        # same reason as the dashed headers.
+        "Deletes:",
     ):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
@@ -71,6 +74,17 @@ def test_audit_demo_runs_the_documented_walkthrough():
     assert "charlie" in after_upserts, after
     assert "bob" not in after_upserts, after
     assert "bob" in after_deletes, after
+
+    # And demonstrate the contrast rather than only asserting it in a comment: the
+    # *unfiltered* trail carries bob on both sides. Without this the full-trail
+    # section is pinned at "the header printed", so an audit_data that regressed to
+    # returning nothing would print "(none)" twice and pass.
+    full = stdout.split("--- Full audit trail (audit_data) ---")[1].split(
+        "--- Audit trail (after"
+    )[0]
+    full_upserts, full_deletes = full.split("Deletes:")
+    assert "bob" in full_upserts, full
+    assert "bob" in full_deletes, full
 
     # bob present catches as_of being ignored; charlie absent catches it resolving
     # to the wrong commit, since he does not exist until TX 2.

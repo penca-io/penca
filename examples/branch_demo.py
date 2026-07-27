@@ -467,9 +467,11 @@ def allocate_round(
 ) -> tuple[tuple[int, str, int], ...]:
     """Decide one round: per visitor, a creative and that visitor's outcome.
 
-    Draws from ``rng`` once per visitor, in visitor order — an allocation that
-    consumed it differently would shift epsilon's whole stream and change the
-    scoreboard at a fixed seed.
+    Calls ``choose_creative`` exactly once per visitor, in visitor order. That —
+    not a draw count — is the load-bearing property: ``pick_even`` and
+    ``pick_greedy`` draw from ``rng`` zero times and ``pick_epsilon`` draws twice
+    when it explores, so an allocation that called ``choose_creative`` differently
+    would shift epsilon's whole stream and change the scoreboard at a fixed seed.
     """
     outcomes: list[tuple[int, str, int]] = []
     for visitor_index in visitor_indexes:
@@ -493,10 +495,18 @@ def apply_outcomes(
     return updated
 
 
-def tally_batch(
-    touched: Sequence[str], updated: Mapping[str, tuple[int, int]]
+def tally_upserts(
+    outcomes: Sequence[tuple[int, str, int]],
+    updated: Mapping[str, tuple[int, int]],
 ) -> pa.Table:
-    """The ``creatives`` upsert payload — same primary keys, new running totals."""
+    """The ``creatives`` upsert payload — same primary keys, new running totals.
+
+    Derives the touched keys from ``outcomes`` rather than taking them, so "every
+    key is present in ``updated`` and in ``HEADLINES``" is structural instead of a
+    precondition the caller has to honour.
+    """
+    touched = sorted({creative_id for _v, creative_id, _c in outcomes})
+
     return pa.table(
         {
             "creative_id": list(touched),
@@ -508,7 +518,7 @@ def tally_batch(
     )
 
 
-def impression_batch(outcomes: Sequence[tuple[int, str, int]]) -> pa.Table:
+def impression_upserts(outcomes: Sequence[tuple[int, str, int]]) -> pa.Table:
     """The ``impressions`` append payload, one row per visitor served."""
     return pa.table(
         {
@@ -541,7 +551,6 @@ def drive_round(
     tallies = read_tallies(client, prod, branch_uuid)
     outcomes = allocate_round(branch_name, visitor_indexes, tallies, feed, rng, epsilon)
     updated = apply_outcomes(tallies, outcomes)
-    touched = sorted({creative_id for _v, creative_id, _c in outcomes})
 
     tx = client.begin_tx(
         catalog_uuid=prod.catalog_uuid,
@@ -555,7 +564,7 @@ def drive_round(
             tx.tx_uuid,
             Mutation(
                 table_uuid=prod.creatives_table_uuid,
-                upserts=tally_batch(touched, updated),
+                upserts=tally_upserts(outcomes, updated),
             ),
             catalog_uuid=prod.catalog_uuid,
             schema_uuid=prod.schema_uuid,
@@ -565,7 +574,7 @@ def drive_round(
             tx.tx_uuid,
             Mutation(
                 table_uuid=prod.impressions_table_uuid,
-                upserts=impression_batch(outcomes),
+                upserts=impression_upserts(outcomes),
             ),
             catalog_uuid=prod.catalog_uuid,
             schema_uuid=prod.schema_uuid,

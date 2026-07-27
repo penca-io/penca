@@ -280,6 +280,22 @@ class _FailingClient:
         fail_delete_catalog: bool = False,
         fail_abort_tx: bool = False,
     ):
+        # A fail_* flag with no exception to raise is a test that pins nothing —
+        # the vacuity class this fake exists to avoid, one forgotten kwarg away.
+        assert raises is not None or not any(
+            (
+                fail_delete_branch,
+                fail_create_schema,
+                fail_delete_catalog,
+                fail_abort_tx,
+            )
+        ), "a fail_* flag without raises never fails"
+        # fail_delete_branch is a uuid, not a bool: True would compare equal to no
+        # branch and pass green, and the sibling flags being bools makes that slip
+        # plausible.
+        assert not isinstance(fail_delete_branch, bool), (
+            "fail_delete_branch takes a branch uuid, not a bool"
+        )
         self.raises = raises
         self.fail_delete_branch = fail_delete_branch
         self.fail_create_schema = fail_create_schema
@@ -394,3 +410,70 @@ def test_an_unwinding_run_keeps_the_original_exception():
     """While unwinding there is a real error to preserve, so stay quiet."""
     demo.raise_for_undeleted(["epsilon"], completed=False)
     demo.raise_for_undeleted([], completed=True)
+
+
+def test_allocate_round_calls_the_policy_once_per_visitor_in_order():
+    """The rng contract the refactor's docstring leans on, pinned.
+
+    Compares against a reference that drives choose_creative by hand, and then
+    compares rng *state* — which is what catches an extra or a missing draw, the
+    failure that would silently shift epsilon's stream and rewrite the scoreboard.
+    """
+    indexes = [2, 0, 1]
+    tallies = _all_measured()
+    feed = [[0, 1, 0, 1]] * 3
+
+    reference_rng = random.Random("pin")
+    expected = tuple(
+        (index, demo.choose_creative("epsilon", index, tallies, reference_rng, 0.5))
+        for index in indexes
+    )
+
+    rng = random.Random("pin")
+    got = demo.allocate_round("epsilon", indexes, tallies, feed, rng, 0.5)
+
+    assert tuple((index, creative) for index, creative, _o in got) == expected
+    assert rng.getstate() == reference_rng.getstate(), "extra or missing rng draws"
+
+
+def test_allocate_round_reads_each_visitors_own_latent_outcome():
+    feed = [[1, 0, 0, 0], [0, 0, 0, 0]]
+    got = demo.allocate_round("even", [0, 1], {}, feed, random.Random(0), 0.0)
+
+    # pick_even sends visitor 0 to CREATIVE_IDS[0] and visitor 1 to CREATIVE_IDS[1].
+    assert got == (
+        (0, demo.CREATIVE_IDS[0], 1),
+        (1, demo.CREATIVE_IDS[1], 0),
+    )
+
+
+def test_apply_outcomes_folds_onto_a_copy():
+    tallies = {"banner": (10, 2)}
+    outcomes = [(0, "banner", 1), (1, "banner", 0), (2, "carousel", 1)]
+
+    updated = demo.apply_outcomes(tallies, outcomes)
+
+    assert updated["banner"] == (12, 3)
+    assert updated["carousel"] == (1, 1), "absent creative starts from (0, 0)"
+    assert tallies == {"banner": (10, 2)}, "the input must not be mutated"
+
+
+def test_upsert_payloads_carry_only_the_touched_creatives():
+    outcomes = [(0, "story", 1), (1, "banner", 0), (2, "story", 0)]
+    updated = demo.apply_outcomes({}, outcomes)
+
+    tallies = demo.tally_upserts(outcomes, updated)
+    assert tallies.column("creative_id").to_pylist() == ["banner", "story"]
+    assert tallies.schema == demo.CREATIVES_SCHEMA
+    assert dict(
+        zip(
+            tallies.column("creative_id").to_pylist(),
+            tallies.column("impressions").to_pylist(),
+            strict=True,
+        )
+    ) == {"banner": 1, "story": 2}
+
+    log = demo.impression_upserts(outcomes)
+    assert log.schema == demo.IMPRESSIONS_SCHEMA
+    assert log.column("visitor_id").to_pylist() == ["v000000", "v000001", "v000002"]
+    assert log.column("converted").to_pylist() == [1, 0, 0]
