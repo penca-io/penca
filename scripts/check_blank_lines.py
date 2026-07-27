@@ -22,6 +22,7 @@ import ast
 import os
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 # Never checked. The generated proto stubs must stay byte-identical to
@@ -134,17 +135,39 @@ def process_file(file_path: Path, fix: bool) -> list[str]:
     return messages
 
 
-def normalized(path: Path) -> Path:
-    """Working-directory-relative form, so absolute and relative paths compare.
+@lru_cache(maxsize=1)
+def repo_root() -> Path:
+    """The repo root, which is what ``EXCLUDED_SUBTREES`` is relative to.
 
-    Both recipes and the hook run from the repo root. Without this, an absolute
-    invocation never matches the repo-relative ``EXCLUDED_SUBTREES`` entries and
-    the generated-stub guard silently does nothing.
+    Anchoring on the process cwd instead would make the generated-stub guard lapse
+    for any invocation from a subdirectory: from ``packages/penca-proto`` the
+    stubs normalize to ``src/penca_proto``, which matches no subtree entry, and
+    ``--fix`` rewrites them. ruff is cwd-independent for the same reason — it
+    resolves excludes against the config file, not the cwd. Cached so the walk
+    does not re-run git per directory.
     """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return Path.cwd().resolve()
+
+    if result.returncode != 0:
+        return Path.cwd().resolve()
+
+    return Path(result.stdout.strip()).resolve()
+
+
+def normalized(path: Path) -> Path:
+    """Repo-root-relative form, so every invocation compares the same way."""
     resolved = path.resolve()
 
     try:
-        return resolved.relative_to(Path.cwd().resolve())
+        return resolved.relative_to(repo_root())
     except ValueError:
         return resolved
 
@@ -241,10 +264,8 @@ def main() -> int:
     paths: list[Path] = []
     for arg in args:
         path = Path(arg)
-        if path.is_file() and path.suffix == ".py":
-            if not is_excluded(path):
-                paths.append(path)
-
+        if path.is_file() and path.suffix == ".py" and not is_excluded(path):
+            paths.append(path)
         elif path.is_dir():
             paths.extend(walk_python_files(path))
 
