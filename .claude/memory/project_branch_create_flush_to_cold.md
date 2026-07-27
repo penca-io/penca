@@ -7,7 +7,7 @@ metadata:
   originSessionId: a2944ddb-3a7e-4250-a08a-734547bc31ba
 ---
 
-The target architecture (per the whitepaper diagram at fabricdb.io/whitepaper.html) is **one fully isolated stack per branch**, scoped under a catalog. Each branch's stack includes its own Flight SQL Server, Write/Query services, Metadata, Postgres, Lifecycle, and SSD-backed Cache Manager. The **only shared mutable substrate is the S3 object store** (annotated "eventually consistent" in the diagram). Branches never share hot state and never coordinate across stacks.
+The target architecture (per the whitepaper diagram at penca.io/whitepaper.html) is **one fully isolated stack per branch**, scoped under a catalog. Each branch's stack includes its own Flight SQL Server, Write/Query services, Metadata, Postgres, Lifecycle, and SSD-backed Cache Manager. The **only shared mutable substrate is the S3 object store** (annotated "eventually consistent" in the diagram). Branches never share hot state and never coordinate across stacks.
 
 CreateBranch in this model = flush parent's hot state to object storage, record resulting tx as `base_tx_uuid`, then provision a fresh empty stack (including empty-init PG) bound to that lineage. No `pg_basebackup`, no CSI VolumeSnapshot CoW. Cold-tier lineage via merge-on-read carries ancestor data.
 
@@ -30,6 +30,6 @@ CreateBranch in this model = flush parent's hot state to object storage, record 
 - The control plane (`penca-api-server`) provisions and tears down whole stacks per `CreateBranch` / `DeleteBranch`, not individual components.
 - Catalog is the tenancy boundary, branch is the sub-unit; tenant isolation maps to catalog namespacing.
 
-Diagram lives at https://fabric-20260409-resources.s3.us-east-1.amazonaws.com/architecture-2ae97248.svg (referenced from the whitepaper). It's a dvisvgm-generated SVG with no text elements — rasterize to PNG (cairosvg works locally) to read it.
+Diagram is referenced from the whitepaper at https://penca.io/whitepaper.html (200 as of 2026-07-27; the old fabricdb.io host only 301-redirects). Its direct asset URL `https://fabric-20260409-resources.s3.us-east-1.amazonaws.com/architecture-2ae97248.svg` now returns **403** — fetch the diagram via the whitepaper page instead. It's a dvisvgm-generated SVG with no text elements — rasterize to PNG (cairosvg works locally) to read it.
 
 [[CHA-67]] and [[CHA-207]] ticket descriptions still show the old plan as of 2026-05-23 — flag for refresh before either is scheduled.
