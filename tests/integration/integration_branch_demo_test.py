@@ -31,8 +31,8 @@ _DEMO_PATH = _REPO_ROOT / "examples" / "branch_demo.py"
 # divergence assertion is reproducible run to run.
 _IMPRESSIONS = 240
 # 11, not 12: 240 divides evenly by 12, so min(start + round_size, impressions) —
-# the partial-final-round clamp — never fired at any tested config. 11 gives 21
-# rounds with a 9-impression last one, exercising it on every run.
+# the partial-final-round clamp — never fired at any tested config. 11 gives
+# 22 rounds, the last one 9 impressions, exercising it on every run.
 _ROUND_SIZE = 11
 _SEED = 20260727
 

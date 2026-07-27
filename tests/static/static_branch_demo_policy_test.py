@@ -331,11 +331,12 @@ class _FailingClient:
         self.fail_write_data = fail_write_data
         self.fail_create_branch_on_call = fail_create_branch_on_call
         # What read_data serves back as the branch's committed tallies.
-        self.tallies = tallies or dict.fromkeys(
-            ("banner", "carousel", "story", "video"), (0, 0)
-        )
+        # Derived, not hardcoded: a change to CREATIVES would otherwise leave the
+        # fake serving run_demo a stale candidate set.
+        self.tallies = tallies or dict.fromkeys(demo.CREATIVE_IDS, (0, 0))
         self.created_branches: list[str] = []
-        self.upserted_creatives: list[str] = []
+        self.fork_seq_nums: list[int | None] = []
+        self.last_upserted_creatives: list[str] = []
         self.deleted: list[str] = []
         self.aborted: list[str] = []
         self.deleted_catalogs: list[str] = []
@@ -381,7 +382,9 @@ class _FailingClient:
         # drop either the tally UPDATE or the log append.
         self.calls.append(f"write_data:{tx_uuid}:{mutation}")
         if getattr(mutation, "table_uuid", None) == "creatives":
-            self.upserted_creatives = mutation.upserts.column("creative_id").to_pylist()
+            self.last_upserted_creatives = mutation.upserts.column(
+                "creative_id"
+            ).to_pylist()
 
         self._maybe_raise(self.fail_write_data)
 
@@ -408,6 +411,7 @@ class _FailingClient:
 
     def create_branch(self, branch_name, *args, **kwargs):
         self.calls.append(f"create_branch:{branch_name}")
+        self.fork_seq_nums.append(kwargs.get("commit_seq_num"))
         self.created_branches.append(branch_name)
         self._maybe_raise(len(self.created_branches) == self.fail_create_branch_on_call)
 
@@ -655,7 +659,7 @@ def test_commit_mutations_puts_every_mutation_in_one_transaction():
     assert seq == 1, "returns the commit's seq num"
 
 
-def _prod() -> object:
+def _prod():
     return demo.ProdContext(
         catalog_uuid="cat",
         main_branch_uuid="uuid-main",
@@ -707,10 +711,10 @@ def test_drive_round_reads_before_it_writes_and_allocates_from_the_read():
         "commit_tx",
     ], f"the round must read committed state before opening the tx; saw {client.calls}"
 
-    assert client.upserted_creatives == ["carousel"], (
+    assert client.last_upserted_creatives == ["carousel"], (
         "the allocation must come from what the read returned — carousel is best "
         "only in the served tallies, and from zeros greedy would take banner. "
-        f"Saw {client.upserted_creatives}"
+        f"Saw {client.last_upserted_creatives}"
     )
 
 
@@ -746,6 +750,15 @@ def test_run_demo_forks_drives_scores_then_discards_in_that_order():
     list_index = kinds.index("list_branches")
 
     assert last_fork < first_round_read, "every fork exists before any round reads"
+
+    # Every read must land before the first delete: last_read is main's POST-discard
+    # isolation read, so `last_read > first_delete` alone is satisfied wherever the
+    # scoreboard collection sits — moving discard_branches ahead of it stayed green.
+    # At impressions=2, round_size=2 that is 3 reads per branch: one round read plus
+    # the tally and log reads collect_branch_outcome makes.
+    assert kinds[:first_delete].count("read_data") == 3 * len(demo.POLICY_NAMES), (
+        f"the scoreboard collection must precede the discard; saw {kinds}"
+    )
     # After, not before: main's isolation read deliberately follows the discard, so
     # it pins that main survives deleting three forks that were reading its shared
     # cold object — the reason those reads were moved past the finally.
@@ -777,6 +790,23 @@ def test_fork_branches_discards_what_it_created_before_it_failed():
     assert client.deleted == [f"uuid-{demo.POLICY_NAMES[0]}"], (
         f"the fork created before the failure must be discarded, saw {client.deleted}"
     )
+
+
+def test_fork_branches_forks_every_branch_at_the_same_commit():
+    """ "Provably start from one identical view of prod" — otherwise unpinned.
+
+    Dropping the commit_seq_num kwarg leaves behaviour identical in run_demo (the
+    forks follow the seed commit, so head equals it) and the integration test
+    passes the kwarg itself rather than going through fork_branches.
+    """
+    client = _FailingClient()
+    prod = _prod()
+
+    demo.fork_branches(client, prod)
+
+    assert client.fork_seq_nums == [prod.seed_commit_seq_num] * len(
+        demo.POLICY_NAMES
+    ), f"every fork must name the seed commit; saw {client.fork_seq_nums}"
 
 
 def test_choose_creative_routes_epsilon_to_the_explorer():
