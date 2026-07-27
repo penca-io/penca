@@ -121,23 +121,27 @@ transcript rather than a contract:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
-| `epsilon` |        3000 |         510 | 17.00% |
 | `greedy`  |        3000 |         417 | 13.90% |
+| `epsilon` |        3000 |         383 | 12.77% |
 | `even`    |        3000 |         307 | 10.23% |
 
-`epsilon` keeps exploring and finds the genuinely best creative; `greedy` locks
-onto the second-best after one lucky round and never revisits it. Both beat the
-fixed split, because both steer on what they wrote. How *fast* greedy commits is
-partly an artifact of `--round-size`, which sets decision granularity as well as
-write granularity — a round's picks are all evaluated against the read taken at
-its start.
+Both reading policies beat the fixed split, because both steer on what they wrote
+— and neither finds the genuinely best creative. `greedy` and `epsilon` each
+converge on `story` (true rate 0.14) rather than `carousel` (0.22); `epsilon` spends
+158 of its 3000 impressions on `carousel` and still does not switch, and its extra
+exploration costs it slightly against pure `greedy`. That is what toy policies look
+like, and it is the honest version of the claim: the read-your-writes loop is what
+separates these branches from the foil, not the quality of the allocator. How fast
+greedy commits is also partly an artifact of `--round-size`, which sets decision
+granularity as well as write granularity — a round's picks are all evaluated
+against the read taken at its start.
 
 **Forking does not copy your row data.** Measured on the seeded `creatives`
-table: after the three forks, `main` holds its rows in **exactly one** object, its
-footprint unchanged by the second and third fork, and each branch stores **zero**
-objects and **zero** bytes of *row data* of its own — while all three read the full
-seeded set. (`create_branch` does copy per-branch *metadata* — schema and table
-entries — by design; what it never copies is the rows.)
+table: after the three forks, `main` holds its rows in **exactly one** cold object,
+unchanged by the second and third fork, and each branch owns **zero** cold objects
+of its own — while all three read the full seeded set. (`create_branch` does copy
+per-branch *metadata* — schema and table entries — by design; what it never copies
+is the rows.)
 Those are the assertions in
 `tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
 and they are the "one copy" half of the headline. (That object measured 562 bytes

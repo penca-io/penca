@@ -353,9 +353,9 @@ def create_ads_tables(
     """Create the ``ads`` schema and both tables.
 
     Returns ``(schema_uuid, creatives_table_uuid, impressions_table_uuid)``.
-    ``branch_uuid`` explicitly on every call: omitting it falls back to the
-    client's constructor-configured default branch, which need not be the "main"
-    of this brand-new catalog.
+    ``branch_uuid`` is passed explicitly on every call so the whole seed is
+    addressed at one branch the caller named, rather than relying on the client's
+    configured default resolving to the same place.
     """
     schema_uuid = client.create_schema(
         "ads",

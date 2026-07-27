@@ -1119,3 +1119,74 @@ def test_a_tied_scoreboard_breaks_on_branch_name():
         "tied branches must order by name, keeping the screenshot reproducible; saw "
         f"{[(b.branch_name, b.conversions) for b in outcome.scoreboard]}"
     )
+
+
+def test_the_shipped_defaults_are_the_ones_the_readme_documents():
+    """The shipped configuration is what a launch reader actually runs.
+
+    Every other test overrides impressions / round_size / seed, and the defaults
+    test pins forwarding rather than values — so a one-token edit to any DEFAULT_*
+    falsified the README with the full gate green. That is not hypothetical: it is
+    how the README's transcript went stale for 18 commits.
+    """
+    assert demo.DEFAULT_IMPRESSIONS == 3000
+    assert demo.DEFAULT_ROUND_SIZE == 25
+    assert demo.DEFAULT_EPSILON == 0.15
+    assert demo.DEFAULT_SEED == 20260727
+
+    # Guards the two degenerate shapes a plausible edit reaches: a round size at or
+    # above the impression count collapses the run to one decision (no
+    # read-your-writes loop at all), and epsilon at 0 collapses that branch into
+    # greedy, erasing the third policy from the launch scoreboard.
+    assert demo.DEFAULT_ROUND_SIZE < demo.DEFAULT_IMPRESSIONS
+    assert 0.0 < demo.DEFAULT_EPSILON < 1.0
+
+
+def test_run_demo_reports_every_branch_round_to_the_callback():
+    """on_round must be called per branch per round, with the round's own outcomes.
+
+    Nothing else reaches it: run_demo defaults it to None, and the printers are
+    tested against a hand-built outcome. Silencing print_round, dropping the call,
+    or swapping the callback's arguments all survived otherwise.
+    """
+    seen: list[tuple[int, str, int]] = []
+    client = _FailingClient()
+    config = demo.DemoConfig(impressions=4, round_size=2, epsilon=0.0, seed=1)
+
+    demo.run_demo(
+        client,
+        config,
+        on_round=lambda index, policy, outcomes: seen.append(
+            (index, policy, len(outcomes))
+        ),
+    )
+
+    rounds = config.impressions // config.round_size
+    assert len(seen) == rounds * len(demo.POLICY_NAMES), (
+        f"one callback per branch per round; saw {seen}"
+    )
+    # Argument order and content, not just the count: a swapped signature would
+    # otherwise pass, and so would handing it the whole run's outcomes.
+    assert [index for index, _policy, _size in seen] == sorted(
+        index for index, _policy, _size in seen
+    ), f"round indexes must arrive in order; saw {seen}"
+    assert {policy for _index, policy, _size in seen} == set(demo.POLICY_NAMES)
+    assert {size for _index, _policy, size in seen} == {config.round_size}, (
+        f"each callback carries its own round's outcomes; saw {seen}"
+    )
+
+
+def test_print_round_emits_the_branch_and_its_creatives(capsys):
+    """print_round's own output, which the callback-wiring test cannot reach.
+
+    That test passes a lambda, so silencing print_round itself survived it — and a
+    silent print_round means an asciinema of the ~50s default run shows nothing
+    between the banner and the scoreboard.
+    """
+    demo.print_round(7, "epsilon", ((3, demo.CREATIVE_IDS[1], 1),))
+
+    printed = capsys.readouterr().out
+    assert printed.strip(), "print_round must emit a line"
+    assert "7" in printed, printed
+    assert "epsilon" in printed, printed
+    assert demo.CREATIVE_IDS[1] in printed, printed

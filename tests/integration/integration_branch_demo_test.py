@@ -69,7 +69,7 @@ def _config(demo: ModuleType):
 
 
 def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, int]]:
-    """Per-branch ``(distinct objects, total bytes)`` of cold persist segments.
+    """Per-branch ``(distinct objects, recorded size_bytes)`` of cold persist segments.
 
     White-box PG read: the gRPC API exposes no storage-footprint surface, and the
     segment index is where ``object_uri`` / ``size_bytes`` are recorded.
@@ -78,6 +78,11 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     length within a merged file and is written only by
     ``compact_persist_segments``, so a freshly persisted segment (which owns its
     whole object) reports 0 there.
+
+    Note ``size_bytes`` is the segment's standalone **in-memory Arrow footprint**
+    (CHA-347), not the size of the object on disk — the write path stopped
+    surfacing that unit entirely. So the assertions below use it only as a
+    non-zero-and-flat signal; the load-bearing claim is the *object count*.
 
     Committed rows only: persist is two-phase, and the read planner gates
     visibility on a segment's own ``commit_micros``. A crashed phase-2 leaves rows
