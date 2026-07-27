@@ -1103,6 +1103,14 @@ def test_a_tied_scoreboard_breaks_on_branch_name():
 
     outcome = demo.run_demo(client, _small_config())
 
+    # The precondition, mirroring the distinct-totals guard on the sibling test: if
+    # the fixture drifts apart, the expected order still holds from the -conversions
+    # half alone and this stops exercising the tie-break at all.
+    tied = {branch.branch_name: branch.conversions for branch in outcome.scoreboard}
+    assert tied["greedy"] == tied["epsilon"], (
+        f"the fixture must tie greedy with epsilon, saw {tied}"
+    )
+
     assert [branch.branch_name for branch in outcome.scoreboard] == [
         "epsilon",
         "greedy",
