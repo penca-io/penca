@@ -106,8 +106,10 @@ Each round, on each branch, inside one transaction:
 `even` splits traffic evenly and never reads the tallies — it is the foil.
 `greedy` and `epsilon` reallocate from their own running results. Then a
 cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
-and `main` is shown untouched. The run is deterministic, so this is what the
-shipped defaults produce (measured 2026-07-27; ~50s):
+and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
+defaults (3000 impressions, 25 per transaction, seed 20260727; ~50s) — the run
+reproduces, but nothing pins these particular figures, so treat them as a dated
+transcript rather than a contract:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -119,15 +121,15 @@ shipped defaults produce (measured 2026-07-27; ~50s):
 onto the second-best after one lucky round and never revisits it. Both beat the
 fixed split, because both steer on what they wrote.
 
-**Forking does not copy your data.** After the three forks, `main` holds its
-seeded rows in **exactly one** object, its footprint unchanged by the second and
-third fork, and each branch stores **zero** objects and **zero** bytes of its own
-— while all three read the full seeded set. Those are the assertions in
+**Forking does not copy your data.** Measured on the seeded `creatives` table:
+after the three forks, `main` holds its rows in **exactly one** object, its
+footprint unchanged by the second and third fork, and each branch stores **zero**
+objects and **zero** bytes of its own — while all three read the full seeded set.
+Those are the assertions in
 `tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
-and they are the "one copy" half of the headline. (That one object measured 562
-bytes on 2026-07-27 — an observation, not an assertion: byte totals move with
-writer version and compression, and this figure covers the `creatives` table
-alone, not the whole catalog.)
+and they are the "one copy" half of the headline. (That object measured 562 bytes
+on 2026-07-27 — an observation, not an assertion: byte totals move with writer
+version and compression.)
 
 Two honest caveats. The allocation policies are deliberately toy — the database
 mechanic is the point, not the bandit. And at this scale the fork itself is the
