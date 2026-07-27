@@ -1,0 +1,224 @@
+"""Integration tests for CHA-517 — the Show HN launch demo.
+
+``examples/branch_demo.py`` forks three branches off ``main``, drives one shared
+deterministic visitor feed through all three, and lets each branch's allocation
+policy read back its *own* committed tallies to steer the next round. These tests
+pin the four claims the launch post makes: the feed is shared and reproducible,
+the read-your-writes policies pull clear of the fixed-split foil, forking does not
+multiply stored bytes, and ``main`` comes out untouched with the forks discarded.
+
+Run via ``just integration-test branch_demo``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+
+from penca_client.naming import TABLE_PERSIST_SEGMENT_METADATA
+from psycopg.sql import SQL, Identifier
+
+from .integration_helpers import get_pg_driver, make_client
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEMO_PATH = _REPO_ROOT / "examples" / "branch_demo.py"
+
+# Small enough to keep the suite quick, large enough that the read-your-writes
+# policies pull clear of the fixed split. Pinned rather than derived so the
+# divergence assertion is reproducible run to run.
+_IMPRESSIONS = 240
+_ROUND_SIZE = 12
+_SEED = 20260727
+
+
+def _load_demo() -> ModuleType:
+    """Import ``examples/branch_demo.py`` by path.
+
+    ``examples/`` is not a package, and pytest puts ``tests/`` — not the repo
+    root — on ``sys.path``, so neither a plain nor a relative import resolves.
+    """
+    spec = importlib.util.spec_from_file_location("branch_demo", _DEMO_PATH)
+    if spec is None or spec.loader is None:
+        msg = f"cannot build an import spec for {_DEMO_PATH}"
+        raise RuntimeError(msg)
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+
+def _config(demo: ModuleType):
+    return demo.DemoConfig(
+        impressions=_IMPRESSIONS,
+        round_size=_ROUND_SIZE,
+        epsilon=demo.DEFAULT_EPSILON,
+        seed=_SEED,
+    )
+
+
+def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, int]]:
+    """Per-branch ``(distinct objects, total bytes)`` of cold persist segments.
+
+    White-box PG read: the gRPC API exposes no storage-footprint surface, and the
+    segment index is where ``object_uri`` / ``length`` are recorded.
+    """
+    parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT branch_uuid, count(DISTINCT object_uri), coalesce(sum(length), 0) "
+            "FROM {tbl} WHERE table_uuid = %s GROUP BY branch_uuid"
+        ).format(tbl=Identifier(parent)),
+        (table_uuid,),
+    )
+
+    return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+
+def test_shared_feed_is_deterministic():
+    """One seed reproduces one feed, and every visitor carries a fixed latent
+    outcome per creative — which is what makes the three branches consume a single
+    shared stream rather than three independent simulations."""
+    demo = _load_demo()
+
+    first = demo.build_visitor_feed(_config(demo))
+    second = demo.build_visitor_feed(_config(demo))
+    assert first == second, "the same seed must reproduce the feed exactly"
+    assert len(first) == _IMPRESSIONS
+
+    assert all(len(outcomes) == len(demo.CREATIVES) for outcomes in first), (
+        "every visitor needs one latent outcome per creative, so two branches "
+        "showing the same creative to the same visitor agree"
+    )
+    assert {value for outcomes in first for value in outcomes} <= {0, 1}
+
+
+def test_demo_forks_diverges_and_isolates_main():
+    """The read-your-writes branches beat the fixed-split foil, each branch's
+    tallies reconcile with its own append-only log, and prod survives untouched
+    with all three forks discarded."""
+    demo = _load_demo()
+
+    outcome = demo.run_demo(make_client(), _config(demo))
+
+    by_name = {branch.branch_name: branch for branch in outcome.scoreboard}
+    assert set(by_name) == {"even", "greedy", "epsilon"}
+
+    even = by_name["even"].conversions
+    assert by_name["greedy"].conversions > even, (
+        f"greedy reads its own tallies and must beat the fixed split; "
+        f"greedy={by_name['greedy'].conversions} even={even}"
+    )
+    assert by_name["epsilon"].conversions > even, (
+        f"epsilon reads its own tallies and must beat the fixed split; "
+        f"epsilon={by_name['epsilon'].conversions} even={even}"
+    )
+
+    for branch in outcome.scoreboard:
+        assert branch.impressions == _IMPRESSIONS
+        assert sum(shown for shown, _ in branch.per_creative.values()) == _IMPRESSIONS
+        assert (
+            sum(converted for _, converted in branch.per_creative.values())
+            == branch.conversions
+        )
+        assert branch.log_conversions == branch.conversions, (
+            f"{branch.branch_name}: the in-place tally and the append-only "
+            f"impressions log disagree ({branch.conversions} vs "
+            f"{branch.log_conversions}) — they commit in one tx and cannot diverge"
+        )
+
+    assert all(tally == (0, 0) for tally in outcome.main_tallies.values()), (
+        f"prod tallies must be untouched, saw {outcome.main_tallies}"
+    )
+    assert outcome.main_impression_rows == 0, "prod logged no impressions"
+    assert outcome.remaining_branches == ("main",), (
+        f"all three forks must be discarded, saw {outcome.remaining_branches}"
+    )
+
+
+def test_forks_share_one_copy_of_the_seeded_data():
+    """Forking three branches off the seeded catalog adds no stored bytes.
+
+    CreateBranch flushes the *source* hot tier to cold once (CHA-273) and copies
+    metadata only — never row data (CHA-178). So main's cold footprint is flat
+    across the second and third fork, each fork owns zero objects and zero bytes,
+    and all three still read the full seeded set.
+    """
+    demo = _load_demo()
+    client = make_client()
+    prod = demo.seed_prod(client, _config(demo))
+
+    baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
+    assert baseline == {}, f"nothing is persisted before the first fork, saw {baseline}"
+
+    seeded = {creative_id for creative_id, _headline, _rate in demo.CREATIVES}
+    fork_uuids: list[str] = []
+    main_footprint: tuple[int, int] | None = None
+    for branch_name in ("even", "greedy", "epsilon"):
+        branch = client.create_branch(
+            branch_name,
+            "cha-517",
+            "fork",
+            commit_seq_num=prod.seed_commit_seq_num,
+            catalog_uuid=prod.catalog_uuid,
+        )
+        fork_uuids.append(branch.branch_uuid)
+
+        stats = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
+        observed = stats.get(prod.main_branch_uuid)
+        assert observed is not None, "the fork must flush main's hot tier to cold"
+        assert observed[0] > 0 and observed[1] > 0, (
+            f"main's cold footprint must be non-empty after a fork, saw {observed}"
+        )
+        if main_footprint is None:
+            main_footprint = observed
+        else:
+            assert observed == main_footprint, (
+                "forking again must not duplicate or re-flush main's cold bytes; "
+                f"{main_footprint} -> {observed}"
+            )
+
+        for fork_uuid in fork_uuids:
+            assert fork_uuid not in stats, (
+                f"fork {fork_uuid} must store zero segments of its own, "
+                f"saw {stats[fork_uuid]}"
+            )
+
+    for fork_uuid in fork_uuids:
+        got = client.read_data(
+            catalog_uuid=prod.catalog_uuid,
+            schema_uuid=prod.schema_uuid,
+            table_uuid=prod.creatives_table_uuid,
+            branch_uuid=fork_uuid,
+        )
+        assert set(got.column("creative_id").to_pylist()) == seeded, (
+            "every fork reads the full seeded set it stores none of"
+        )
+
+
+def test_demo_script_runs_as_cli():
+    """The script runs end-to-end with no manual setup beyond the sourced env."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_DEMO_PATH),
+            "--impressions",
+            str(_IMPRESSIONS),
+            "--round-size",
+            str(_ROUND_SIZE),
+            "--seed",
+            str(_SEED),
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+    stdout = result.stdout.lower()
+    assert "scoreboard" in stdout, result.stdout[-2000:]
+    assert "prod" in stdout, result.stdout[-2000:]
