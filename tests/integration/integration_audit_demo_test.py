@@ -41,15 +41,17 @@ def test_audit_demo_runs_the_documented_walkthrough():
     client = make_client()
     before = _demo_catalogs(client)
 
-    result = subprocess.run(
-        [sys.executable, str(_DEMO_PATH)],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
-    )
+    # try opens before the subprocess: audit_demo.py creates its catalog before it
+    # prints anything, so a TimeoutExpired on a wedged run has already stranded one.
     try:
+        result = subprocess.run(
+            [sys.executable, str(_DEMO_PATH)],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
         _assert_walkthrough(result)
 
         # Inside the try, so it pins the demo's behaviour without gating cleanup:
@@ -60,7 +62,13 @@ def test_audit_demo_runs_the_documented_walkthrough():
         # finally, and reaping whatever appeared rather than gating on the count:
         # audit_demo.py creates its catalog before printing anything, so every red
         # run strands one — which is precisely what this reap exists to prevent.
-        for catalog_name in _demo_catalogs(client) - before:
+        try:
+            leaked = _demo_catalogs(client) - before
+        except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+            print(f"(could not list catalogs to reap: {exc})")
+            leaked = set()
+
+        for catalog_name in leaked:
             try:
                 client.delete_catalog(catalog_name=catalog_name)
             except Exception as exc:  # noqa: BLE001 - must not mask a real failure

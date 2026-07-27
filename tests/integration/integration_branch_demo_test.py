@@ -271,29 +271,22 @@ def test_forks_share_one_copy_of_the_seeded_data():
         # finally, not straight-line: a red run is exactly when leaving live state
         # behind hurts most, and later tests share this stack.
         #
-        # Both calls, in this order — a catalog delete does NOT subsume the branch
-        # deletes. `MetadataManager::delete_catalog` resolves main and cascades the
-        # PG metadata from there; the per-branch object-storage deletes are
-        # `delete_branch`'s job alone. That is harmless here only because this test
-        # asserts the forks own zero segments, which is exactly the assertion a
-        # future storage-footprint edit would change.
-        # delete_branch is what enumerates persist/snapshot segments and issues the
-        # object deletes; delete_catalog resolves main and soft-deletes PG metadata
-        # only. So the branch deletes are the object-storage reap and the catalog
-        # delete is the metadata reap — neither subsumes the other.
+        # delete_branch enumerates a branch's segments and issues the object
+        # deletes; delete_catalog resolves main and soft-deletes PG metadata.
+        # Neither subsumes the other.
         #
-        # Forks only, NOT main — and main's one seeded object is therefore left to
-        # the object store's own lifecycle. That is a knowing trade, not an
-        # oversight: delete_catalog resolves main to do its cascade, so deleting
-        # main's branch first makes the catalog delete fail with
-        # "branch not found: main" and leaks the catalog row instead. Verified by
-        # doing exactly that. Reaping main's objects would need the branch delete
-        # to run *after* the catalog delete, which is not a thing the API offers.
+        # Forks only, NOT main, so main's one seeded object is left to the object
+        # store's own lifecycle. A knowing trade: delete_catalog resolves main to
+        # run its cascade, so deleting main's branch first makes the catalog delete
+        # fail with "branch not found: main" and leaks the catalog row instead —
+        # verified by doing exactly that. Reaping main's objects would need the
+        # branch delete to run *after* the catalog delete, which the API does not
+        # offer.
         #
-        # So: the fork deletes are metadata hygiene, the catalog delete is the
-        # metadata reap, and the seeded object outlives both. Each is best-effort so
-        # one failure cannot skip what follows or replace a real assertion failure
-        # with a cleanup error.
+        # The forks own zero segments here (this test asserts it), so their deletes
+        # are metadata hygiene rather than an object reap. Each step is best-effort
+        # so one failure cannot skip what follows or replace a real assertion
+        # failure with a cleanup error.
         for fork_uuid in fork_uuids:
             _cleanup_branch(client, prod.catalog_uuid, fork_uuid)
 
