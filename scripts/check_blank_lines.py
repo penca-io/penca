@@ -238,8 +238,10 @@ def collect_paths(args: Sequence[str]) -> list[Path]:
 
     A file argument is filtered through ``is_excluded``; a directory argument is
     walked. Gitignored paths are dropped from both. An argument that names neither
-    is fatal: a formatting gate that silently collects nothing from a mistyped
-    scope reports success on code it never looked at.
+    is fatal, and says which case it hit: a formatting gate that silently collects
+    nothing from a mistyped scope reports success on code it never looked at, but
+    reporting "no such path" for an existing non-Python file sends the reader
+    hunting a typo that is not there.
     """
     paths: list[Path] = []
     for arg in args:
@@ -249,6 +251,8 @@ def collect_paths(args: Sequence[str]) -> list[Path]:
                 paths.append(path)
         elif path.is_dir():
             paths.extend(walk_python_files(path))
+        elif path.exists():
+            raise SystemExit(f"not a Python file or directory: {arg}")
         else:
             raise SystemExit(f"no such path: {arg}")
 

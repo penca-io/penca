@@ -194,6 +194,23 @@ def test_collect_paths_rejects_a_path_that_does_not_exist(monkeypatch):
     try:
         checker.collect_paths(["tests/statik"])
     except SystemExit as exc:
-        assert "tests/statik" in str(exc)
+        assert "no such path" in str(exc) and "tests/statik" in str(exc)
     else:
         raise AssertionError("a nonexistent scope must be fatal")
+
+
+def test_collect_paths_distinguishes_a_non_python_file_from_a_missing_one(monkeypatch):
+    """An existing non-.py argument must not be reported as a missing path.
+
+    `just format-check README.md` used to say "no such path: README.md", sending
+    the reader hunting a typo that is not there.
+    """
+    monkeypatch.chdir(REPO_ROOT)
+    assert (REPO_ROOT / "README.md").is_file()
+    try:
+        checker.collect_paths(["README.md"])
+    except SystemExit as exc:
+        assert "not a Python file or directory" in str(exc), str(exc)
+        assert "no such path" not in str(exc), str(exc)
+    else:
+        raise AssertionError("an existing non-Python argument must be fatal too")

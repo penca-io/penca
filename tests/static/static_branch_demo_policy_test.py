@@ -12,8 +12,11 @@ fixed-split foil's wraparound, the unknown-policy failure, the round pipeline
 (``allocate_round``'s one-call-per-visitor contract and its rng state,
 ``apply_outcomes``' copy-fold, both upsert payloads), the cleanup helpers' promise
 not to mask the exception they are unwinding, and — against a hand-built
-``DemoOutcome``, no engine needed — the printers and the CLI's input validation. No Docker, no fixtures, no penca services — runs under
-``just static-test branch_demo_policy`` and ``just check``.
+``DemoOutcome``, no engine needed — the printers and the CLI's input validation,
+the per-policy rng seeding that keeps exploration independent of the stream that
+built the feed, and the single-transaction guarantee behind ``commit_mutations``.
+No Docker, no fixtures, no penca services — runs under ``just static-test
+branch_demo_policy`` and ``just check``.
 """
 
 from __future__ import annotations
@@ -310,6 +313,9 @@ class _FailingClient:
         self.deleted: list[str] = []
         self.aborted: list[str] = []
         self.deleted_catalogs: list[str] = []
+        # One ordered log across all methods. Separate per-method lists cannot pin
+        # an ordering claim: two independent lists are satisfied in either order.
+        self.calls: list[str] = []
 
     def _maybe_raise(self, should_fail: bool) -> None:
         if should_fail and self.raises is not None:
@@ -321,6 +327,7 @@ class _FailingClient:
 
     def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
         self.aborted.append(tx_uuid)
+        self.calls.append("abort_tx")
         self._maybe_raise(self.fail_abort_tx)
 
     def create_catalog(self, catalog_name: str, owner: str) -> tuple[str, str]:
@@ -335,16 +342,22 @@ class _FailingClient:
         return "table-uuid"
 
     def begin_tx(self, *args, **kwargs):
+        self.calls.append("begin_tx")
+
         return SimpleNamespace(tx_uuid="tx")
 
-    def write_data(self, *args, **kwargs) -> None:
+    def write_data(self, tx_uuid, *args, **kwargs) -> None:
+        self.calls.append(f"write_data:{tx_uuid}")
         self._maybe_raise(self.fail_write_data)
 
-    def commit_tx(self, *args, **kwargs):
+    def commit_tx(self, tx_uuid, *args, **kwargs):
+        self.calls.append(f"commit_tx:{tx_uuid}")
+
         return SimpleNamespace(commit_seq_num=1)
 
     def delete_catalog(self, catalog_uuid: str) -> None:
         self.deleted_catalogs.append(catalog_uuid)
+        self.calls.append("delete_catalog")
         self._maybe_raise(self.fail_delete_catalog)
 
 
@@ -463,12 +476,13 @@ def test_allocate_round_reads_each_visitors_own_latent_outcome():
     visitor index yields ``feed[5][5]`` and raises — both mis-indexings a weaker
     fixture would let through.
     """
-    feed = [[0, 0, 0, 0]] * 5 + [[0, 1, 0, 0]]
+    # Row 0 written separately from the `* 4` replication, which aliases one list.
+    feed = [[1, 0, 0, 0]] + [[0, 0, 0, 0]] * 4 + [[0, 1, 0, 0]]
     got = demo.allocate_round("even", [5, 0], {}, feed, random.Random(0), 0.0)
 
     assert got == (
         (5, demo.CREATIVE_IDS[1], 1),
-        (0, demo.CREATIVE_IDS[0], 0),
+        (0, demo.CREATIVE_IDS[0], 1),
     )
 
 
@@ -484,7 +498,12 @@ def test_apply_outcomes_folds_onto_a_copy():
 
 
 def test_upsert_payloads_carry_only_the_touched_creatives():
-    outcomes = [(0, "story", 1), (1, "banner", 0), (2, "story", 0)]
+    # Visitor indexes deliberately disjoint from their positions. Equal-to-position
+    # indexes let a positional `enumerate` read pass — and in the real demo
+    # visitor_indexes is a global range (round 2 starts at 25), so a positional read
+    # would re-emit v000000.. every round and, since visitor_id is the impressions
+    # primary key, silently REPLACE the previous round's log instead of appending.
+    outcomes = [(7, "story", 1), (1, "banner", 0), (4, "story", 0)]
     updated = demo.apply_outcomes({}, outcomes)
 
     tallies = demo.tally_upserts(outcomes, updated)
@@ -505,7 +524,7 @@ def test_upsert_payloads_carry_only_the_touched_creatives():
 
     log = demo.impression_upserts(outcomes)
     assert log.schema == demo.IMPRESSIONS_SCHEMA
-    assert log.column("visitor_id").to_pylist() == ["v000000", "v000001", "v000002"]
+    assert log.column("visitor_id").to_pylist() == ["v000007", "v000001", "v000004"]
     assert log.column("creative_id").to_pylist() == ["story", "banner", "story"]
     assert log.column("converted").to_pylist() == [1, 0, 0]
 
@@ -525,5 +544,33 @@ def test_a_failed_seed_transaction_aborts_then_drops_the_catalog():
     else:
         raise AssertionError("the write failure must propagate")
 
-    assert client.aborted == ["tx"], "the open tx must be aborted"
-    assert client.deleted_catalogs == ["cat"], "then the catalog must be dropped"
+    assert client.calls[-2:] == ["abort_tx", "delete_catalog"], (
+        f"abort the tx first, then drop the catalog; saw {client.calls}"
+    )
+
+
+def test_commit_mutations_puts_every_mutation_in_one_transaction():
+    """The contract the helper exists for.
+
+    An implementation opening a fresh transaction per mutation (begin, write,
+    commit, per element) would pass every other test in this file, and only a
+    torn scoreboard read in the integration demo would notice.
+    """
+    client = _FailingClient()
+
+    seq = demo.commit_mutations(
+        client,
+        catalog_uuid="cat",
+        schema_uuid="schema",
+        branch_uuid="branch",
+        comment="two tables, one tx",
+        mutations=["m1", "m2"],
+    )
+
+    assert client.calls == [
+        "begin_tx",
+        "write_data:tx",
+        "write_data:tx",
+        "commit_tx:tx",
+    ], f"one begin, both writes on that tx, one commit; saw {client.calls}"
+    assert seq == 1, "returns the commit's seq num"
