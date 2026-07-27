@@ -1156,7 +1156,7 @@ def test_run_demo_reports_every_branch_round_to_the_callback():
     tested against a hand-built outcome. Silencing print_round, dropping the call,
     or swapping the callback's arguments all survived otherwise.
     """
-    seen: list[tuple[int, str, int]] = []
+    seen: list[tuple[int, str, tuple[str, ...]]] = []
     client = _FailingClient()
     config = demo.DemoConfig(impressions=4, round_size=2, epsilon=0.0, seed=1)
 
@@ -1164,22 +1164,30 @@ def test_run_demo_reports_every_branch_round_to_the_callback():
         client,
         config,
         on_round=lambda index, policy, outcomes: seen.append(
-            (index, policy, len(outcomes))
+            (index, policy, tuple(creative for _v, creative, _o in outcomes))
         ),
     )
 
     rounds = config.impressions // config.round_size
-    assert len(seen) == rounds * len(demo.POLICY_NAMES), (
-        f"one callback per branch per round; saw {seen}"
-    )
-    # Argument order and content, not just the count: a swapped signature would
-    # otherwise pass, and so would handing it the whole run's outcomes.
-    assert [index for index, _policy, _size in seen] == sorted(
-        index for index, _policy, _size in seen
-    ), f"round indexes must arrive in order; saw {seen}"
-    assert {policy for _index, policy, _size in seen} == set(demo.POLICY_NAMES)
-    assert {size for _index, _policy, size in seen} == {config.round_size}, (
-        f"each callback carries its own round's outcomes; saw {seen}"
+    # Exact indexes, not merely non-decreasing: passing `start` instead of
+    # round_index yields 0, 0, 0, 2, 2, 2 — still sorted, still six entries — while
+    # the demo prints "round 0 … round 2 … round 4". A constant index passes too.
+    assert [index for index, _policy, _creatives in seen] == [
+        index for index in range(rounds) for _ in demo.POLICY_NAMES
+    ], f"each round index must reach every branch exactly once; saw {seen}"
+    assert {policy for _index, policy, _creatives in seen} == set(demo.POLICY_NAMES)
+    assert {len(creatives) for _index, _policy, creatives in seen} == {
+        config.round_size
+    }, f"each callback carries one round's worth of outcomes; saw {seen}"
+
+    # The creatives, not just the count: hoisting the callback out of the per-policy
+    # loop and handing every branch the last-computed outcomes keeps the count, the
+    # policy set and the sizes identical. With epsilon=0 and the fake's all-zero
+    # tallies, `even` round-robins over CREATIVE_IDS while greedy and epsilon both
+    # take CREATIVE_IDS[0], so the payloads are genuinely distinguishable.
+    by_branch = {(index, policy): creatives for index, policy, creatives in seen}
+    assert by_branch[(0, "even")] != by_branch[(0, "greedy")], (
+        f"each branch must receive its own outcomes; saw {seen}"
     )
 
 
