@@ -205,13 +205,10 @@ def test_forks_share_one_copy_of_the_seeded_data():
     client = make_client()
     prod = demo.seed_prod(client)
 
-    # try opens immediately after the catalog exists. With it opening below the
-    # baseline assertion, a red baseline — or a raise out of the white-box PG read
-    # — stranded the prod_<hex> catalog, which is the leak this cleanup exists to
-    # close. This test cleans up on red *and* green; the divergence test above
-    # deliberately keeps its catalog on red for inspection. Two different policies,
-    # each stated where it applies, rather than one test silently implementing both
-    # depending on which assertion fired.
+    # try opens as soon as the catalog exists, so every assertion below is covered
+    # by the cleanup. This test reaps on red and green alike; the divergence test
+    # above deliberately does the opposite and keeps its catalog on red, for
+    # inspection.
     fork_uuids: list[str] = []
     try:
         baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
