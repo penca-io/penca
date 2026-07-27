@@ -1179,14 +1179,18 @@ def test_run_demo_reports_every_branch_round_to_the_callback():
     # the lexicographically lowest id (pick_greedy ties on the creative_id key),
     # while `even` round-robins on the visitor index, so its payload differs per
     # round and per position within the round.
-    rounds = config.impressions // config.round_size
-    tied = (min(demo.CREATIVE_IDS),) * config.round_size
+    # Ceiling division and the same clamp run_demo applies, so the oracle models a
+    # partial final round rather than assuming impressions divides evenly. Today's
+    # fixture divides evenly; without this, editing it to one that does not would
+    # break the oracle instead of exercising the demo.
+    rounds = -(-config.impressions // config.round_size)
     expected = []
     for index in range(rounds):
         start = index * config.round_size
+        visitors = range(start, min(start + config.round_size, config.impressions))
+        tied = (min(demo.CREATIVE_IDS),) * len(visitors)
         even_payload = tuple(
-            demo.CREATIVE_IDS[visitor % len(demo.CREATIVE_IDS)]
-            for visitor in range(start, start + config.round_size)
+            demo.CREATIVE_IDS[visitor % len(demo.CREATIVE_IDS)] for visitor in visitors
         )
         for policy in demo.POLICY_NAMES:
             expected.append((index, policy, even_payload if policy == "even" else tied))
@@ -1219,11 +1223,16 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     assert "7" in printed, printed
     assert "epsilon" in printed, printed
     assert demo.CREATIVE_IDS[1] in printed, printed
+    # Both creatives, joined as the line renders them: the round's line reports
+    # what it actually served, so `shown = [outcomes[0][1]]` — dropping everything
+    # after the first — must not pass.
+    assert f"{demo.CREATIVE_IDS[1]}, {demo.CREATIVE_IDS[2]}" in printed, printed
     # The conversion count too: `converted = 0` survived otherwise, and the count
-    # is the only number in the line that changes as the run progresses. The whole
-    # field rather than a prefix — "1 conversion" also matches "11 conversions",
-    # which is what a count mutant prints once the round size passes ten.
-    assert "1 conversions" in printed, printed
+    # is the only number in the line that changes as the run progresses. Anchored
+    # on the leading space that `{converted:>3}` guarantees, since "1 conversions"
+    # is itself a substring of "11 conversions" — what a count mutant prints once
+    # the round size passes ten.
+    assert " 1 conversions" in printed, printed
 
 
 def test_the_best_creative_is_not_the_first_by_id():
