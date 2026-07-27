@@ -1168,26 +1168,32 @@ def test_run_demo_reports_every_branch_round_to_the_callback():
         ),
     )
 
+    # `seen` is fully determined by the fixture, so pin it whole rather than in
+    # projections. Exact indexes, not merely non-decreasing: passing `start` instead
+    # of round_index yields 0, 0, 0, 2, 2, 2 — still sorted, still six entries. And
+    # the payloads by value, not by a difference assertion: greedy and epsilon are
+    # byte-identical here, so handing greedy epsilon's outcomes — or swapping even's
+    # and greedy's outright — kept every set, count and inequality true.
+    #
+    # With epsilon=0 and the fake's all-zero tallies, greedy and epsilon both take
+    # the lexicographically lowest id (pick_greedy ties on the creative_id key),
+    # while `even` round-robins on the visitor index, so its payload differs per
+    # round and per position within the round.
     rounds = config.impressions // config.round_size
-    # Exact indexes, not merely non-decreasing: passing `start` instead of
-    # round_index yields 0, 0, 0, 2, 2, 2 — still sorted, still six entries — while
-    # the demo prints "round 0 … round 2 … round 4". A constant index passes too.
-    assert [index for index, _policy, _creatives in seen] == [
-        index for index in range(rounds) for _ in demo.POLICY_NAMES
-    ], f"each round index must reach every branch exactly once; saw {seen}"
-    assert {policy for _index, policy, _creatives in seen} == set(demo.POLICY_NAMES)
-    assert {len(creatives) for _index, _policy, creatives in seen} == {
-        config.round_size
-    }, f"each callback carries one round's worth of outcomes; saw {seen}"
+    tied = (min(demo.CREATIVE_IDS),) * config.round_size
+    expected = []
+    for index in range(rounds):
+        start = index * config.round_size
+        even_payload = tuple(
+            demo.CREATIVE_IDS[visitor % len(demo.CREATIVE_IDS)]
+            for visitor in range(start, start + config.round_size)
+        )
+        for policy in demo.POLICY_NAMES:
+            expected.append((index, policy, even_payload if policy == "even" else tied))
 
-    # The creatives, not just the count: hoisting the callback out of the per-policy
-    # loop and handing every branch the last-computed outcomes keeps the count, the
-    # policy set and the sizes identical. With epsilon=0 and the fake's all-zero
-    # tallies, `even` round-robins over CREATIVE_IDS while greedy and epsilon both
-    # take CREATIVE_IDS[0], so the payloads are genuinely distinguishable.
-    by_branch = {(index, policy): creatives for index, policy, creatives in seen}
-    assert by_branch[(0, "even")] != by_branch[(0, "greedy")], (
-        f"each branch must receive its own outcomes; saw {seen}"
+    assert seen == expected, (
+        f"every round must reach every branch once, with its own outcomes;\n"
+        f"  saw  {seen}\n  want {expected}"
     )
 
 
@@ -1198,7 +1204,15 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     silent print_round means an asciinema of the ~50s default run shows nothing
     between the banner and the scoreboard.
     """
-    demo.print_round(7, "epsilon", ((3, demo.CREATIVE_IDS[1], 1),))
+    # Two outcomes, one converting, so the count and the sum differ: with a single
+    # converting outcome both are 1, and `converted = len(outcomes)` — counting
+    # impressions shown rather than conversions, the likeliest confusion in that
+    # line — renders identically.
+    demo.print_round(
+        7,
+        "epsilon",
+        ((3, demo.CREATIVE_IDS[1], 1), (4, demo.CREATIVE_IDS[2], 0)),
+    )
 
     printed = capsys.readouterr().out
     assert printed.strip(), "print_round must emit a line"
@@ -1206,8 +1220,10 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     assert "epsilon" in printed, printed
     assert demo.CREATIVE_IDS[1] in printed, printed
     # The conversion count too: `converted = 0` survived otherwise, and the count
-    # is the only number in the line that changes as the run progresses.
-    assert "1 conversion" in printed, printed
+    # is the only number in the line that changes as the run progresses. The whole
+    # field rather than a prefix — "1 conversion" also matches "11 conversions",
+    # which is what a count mutant prints once the round size passes ten.
+    assert "1 conversions" in printed, printed
 
 
 def test_the_best_creative_is_not_the_first_by_id():
@@ -1222,7 +1238,13 @@ def test_the_best_creative_is_not_the_first_by_id():
     rates = {creative_id: rate for creative_id, _headline, rate in demo.CREATIVES}
     best = max(rates, key=lambda creative_id: rates[creative_id])
 
-    assert best != demo.CREATIVE_IDS[0], (
+    # min(rates), not CREATIVE_IDS[0]: pick_greedy ties on the creative_id key, so
+    # from all-zero tallies it takes the lexicographically lowest id, which is what
+    # must not be the winner. Position and minimum coincide only because CREATIVES
+    # happens to be listed alphabetically — pinning the position both passes a
+    # reorder that puts the best creative on greedy's tie-break (the mutant this
+    # test exists to kill) and fails a reorder that changes no rate at all.
+    assert best != min(rates), (
         f"the best creative must not also be the lowest id, saw {best} with {rates}"
     )
     assert len(set(rates.values())) == len(rates), (
