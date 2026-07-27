@@ -8,7 +8,7 @@ feed its logs here to see where wall time goes per span.
 
 Usage:
     # straight from a container, just the 18:33:0x window, with totals:
-    docker logs "${COMPOSE_PROJECT_NAME}-query-1" 2>&1 \
+    docker logs "penca-$(basename "$PWD")-query-1" 2>&1 \
         | python3 scripts/telemetry/span_trace_table.py --prefix 2026-05-31T18:33:0 --totals
 
     # from a captured logfile:

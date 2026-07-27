@@ -30,6 +30,6 @@ CreateBranch in this model = flush parent's hot state to object storage, record 
 - The control plane (`penca-api-server`) provisions and tears down whole stacks per `CreateBranch` / `DeleteBranch`, not individual components.
 - Catalog is the tenancy boundary, branch is the sub-unit; tenant isolation maps to catalog namespacing.
 
-Diagram: `https://penca-20260409-resources.s3.us-east-1.amazonaws.com/architecture-4801c4de.svg` (200 as of 2026-07-27), embedded in https://penca.io/whitepaper.html. The asset was **renamed with the product** — the pre-rename `fabric-20260409-resources/architecture-2ae97248.svg` now 403s, so unlike `fabric-sccache` this bucket did change. It's a dvisvgm-generated SVG with no text elements — rasterize to PNG (cairosvg works locally) to read it.
+Diagram: `https://penca-20260409-resources.s3.us-east-1.amazonaws.com/architecture-4801c4de.svg` (200 as of 2026-07-27), embedded in https://penca.io/whitepaper.html. The asset was **renamed with the product** — the pre-rename `fabric-20260409-resources/architecture-2ae97248.svg` now 403s, so unlike [[reference_sccache_s3_build_cache]]'s `fabric-sccache`, this bucket did change. It's a dvisvgm-generated SVG with no text elements — rasterize to PNG (cairosvg works locally) to read it.
 
 [[CHA-67]] and [[CHA-207]] ticket descriptions still show the old plan as of 2026-05-23 — flag for refresh before either is scheduled.
