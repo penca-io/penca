@@ -5,29 +5,17 @@ Open-source and self-hostable on object storage — no second system, no ETL.
 
 Forks three branches off `main`, drives one shared deterministic visitor feed
 through all three, and lets each branch's ad-allocation policy read back its
-*own* committed tallies to steer the next round — transacting and reading
-analytically against the same copy of the data, in one loop. Then it scores the
-branches against each other and throws all three away; prod is never touched.
+*own* committed tallies to steer the next round. Then it scores the branches
+against each other and throws all three away; prod is never touched.
 
-The round loop is ordinary SQL over Flight SQL: SELECT the tallies, decide, then
-INSERT ... ON CONFLICT DO UPDATE plus an append, inside BEGIN/COMMIT. Each
-branch is one connection — branch selection is bound at handshake and immutable
-for the connection's lifetime, Postgres-shaped — so a branch is reachable as a
-plain SQL endpoint and any Flight SQL driver would send exactly these
-statements. Setup (create the catalog, tables and forks) uses the gRPC client
-because forking pins to the seed's commit_seq_num, which SQL does not hand back.
+The round loop is ordinary SQL. Each branch is one connection — branch selection
+binds at handshake and is immutable for the connection's lifetime, the way a
+Postgres connection is to one database — so a branch is a plain SQL endpoint and
+the statements below are what any Flight SQL driver would send. Read
+`run_rounds`; it is the point of this file.
 
-Every branch reads its own committed tallies each round — the tally is
-cumulative, so writing it is a read-modify-write and read-your-writes is
-unavoidable. What `even` ignores is the *content*: it splits traffic on the
-visitor index alone, so it is the foil at the point of decision. `greedy` and
-`epsilon` allocate from what they just wrote, which is the whole point. The
-policies are deliberately toy — the database mechanic is the product here, not
-the bandit.
-
-The round's SELECT is of *committed* state, taken before BEGIN. Reading inside
-the open transaction would take the slower read-your-own-uncommitted-writes path
-and buy this demo nothing: there is nothing uncommitted yet to see.
+Setup (catalog, tables, forks) uses the gRPC client, because forking pins to the
+seed's commit_seq_num and SQL does not hand that back.
 
 Requires Docker services running: just penca-up
 """
@@ -36,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -53,20 +41,23 @@ CREATIVES = (
     ("video", "Watch a 90-second tour", 0.02),
 )
 CREATIVE_IDS = tuple(creative_id for creative_id, _headline, _rate in CREATIVES)
-CREATIVE_POSITION = {
-    creative_id: position for position, creative_id in enumerate(CREATIVE_IDS)
-}
-HEADLINES = {creative_id: headline for creative_id, headline, _rate in CREATIVES}
+CREATIVE_POSITION = {cid: pos for pos, cid in enumerate(CREATIVE_IDS)}
+HEADLINES = {cid: headline for cid, headline, _rate in CREATIVES}
 
 POLICY_NAMES = ("even", "greedy", "epsilon")
-
-# The setup creates these by name over gRPC; the round loop addresses them by
-# name over SQL. Kept as constants so the two can never drift.
 SCHEMA_NAME = "ads"
-CREATIVES_TABLE = "creatives"
-IMPRESSIONS_TABLE = "impressions"
-
 AUTHOR = "penca-demo"
+
+DEFAULT_IMPRESSIONS = 3000
+DEFAULT_EPSILON = 0.15
+DEFAULT_SEED = 20260727
+# Impressions per transaction. A statement costs ~28ms regardless of how many
+# rows it carries, so this buys wall-clock, not throughput: 25 puts the default
+# run near 50s where `--round-size 1` would take far longer. It also sets
+# *decision* granularity — a round's picks are all evaluated against the one
+# SELECT taken at its start, so greedy serves the same creative for a whole
+# round. TODO(CHA-525): batching a round's statements would cut this further.
+DEFAULT_ROUND_SIZE = 25
 
 CREATIVES_SCHEMA = pa.schema(
     [
@@ -76,7 +67,6 @@ CREATIVES_SCHEMA = pa.schema(
         pa.field("conversions", pa.int64()),
     ]
 )
-CREATIVES_PK_SCHEMA = pa.schema([pa.field("creative_id", pa.utf8())])
 IMPRESSIONS_SCHEMA = pa.schema(
     [
         pa.field("visitor_id", pa.utf8()),
@@ -84,24 +74,6 @@ IMPRESSIONS_SCHEMA = pa.schema(
         pa.field("converted", pa.int64()),
     ]
 )
-
-DEFAULT_IMPRESSIONS = 3000
-DEFAULT_EPSILON = 0.15
-DEFAULT_SEED = 20260727
-
-# Impressions allocated per transaction. A round costs ~145ms measured
-# 2026-07-27 — and costs the same whether it carries 1 impression or 25, because
-# that time is fixed per-RPC overhead rather than per-row work (TODO(CHA-523):
-# a 4-row cold read alone is ~70ms of it). So this knob buys wall-clock, not
-# throughput: 25 puts the default run near 50s where `--round-size 1` would take
-# 24 minutes. `--round-size 1` is the literal per-impression loop and still works.
-#
-# It also sets *decision* granularity, not just write granularity: a round's picks
-# are all evaluated against the one read taken at its start, so greedy serves the
-# same creative for a whole round. Reallocation frequency is impressions /
-# round_size, and how fast greedy commits to a creative is partly an artifact of
-# this number rather than of the policy alone.
-DEFAULT_ROUND_SIZE = 25
 
 
 @dataclass(frozen=True)
@@ -114,7 +86,10 @@ class DemoConfig:
 
 @dataclass(frozen=True)
 class ProdContext:
-    """Identifiers for the seeded catalog every later call threads through."""
+    """What setup produces: the seeded catalog, addressed both ways.
+
+    uuids for the gRPC calls, names for the SQL.
+    """
 
     catalog_uuid: str
     catalog_name: str
@@ -126,28 +101,11 @@ class ProdContext:
 
     @property
     def creatives(self) -> str:
-        """Fully-qualified ``creatives``, the way SQL addresses it."""
-        return f"{self.catalog_name}.{SCHEMA_NAME}.{CREATIVES_TABLE}"
+        return f"{self.catalog_name}.{SCHEMA_NAME}.creatives"
 
     @property
     def impressions(self) -> str:
-        return f"{self.catalog_name}.{SCHEMA_NAME}.{IMPRESSIONS_TABLE}"
-
-
-@dataclass(frozen=True)
-class BranchSession:
-    """One branch, and a Flight SQL connection pinned to it.
-
-    Branch selection is connection-scoped, not a statement the session can
-    change — ``SET branch = ...`` is rejected, and the pin rides the
-    ``x-penca-branch`` header at handshake. That is Postgres-shaped and it is
-    the point: a branch is reachable as an ordinary SQL endpoint, so the round
-    loop below is the SQL any driver would send.
-    """
-
-    name: str
-    uuid: str
-    sql: PencaClient
+        return f"{self.catalog_name}.{SCHEMA_NAME}.impressions"
 
 
 @dataclass(frozen=True)
@@ -158,9 +116,7 @@ class BranchOutcome:
     conversions: int
     per_creative: Mapping[str, tuple[int, int]]
     # Re-derived from the append-only impressions log. Must equal `conversions`
-    # and `impressions`: the tally UPDATE and the log append commit in one tx.
-    # The row count is the one that catches an overlapping visitor range
-    # replacing log rows instead of appending, since visitor_id is the PK.
+    # and `impressions`: the tally upsert and the log append commit together.
     log_conversions: int
     log_impressions: int
 
@@ -174,35 +130,29 @@ class DemoOutcome:
     remaining_branches: tuple[str, ...]
 
 
+# --- the policies ------------------------------------------------------------
+# Deliberately toy. The database mechanic is the product here, not the bandit.
+
+
 def build_visitor_feed(config: DemoConfig) -> tuple[tuple[int, ...], ...]:
     """One shared, reproducible stream of visitors.
 
-    Returns one row per visitor holding that visitor's latent 0/1 outcome for
-    *every* creative, in ``CREATIVES`` order. Fixing all four outcomes up front is
-    what makes the branches share a single feed: two branches showing the same
-    creative to the same visitor get the same answer, so their scoreboards differ
-    only because their allocation policies differ.
+    One row per visitor holding that visitor's latent 0/1 outcome for *every*
+    creative. Fixing all four up front is what makes the branches share a feed:
+    two branches showing the same creative to the same visitor get the same
+    answer, so their scoreboards differ only because their policies differ.
     """
     rng = random.Random(config.seed)
-    rates = tuple(rate for _creative_id, _headline, rate in CREATIVES)
+    rates = tuple(rate for _cid, _headline, rate in CREATIVES)
 
     return tuple(
         tuple(int(rng.random() < rate) for rate in rates)
-        for _visitor_index in range(config.impressions)
+        for _visitor in range(config.impressions)
     )
 
 
 def smoothed_rate(tally: tuple[int, int]) -> float:
-    """Laplace-smoothed conversion rate for one creative's ``(shown, converted)``.
-
-    The +1/+2 prior scores an untried creative at 0.5, above any rate a creative
-    with real exposure can measure at this demo's true rates. So greedy is pulled
-    toward creatives it has not tried yet, and its exploration is driven by
-    evidence rather than by the id tie-break — without the prior all four start at
-    0/0 and the tie-break alone pins greedy to the first creative forever. This is
-    a bias, not a guaranteed one-pass sweep: a creative whose first exposure
-    converts scores above 0.5 and can be re-picked immediately.
-    """
+    """Laplace-smoothed conversion rate, so an untried creative scores 0.5."""
     shown, converted = tally
 
     return (converted + 1) / (shown + 2)
@@ -211,8 +161,8 @@ def smoothed_rate(tally: tuple[int, int]) -> float:
 def pick_even(visitor_index: int) -> str:
     """Fixed round-robin split on the visitor index.
 
-    The foil — not because it skips the read (``drive_round`` reads for every
-    branch) but because it ignores what the read said.
+    The foil — not because it skips the read (every branch reads) but because it
+    ignores what the read said.
     """
     return CREATIVE_IDS[visitor_index % len(CREATIVE_IDS)]
 
@@ -220,29 +170,19 @@ def pick_even(visitor_index: int) -> str:
 def pick_greedy(tallies: Mapping[str, tuple[int, int]]) -> str:
     """Best smoothed rate so far; among ties, the lowest ``creative_id``.
 
-    Ranks over ``CREATIVE_IDS`` rather than over ``tallies``' keys, so the
-    candidate set matches the other two policies no matter what the read returned:
-    a creative missing from ``tallies`` counts as untried instead of becoming
-    unreachable for the rest of the run. That fixed tuple is what makes the pick
-    reproducible; the ``creative_id`` key only decides *which* tied creative wins.
+    Ranks over ``CREATIVE_IDS`` rather than over ``tallies``' keys, so a creative
+    missing from the read counts as untried instead of becoming unreachable.
     """
-    ranked = sorted(
+    return sorted(
         CREATIVE_IDS,
-        key=lambda creative_id: (
-            -smoothed_rate(tallies.get(creative_id, (0, 0))),
-            creative_id,
-        ),
-    )
-
-    return ranked[0]
+        key=lambda cid: (-smoothed_rate(tallies.get(cid, (0, 0))), cid),
+    )[0]
 
 
 def pick_epsilon(
-    tallies: Mapping[str, tuple[int, int]],
-    rng: random.Random,
-    epsilon: float,
+    tallies: Mapping[str, tuple[int, int]], rng: random.Random, epsilon: float
 ) -> str:
-    """Greedy, with an ``epsilon`` chance of exploring uniformly instead."""
+    """Explore with probability ``epsilon``, else exploit."""
     if rng.random() < epsilon:
         return rng.choice(CREATIVE_IDS)
 
@@ -256,11 +196,6 @@ def choose_creative(
     rng: random.Random,
     epsilon: float,
 ) -> str:
-    """Dispatch to the named policy.
-
-    ``even`` is handed ``tallies`` and ignores them, which is the whole reason it
-    is here: it needs no read-your-writes, so it makes the other two legible.
-    """
     if policy_name == "even":
         return pick_even(visitor_index)
 
@@ -274,234 +209,101 @@ def choose_creative(
     raise ValueError(msg)
 
 
-def abort_quietly(
-    client: PencaClient, catalog_uuid: str, tx_uuid: str, branch_uuid: str
-) -> None:
-    """Best-effort abort of an open tx, never masking why we are unwinding.
-
-    An open penca tx is not inert: until it times out server-side it clamps cold
-    isolation and fences purge/GC on its branch. But the abort must not replace
-    the exception that triggered it — ``abort_tx`` raises FailedPrecondition if the
-    tx actually committed (a dropped commit response lands exactly there), and if
-    the write failed because the stack is unreachable the abort fails too.
-    ``Exception``, not ``BaseException``, so a second Ctrl-C still gets through.
-    """
-    try:
-        client.abort_tx(tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
-    except Exception as exc:
-        print(f"  (could not abort tx {tx_uuid}: {exc})")
-
-
-def discard_branches(
-    client: PencaClient, catalog_uuid: str, branch_uuids: Iterable[str]
-) -> list[str]:
-    """Delete every branch, attempting all of them; return the ones that failed.
-
-    Guarded per branch for two reasons: one failure must not strand the rest, and
-    when this runs from a ``finally`` an unguarded raise would replace the
-    exception being propagated — and the usual reason a delete fails is that the
-    stack is unreachable, i.e. exactly the error worth keeping. Returning the
-    failures rather than swallowing them lets the caller decide, which matters on
-    the success path where there is no exception worth protecting.
-    """
-    failed: list[str] = []
-    for branch_uuid in branch_uuids:
-        try:
-            client.delete_branch(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
-        except Exception as exc:
-            print(f"  (could not delete branch {branch_uuid}: {exc})")
-            failed.append(branch_uuid)
-
-    return failed
-
-
-def raise_for_undeleted(
-    undeleted: Sequence[str], *, catalog_uuid: str, completed: bool
-) -> None:
-    """Fail a run that finished normally but could not discard its branches.
-
-    Deliberately does not say "the scoreboard above": this raises from
-    ``run_demo``'s ``finally``, so ``run_demo`` never returns and ``main`` never
-    reaches ``print_scoreboard`` — there is no scoreboard above. The catalog uuid
-    is named because ``delete_branch`` needs it, so the manual cleanup this asks
-    for is actually performable from the message.
-    """
-    if undeleted and completed:
-        msg = (
-            f"the run succeeded but these branches could not be discarded: "
-            f"{', '.join(undeleted)} — still live in catalog {catalog_uuid}, "
-            f"delete them by hand"
-        )
-        raise RuntimeError(msg)
-
-
-def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
-    """Best-effort delete of a catalog, for unwinding a half-built seed."""
-    try:
-        client.delete_catalog(catalog_uuid=catalog_uuid)
-    except Exception as exc:
-        print(f"  (could not delete catalog {catalog_uuid}: {exc})")
-
-
-def commit_mutations(
-    client: PencaClient,
-    *,
-    catalog_uuid: str,
-    schema_uuid: str,
-    branch_uuid: str,
-    comment: str,
-    mutations: Sequence[Mutation],
-) -> int:
-    """Write every mutation in one transaction; return its ``commit_seq_num``.
-
-    The single owner of the begin → write → commit → abort-on-failure shape, so the
-    seeding write and the per-round write cannot drift apart. Multiple mutations in
-    one tx is the load-bearing part for a round: the tally UPDATE and the
-    impression-log append commit together or not at all.
-    """
-    tx = client.begin_tx(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-        author=AUTHOR,
-        comment=comment,
-    )
-    try:
-        for mutation in mutations:
-            client.write_data(
-                tx.tx_uuid,
-                mutation,
-                catalog_uuid=catalog_uuid,
-                schema_uuid=schema_uuid,
-                branch_uuid=branch_uuid,
-            )
-
-        committed = client.commit_tx(
-            tx.tx_uuid,
-            catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
-        )
-    except BaseException:
-        abort_quietly(client, catalog_uuid, tx.tx_uuid, branch_uuid)
-        raise
-
-    return committed.commit_seq_num
-
-
-def create_ads_tables(
-    client: PencaClient, *, catalog_uuid: str, main_branch_uuid: str
-) -> tuple[str, str, str]:
-    """Create the ``ads`` schema and both tables.
-
-    Returns ``(schema_uuid, creatives_table_uuid, impressions_table_uuid)``.
-    ``branch_uuid`` is passed explicitly on every call so the whole seed is
-    addressed at one branch the caller named, rather than relying on the client's
-    configured default resolving to the same place.
-    """
-    schema_uuid = client.create_schema(
-        SCHEMA_NAME,
-        catalog_uuid=catalog_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create ads schema",
-    )
-    creatives_table_uuid = client.create_table(
-        CREATIVES_TABLE,
-        CREATIVES_SCHEMA,
-        primary_keys=["creative_id"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create creatives table",
-    )
-    impressions_table_uuid = client.create_table(
-        IMPRESSIONS_TABLE,
-        IMPRESSIONS_SCHEMA,
-        primary_keys=["visitor_id"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create impressions table",
-    )
-
-    return schema_uuid, creatives_table_uuid, impressions_table_uuid
-
-
-def commit_seed_tallies(
-    client: PencaClient,
-    *,
-    catalog_uuid: str,
-    main_branch_uuid: str,
-    schema_uuid: str,
-    creatives_table_uuid: str,
-) -> int:
-    """Commit the four creatives at zeroed tallies; return the commit's seq num."""
-    return commit_mutations(
-        client,
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        comment="seed creatives with zeroed tallies",
-        mutations=[
-            Mutation(
-                table_uuid=creatives_table_uuid,
-                upserts=pa.table(
-                    {
-                        "creative_id": list(CREATIVE_IDS),
-                        "headline": [HEADLINES[c] for c in CREATIVE_IDS],
-                        "impressions": [0] * len(CREATIVE_IDS),
-                        "conversions": [0] * len(CREATIVE_IDS),
-                    },
-                    schema=CREATIVES_SCHEMA,
-                ),
-            )
-        ],
-    )
+# --- setup, over gRPC --------------------------------------------------------
 
 
 def seed_prod(client: PencaClient) -> ProdContext:
     """Create the prod catalog, the two tables, and commit the zeroed tallies."""
     catalog_name = f"prod_{uuid4().hex[:8]}"
-    catalog_uuid, main_branch_uuid = client.create_catalog(catalog_name, AUTHOR)
+    catalog_uuid, main_uuid = client.create_catalog(catalog_name, AUTHOR)
+
     try:
-        schema_uuid, creatives_table_uuid, impressions_table_uuid = create_ads_tables(
-            client, catalog_uuid=catalog_uuid, main_branch_uuid=main_branch_uuid
-        )
-        seed_commit_seq_num = commit_seed_tallies(
-            client,
+        schema_uuid = client.create_schema(
+            SCHEMA_NAME,
             catalog_uuid=catalog_uuid,
-            main_branch_uuid=main_branch_uuid,
-            schema_uuid=schema_uuid,
-            creatives_table_uuid=creatives_table_uuid,
+            branch_uuid=main_uuid,
+            author=AUTHOR,
+            comment="create ads schema",
         )
+        table_uuids = {
+            name: client.create_table(
+                name,
+                schema,
+                primary_keys=[primary_key],
+                catalog_uuid=catalog_uuid,
+                schema_uuid=schema_uuid,
+                branch_uuid=main_uuid,
+                author=AUTHOR,
+                comment=f"create {name} table",
+            )
+            for name, schema, primary_key in (
+                ("creatives", CREATIVES_SCHEMA, "creative_id"),
+                ("impressions", IMPRESSIONS_SCHEMA, "visitor_id"),
+            )
+        }
+
+        # One row per creative at zero, so every later write is an in-place
+        # update of an existing row rather than a first insert.
+        zeroed = pa.table(
+            {
+                "creative_id": list(CREATIVE_IDS),
+                "headline": [HEADLINES[cid] for cid in CREATIVE_IDS],
+                "impressions": [0] * len(CREATIVE_IDS),
+                "conversions": [0] * len(CREATIVE_IDS),
+            },
+            schema=CREATIVES_SCHEMA,
+        )
+        tx = client.begin_tx(
+            catalog_uuid=catalog_uuid, branch_uuid=main_uuid, author=AUTHOR
+        )
+        try:
+            client.write_data(
+                tx.tx_uuid,
+                Mutation(table_uuid=table_uuids["creatives"], upserts=zeroed),
+                catalog_uuid=catalog_uuid,
+                schema_uuid=schema_uuid,
+                branch_uuid=main_uuid,
+            )
+            seed_seq = client.commit_tx(
+                tx.tx_uuid,
+                catalog_uuid=catalog_uuid,
+                branch_uuid=main_uuid,
+            ).commit_seq_num
+        except BaseException:
+            # An open tx is not inert: until it times out it clamps cold
+            # isolation and fences purge/GC on its branch. Guarded so it never
+            # replaces the exception that triggered it.
+            try:
+                client.abort_tx(
+                    tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=main_uuid
+                )
+            except Exception as exc:
+                print(f"  (could not abort tx: {exc})")
+
+            raise
     except BaseException:
-        # Everything below the create_catalog lives inside the catalog, so
-        # dropping it unwinds the whole partial seed. seed_prod created the
-        # catalog, so seed_prod owns removing it — splitting this across the two
-        # helpers would make the ownership ambiguous. Without it each failed
-        # attempt strands another prod_<hex> catalog on a shared stack.
+        # Everything above lives inside the catalog, so dropping it unwinds the
+        # whole partial seed. Without this each failed attempt strands a
+        # prod_<hex> catalog on a shared stack.
         discard_catalog(client, catalog_uuid)
         raise
 
     return ProdContext(
         catalog_uuid=catalog_uuid,
         catalog_name=catalog_name,
-        main_branch_uuid=main_branch_uuid,
+        main_branch_uuid=main_uuid,
         schema_uuid=schema_uuid,
-        creatives_table_uuid=creatives_table_uuid,
-        impressions_table_uuid=impressions_table_uuid,
-        seed_commit_seq_num=seed_commit_seq_num,
+        creatives_table_uuid=table_uuids["creatives"],
+        impressions_table_uuid=table_uuids["impressions"],
+        seed_commit_seq_num=seed_seq,
     )
 
 
 def fork_branches(client: PencaClient, prod: ProdContext) -> dict[str, str]:
     """Fork one branch per policy off ``main``, all at the seed commit.
 
-    Every fork names the same explicit ``commit_seq_num`` so the three branches
-    provably start from one identical view of prod, rather than from whatever the
-    head happened to be when each call landed.
+    Every fork is pinned to the same explicit commit_seq_num, so the three
+    branches provably start from identical state.
     """
     created: dict[str, str] = {}
     try:
@@ -514,41 +316,38 @@ def fork_branches(client: PencaClient, prod: ProdContext) -> dict[str, str]:
                 catalog_uuid=prod.catalog_uuid,
             ).branch_uuid
     except BaseException:
-        # A failure on the second or third fork would otherwise leave the earlier
-        # ones live: run_demo's finally only covers branches it was handed.
-        discard_branches(client, prod.catalog_uuid, created.values())
+        # A failure on the second or third fork would otherwise leave the
+        # earlier ones live.
+        discard_branches(client, prod.catalog_uuid, list(created.values()))
         raise
 
     return created
 
 
+# --- the round loop, over SQL ------------------------------------------------
+
+
 def sql_str(value: str) -> str:
     """Quote a SQL string literal.
 
-    The values here are all our own constants, so this is not standing between
-    the demo and hostile input — it is here so a reader copying the pattern
-    copies a quoted one.
+    Inlined rather than bound because parameterized INSERT ... VALUES does not
+    bind on this server yet — TODO(CHA-526). Once it does these become real
+    placeholders and this helper goes away.
     """
     escaped = value.replace("'", "''")
 
     return f"'{escaped}'"
 
 
-def read_tallies(
-    session: BranchSession, prod: ProdContext
-) -> dict[str, tuple[int, int]]:
-    """Read one branch's running ``creative_id -> (shown, converted)`` tallies.
-
-    An ordinary SELECT on a branch-pinned connection — the analytical read and
-    the transactional writes below go to the same table over the same protocol.
-    """
-    got = session.sql.execute_query(
+def read_tallies(conn: PencaClient, prod: ProdContext) -> dict[str, tuple[int, int]]:
+    """``creative_id -> (shown, converted)`` for whichever branch ``conn`` is on."""
+    got = conn.execute_query(
         f"SELECT creative_id, impressions, conversions FROM {prod.creatives}"
     )
 
     return {
-        creative_id: (shown, converted)
-        for creative_id, shown, converted in zip(
+        cid: (shown, converted)
+        for cid, shown, converted in zip(
             got.column("creative_id").to_pylist(),
             got.column("impressions").to_pylist(),
             got.column("conversions").to_pylist(),
@@ -557,199 +356,160 @@ def read_tallies(
     }
 
 
-def read_impression_log(session: BranchSession, prod: ProdContext) -> tuple[int, int]:
-    """Re-derive ``(rows, conversions)`` from the branch's append-only log.
+def run_rounds(
+    prod: ProdContext,
+    branches: Mapping[str, PencaClient],
+    config: DemoConfig,
+    feed: Sequence[Sequence[int]],
+    on_round: Callable[[int, str, tuple[tuple[int, str, int], ...]], None] | None,
+) -> None:
+    """Read → decide → write, one round at a time, on every branch.
 
-    Aggregated server-side rather than by materializing the log: at the default
-    3000 impressions each branch's log is 3000 rows, and the whole point of the
-    reconciliation is that the engine can answer it analytically.
+    Rounds are the outer loop and branches the inner one, so all three advance
+    through the shared feed in lockstep: they see identical traffic and diverge
+    only on policy. Everything each branch does here is SQL on its own
+    connection.
     """
-    got = session.sql.execute_query(
-        f"SELECT count(*) AS rows, coalesce(sum(converted), 0) AS conversions "
+    rngs = {name: random.Random(f"{config.seed}:{name}") for name in POLICY_NAMES}
+
+    for round_index, start in enumerate(
+        range(0, config.impressions, config.round_size)
+    ):
+        visitors = range(start, min(start + config.round_size, config.impressions))
+
+        for policy_name, conn in branches.items():
+            # 1. Read this branch's own committed tallies. Before BEGIN on
+            #    purpose: reading inside the open transaction would take the
+            #    slower read-your-own-uncommitted-writes path and buy us nothing.
+            tallies = read_tallies(conn, prod)
+
+            # 2. Decide, from what we just read. `even` ignores the content and
+            #    splits on the visitor index — that is what makes it the foil.
+            outcomes = []
+            for visitor in visitors:
+                creative_id = choose_creative(
+                    policy_name, visitor, tallies, rngs[policy_name], config.epsilon
+                )
+                outcomes.append(
+                    (
+                        visitor,
+                        creative_id,
+                        feed[visitor][CREATIVE_POSITION[creative_id]],
+                    )
+                )
+
+            # 3. Fold the round into the running totals. The tally is cumulative,
+            #    so writing it is a read-modify-write — read-your-writes is not
+            #    optional here, it is the only way the number can be right.
+            updated = dict(tallies)
+            for _visitor, creative_id, converted in outcomes:
+                shown, hits = updated[creative_id]
+                updated[creative_id] = (shown + 1, hits + converted)
+
+            served = sorted({creative_id for _v, creative_id, _c in outcomes})
+            tally_rows = ", ".join(
+                f"({sql_str(cid)}, {sql_str(HEADLINES[cid])}, "
+                f"{updated[cid][0]}, {updated[cid][1]})"
+                for cid in served
+            )
+            log_rows = ", ".join(
+                f"({sql_str(f'v{visitor:06d}')}, {sql_str(creative_id)}, {converted})"
+                for visitor, creative_id, converted in outcomes
+            )
+
+            # 4. Both tables, one transaction — so a scoreboard read can never
+            #    catch the tally and the log disagreeing.
+            conn.execute_update("BEGIN")
+            try:
+                conn.execute_update(
+                    f"INSERT INTO {prod.creatives} "
+                    "(creative_id, headline, impressions, conversions) "
+                    f"VALUES {tally_rows} "
+                    "ON CONFLICT (creative_id) DO UPDATE SET "
+                    "impressions = EXCLUDED.impressions, "
+                    "conversions = EXCLUDED.conversions"
+                )
+                conn.execute_update(
+                    f"INSERT INTO {prod.impressions} "
+                    f"(visitor_id, creative_id, converted) VALUES {log_rows}"
+                )
+                conn.execute_update("COMMIT")
+            except BaseException:
+                # Roll back rather than leave the transaction open to time out,
+                # but never let the rollback replace the error that caused it.
+                try:
+                    conn.execute_update("ROLLBACK")
+                except Exception as exc:
+                    print(f"  (could not roll back on {policy_name}: {exc})")
+
+                raise
+
+            if on_round is not None:
+                on_round(round_index, policy_name, tuple(outcomes))
+
+
+def score_branch(
+    conn: PencaClient, prod: ProdContext, name: str, branch_uuid: str
+) -> BranchOutcome:
+    """Final tallies, reconciled against the branch's own append-only log.
+
+    The reconciliation is aggregated server-side rather than by pulling 3000
+    rows back — the engine answering it analytically, on the same copy it just
+    transacted against, is the thing worth showing.
+    """
+    per_creative = read_tallies(conn, prod)
+    log = conn.execute_query(
+        "SELECT count(*) AS rows, coalesce(sum(converted), 0) AS conversions "
         f"FROM {prod.impressions}"
     )
 
-    return (got.column("rows")[0].as_py(), got.column("conversions")[0].as_py())
-
-
-def allocate_round(
-    policy_name: str,
-    visitor_indexes: Sequence[int],
-    tallies: Mapping[str, tuple[int, int]],
-    feed: Sequence[Sequence[int]],
-    rng: random.Random,
-    epsilon: float,
-) -> tuple[tuple[int, str, int], ...]:
-    """Decide one round: per visitor, a creative and that visitor's outcome.
-
-    Calls ``choose_creative`` exactly once per visitor, in visitor order. That —
-    not a draw count — is the load-bearing property: ``pick_even`` and
-    ``pick_greedy`` draw from ``rng`` zero times and ``pick_epsilon`` draws twice
-    when it explores, so an allocation that called ``choose_creative`` differently
-    would shift epsilon's whole stream and change the scoreboard at a fixed seed.
-    """
-    outcomes: list[tuple[int, str, int]] = []
-    for visitor_index in visitor_indexes:
-        creative_id = choose_creative(policy_name, visitor_index, tallies, rng, epsilon)
-        converted = feed[visitor_index][CREATIVE_POSITION[creative_id]]
-        outcomes.append((visitor_index, creative_id, converted))
-
-    return tuple(outcomes)
-
-
-def apply_outcomes(
-    tallies: Mapping[str, tuple[int, int]],
-    outcomes: Sequence[tuple[int, str, int]],
-) -> dict[str, tuple[int, int]]:
-    """Fold a round's outcomes onto a copy of the tallies."""
-    updated = dict(tallies)
-    for _visitor_index, creative_id, converted in outcomes:
-        shown, conversions = updated.get(creative_id, (0, 0))
-        updated[creative_id] = (shown + 1, conversions + converted)
-
-    return updated
-
-
-def tally_upsert_sql(
-    prod: ProdContext,
-    outcomes: Sequence[tuple[int, str, int]],
-    updated: Mapping[str, tuple[int, int]],
-) -> str:
-    """The ``creatives`` upsert — same primary keys, new running totals.
-
-    Derives the touched keys from ``outcomes`` rather than taking them, so "every
-    key is present in ``updated`` and in ``HEADLINES``" is structural instead of a
-    precondition the caller has to honour.
-    """
-    touched = sorted({creative_id for _v, creative_id, _c in outcomes})
-    values = ", ".join(
-        f"({sql_str(creative_id)}, {sql_str(HEADLINES[creative_id])}, "
-        f"{updated[creative_id][0]}, {updated[creative_id][1]})"
-        for creative_id in touched
-    )
-
-    return (
-        f"INSERT INTO {prod.creatives} "
-        "(creative_id, headline, impressions, conversions) "
-        f"VALUES {values} "
-        "ON CONFLICT (creative_id) DO UPDATE SET "
-        "impressions = EXCLUDED.impressions, conversions = EXCLUDED.conversions"
-    )
-
-
-def impression_append_sql(
-    prod: ProdContext, outcomes: Sequence[tuple[int, str, int]]
-) -> str:
-    """The ``impressions`` append, one row per visitor served."""
-    values = ", ".join(
-        f"({sql_str(f'v{visitor:06d}')}, {sql_str(creative_id)}, {converted})"
-        for visitor, creative_id, converted in outcomes
-    )
-
-    return (
-        f"INSERT INTO {prod.impressions} (visitor_id, creative_id, converted) "
-        f"VALUES {values}"
-    )
-
-
-def commit_statements(session: BranchSession, statements: Sequence[str]) -> None:
-    """Run every statement in one transaction, rolling back if any fails.
-
-    ``BEGIN`` / ``COMMIT`` are ordinary statements on the connection: the SQL
-    server binds the DML between them to a single Penca transaction, opening it
-    lazily on the first DML and committing it here. So the tally update and the
-    log append land together or not at all, and a scoreboard read can never catch
-    them disagreeing.
-
-    The ``ROLLBACK`` is guarded and never replaces the exception that triggered
-    it: an open transaction is not inert — until it times out it clamps cold
-    isolation and fences purge/GC on its branch — but the write's own error is
-    the one worth propagating. ``Exception``, not ``BaseException``, so a second
-    Ctrl-C still gets through.
-    """
-    session.sql.execute_update("BEGIN")
-    try:
-        for statement in statements:
-            session.sql.execute_update(statement)
-
-        session.sql.execute_update("COMMIT")
-    except BaseException:
-        try:
-            session.sql.execute_update("ROLLBACK")
-        except Exception as exc:
-            print(f"  (could not roll back on {session.name}: {exc})")
-
-        raise
-
-
-def drive_round(
-    session: BranchSession,
-    prod: ProdContext,
-    visitor_indexes: Sequence[int],
-    feed: Sequence[Sequence[int]],
-    rng: random.Random,
-    epsilon: float,
-) -> tuple[tuple[int, str, int], ...]:
-    """Run one round on one branch; return its ``(visitor, creative, converted)``.
-
-    This is the load-bearing loop: SELECT, decide, then INSERT both tables in one
-    transaction. The read is of the branch's *own* committed state, so the
-    allocation is steered by what this branch's previous rounds wrote — on the
-    same copy of the data it is transacting against, over the same connection.
-
-    The read is taken before ``BEGIN``, deliberately. Reading inside the open
-    transaction would take the slower read-your-own-uncommitted-writes path and
-    buy this demo nothing: there is nothing uncommitted yet to see.
-    """
-    tallies = read_tallies(session, prod)
-    outcomes = allocate_round(
-        session.name, visitor_indexes, tallies, feed, rng, epsilon
-    )
-    updated = apply_outcomes(tallies, outcomes)
-
-    commit_statements(
-        session,
-        (
-            tally_upsert_sql(prod, outcomes, updated),
-            impression_append_sql(prod, outcomes),
-        ),
-    )
-
-    return outcomes
-
-
-def collect_branch_outcome(session: BranchSession, prod: ProdContext) -> BranchOutcome:
-    """Read a branch's final tallies and reconcile them against its own log."""
-    per_creative = read_tallies(session, prod)
-    log_impressions, log_conversions = read_impression_log(session, prod)
-
     return BranchOutcome(
-        branch_name=session.name,
-        branch_uuid=session.uuid,
+        branch_name=name,
+        branch_uuid=branch_uuid,
         impressions=sum(shown for shown, _ in per_creative.values()),
         conversions=sum(converted for _, converted in per_creative.values()),
         per_creative=per_creative,
-        log_conversions=log_conversions,
-        log_impressions=log_impressions,
+        log_conversions=log.column("conversions")[0].as_py(),
+        log_impressions=log.column("rows")[0].as_py(),
     )
 
 
-def policy_rngs(config: DemoConfig) -> dict[str, random.Random]:
-    """One RNG per policy, so exploration is reproducible per branch.
+# --- cleanup -----------------------------------------------------------------
 
-    Seeded on a ``"seed:name"`` string rather than ``seed + index``: a bare offset
-    gives index 0 the same stream ``build_visitor_feed``'s int seed produces, so a
-    reading policy at that position would explore against the very outcomes that
-    stream generated. A str seed cannot collide with the feed's int seed.
+
+def discard_branches(
+    client: PencaClient, catalog_uuid: str, branch_uuids: Sequence[str]
+) -> list[str]:
+    """Delete every branch, attempting all of them; return the ones that failed.
+
+    Guarded per branch: one failure must not strand the rest, and when this runs
+    from a ``finally`` an unguarded raise would replace the exception being
+    propagated.
     """
-    return {
-        policy_name: random.Random(f"{config.seed}:{policy_name}")
-        for policy_name in POLICY_NAMES
-    }
+    failed: list[str] = []
+    for branch_uuid in branch_uuids:
+        try:
+            client.delete_branch(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+        except Exception as exc:
+            print(f"  (could not delete branch {branch_uuid}: {exc})")
+            failed.append(branch_uuid)
+
+    return failed
+
+
+def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
+    """Best-effort delete, for unwinding a half-built seed."""
+    try:
+        client.delete_catalog(catalog_uuid=catalog_uuid)
+    except Exception as exc:
+        print(f"  (could not delete catalog {catalog_uuid}: {exc})")
+
+
+# --- the whole run -----------------------------------------------------------
 
 
 def connect_to_branch(catalog_name: str, branch_name: str) -> PencaClient:
-    """Open a Flight SQL connection pinned to one branch of one catalog."""
+    """A Flight SQL connection pinned to one branch of one catalog."""
     return PencaClient.from_settings(catalog=catalog_name, branch=branch_name)
 
 
@@ -760,109 +520,74 @@ def run_demo(
     | None = None,
     connect: Callable[[str, str], PencaClient] = connect_to_branch,
 ) -> DemoOutcome:
-    """Fork, drive the shared feed through every branch, score, then discard.
-
-    Rounds are the outer loop and branches the inner one, so all three branches
-    advance through the shared feed in lockstep — the point being that they see
-    identical traffic and diverge only on policy.
-    """
+    """Fork, drive the shared feed through every branch, score, then discard."""
     feed = build_visitor_feed(config)
     prod = seed_prod(client)
     try:
-        branches = fork_branches(client, prod)
+        branch_uuids = fork_branches(client, prod)
     except BaseException:
-        # Symmetry with seed_prod: a failure here leaves the same prod_<hex>
-        # catalog a failed seed would have dropped. fork_branches already discards
-        # whatever forks it managed to create.
-        #
-        # Deliberately the last point at which the catalog is dropped. Once the
-        # rounds start, prod holds committed state that is the whole subject of the
-        # demo, so a mid-run failure KEEPS the catalog for inspection — the forks
-        # are still discarded by run_demo's finally, and print_isolation names the
-        # catalog so it can be cleaned up by hand.
+        # The last point at which the catalog is dropped. Once the rounds start,
+        # prod holds committed state that is the subject of the demo, so a
+        # mid-run failure KEEPS the catalog for inspection.
         discard_catalog(client, prod.catalog_uuid)
         raise
 
-    rngs = policy_rngs(config)
-    # One pinned SQL connection per branch. Branch selection is bound at
-    # handshake and immutable for the connection's lifetime, so "three branches"
-    # is literally three endpoints — which is the shape a reader would use.
-    sessions = [
-        BranchSession(
-            name=policy_name,
-            uuid=branches[policy_name],
-            sql=connect(prod.catalog_name, policy_name),
-        )
-        for policy_name in POLICY_NAMES
-    ]
+    # One pinned connection per branch: three branches is literally three
+    # endpoints, which is the shape a reader would use.
+    branches = {name: connect(prod.catalog_name, name) for name in POLICY_NAMES}
 
     completed = False
     try:
-        for round_index, start in enumerate(
-            range(0, config.impressions, config.round_size)
-        ):
-            visitor_indexes = range(
-                start, min(start + config.round_size, config.impressions)
-            )
-            for session in sessions:
-                outcomes = drive_round(
-                    session,
-                    prod,
-                    visitor_indexes,
-                    feed,
-                    rngs[session.name],
-                    config.epsilon,
-                )
-                if on_round is not None:
-                    on_round(round_index, session.name, outcomes)
-
+        run_rounds(prod, branches, config, feed, on_round)
         scoreboard = sorted(
-            (collect_branch_outcome(session, prod) for session in sessions),
+            (
+                score_branch(branches[name], prod, name, branch_uuids[name])
+                for name in POLICY_NAMES
+            ),
             key=lambda outcome: (-outcome.conversions, outcome.branch_name),
         )
-
         completed = True
     finally:
-        # finally, not straight-line: the docstring promises the forks are thrown
-        # away, and a failed run is exactly when leaving three live branches behind
-        # would hurt most. The prod_* catalog deliberately survives — prod
-        # outliving its forks is the thing being demonstrated.
-        undeleted = discard_branches(client, prod.catalog_uuid, branches.values())
+        # finally, not straight-line: a failed run is exactly when leaving three
+        # live branches behind would hurt most. The prod_* catalog deliberately
+        # survives — prod outliving its forks is the thing being demonstrated.
+        undeleted = discard_branches(
+            client, prod.catalog_uuid, list(branch_uuids.values())
+        )
         # Only swallow while unwinding. On a green run a failed delete must not
-        # degrade to a printed line: the demo would exit 0 with live forks, and
-        # print_isolation would list them directly above "N parallel universes …
-        # were thrown away". A frame-local flag rather than sys.exc_info(), which
-        # reports an exception being handled anywhere up the stack — a caller that
-        # invoked run_demo from inside an except block would suppress this raise.
-        raise_for_undeleted(
-            undeleted, catalog_uuid=prod.catalog_uuid, completed=completed
-        )
+        # degrade to a printed line: the demo would exit 0 with live forks while
+        # claiming below that all three were thrown away.
+        if undeleted and completed:
+            msg = (
+                f"the run succeeded but these branches could not be discarded: "
+                f"{', '.join(undeleted)} — still live in catalog "
+                f"{prod.catalog_uuid}, delete them by hand"
+            )
+            raise RuntimeError(msg)
 
-    # Main is read AFTER the discard on purpose. Read before it, "prod untouched"
-    # only covers the run; read after, it also covers the thing this demo is
-    # uniquely placed to show — main's one shared cold object survives deleting
-    # three forks that were reading it.
-    main_session = BranchSession(
-        name="main",
-        uuid=prod.main_branch_uuid,
-        sql=connect(prod.catalog_name, "main"),
-    )
-    main_tallies = read_tallies(main_session, prod)
-    main_impression_rows, _ = read_impression_log(main_session, prod)
-    remaining = tuple(
-        sorted(
-            branch.branch_name
-            for branch in client.list_branches(catalog_uuid=prod.catalog_uuid)
-        )
+    # Main is read AFTER the discard on purpose: read before it, "prod
+    # untouched" only covers the run; read after, it also covers main's one
+    # shared cold object surviving the deletion of three forks that read it.
+    main_conn = connect(prod.catalog_name, "main")
+    main_log = main_conn.execute_query(
+        f"SELECT count(*) AS rows FROM {prod.impressions}"
     )
 
     return DemoOutcome(
         catalog_uuid=prod.catalog_uuid,
         scoreboard=tuple(scoreboard),
-        main_tallies=main_tallies,
-        main_impression_rows=main_impression_rows,
-        remaining_branches=remaining,
+        main_tallies=read_tallies(main_conn, prod),
+        main_impression_rows=main_log.column("rows")[0].as_py(),
+        remaining_branches=tuple(
+            sorted(
+                branch.branch_name
+                for branch in client.list_branches(catalog_uuid=prod.catalog_uuid)
+            )
+        ),
     )
+
+
+# --- output ------------------------------------------------------------------
 
 
 def print_round(
@@ -878,43 +603,42 @@ def print_round(
 
 
 def conversion_rate(branch: BranchOutcome) -> str:
-    """Formatted rate, tolerant of a branch that was never shown anything."""
     if branch.impressions == 0:
         return "n/a"
 
     return f"{branch.conversions / branch.impressions:.2%}"
 
 
+def _markdown(columns: dict[str, list]) -> str:
+    return pa.table(columns).to_pandas().to_markdown(index=False)
+
+
 def print_scoreboard(outcome: DemoOutcome) -> None:
-    """Cross-branch scoreboard, then each branch's allocation."""
     print("\n--- Cross-branch scoreboard (ranked) ---")
     print(
-        pa.table(
+        _markdown(
             {
-                "branch": [branch.branch_name for branch in outcome.scoreboard],
-                "impressions": [branch.impressions for branch in outcome.scoreboard],
-                "conversions": [branch.conversions for branch in outcome.scoreboard],
-                "rate": [conversion_rate(branch) for branch in outcome.scoreboard],
+                "branch": [b.branch_name for b in outcome.scoreboard],
+                "impressions": [b.impressions for b in outcome.scoreboard],
+                "conversions": [b.conversions for b in outcome.scoreboard],
+                "rate": [conversion_rate(b) for b in outcome.scoreboard],
             }
         )
-        .to_pandas()
-        .to_markdown(index=False)
     )
 
     print("\n--- Where each branch spent its traffic ---")
     rows = [
-        (branch.branch_name, creative_id, shown, converted)
+        (branch.branch_name, cid, shown, converted)
         for branch in outcome.scoreboard
-        for creative_id, (shown, converted) in sorted(
-            # creative_id breaks ties: `even` shows all four an equal number of
-            # times, and without it their order comes from whatever row order
-            # read_data returned, so identical input could print differently.
-            branch.per_creative.items(),
-            key=lambda item: (-item[1][0], item[0]),
+        # creative_id breaks ties: `even` shows all four equally often, and
+        # without it their order comes from whatever row order the read
+        # returned, so identical input could print differently.
+        for cid, (shown, converted) in sorted(
+            branch.per_creative.items(), key=lambda item: (-item[1][0], item[0])
         )
     ]
     print(
-        pa.table(
+        _markdown(
             {
                 "branch": [row[0] for row in rows],
                 "creative": [row[1] for row in rows],
@@ -922,29 +646,24 @@ def print_scoreboard(outcome: DemoOutcome) -> None:
                 "conversions": [row[3] for row in rows],
             }
         )
-        .to_pandas()
-        .to_markdown(index=False)
     )
 
 
 def print_isolation(outcome: DemoOutcome) -> None:
-    """Prod's own state after the run, and the post-discard branch list."""
     print("\n--- prod (main) after the run ---")
     creative_ids = sorted(outcome.main_tallies)
     print(
-        pa.table(
+        _markdown(
             {
                 "creative": creative_ids,
                 "impressions": [outcome.main_tallies[c][0] for c in creative_ids],
                 "conversions": [outcome.main_tallies[c][1] for c in creative_ids],
             }
         )
-        .to_pandas()
-        .to_markdown(index=False)
     )
     print(f"\nprod impression log: {outcome.main_impression_rows} rows")
-    # Name the catalog: it deliberately outlives the run, so a reader who wants to
-    # poke at it — or clean it up — needs to know what it is called.
+    # Name the catalog: it deliberately outlives the run, so a reader who wants
+    # to poke at it — or clean it up — needs to know what it is called.
     print(f"prod catalog (kept): {outcome.catalog_uuid}")
     print(f"branches remaining after discard: {', '.join(outcome.remaining_branches)}")
     print(
@@ -963,8 +682,8 @@ def parse_args() -> DemoConfig:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     args = parser.parse_args()
     # Validate before main() opens a client: every one of these otherwise fails
-    # *after* seed_prod and fork_branches have created a catalog and three
-    # branches, so a typo'd flag would leave debris behind a stack trace.
+    # *after* the catalog and three branches exist, so a typo'd flag would leave
+    # debris behind a stack trace.
     if args.impressions < 1:
         parser.error("--impressions must be at least 1")
 

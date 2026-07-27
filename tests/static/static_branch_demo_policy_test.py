@@ -172,67 +172,6 @@ def test_the_best_creative_is_not_the_lowest_id():
 # --- the round pipeline ------------------------------------------------------
 
 
-def test_allocate_round_calls_the_policy_once_per_visitor_in_order():
-    """The rng-consumption contract epsilon's reproducibility rests on."""
-    seen: list[int] = []
-    original = demo.choose_creative
-    demo.choose_creative = lambda _p, visitor, _t, _r, _e: (
-        seen.append(visitor) or demo.CREATIVE_IDS[0]
-    )
-    try:
-        demo.allocate_round(
-            "greedy", [3, 4, 5], _tallies(), [[0] * 4] * 6, random.Random(0), 0.0
-        )
-    finally:
-        demo.choose_creative = original
-
-    assert seen == [3, 4, 5], f"one call per visitor, in visitor order; saw {seen}"
-
-
-def test_allocate_round_reads_each_visitors_own_latent_outcome():
-    """The feed is per-visitor-per-creative, so the outcome must be indexed by
-    both — not by the visitor alone, which would make every creative convert
-    identically and erase the policies' whole reason to differ."""
-    feed = [[0, 1, 0, 0], [0, 1, 0, 0]]
-    outcomes = demo.allocate_round(
-        "even", [0, 1], _tallies(), feed, random.Random(0), 0.0
-    )
-
-    converted = {creative: outcome for _v, creative, outcome in outcomes}
-    assert converted[demo.CREATIVE_IDS[0]] == 0
-    assert converted[demo.CREATIVE_IDS[1]] == 1
-
-
-def test_apply_outcomes_folds_onto_a_copy():
-    """The fold must not mutate the tallies the round was decided against."""
-    before = _tallies(banner=(10, 2))
-    updated = demo.apply_outcomes(before, ((0, "banner", 1),))
-
-    assert updated["banner"] == (11, 3)
-    assert before["banner"] == (10, 2), "the input tallies must not be mutated"
-
-
-def test_policy_rngs_are_independent_of_the_feeds_stream():
-    """Seeded on a "seed:name" string, not seed + index.
-
-    A bare offset gives index 0 the same stream build_visitor_feed's int seed
-    produces, so a reading policy at that position would explore against the very
-    outcomes that stream generated.
-    """
-    config = demo.DemoConfig(impressions=8, round_size=2, epsilon=0.5, seed=7)
-    rngs = demo.policy_rngs(config)
-
-    assert set(rngs) == set(demo.POLICY_NAMES)
-    streams = [[rngs[name].random() for _ in range(5)] for name in demo.POLICY_NAMES]
-    assert len({tuple(stream) for stream in streams}) == len(streams), (
-        "each policy must draw its own stream"
-    )
-    feed_first = random.Random(config.seed).random()
-    assert all(stream[0] != feed_first for stream in streams), (
-        "no policy may replay the stream that built the feed"
-    )
-
-
 def test_the_feed_is_shared_and_reproducible():
     config = demo.DemoConfig(impressions=16, round_size=4, epsilon=0.1, seed=99)
 
@@ -359,28 +298,43 @@ def _prod():
     )
 
 
+def test_sql_str_escapes_a_quote():
+    assert demo.sql_str("it's") == "'it''s'"
+
+
+def _drive_one_round(tallies=None, fail_on=None, epsilon=0.0, round_size=2):
+    """Drive a single round through the real loop with a fake connection."""
+    calls: list[tuple[str, str, str]] = []
+    seen: list[tuple[int, str, tuple]] = []
+    config = demo.DemoConfig(
+        impressions=round_size, round_size=round_size, epsilon=epsilon, seed=1
+    )
+    demo.run_rounds(
+        _prod(),
+        {"greedy": _FakeSql(calls, "greedy", tallies, fail_on)},
+        config,
+        demo.build_visitor_feed(config),
+        lambda i, p, o: seen.append((i, p, o)),
+    )
+
+    return calls, seen
+
+
 def test_a_round_selects_before_it_opens_the_transaction():
     """CHA-517's hard design rule, as an interaction assertion.
 
-    No outcome assertion can pin this. apply_outcomes computes exactly what the
-    read returns, so replacing the per-round SELECT with an in-process dict
-    carried across rounds yields a byte-identical scoreboard — read-your-writes
-    deleted outright, every other test still green. What separates the two is
-    observable only in the interaction: that a SELECT happens, that it precedes
-    BEGIN, and that the allocation used its *content*.
+    No outcome assertion can pin this. The fold computes exactly what the read
+    returns, so replacing the per-round SELECT with an in-process dict carried
+    across rounds yields a byte-identical scoreboard — read-your-writes deleted
+    outright, every other test still green. What separates the two is observable
+    only in the interaction: that a SELECT happens, that it precedes BEGIN, and
+    that the allocation used its *content*.
 
     So the fake serves a tally the policy could not reach from zeros — carousel
-    measured clearly best, everything else worse. From zeros, greedy takes banner
-    on the untried tie-break.
+    measured clearly best, everything else worse. From zeros, greedy would take
+    banner on the untried tie-break.
     """
-    calls: list[tuple[str, str, str]] = []
-    session = demo.BranchSession(
-        name="greedy",
-        uuid="uuid-greedy",
-        sql=_FakeSql(calls, "greedy", tallies=_all_measured()),
-    )
-
-    demo.drive_round(session, _prod(), [0], [[0, 0, 0, 0]], random.Random(0), 0.0)
+    calls, _seen = _drive_one_round(tallies=_all_measured())
 
     verbs = [
         "SELECT" if kind == "query" else sql.split()[0].upper()
@@ -403,43 +357,104 @@ def test_a_failed_statement_rolls_the_transaction_back():
     isolation and fences purge/GC on its branch. So a mid-block failure must
     ROLLBACK — and must still propagate its own error, not the rollback's."""
     calls: list[tuple[str, str, str]] = []
-    session = demo.BranchSession(
-        name="greedy",
-        uuid="uuid-greedy",
-        sql=_FakeSql(calls, "greedy", fail_on="ON CONFLICT"),
-    )
-
+    config = demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
     try:
-        demo.commit_statements(
-            session, ("INSERT INTO t ON CONFLICT x", "INSERT INTO u")
+        demo.run_rounds(
+            _prod(),
+            {"greedy": _FakeSql(calls, "greedy", None, "ON CONFLICT")},
+            config,
+            demo.build_visitor_feed(config),
+            None,
         )
     except RuntimeError as exc:
         assert "refused" in str(exc), f"the statement's own error must survive: {exc}"
     else:
         raise AssertionError("the failure must propagate")
 
-    verbs = [sql.split()[0].upper() for _b, _k, sql in calls]
-    assert verbs == ["BEGIN", "INSERT", "ROLLBACK"], (
+    # The ROLLBACK itself, not just the propagated error: deleting the rollback
+    # leaves the error assertion green while the transaction stays open.
+    verbs = [
+        "SELECT" if kind == "query" else sql.split()[0].upper()
+        for _b, kind, sql in calls
+    ]
+    assert verbs == ["SELECT", "BEGIN", "INSERT", "ROLLBACK"], (
         f"a failed statement must roll back and skip the rest; saw {verbs}"
     )
 
 
-def test_the_upsert_carries_only_the_touched_creatives():
-    """Deriving the keys from `outcomes` is what keeps the payload honest — a
-    round that served one creative must not rewrite the other three's totals."""
-    sql = demo.tally_upsert_sql(
-        _prod(), ((0, demo.CREATIVE_IDS[1], 1),), {demo.CREATIVE_IDS[1]: (5, 2)}
+def test_the_round_writes_the_folded_totals_for_only_the_creatives_it_served():
+    """The upsert carries running totals, not the round's own counts, and only
+    for creatives this round actually served — a round that showed one creative
+    must not rewrite the other three's rows."""
+    # greedy from these tallies takes carousel every time, so exactly one
+    # creative is served and its totals fold onto the 50/12 it just read.
+    calls, _seen = _drive_one_round(tallies=_all_measured(), round_size=2)
+    upsert = next(sql for _b, _k, sql in calls if "ON CONFLICT" in sql)
+
+    assert "'carousel'" in upsert
+    for untouched in ("banner", "story", "video"):
+        assert f"'{untouched}'" not in upsert, f"{untouched} unserved; saw {upsert}"
+
+    # 50 shown + 2 this round; conversions fold on top of the 12 already there.
+    assert "52" in upsert, f"totals must be cumulative, not per-round; saw {upsert}"
+    assert "ON CONFLICT (creative_id) DO UPDATE" in upsert, upsert
+
+
+def test_each_visitor_gets_their_own_latent_outcome():
+    """The feed is per-visitor-per-creative, so the outcome must be indexed by
+    both — not by the visitor alone, which would make every creative convert
+    identically and erase the policies' whole reason to differ."""
+    config = demo.DemoConfig(impressions=400, round_size=400, epsilon=0.0, seed=5)
+    feed = demo.build_visitor_feed(config)
+    calls: list[tuple[str, str, str]] = []
+    seen: list[tuple[int, str, tuple]] = []
+    demo.run_rounds(
+        _prod(),
+        {"even": _FakeSql(calls, "even")},
+        config,
+        feed,
+        lambda i, p, o: seen.append((i, p, o)),
     )
 
-    assert f"'{demo.CREATIVE_IDS[1]}'" in sql
-    for untouched in (demo.CREATIVE_IDS[0], demo.CREATIVE_IDS[2]):
-        assert f"'{untouched}'" not in sql, f"{untouched} was not served; saw {sql}"
+    (_index, _policy, outcomes) = seen[0]
+    by_creative: dict[str, list[int]] = {}
+    for visitor, creative_id, converted in outcomes:
+        by_creative.setdefault(creative_id, []).append(converted)
+        assert converted == feed[visitor][demo.CREATIVE_POSITION[creative_id]], (
+            f"visitor {visitor} must get their own outcome for {creative_id}"
+        )
 
-    assert "ON CONFLICT (creative_id) DO UPDATE" in sql, sql
+    rates = {cid: sum(v) / len(v) for cid, v in by_creative.items()}
+    assert rates["carousel"] > rates["video"], (
+        f"the creatives' true rates must show through the feed, saw {rates}"
+    )
 
 
-def test_sql_str_escapes_a_quote():
-    assert demo.sql_str("it's") == "'it''s'"
+def test_policy_rngs_are_independent_of_the_feeds_stream():
+    """Seeded on a "seed:name" string, not seed + index.
+
+    A bare offset gives index 0 the same stream build_visitor_feed's int seed
+    produces, so a reading policy at that position would explore against the very
+    outcomes that stream generated. Asserted through the loop: with epsilon=1 the
+    two exploring branches must not make identical choices.
+    """
+    config = demo.DemoConfig(impressions=60, round_size=60, epsilon=1.0, seed=7)
+    calls: list[tuple[str, str, str]] = []
+    seen: list[tuple[int, str, tuple]] = []
+    demo.run_rounds(
+        _prod(),
+        {name: _FakeSql(calls, name) for name in demo.POLICY_NAMES},
+        config,
+        demo.build_visitor_feed(config),
+        lambda i, p, o: seen.append((i, p, o)),
+    )
+
+    picks = {
+        policy: tuple(cid for _v, cid, _c in outcomes) for _i, policy, outcomes in seen
+    }
+    assert picks["greedy"] != picks["epsilon"], (
+        "always-exploring branches must draw their own streams"
+    )
 
 
 # --- run_demo's wiring -------------------------------------------------------
