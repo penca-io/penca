@@ -106,8 +106,8 @@ Each round, on each branch, inside one transaction:
 `even` splits traffic evenly and never reads the tallies — it is the foil.
 `greedy` and `epsilon` reallocate from their own running results. Then a
 cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
-and `main` is shown untouched. A representative run at the 3000-impression
-default (~50s):
+and `main` is shown untouched. The run is deterministic, so this is what the
+shipped defaults produce (measured 2026-07-27; ~50s):
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -120,11 +120,14 @@ onto the second-best after one lucky round and never revisits it. Both beat the
 fixed split, because both steer on what they wrote.
 
 **Forking does not copy your data.** After the three forks, `main` holds its
-seeded rows in **one** object of **562 bytes**, unchanged by the second and third
-fork, and each branch stores **zero** objects and **zero** bytes of its own —
-while all three read the full seeded set. That is the "one copy" half of the
-headline, asserted in
-`tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`.
+seeded rows in **exactly one** object, its footprint unchanged by the second and
+third fork, and each branch stores **zero** objects and **zero** bytes of its own
+— while all three read the full seeded set. Those are the assertions in
+`tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
+and they are the "one copy" half of the headline. (That one object measured 562
+bytes on 2026-07-27 — an observation, not an assertion: byte totals move with
+writer version and compression, and this figure covers the `creatives` table
+alone, not the whole catalog.)
 
 Two honest caveats. The allocation policies are deliberately toy — the database
 mechanic is the point, not the bandit. And at this scale the fork itself is the
@@ -133,6 +136,10 @@ row-store at real volume or on a query shape a row-store chokes on, which is not
 what a 3000-impression demo shows.
 
 ### `examples/audit_demo.py` — time travel and the audit trail
+
+```bash
+uv run python examples/audit_demo.py    # same sourced env, no extra setup
+```
 
 `audit_demo.py` walks through Penca's auditable-store semantics on a
 fresh `users(name PK, value)` table:

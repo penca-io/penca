@@ -196,8 +196,17 @@ def test_forks_share_one_copy_of_the_seeded_data():
             stats = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
             observed = stats.get(prod.main_branch_uuid)
             assert observed is not None, "the fork must flush main's hot tier to cold"
-            assert observed[0] > 0 and observed[1] > 0, (
-                f"main's cold footprint must be non-empty after a fork, saw {observed}"
+            # Exactly one object: this is the "one copy of your data" claim the
+            # README makes, so pin the count. Safe at any segment cap — the seeded
+            # table is four rows in one commit, orders of magnitude under both the
+            # 1 MiB test cap and the 64 MiB default. The byte total is deliberately
+            # only checked as non-zero and flat; it moves with writer version and
+            # compression, so pinning it would be brittle without adding meaning.
+            assert observed[0] == 1, (
+                f"main's seeded rows must live in exactly one object, saw {observed}"
+            )
+            assert observed[1] > 0, (
+                f"main's cold footprint must carry bytes after a fork, saw {observed}"
             )
             if main_footprint is None:
                 main_footprint = observed
