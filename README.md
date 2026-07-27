@@ -96,17 +96,36 @@ and drives **one** shared, deterministic visitor feed through all three. Each
 visitor's response to each creative is fixed up front, so the branches see
 identical traffic and can only diverge on what they *do* with it.
 
-Each round, on each branch:
+The round loop is **ordinary SQL over Flight SQL** — each branch is one
+connection, and branch selection binds at handshake and is immutable for the
+connection's lifetime, the way a Postgres connection is to one database. So a
+branch is reachable as a plain SQL endpoint, and these are the statements any
+Flight SQL driver would send:
 
-1. **read** that branch's own committed tallies — read-your-writes, on the same
-   copy it is about to transact against;
-2. the allocation policy picks creatives from what it just read;
-3. **UPDATE** the tally row in place and append the impression rows — these two
-   share one transaction, so the tally and the log can never disagree.
+```sql
+-- 1. read this branch's own committed tallies (read-your-writes,
+--    on the same copy it is about to transact against)
+SELECT creative_id, impressions, conversions FROM prod_a1b2c3d4.ads.creatives;
 
-The read is of committed state and sits just before the transaction, not inside
-it; reading inside the open transaction would take a slower path and buy the demo
-nothing.
+-- 2. the allocation policy picks creatives from what it just read, then:
+BEGIN;
+INSERT INTO prod_a1b2c3d4.ads.creatives (creative_id, headline, impressions, conversions)
+VALUES ('carousel', 'One copy of your data. Both workloads.', 425, 94)
+ON CONFLICT (creative_id) DO UPDATE
+  SET impressions = EXCLUDED.impressions, conversions = EXCLUDED.conversions;
+INSERT INTO prod_a1b2c3d4.ads.impressions (visitor_id, creative_id, converted)
+VALUES ('v000401', 'carousel', 1), ('v000402', 'carousel', 0);
+COMMIT;
+```
+
+The tally upsert and the log append share one transaction, so the two can never
+disagree. The `SELECT` is of committed state and sits just before `BEGIN`, not
+inside it; reading inside the open transaction would take a slower path and buy
+the demo nothing.
+
+Setup — creating the catalog, the tables and the three forks — uses the gRPC
+client, because forking pins to the seed's `commit_seq_num` and SQL does not
+hand that back. Everything in the loop above is SQL.
 
 Every branch reads its tallies each round — the tally is cumulative, so writing it
 is a read-modify-write. `even` is the foil because it ignores *what the read said*,

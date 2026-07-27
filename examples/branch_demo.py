@@ -9,16 +9,25 @@ through all three, and lets each branch's ad-allocation policy read back its
 analytically against the same copy of the data, in one loop. Then it scores the
 branches against each other and throws all three away; prod is never touched.
 
-Every branch reads its own committed tallies each round — the tally is cumulative,
-so writing it is a read-modify-write and read-your-writes is unavoidable. What
-`even` ignores is the *content*: it splits traffic on the visitor index alone, so
-it is the foil at the point of decision. `greedy` and `epsilon` allocate from what
-they just wrote, which is the whole point. The policies are deliberately toy — the
-database mechanic is the product here, not the bandit.
+The round loop is ordinary SQL over Flight SQL: SELECT the tallies, decide, then
+INSERT ... ON CONFLICT DO UPDATE plus an append, inside BEGIN/COMMIT. Each
+branch is one connection — branch selection is bound at handshake and immutable
+for the connection's lifetime, Postgres-shaped — so a branch is reachable as a
+plain SQL endpoint and any Flight SQL driver would send exactly these
+statements. Setup (create the catalog, tables and forks) uses the gRPC client
+because forking pins to the seed's commit_seq_num, which SQL does not hand back.
 
-The round's read is of *committed* state, taken before `begin_tx`; the write side
-is what shares one transaction. Reading inside the open tx would take the slower
-read-your-own-uncommitted-writes path and buy this demo nothing.
+Every branch reads its own committed tallies each round — the tally is
+cumulative, so writing it is a read-modify-write and read-your-writes is
+unavoidable. What `even` ignores is the *content*: it splits traffic on the
+visitor index alone, so it is the foil at the point of decision. `greedy` and
+`epsilon` allocate from what they just wrote, which is the whole point. The
+policies are deliberately toy — the database mechanic is the product here, not
+the bandit.
+
+The round's SELECT is of *committed* state, taken before BEGIN. Reading inside
+the open transaction would take the slower read-your-own-uncommitted-writes path
+and buy this demo nothing: there is nothing uncommitted yet to see.
 
 Requires Docker services running: just penca-up
 """
@@ -50,6 +59,12 @@ CREATIVE_POSITION = {
 HEADLINES = {creative_id: headline for creative_id, headline, _rate in CREATIVES}
 
 POLICY_NAMES = ("even", "greedy", "epsilon")
+
+# The setup creates these by name over gRPC; the round loop addresses them by
+# name over SQL. Kept as constants so the two can never drift.
+SCHEMA_NAME = "ads"
+CREATIVES_TABLE = "creatives"
+IMPRESSIONS_TABLE = "impressions"
 
 AUTHOR = "penca-demo"
 
@@ -102,11 +117,37 @@ class ProdContext:
     """Identifiers for the seeded catalog every later call threads through."""
 
     catalog_uuid: str
+    catalog_name: str
     main_branch_uuid: str
     schema_uuid: str
     creatives_table_uuid: str
     impressions_table_uuid: str
     seed_commit_seq_num: int
+
+    @property
+    def creatives(self) -> str:
+        """Fully-qualified ``creatives``, the way SQL addresses it."""
+        return f"{self.catalog_name}.{SCHEMA_NAME}.{CREATIVES_TABLE}"
+
+    @property
+    def impressions(self) -> str:
+        return f"{self.catalog_name}.{SCHEMA_NAME}.{IMPRESSIONS_TABLE}"
+
+
+@dataclass(frozen=True)
+class BranchSession:
+    """One branch, and a Flight SQL connection pinned to it.
+
+    Branch selection is connection-scoped, not a statement the session can
+    change — ``SET branch = ...`` is rejected, and the pin rides the
+    ``x-penca-branch`` header at handshake. That is Postgres-shaped and it is
+    the point: a branch is reachable as an ordinary SQL endpoint, so the round
+    loop below is the SQL any driver would send.
+    """
+
+    name: str
+    uuid: str
+    sql: PencaClient
 
 
 @dataclass(frozen=True)
@@ -358,14 +399,14 @@ def create_ads_tables(
     configured default resolving to the same place.
     """
     schema_uuid = client.create_schema(
-        "ads",
+        SCHEMA_NAME,
         catalog_uuid=catalog_uuid,
         branch_uuid=main_branch_uuid,
         author=AUTHOR,
         comment="create ads schema",
     )
     creatives_table_uuid = client.create_table(
-        "creatives",
+        CREATIVES_TABLE,
         CREATIVES_SCHEMA,
         primary_keys=["creative_id"],
         catalog_uuid=catalog_uuid,
@@ -375,7 +416,7 @@ def create_ads_tables(
         comment="create creatives table",
     )
     impressions_table_uuid = client.create_table(
-        "impressions",
+        IMPRESSIONS_TABLE,
         IMPRESSIONS_SCHEMA,
         primary_keys=["visitor_id"],
         catalog_uuid=catalog_uuid,
@@ -422,9 +463,8 @@ def commit_seed_tallies(
 
 def seed_prod(client: PencaClient) -> ProdContext:
     """Create the prod catalog, the two tables, and commit the zeroed tallies."""
-    catalog_uuid, main_branch_uuid = client.create_catalog(
-        f"prod_{uuid4().hex[:8]}", AUTHOR
-    )
+    catalog_name = f"prod_{uuid4().hex[:8]}"
+    catalog_uuid, main_branch_uuid = client.create_catalog(catalog_name, AUTHOR)
     try:
         schema_uuid, creatives_table_uuid, impressions_table_uuid = create_ads_tables(
             client, catalog_uuid=catalog_uuid, main_branch_uuid=main_branch_uuid
@@ -447,6 +487,7 @@ def seed_prod(client: PencaClient) -> ProdContext:
 
     return ProdContext(
         catalog_uuid=catalog_uuid,
+        catalog_name=catalog_name,
         main_branch_uuid=main_branch_uuid,
         schema_uuid=schema_uuid,
         creatives_table_uuid=creatives_table_uuid,
@@ -481,18 +522,28 @@ def fork_branches(client: PencaClient, prod: ProdContext) -> dict[str, str]:
     return created
 
 
+def sql_str(value: str) -> str:
+    """Quote a SQL string literal.
+
+    The values here are all our own constants, so this is not standing between
+    the demo and hostile input — it is here so a reader copying the pattern
+    copies a quoted one.
+    """
+    escaped = value.replace("'", "''")
+
+    return f"'{escaped}'"
+
+
 def read_tallies(
-    client: PencaClient,
-    prod: ProdContext,
-    branch_uuid: str,
+    session: BranchSession, prod: ProdContext
 ) -> dict[str, tuple[int, int]]:
-    """Read one branch's running ``creative_id -> (shown, converted)`` tallies."""
-    got = client.read_data(
-        catalog_uuid=prod.catalog_uuid,
-        schema_uuid=prod.schema_uuid,
-        table_uuid=prod.creatives_table_uuid,
-        branch_uuid=branch_uuid,
-        columns=["creative_id", "impressions", "conversions"],
+    """Read one branch's running ``creative_id -> (shown, converted)`` tallies.
+
+    An ordinary SELECT on a branch-pinned connection — the analytical read and
+    the transactional writes below go to the same table over the same protocol.
+    """
+    got = session.sql.execute_query(
+        f"SELECT creative_id, impressions, conversions FROM {prod.creatives}"
     )
 
     return {
@@ -506,19 +557,19 @@ def read_tallies(
     }
 
 
-def read_impression_log(
-    client: PencaClient,
-    prod: ProdContext,
-    branch_uuid: str,
-) -> pa.Table:
-    """Read one branch's append-only impression log."""
-    return client.read_data(
-        catalog_uuid=prod.catalog_uuid,
-        schema_uuid=prod.schema_uuid,
-        table_uuid=prod.impressions_table_uuid,
-        branch_uuid=branch_uuid,
-        columns=["creative_id", "converted"],
+def read_impression_log(session: BranchSession, prod: ProdContext) -> tuple[int, int]:
+    """Re-derive ``(rows, conversions)`` from the branch's append-only log.
+
+    Aggregated server-side rather than by materializing the log: at the default
+    3000 impressions each branch's log is 3000 rows, and the whole point of the
+    reconciliation is that the engine can answer it analytically.
+    """
+    got = session.sql.execute_query(
+        f"SELECT count(*) AS rows, coalesce(sum(converted), 0) AS conversions "
+        f"FROM {prod.impressions}"
     )
+
+    return (got.column("rows")[0].as_py(), got.column("conversions")[0].as_py())
 
 
 def allocate_round(
@@ -559,45 +610,81 @@ def apply_outcomes(
     return updated
 
 
-def tally_upserts(
+def tally_upsert_sql(
+    prod: ProdContext,
     outcomes: Sequence[tuple[int, str, int]],
     updated: Mapping[str, tuple[int, int]],
-) -> pa.Table:
-    """The ``creatives`` upsert payload — same primary keys, new running totals.
+) -> str:
+    """The ``creatives`` upsert — same primary keys, new running totals.
 
     Derives the touched keys from ``outcomes`` rather than taking them, so "every
     key is present in ``updated`` and in ``HEADLINES``" is structural instead of a
     precondition the caller has to honour.
     """
     touched = sorted({creative_id for _v, creative_id, _c in outcomes})
+    values = ", ".join(
+        f"({sql_str(creative_id)}, {sql_str(HEADLINES[creative_id])}, "
+        f"{updated[creative_id][0]}, {updated[creative_id][1]})"
+        for creative_id in touched
+    )
 
-    return pa.table(
-        {
-            "creative_id": list(touched),
-            "headline": [HEADLINES[creative_id] for creative_id in touched],
-            "impressions": [updated[creative_id][0] for creative_id in touched],
-            "conversions": [updated[creative_id][1] for creative_id in touched],
-        },
-        schema=CREATIVES_SCHEMA,
+    return (
+        f"INSERT INTO {prod.creatives} "
+        "(creative_id, headline, impressions, conversions) "
+        f"VALUES {values} "
+        "ON CONFLICT (creative_id) DO UPDATE SET "
+        "impressions = EXCLUDED.impressions, conversions = EXCLUDED.conversions"
     )
 
 
-def impression_upserts(outcomes: Sequence[tuple[int, str, int]]) -> pa.Table:
-    """The ``impressions`` append payload, one row per visitor served."""
-    return pa.table(
-        {
-            "visitor_id": [f"v{visitor:06d}" for visitor, _c, _o in outcomes],
-            "creative_id": [creative_id for _v, creative_id, _o in outcomes],
-            "converted": [converted for _v, _c, converted in outcomes],
-        },
-        schema=IMPRESSIONS_SCHEMA,
+def impression_append_sql(
+    prod: ProdContext, outcomes: Sequence[tuple[int, str, int]]
+) -> str:
+    """The ``impressions`` append, one row per visitor served."""
+    values = ", ".join(
+        f"({sql_str(f'v{visitor:06d}')}, {sql_str(creative_id)}, {converted})"
+        for visitor, creative_id, converted in outcomes
     )
+
+    return (
+        f"INSERT INTO {prod.impressions} (visitor_id, creative_id, converted) "
+        f"VALUES {values}"
+    )
+
+
+def commit_statements(session: BranchSession, statements: Sequence[str]) -> None:
+    """Run every statement in one transaction, rolling back if any fails.
+
+    ``BEGIN`` / ``COMMIT`` are ordinary statements on the connection: the SQL
+    server binds the DML between them to a single Penca transaction, opening it
+    lazily on the first DML and committing it here. So the tally update and the
+    log append land together or not at all, and a scoreboard read can never catch
+    them disagreeing.
+
+    The ``ROLLBACK`` is guarded and never replaces the exception that triggered
+    it: an open transaction is not inert — until it times out it clamps cold
+    isolation and fences purge/GC on its branch — but the write's own error is
+    the one worth propagating. ``Exception``, not ``BaseException``, so a second
+    Ctrl-C still gets through.
+    """
+    session.sql.execute_update("BEGIN")
+    try:
+        for statement in statements:
+            session.sql.execute_update(statement)
+
+        session.sql.execute_update("COMMIT")
+    except BaseException:
+        try:
+            session.sql.execute_update("ROLLBACK")
+        except Exception as exc:
+            print(f"  (could not roll back on {session.name}: {exc})")
+
+        raise
 
 
 def drive_round(
-    client: PencaClient,
+    session: BranchSession,
     prod: ProdContext,
-    branch: tuple[str, str],
     visitor_indexes: Sequence[int],
     feed: Sequence[Sequence[int]],
     rng: random.Random,
@@ -605,56 +692,45 @@ def drive_round(
 ) -> tuple[tuple[int, str, int], ...]:
     """Run one round on one branch; return its ``(visitor, creative, converted)``.
 
-    This is the load-bearing loop: read → allocate → write. The read is of the
-    branch's *own* committed state, so the allocation is steered by what this
-    branch's previous rounds wrote — on the same copy of the data it is transacting
-    against. The tally UPDATE and the log append share one transaction, so a
-    scoreboard read can never catch them disagreeing.
+    This is the load-bearing loop: SELECT, decide, then INSERT both tables in one
+    transaction. The read is of the branch's *own* committed state, so the
+    allocation is steered by what this branch's previous rounds wrote — on the
+    same copy of the data it is transacting against, over the same connection.
+
+    The read is taken before ``BEGIN``, deliberately. Reading inside the open
+    transaction would take the slower read-your-own-uncommitted-writes path and
+    buy this demo nothing: there is nothing uncommitted yet to see.
     """
-    branch_name, branch_uuid = branch
-    tallies = read_tallies(client, prod, branch_uuid)
-    outcomes = allocate_round(branch_name, visitor_indexes, tallies, feed, rng, epsilon)
+    tallies = read_tallies(session, prod)
+    outcomes = allocate_round(
+        session.name, visitor_indexes, tallies, feed, rng, epsilon
+    )
     updated = apply_outcomes(tallies, outcomes)
 
-    commit_mutations(
-        client,
-        catalog_uuid=prod.catalog_uuid,
-        schema_uuid=prod.schema_uuid,
-        branch_uuid=branch_uuid,
-        comment=f"{branch_name}: {len(outcomes)} impressions",
-        mutations=[
-            Mutation(
-                table_uuid=prod.creatives_table_uuid,
-                upserts=tally_upserts(outcomes, updated),
-            ),
-            Mutation(
-                table_uuid=prod.impressions_table_uuid,
-                upserts=impression_upserts(outcomes),
-            ),
-        ],
+    commit_statements(
+        session,
+        (
+            tally_upsert_sql(prod, outcomes, updated),
+            impression_append_sql(prod, outcomes),
+        ),
     )
 
     return outcomes
 
 
-def collect_branch_outcome(
-    client: PencaClient,
-    prod: ProdContext,
-    branch: tuple[str, str],
-) -> BranchOutcome:
+def collect_branch_outcome(session: BranchSession, prod: ProdContext) -> BranchOutcome:
     """Read a branch's final tallies and reconcile them against its own log."""
-    branch_name, branch_uuid = branch
-    per_creative = read_tallies(client, prod, branch_uuid)
-    log = read_impression_log(client, prod, branch_uuid)
+    per_creative = read_tallies(session, prod)
+    log_impressions, log_conversions = read_impression_log(session, prod)
 
     return BranchOutcome(
-        branch_name=branch_name,
-        branch_uuid=branch_uuid,
+        branch_name=session.name,
+        branch_uuid=session.uuid,
         impressions=sum(shown for shown, _ in per_creative.values()),
         conversions=sum(converted for _, converted in per_creative.values()),
         per_creative=per_creative,
-        log_conversions=sum(log.column("converted").to_pylist()),
-        log_impressions=log.num_rows,
+        log_conversions=log_conversions,
+        log_impressions=log_impressions,
     )
 
 
@@ -672,11 +748,17 @@ def policy_rngs(config: DemoConfig) -> dict[str, random.Random]:
     }
 
 
+def connect_to_branch(catalog_name: str, branch_name: str) -> PencaClient:
+    """Open a Flight SQL connection pinned to one branch of one catalog."""
+    return PencaClient.from_settings(catalog=catalog_name, branch=branch_name)
+
+
 def run_demo(
     client: PencaClient,
     config: DemoConfig,
     on_round: Callable[[int, str, tuple[tuple[int, str, int], ...]], None]
     | None = None,
+    connect: Callable[[str, str], PencaClient] = connect_to_branch,
 ) -> DemoOutcome:
     """Fork, drive the shared feed through every branch, score, then discard.
 
@@ -702,6 +784,17 @@ def run_demo(
         raise
 
     rngs = policy_rngs(config)
+    # One pinned SQL connection per branch. Branch selection is bound at
+    # handshake and immutable for the connection's lifetime, so "three branches"
+    # is literally three endpoints — which is the shape a reader would use.
+    sessions = [
+        BranchSession(
+            name=policy_name,
+            uuid=branches[policy_name],
+            sql=connect(prod.catalog_name, policy_name),
+        )
+        for policy_name in POLICY_NAMES
+    ]
 
     completed = False
     try:
@@ -711,24 +804,20 @@ def run_demo(
             visitor_indexes = range(
                 start, min(start + config.round_size, config.impressions)
             )
-            for policy_name in POLICY_NAMES:
+            for session in sessions:
                 outcomes = drive_round(
-                    client,
+                    session,
                     prod,
-                    (policy_name, branches[policy_name]),
                     visitor_indexes,
                     feed,
-                    rngs[policy_name],
+                    rngs[session.name],
                     config.epsilon,
                 )
                 if on_round is not None:
-                    on_round(round_index, policy_name, outcomes)
+                    on_round(round_index, session.name, outcomes)
 
         scoreboard = sorted(
-            (
-                collect_branch_outcome(client, prod, (policy_name, branch_uuid))
-                for policy_name, branch_uuid in branches.items()
-            ),
+            (collect_branch_outcome(session, prod) for session in sessions),
             key=lambda outcome: (-outcome.conversions, outcome.branch_name),
         )
 
@@ -753,10 +842,13 @@ def run_demo(
     # only covers the run; read after, it also covers the thing this demo is
     # uniquely placed to show — main's one shared cold object survives deleting
     # three forks that were reading it.
-    main_tallies = read_tallies(client, prod, prod.main_branch_uuid)
-    main_impression_rows = read_impression_log(
-        client, prod, prod.main_branch_uuid
-    ).num_rows
+    main_session = BranchSession(
+        name="main",
+        uuid=prod.main_branch_uuid,
+        sql=connect(prod.catalog_name, "main"),
+    )
+    main_tallies = read_tallies(main_session, prod)
+    main_impression_rows, _ = read_impression_log(main_session, prod)
     remaining = tuple(
         sorted(
             branch.branch_name
