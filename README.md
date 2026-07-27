@@ -96,15 +96,22 @@ and drives **one** shared, deterministic visitor feed through all three. Each
 visitor's response to each creative is fixed up front, so the branches see
 identical traffic and can only diverge on what they *do* with it.
 
-Each round, on each branch, inside one transaction:
+Each round, on each branch:
 
 1. **read** that branch's own committed tallies — read-your-writes, on the same
-   copy it is transacting against;
-2. the allocation policy picks a creative from what it just read;
-3. **UPDATE** the tally row in place and append the impression rows, one commit.
+   copy it is about to transact against;
+2. the allocation policy picks creatives from what it just read;
+3. **UPDATE** the tally row in place and append the impression rows — these two
+   share one transaction, so the tally and the log can never disagree.
 
-`even` splits traffic evenly and never reads the tallies — it is the foil.
-`greedy` and `epsilon` reallocate from their own running results. Then a
+The read is of committed state and sits just before the transaction, not inside
+it; reading inside the open transaction would take a slower path and buy the demo
+nothing.
+
+Every branch reads its tallies each round — the tally is cumulative, so writing it
+is a read-modify-write. `even` is the foil because it ignores *what the read said*,
+splitting on the visitor index alone; `greedy` and `epsilon` reallocate from their
+own running results. Then a
 cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
 and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
 defaults (3000 impressions, 25 per transaction, epsilon 0.15, seed
@@ -120,12 +127,17 @@ transcript rather than a contract:
 
 `epsilon` keeps exploring and finds the genuinely best creative; `greedy` locks
 onto the second-best after one lucky round and never revisits it. Both beat the
-fixed split, because both steer on what they wrote.
+fixed split, because both steer on what they wrote. How *fast* greedy commits is
+partly an artifact of `--round-size`, which sets decision granularity as well as
+write granularity — a round's picks are all evaluated against the read taken at
+its start.
 
-**Forking does not copy your data.** Measured on the seeded `creatives` table:
-after the three forks, `main` holds its rows in **exactly one** object, its
+**Forking does not copy your row data.** Measured on the seeded `creatives`
+table: after the three forks, `main` holds its rows in **exactly one** object, its
 footprint unchanged by the second and third fork, and each branch stores **zero**
-objects and **zero** bytes of its own — while all three read the full seeded set.
+objects and **zero** bytes of *row data* of its own — while all three read the full
+seeded set. (`create_branch` does copy per-branch *metadata* — schema and table
+entries — by design; what it never copies is the rows.)
 Those are the assertions in
 `tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
 and they are the "one copy" half of the headline. (That object measured 562 bytes

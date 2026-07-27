@@ -214,3 +214,28 @@ def test_collect_paths_distinguishes_a_non_python_file_from_a_missing_one(monkey
         assert "no such path" not in str(exc), str(exc)
     else:
         raise AssertionError("an existing non-Python argument must be fatal too")
+
+
+def test_stub_exclusion_agrees_with_ruff_config():
+    """One exclusion policy, two files — pin that they still agree.
+
+    ``pyproject.toml``'s ``[tool.ruff] extend-exclude`` and this script's
+    ``EXCLUDED_SUBTREES`` both exist to keep the generated stubs byte-identical to
+    ``just compile-protos-py`` output. They are maintained by hand in separate
+    files and both sit on a ``--fix`` path, so a divergence silently un-protects
+    the stubs from one of the two gates.
+    """
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    ruff_section = pyproject.split("[tool.ruff]", 1)[1].split("\n[", 1)[0]
+    excluded = {
+        line.strip().strip(',"')
+        for line in ruff_section.splitlines()
+        if line.strip().startswith('"')
+    }
+
+    assert excluded, f"no extend-exclude entries parsed from:\n{ruff_section}"
+    assert excluded == {str(subtree) for subtree in checker.EXCLUDED_SUBTREES}, (
+        "pyproject's ruff extend-exclude and check_blank_lines' EXCLUDED_SUBTREES "
+        f"have diverged: ruff={excluded} "
+        f"script={{{', '.join(str(s) for s in checker.EXCLUDED_SUBTREES)}}}"
+    )

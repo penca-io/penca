@@ -9,10 +9,16 @@ through all three, and lets each branch's ad-allocation policy read back its
 analytically against the same copy of the data, in one loop. Then it scores the
 branches against each other and throws all three away; prod is never touched.
 
-`even` splits traffic evenly and reads nothing: it is the foil. `greedy` and
-`epsilon` reallocate from what they just wrote, which is the whole point. The
-policies are deliberately toy — the database mechanic is the product here, not
-the bandit.
+Every branch reads its own committed tallies each round — the tally is cumulative,
+so writing it is a read-modify-write and read-your-writes is unavoidable. What
+`even` ignores is the *content*: it splits traffic on the visitor index alone, so
+it is the foil at the point of decision. `greedy` and `epsilon` allocate from what
+they just wrote, which is the whole point. The policies are deliberately toy — the
+database mechanic is the product here, not the bandit.
+
+The round's read is of *committed* state, taken before `begin_tx`; the write side
+is what shares one transaction. Reading inside the open tx would take the slower
+read-your-own-uncommitted-writes path and buy this demo nothing.
 
 Requires Docker services running: just penca-up
 """
@@ -74,6 +80,12 @@ DEFAULT_SEED = 20260727
 # a 4-row cold read alone is ~70ms of it). So this knob buys wall-clock, not
 # throughput: 25 puts the default run near 50s where `--round-size 1` would take
 # 24 minutes. `--round-size 1` is the literal per-impression loop and still works.
+#
+# It also sets *decision* granularity, not just write granularity: a round's picks
+# are all evaluated against the one read taken at its start, so greedy serves the
+# same creative for a whole round. Reallocation frequency is impressions /
+# round_size, and how fast greedy commits to a creative is partly an artifact of
+# this number rather than of the policy alone.
 DEFAULT_ROUND_SIZE = 25
 
 
@@ -156,7 +168,11 @@ def smoothed_rate(tally: tuple[int, int]) -> float:
 
 
 def pick_even(visitor_index: int) -> str:
-    """Fixed round-robin split. Reads nothing — this is the foil."""
+    """Fixed round-robin split on the visitor index.
+
+    The foil — not because it skips the read (``drive_round`` reads for every
+    branch) but because it ignores what the read said.
+    """
     return CREATIVE_IDS[visitor_index % len(CREATIVE_IDS)]
 
 
@@ -261,7 +277,11 @@ def discard_branches(
 def raise_for_undeleted(undeleted: Sequence[str], *, completed: bool) -> None:
     """Fail a run that finished normally but could not discard its branches."""
     if undeleted and completed:
-        msg = f"could not discard branches: {', '.join(undeleted)}"
+        msg = (
+            f"could not discard branches: {', '.join(undeleted)}. The run itself "
+            f"succeeded — the scoreboard above is valid; these branches are still "
+            f"live and need deleting by hand."
+        )
         raise RuntimeError(msg)
 
 
@@ -657,7 +677,15 @@ def run_demo(
     """
     feed = build_visitor_feed(config)
     prod = seed_prod(client)
-    branches = fork_branches(client, prod)
+    try:
+        branches = fork_branches(client, prod)
+    except BaseException:
+        # Symmetry with seed_prod: a failure here leaves the same prod_<hex>
+        # catalog a failed seed would have dropped. fork_branches already discards
+        # whatever forks it managed to create.
+        discard_catalog(client, prod.catalog_uuid)
+        raise
+
     rngs = policy_rngs(config)
 
     completed = False
@@ -689,10 +717,6 @@ def run_demo(
             key=lambda outcome: (-outcome.conversions, outcome.branch_name),
         )
 
-        main_tallies = read_tallies(client, prod, prod.main_branch_uuid)
-        main_impression_rows = read_impression_log(
-            client, prod, prod.main_branch_uuid
-        ).num_rows
         completed = True
     finally:
         # finally, not straight-line: the docstring promises the forks are thrown
@@ -708,6 +732,14 @@ def run_demo(
         # invoked run_demo from inside an except block would suppress this raise.
         raise_for_undeleted(undeleted, completed=completed)
 
+    # Main is read AFTER the discard on purpose. Read before it, "prod untouched"
+    # only covers the run; read after, it also covers the thing this demo is
+    # uniquely placed to show — main's one shared cold object survives deleting
+    # three forks that were reading it.
+    main_tallies = read_tallies(client, prod, prod.main_branch_uuid)
+    main_impression_rows = read_impression_log(
+        client, prod, prod.main_branch_uuid
+    ).num_rows
     remaining = tuple(
         sorted(
             branch.branch_name
@@ -802,6 +834,9 @@ def print_isolation(outcome: DemoOutcome) -> None:
         .to_markdown(index=False)
     )
     print(f"\nprod impression log: {outcome.main_impression_rows} rows")
+    # Name the catalog: it deliberately outlives the run, so a reader who wants to
+    # poke at it — or clean it up — needs to know what it is called.
+    print(f"prod catalog (kept): {outcome.catalog_uuid}")
     print(f"branches remaining after discard: {', '.join(outcome.remaining_branches)}")
     print(
         f"\nprod is intact. {len(POLICY_NAMES)} parallel universes ran against it "

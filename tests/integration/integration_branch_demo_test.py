@@ -93,6 +93,14 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     return {row[0]: (int(row[1]), int(row[2])) for row in rows}
 
 
+def _cleanup_catalog(client, catalog_uuid: str) -> None:
+    """Best-effort: never turn a cleanup failure into the test's failure."""
+    try:
+        client.delete_catalog(catalog_uuid=catalog_uuid)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask a real failure
+        print(f"(could not delete catalog {catalog_uuid}: {exc})")
+
+
 def test_shared_feed_is_deterministic():
     """One seed reproduces one feed, and every visitor carries a fixed latent
     outcome per creative — which is what makes the three branches consume a single
@@ -120,7 +128,12 @@ def test_demo_forks_diverges_and_isolates_main():
     with all three forks discarded."""
     demo = _load_demo()
 
-    outcome = demo.run_demo(make_client(), _config(demo))
+    client = make_client()
+    outcome = demo.run_demo(client, _config(demo))
+    # run_demo keeps the prod catalog on purpose — prod outliving its forks is the
+    # demo. The test created it, so the test cleans it up rather than leaking one
+    # per run onto a stack the rest of the suite shares.
+    _cleanup_catalog(client, outcome.catalog_uuid)
 
     by_name = {branch.branch_name: branch for branch in outcome.scoreboard}
     assert set(by_name) == {"even", "greedy", "epsilon"}
@@ -155,8 +168,13 @@ def test_demo_forks_diverges_and_isolates_main():
             f"and only the row count catches it"
         )
 
+    # These reads happen AFTER the three delete_branch calls, so they pin more than
+    # "the run left prod alone": main's rows live in one cold object that all three
+    # forks were reading, and it has to survive their deletion. delete_branch is
+    # safe today (every enumeration pins branch_uuid), but a regression there would
+    # otherwise still print a green demo.
     assert all(tally == (0, 0) for tally in outcome.main_tallies.values()), (
-        f"prod tallies must be untouched, saw {outcome.main_tallies}"
+        f"prod tallies must survive the discard untouched, saw {outcome.main_tallies}"
     )
     assert outcome.main_impression_rows == 0, "prod logged no impressions"
     assert outcome.remaining_branches == ("main",), (
