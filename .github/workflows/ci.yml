@@ -82,8 +82,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages
-      - run: uv run ruff check packages/penca-client/src/penca_client/
-      - run: uv run ruff format --check packages/
+      # Repo-wide, matching `just lint` / `just format-check` and the pre-commit
+      # hook. A narrower scope here let examples/ and tests/ drift out of
+      # compliance while CI stayed green.
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: python scripts/check_blank_lines.py
 
   python-unit:

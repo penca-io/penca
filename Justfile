@@ -312,17 +312,20 @@ compile-protos-rs:
 # Regenerate protobuf bindings for both Python and Rust
 compile-protos: compile-protos-py compile-protos-rs
 
-# Run ruff linter
+# Run ruff linter over the whole repo. The scope matches the repo-wide
+# pre-commit hook (`pass_filenames: false`) on purpose: when this recipe was
+# scoped to packages/penca-client/, examples/ and tests/ drifted out of
+# compliance and only the hook noticed, silently rewriting files mid-commit.
 lint:
-    uv run ruff check packages/penca-client/src/penca_client/
+    uv run ruff check .
 
 # Run ruff formatter + blank line fixer
-format path="packages/":
+format path=".":
     uv run ruff format {{path}}
     python scripts/check_blank_lines.py --fix
 
 # Check formatting without modifying files
-format-check path="packages/":
+format-check path=".":
     uv run ruff format --check {{path}}
     python scripts/check_blank_lines.py
 
