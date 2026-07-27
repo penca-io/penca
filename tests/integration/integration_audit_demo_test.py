@@ -49,6 +49,25 @@ def test_audit_demo_runs_the_documented_walkthrough():
         check=False,
         timeout=300,
     )
+    try:
+        _assert_walkthrough(result)
+
+        # Inside the try, so it pins the demo's behaviour without gating cleanup:
+        # if more than one catalog appeared, the finally still reaps all of them.
+        created = _demo_catalogs(client) - before
+        assert len(created) == 1, f"expected one new demo_ catalog, saw {created}"
+    finally:
+        # finally, and reaping whatever appeared rather than gating on the count:
+        # audit_demo.py creates its catalog before printing anything, so every red
+        # run strands one — which is precisely what this reap exists to prevent.
+        for catalog_name in _demo_catalogs(client) - before:
+            try:
+                client.delete_catalog(catalog_name=catalog_name)
+            except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+                print(f"(could not delete catalog {catalog_name}: {exc})")
+
+
+def _assert_walkthrough(result) -> None:
     assert result.returncode == 0, result.stderr[-4000:]
 
     stdout = result.stdout
@@ -110,11 +129,3 @@ def test_audit_demo_runs_the_documented_walkthrough():
     time_travel = stdout.split("--- Time-travel: state as of TX 1 ---")[1]
     assert "bob" in time_travel, time_travel
     assert "charlie" not in time_travel, time_travel
-
-    created = _demo_catalogs(client) - before
-    assert len(created) == 1, f"expected exactly one new demo_ catalog, saw {created}"
-    for catalog_name in created:
-        try:
-            client.delete_catalog(catalog_name=catalog_name)
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask a failure
-            print(f"(could not delete catalog {catalog_name}: {exc})")

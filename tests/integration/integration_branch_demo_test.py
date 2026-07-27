@@ -93,6 +93,15 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     return {row[0]: (int(row[1]), int(row[2])) for row in rows}
 
 
+def _cleanup_branch(client, catalog_uuid: str, branch_uuid: str) -> None:
+    """Best-effort, mirroring _cleanup_catalog: a cleanup failure must never
+    become the test's failure, nor gate the cleanup that follows it."""
+    try:
+        client.delete_branch(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask a real failure
+        print(f"(could not delete branch {branch_uuid}: {exc})")
+
+
 def _cleanup_catalog(client, catalog_uuid: str) -> None:
     """Best-effort: never turn a cleanup failure into the test's failure."""
     try:
@@ -271,8 +280,25 @@ def test_forks_share_one_copy_of_the_seeded_data():
         # `delete_branch`'s job alone. That is harmless here only because this test
         # asserts the forks own zero segments, which is exactly the assertion a
         # future storage-footprint edit would change.
+        # delete_branch is what enumerates persist/snapshot segments and issues the
+        # object deletes; delete_catalog resolves main and soft-deletes PG metadata
+        # only. So the branch deletes are the object-storage reap and the catalog
+        # delete is the metadata reap — neither subsumes the other.
+        #
+        # Forks only, NOT main — and main's one seeded object is therefore left to
+        # the object store's own lifecycle. That is a knowing trade, not an
+        # oversight: delete_catalog resolves main to do its cascade, so deleting
+        # main's branch first makes the catalog delete fail with
+        # "branch not found: main" and leaks the catalog row instead. Verified by
+        # doing exactly that. Reaping main's objects would need the branch delete
+        # to run *after* the catalog delete, which is not a thing the API offers.
+        #
+        # So: the fork deletes are metadata hygiene, the catalog delete is the
+        # metadata reap, and the seeded object outlives both. Each is best-effort so
+        # one failure cannot skip what follows or replace a real assertion failure
+        # with a cleanup error.
         for fork_uuid in fork_uuids:
-            client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
+            _cleanup_branch(client, prod.catalog_uuid, fork_uuid)
 
         _cleanup_catalog(client, prod.catalog_uuid)
 
