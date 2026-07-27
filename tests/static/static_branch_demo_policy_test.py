@@ -178,13 +178,17 @@ def test_printers_emit_a_scoreboard_and_the_isolation_proof(capsys):
 
     assert "prod is intact" in printed
 
-    # Patch POLICY_NAMES so the derived count differs from the real 3: comparing
-    # against len(POLICY_NAMES) on both sides passes for a hardcoded "3".
+    # Patch POLICY_NAMES so the derived count differs from the real 3 — comparing
+    # len(POLICY_NAMES) on both sides passes for a hardcoded "3". The outcome is
+    # rebuilt inside the patched window so it carries two branches too: pinning the
+    # printed count against a three-branch outcome would pin the count's *source*
+    # (the module global) rather than the property, and would fail an equally
+    # derived rewrite to len(outcome.scoreboard).
     original = demo.POLICY_NAMES
     demo.POLICY_NAMES = ("even", "greedy")
     try:
         capsys.readouterr()
-        demo.print_isolation(outcome)
+        demo.print_isolation(_synthetic_outcome())
         assert "2 parallel universes" in capsys.readouterr().out, (
             "the punchline must derive the branch count, not hardcode it"
         )

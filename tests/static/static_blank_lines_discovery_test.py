@@ -237,8 +237,13 @@ def test_stub_exclusion_agrees_with_ruff_config():
         f"built-in defaults. Section was:\n{ruff_section}"
     )
     entries = ruff_section.split("extend-exclude = [", 1)[1].split("]", 1)[0]
+    # Quoted lines only: "any non-blank line" turns a comment inside the array into
+    # a bogus member and reds a legal pyproject edit. The plain-`exclude` mutant is
+    # already killed by the extend-exclude assertion above.
     excluded = {
-        line.strip().strip(',"') for line in entries.splitlines() if line.strip()
+        line.strip().strip(',"')
+        for line in entries.splitlines()
+        if line.strip().startswith('"')
     }
 
     assert excluded, f"no extend-exclude entries parsed from:\n{ruff_section}"
