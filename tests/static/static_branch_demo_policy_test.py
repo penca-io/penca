@@ -556,7 +556,11 @@ def test_a_failed_seed_transaction_aborts_then_drops_the_catalog():
     # embeds an entire Arrow table.
     assert len(client.calls) == 4, f"each step exactly once; saw {client.calls}"
     assert client.calls[0] == "begin_tx"
-    assert client.calls[1].startswith("write_data:tx:")
+    # "Mutation(" not just the "write_data:tx:" prefix: the fake's mutation
+    # parameter defaults to None, so a prefix check is satisfied by
+    # "write_data:tx:None" — a call carrying no payload, which is the exact class
+    # putting the mutation in the key was meant to catch.
+    assert client.calls[1].startswith("write_data:tx:Mutation("), client.calls[1]
     assert client.calls[2:] == ["abort_tx:tx", "delete_catalog:cat"], (
         f"abort the tx, then drop the catalog; saw {client.calls}"
     )

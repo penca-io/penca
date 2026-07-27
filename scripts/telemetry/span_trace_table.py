@@ -8,6 +8,8 @@ feed its logs here to see where wall time goes per span.
 
 Usage:
     # straight from a container, just the 18:33:0x window, with totals:
+    # Run from inside the repo: the compose project is penca-<repo dir>. Outside
+    # a checkout the substitution is empty and you get "penca--query-1".
     docker logs "penca-$(basename "$(git rev-parse --show-toplevel)")-query-1" 2>&1 \
         | python3 scripts/telemetry/span_trace_table.py --prefix 2026-05-31T18:33:0 --totals
 

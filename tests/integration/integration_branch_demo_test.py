@@ -253,11 +253,12 @@ def test_forks_share_one_copy_of_the_seeded_data():
                 "every fork reads the full seeded set it stores none of"
             )
     finally:
-        # finally, not straight-line: a red run is exactly when leaving live
-        # branches behind hurts most, and later tests share this stack. Iterating
-        # fork_uuids covers a partial fork set.
-        for fork_uuid in fork_uuids:
-            client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
+        # finally, not straight-line: a red run is exactly when leaving live state
+        # behind hurts most, and later tests share this stack. Deleting the catalog
+        # subsumes the three branch deletes, covers a partial fork set, and — unlike
+        # the fork loop this replaced — also stops the prod_<hex> catalog leaking
+        # once per run.
+        _cleanup_catalog(client, prod.catalog_uuid)
 
 
 def test_demo_script_runs_as_cli():

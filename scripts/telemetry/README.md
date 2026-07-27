@@ -29,6 +29,9 @@ the logs in.
 #      RUST_LOG=info,penca=debug,penca_merge=trace,penca_storage_meta=trace
 
 # 2. run the workload (one query, a load loop, etc.), then summarize:
+# Run from inside the repo: the compose project is penca-<repo dir>, matching
+# Justfile:11. Outside a checkout the substitution is empty and you get
+# "penca--query-1".
 docker logs "penca-$(basename "$(git rev-parse --show-toplevel)")-query-1" 2>&1 \
   | python3 scripts/telemetry/span_trace_table.py --prefix 2026-05-31T18:33:0 --totals
 
