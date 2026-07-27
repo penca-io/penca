@@ -1110,6 +1110,13 @@ def test_a_tied_scoreboard_breaks_on_branch_name():
     assert tied["greedy"] == tied["epsilon"], (
         f"the fixture must tie greedy with epsilon, saw {tied}"
     )
+    # The other half of the precondition: this only discriminates while greedy is
+    # inserted BEFORE epsilon. Reorder POLICY_NAMES and a stable sort without the
+    # tie-break yields the expected order anyway.
+    names = list(demo.POLICY_NAMES)
+    assert names.index("greedy") < names.index("epsilon"), (
+        f"POLICY_NAMES must keep greedy before epsilon for this to bite, saw {names}"
+    )
 
     assert [branch.branch_name for branch in outcome.scoreboard] == [
         "epsilon",
@@ -1190,3 +1197,26 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     assert "7" in printed, printed
     assert "epsilon" in printed, printed
     assert demo.CREATIVE_IDS[1] in printed, printed
+    # The conversion count too: `converted = 0` survived otherwise, and the count
+    # is the only number in the line that changes as the run progresses.
+    assert "1 conversion" in printed, printed
+
+
+def test_the_best_creative_is_not_the_first_by_id():
+    """CREATIVES' own stated invariant, which every test merely derives from.
+
+    "The best performer is deliberately not the first by id, so 'pick the winner'
+    is never the same decision as 'pick the first thing you see'." Swapping
+    banner's and carousel's rates satisfies every other test — the policies still
+    rank correctly over whatever rates they are given — while quietly making the
+    greedy tie-break and the from-zeros fixtures prove nothing.
+    """
+    rates = {creative_id: rate for creative_id, _headline, rate in demo.CREATIVES}
+    best = max(rates, key=lambda creative_id: rates[creative_id])
+
+    assert best != demo.CREATIVE_IDS[0], (
+        f"the best creative must not also be the lowest id, saw {best} with {rates}"
+    )
+    assert len(set(rates.values())) == len(rates), (
+        f"the rates must stay distinct or 'the best' is ambiguous, saw {rates}"
+    )

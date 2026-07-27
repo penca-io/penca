@@ -144,9 +144,9 @@ per-branch *metadata* — schema and table entries — by design; what it never 
 is the rows.)
 Those are the assertions in
 `tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
-and they are the "one copy" half of the headline. (That object measured 562 bytes
-on 2026-07-27 — an observation, not an assertion: byte totals move with writer
-version and compression.)
+and they are the "one copy" half of the headline. (Penca records an in-memory Arrow footprint per segment rather than the
+object's size on disk, so there is no stored-byte figure to quote here — the
+load-bearing claim is the object count.)
 
 Two honest caveats. The allocation policies are deliberately toy — the database
 mechanic is the point, not the bandit. And at this scale the fork itself is the
