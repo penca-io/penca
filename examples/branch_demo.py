@@ -273,82 +273,111 @@ def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
         print(f"  (could not delete catalog {catalog_uuid}: {exc})")
 
 
+def create_ads_tables(
+    client: PencaClient, catalog_uuid: str, main_branch_uuid: str
+) -> tuple[str, str, str]:
+    """Create the ``ads`` schema and both tables.
+
+    Returns ``(schema_uuid, creatives_table_uuid, impressions_table_uuid)``.
+    ``branch_uuid`` explicitly on every call: omitting it falls back to the
+    client's constructor-configured default branch, which need not be the "main"
+    of this brand-new catalog.
+    """
+    schema_uuid = client.create_schema(
+        "ads",
+        catalog_uuid=catalog_uuid,
+        branch_uuid=main_branch_uuid,
+        author=AUTHOR,
+        comment="create ads schema",
+    )
+    creatives_table_uuid = client.create_table(
+        "creatives",
+        CREATIVES_SCHEMA,
+        primary_keys=["creative_id"],
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=main_branch_uuid,
+        author=AUTHOR,
+        comment="create creatives table",
+    )
+    impressions_table_uuid = client.create_table(
+        "impressions",
+        IMPRESSIONS_SCHEMA,
+        primary_keys=["visitor_id"],
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=main_branch_uuid,
+        author=AUTHOR,
+        comment="create impressions table",
+    )
+
+    return schema_uuid, creatives_table_uuid, impressions_table_uuid
+
+
+def commit_seed_tallies(
+    client: PencaClient,
+    catalog_uuid: str,
+    main_branch_uuid: str,
+    schema_uuid: str,
+    creatives_table_uuid: str,
+) -> int:
+    """Commit the four creatives at zeroed tallies; return the commit's seq num."""
+    tx = client.begin_tx(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=main_branch_uuid,
+        author=AUTHOR,
+        comment="seed creatives with zeroed tallies",
+    )
+    try:
+        client.write_data(
+            tx.tx_uuid,
+            Mutation(
+                table_uuid=creatives_table_uuid,
+                upserts=pa.table(
+                    {
+                        "creative_id": list(CREATIVE_IDS),
+                        "headline": [HEADLINES[c] for c in CREATIVE_IDS],
+                        "impressions": [0] * len(CREATIVE_IDS),
+                        "conversions": [0] * len(CREATIVE_IDS),
+                    },
+                    schema=CREATIVES_SCHEMA,
+                ),
+            ),
+            catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
+            branch_uuid=main_branch_uuid,
+        )
+        committed = client.commit_tx(
+            tx.tx_uuid,
+            catalog_uuid=catalog_uuid,
+            branch_uuid=main_branch_uuid,
+        )
+    except BaseException:
+        abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
+        raise
+
+    return committed.commit_seq_num
+
+
 def seed_prod(client: PencaClient) -> ProdContext:
     """Create the prod catalog, the two tables, and commit the zeroed tallies."""
     catalog_uuid, main_branch_uuid = client.create_catalog(
         f"prod_{uuid4().hex[:8]}", AUTHOR
     )
     try:
-        # branch_uuid explicitly on every call: omitting it falls back to the
-        # client's constructor-configured default branch, which need not be the
-        # "main" of this brand-new catalog.
-        schema_uuid = client.create_schema(
-            "ads",
-            catalog_uuid=catalog_uuid,
-            branch_uuid=main_branch_uuid,
-            author=AUTHOR,
-            comment="create ads schema",
+        schema_uuid, creatives_table_uuid, impressions_table_uuid = create_ads_tables(
+            client, catalog_uuid, main_branch_uuid
         )
-        creatives_table_uuid = client.create_table(
-            "creatives",
-            CREATIVES_SCHEMA,
-            primary_keys=["creative_id"],
-            catalog_uuid=catalog_uuid,
-            schema_uuid=schema_uuid,
-            branch_uuid=main_branch_uuid,
-            author=AUTHOR,
-            comment="create creatives table",
+        seed_commit_seq_num = commit_seed_tallies(
+            client, catalog_uuid, main_branch_uuid, schema_uuid, creatives_table_uuid
         )
-        impressions_table_uuid = client.create_table(
-            "impressions",
-            IMPRESSIONS_SCHEMA,
-            primary_keys=["visitor_id"],
-            catalog_uuid=catalog_uuid,
-            schema_uuid=schema_uuid,
-            branch_uuid=main_branch_uuid,
-            author=AUTHOR,
-            comment="create impressions table",
-        )
-
-        tx = client.begin_tx(
-            catalog_uuid=catalog_uuid,
-            schema_uuid=schema_uuid,
-            branch_uuid=main_branch_uuid,
-            author=AUTHOR,
-            comment="seed creatives with zeroed tallies",
-        )
-        try:
-            client.write_data(
-                tx.tx_uuid,
-                Mutation(
-                    table_uuid=creatives_table_uuid,
-                    upserts=pa.table(
-                        {
-                            "creative_id": list(CREATIVE_IDS),
-                            "headline": [HEADLINES[c] for c in CREATIVE_IDS],
-                            "impressions": [0] * len(CREATIVE_IDS),
-                            "conversions": [0] * len(CREATIVE_IDS),
-                        },
-                        schema=CREATIVES_SCHEMA,
-                    ),
-                ),
-                catalog_uuid=catalog_uuid,
-                schema_uuid=schema_uuid,
-                branch_uuid=main_branch_uuid,
-            )
-            committed = client.commit_tx(
-                tx.tx_uuid,
-                catalog_uuid=catalog_uuid,
-                branch_uuid=main_branch_uuid,
-            )
-        except BaseException:
-            abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
-            raise
     except BaseException:
-        # Everything below the create_catalog — the schema, both tables, the seed
-        # tx — is inside the catalog, so dropping it unwinds the whole partial
-        # seed. Without this each failed attempt strands another prod_<hex>
-        # catalog on a shared stack, and retries accumulate them.
+        # Everything below the create_catalog lives inside the catalog, so
+        # dropping it unwinds the whole partial seed. seed_prod created the
+        # catalog, so seed_prod owns removing it — splitting this across the two
+        # helpers would make the ownership ambiguous. Without it each failed
+        # attempt strands another prod_<hex> catalog on a shared stack.
         discard_catalog(client, catalog_uuid)
         raise
 
@@ -358,7 +387,7 @@ def seed_prod(client: PencaClient) -> ProdContext:
         schema_uuid=schema_uuid,
         creatives_table_uuid=creatives_table_uuid,
         impressions_table_uuid=impressions_table_uuid,
-        seed_commit_seq_num=committed.commit_seq_num,
+        seed_commit_seq_num=seed_commit_seq_num,
     )
 
 
