@@ -288,8 +288,7 @@ def test_forks_share_one_copy_of_the_seeded_data():
         #
         # On a green run the forks own zero segments (this test asserts it), so
         # their deletes are metadata hygiene. On the red run that assertion catches
-        # — a fork that DOES own segments — they are the object reap, which is why
-        # they belong in the finally rather than on the success path. Each step is
+        # — a fork that DOES own segments — they are the object reap. Each step is
         # best-effort so one failure cannot skip what follows or replace a real
         # assertion failure with a cleanup error.
         for fork_uuid in fork_uuids:
