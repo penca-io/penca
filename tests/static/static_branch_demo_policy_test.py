@@ -239,19 +239,19 @@ def test_policy_rng_streams_are_independent_of_the_feed_and_of_each_other():
     }
     assert set(streams) == set(demo.POLICY_NAMES)
 
-    # Derive the feed's stream from build_visitor_feed itself rather than
-    # rebuilding random.Random(seed) by hand: a change to the feed's seeding must
-    # fail here, not silently invalidate the comparison.
+    # One generator, its draws reused for both halves. Re-constructing
+    # random.Random(seed) per iteration would yield [r0, r0, r0, r0] rather than
+    # the feed's [r0, r1, r2, r3], and the comparison below could never fail.
     feed_rng = random.Random(config.seed)
+    feed_stream = [feed_rng.random() for _ in range(4)]
     expected_first_row = tuple(
-        int(feed_rng.random() < rate) for *_head, rate in demo.CREATIVES
+        int(draw < rate)
+        for draw, (*_head, rate) in zip(feed_stream, demo.CREATIVES, strict=False)
     )
     assert demo.build_visitor_feed(config)[0] == expected_first_row, (
         "the feed is no longer drawn from random.Random(seed) in CREATIVES order; "
         "update this test's model of it before trusting the comparison below"
     )
-
-    feed_stream = [random.Random(config.seed).random() for _ in range(4)]
     for policy_name, stream in streams.items():
         assert stream != feed_stream, (
             f"{policy_name}'s stream must not match the one that built the feed"
@@ -271,6 +271,7 @@ class _FailingClient:
         self.fail_on = fail_on
         self.deleted: list[str] = []
         self.aborted: list[str] = []
+        self.deleted_catalogs: list[str] = []
 
     def delete_branch(self, catalog_uuid: str, branch_uuid: str) -> None:
         self.deleted.append(branch_uuid)
@@ -279,8 +280,20 @@ class _FailingClient:
 
     def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
         self.aborted.append(tx_uuid)
-        if self.raises is not None:
+        if self.raises is not None and self.fail_on in (None, tx_uuid):
             raise self.raises
+
+    def create_catalog(self, catalog_name: str, owner: str) -> tuple[str, str]:
+        return "cat", "main-uuid"
+
+    def create_schema(self, *args, **kwargs) -> str:
+        if self.raises is not None and self.fail_on in (None, "schema"):
+            raise self.raises
+
+        return "schema-uuid"
+
+    def delete_catalog(self, catalog_uuid: str) -> None:
+        self.deleted_catalogs.append(catalog_uuid)
 
 
 def test_discard_branches_attempts_every_branch_and_reports_the_failures():
@@ -320,3 +333,40 @@ def test_cleanup_helpers_let_a_second_ctrl_c_through():
         pass
     else:
         raise AssertionError("KeyboardInterrupt must not be swallowed")
+
+
+def test_seed_prod_drops_the_catalog_it_created_when_setup_fails():
+    """A failed seed must not strand a prod_<hex> catalog on a shared stack."""
+    client = _FailingClient(raises=RuntimeError("no schema"), fail_on="schema")
+    try:
+        demo.seed_prod(client)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the setup failure must propagate")
+
+    assert client.deleted_catalogs == ["cat"], (
+        "the catalog created before the failure must be dropped"
+    )
+
+
+def test_discard_catalog_does_not_propagate_a_delete_failure():
+    client = _FailingClient(raises=RuntimeError("boom"))
+    demo.discard_catalog(client, "cat")
+    assert client.deleted_catalogs == ["cat"]
+
+
+def test_a_green_run_fails_when_a_branch_could_not_be_discarded():
+    """The whole point of the flag: exiting 0 with live forks is not acceptable."""
+    try:
+        demo.raise_for_undeleted(["epsilon"], completed=True)
+    except RuntimeError as exc:
+        assert "epsilon" in str(exc)
+    else:
+        raise AssertionError("a completed run with undeleted branches must raise")
+
+
+def test_an_unwinding_run_keeps_the_original_exception():
+    """While unwinding there is a real error to preserve, so stay quiet."""
+    demo.raise_for_undeleted(["epsilon"], completed=False)
+    demo.raise_for_undeleted([], completed=True)

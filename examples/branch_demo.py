@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -257,6 +256,13 @@ def discard_branches(
             failed.append(branch_uuid)
 
     return failed
+
+
+def raise_for_undeleted(undeleted: Sequence[str], *, completed: bool) -> None:
+    """Fail a run that finished normally but could not discard its branches."""
+    if undeleted and completed:
+        msg = f"could not discard branches: {', '.join(undeleted)}"
+        raise RuntimeError(msg)
 
 
 def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
@@ -573,6 +579,7 @@ def run_demo(
     branches = fork_branches(client, prod)
     rngs = policy_rngs(config)
 
+    completed = False
     try:
         for round_index, start in enumerate(
             range(0, config.impressions, config.round_size)
@@ -605,6 +612,7 @@ def run_demo(
         main_impression_rows = read_impression_log(
             client, prod, prod.main_branch_uuid
         ).num_rows
+        completed = True
     finally:
         # finally, not straight-line: the docstring promises the forks are thrown
         # away, and a failed run is exactly when leaving three live branches behind
@@ -614,10 +622,10 @@ def run_demo(
         # Only swallow while unwinding. On a green run a failed delete must not
         # degrade to a printed line: the demo would exit 0 with live forks, and
         # print_isolation would list them directly above "N parallel universes …
-        # were thrown away".
-        if undeleted and sys.exc_info()[1] is None:
-            msg = f"could not discard branches: {', '.join(undeleted)}"
-            raise RuntimeError(msg)
+        # were thrown away". A frame-local flag rather than sys.exc_info(), which
+        # reports an exception being handled anywhere up the stack — a caller that
+        # invoked run_demo from inside an except block would suppress this raise.
+        raise_for_undeleted(undeleted, completed=completed)
 
     remaining = tuple(
         sorted(
