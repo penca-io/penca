@@ -37,7 +37,11 @@ def _load_script():
 checker = _load_script()
 
 
-def test_generated_stubs_are_excluded_by_relative_and_absolute_path():
+def test_generated_stubs_are_excluded_by_relative_and_absolute_path(monkeypatch):
+    # Relative inputs resolve against the cwd, so pin it: this suite's whole
+    # subject is path anchoring, and a false failure from pytest's cwd would be
+    # indistinguishable from the bug.
+    monkeypatch.chdir(REPO_ROOT)
     stub = STUB_SUBTREE / "external/v1/common_pb2.py"
     assert checker.is_excluded(stub)
     assert checker.is_excluded(REPO_ROOT / stub)
@@ -48,20 +52,15 @@ def test_generated_stubs_stay_excluded_from_a_subdirectory_cwd(monkeypatch):
 
     Anchored to cwd, running from ``packages/penca-proto`` normalized the stubs to
     ``src/penca_proto``, which matched no subtree entry — so ``--fix`` rewrote
-    generated code. repo_root is cached, so clear it around the chdir.
+    generated code.
     """
-    checker.repo_root.cache_clear()
-    try:
-        monkeypatch.chdir(REPO_ROOT / "packages/penca-proto")
-        assert checker.is_excluded(Path("src/penca_proto/external/v1/common_pb2.py"))
-        assert checker.is_excluded(
-            REPO_ROOT / STUB_SUBTREE / "external/v1/common_pb2.py"
-        )
-    finally:
-        checker.repo_root.cache_clear()
+    monkeypatch.chdir(REPO_ROOT / "packages/penca-proto")
+    assert checker.is_excluded(Path("src/penca_proto/external/v1/common_pb2.py"))
+    assert checker.is_excluded(REPO_ROOT / STUB_SUBTREE / "external/v1/common_pb2.py")
 
 
-def test_build_and_venv_trees_are_excluded_wherever_they_appear():
+def test_build_and_venv_trees_are_excluded_wherever_they_appear(monkeypatch):
+    monkeypatch.chdir(REPO_ROOT)
     for candidate in (
         Path(".venv/lib/python3.10/site-packages/x.py"),
         Path("packages/penca-client/build/lib/x.py"),
@@ -74,19 +73,44 @@ def test_build_and_venv_trees_are_excluded_wherever_they_appear():
     assert not checker.is_excluded(Path("tests/static/x.py"))
 
 
-def test_the_walk_never_descends_into_an_excluded_tree(tmp_path):
-    """Pruning happens during the walk, not by filtering its results."""
+def test_the_walk_never_descends_into_an_excluded_tree(tmp_path, monkeypatch):
+    """Pruning happens *during* the walk, not by filtering its results.
+
+    Spies on the directories actually visited, because the output alone cannot
+    tell the two apart — the old rglob-plus-filter implementation returned the
+    same file set. The contract here is a performance one: never scandir .venv or
+    target on ``just check``'s hot path.
+    """
     (tmp_path / "src").mkdir()
     (tmp_path / "src/keep.py").write_text("x = 1\n")
     for excluded in (".venv", "target", "__pycache__"):
         (tmp_path / excluded).mkdir()
+        (tmp_path / excluded / "nested").mkdir()
         (tmp_path / excluded / "skip.py").write_text("x = 1\n")
+
+    visited: list[str] = []
+    real_walk = checker.os.walk
+
+    def recording_walk(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+            visited.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(checker.os, "walk", recording_walk)
 
     found = {path.name for path in checker.walk_python_files(tmp_path)}
     assert found == {"keep.py"}
 
+    # Liveness first: without it a glob-based implementation records no visits and
+    # the "never descended" check below passes on an empty list.
+    assert visited, "walk_python_files must walk with os.walk, not glob and filter"
+    for excluded in (".venv", "target", "__pycache__"):
+        assert not any(excluded in dirpath for dirpath in visited), (
+            f"the walk descended into {excluded}: {visited}"
+        )
 
-def test_gitignored_paths_are_dropped_including_non_ascii_names():
+
+def test_gitignored_paths_are_dropped_including_non_ascii_names(monkeypatch):
     """``git check-ignore`` renders paths through ``core.quotePath``.
 
     Without NUL-delimited output a non-ASCII name comes back escaped, never
@@ -94,7 +118,9 @@ def test_gitignored_paths_are_dropped_including_non_ascii_names():
     filter exists to prevent. ``tests/tdd/`` is gitignored, so it is a real
     fixture rather than a synthetic one.
     """
+    monkeypatch.chdir(REPO_ROOT)
     scratch = REPO_ROOT / "tests/tdd"
+    created_scratch = not scratch.exists()
     scratch.mkdir(exist_ok=True)
     ascii_path = scratch / "static_probe.py"
     unicode_path = scratch / "static_probé.py"
@@ -115,3 +141,5 @@ def test_gitignored_paths_are_dropped_including_non_ascii_names():
     finally:
         ascii_path.unlink(missing_ok=True)
         unicode_path.unlink(missing_ok=True)
+        if created_scratch:
+            scratch.rmdir()

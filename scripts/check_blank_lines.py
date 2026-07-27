@@ -22,7 +22,6 @@ import ast
 import os
 import subprocess
 import sys
-from functools import lru_cache
 from pathlib import Path
 
 # Never checked. The generated proto stubs must stay byte-identical to
@@ -33,6 +32,12 @@ EXCLUDED_DIR_NAMES = frozenset(
     {".git", ".venv", "__pycache__", "node_modules", "target", "build", "dist"}
 )
 EXCLUDED_SUBTREES = (Path("packages/penca-proto/src/penca_proto"),)
+
+# The anchor EXCLUDED_SUBTREES is relative to. Derived from this file's own
+# location rather than the process cwd or `git rev-parse`: both of those degrade
+# silently — a cwd inside a *different* git repo resolves to that repo's root, the
+# stub paths then match no subtree entry, and `--fix` rewrites generated code.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 COMPOUND_TYPES = (
     ast.If,
@@ -135,39 +140,12 @@ def process_file(file_path: Path, fix: bool) -> list[str]:
     return messages
 
 
-@lru_cache(maxsize=1)
-def repo_root() -> Path:
-    """The repo root, which is what ``EXCLUDED_SUBTREES`` is relative to.
-
-    Anchoring on the process cwd instead would make the generated-stub guard lapse
-    for any invocation from a subdirectory: from ``packages/penca-proto`` the
-    stubs normalize to ``src/penca_proto``, which matches no subtree entry, and
-    ``--fix`` rewrites them. ruff is cwd-independent for the same reason — it
-    resolves excludes against the config file, not the cwd. Cached so the walk
-    does not re-run git per directory.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return Path.cwd().resolve()
-
-    if result.returncode != 0:
-        return Path.cwd().resolve()
-
-    return Path(result.stdout.strip()).resolve()
-
-
 def normalized(path: Path) -> Path:
     """Repo-root-relative form, so every invocation compares the same way."""
     resolved = path.resolve()
 
     try:
-        return resolved.relative_to(repo_root())
+        return resolved.relative_to(REPO_ROOT)
     except ValueError:
         return resolved
 

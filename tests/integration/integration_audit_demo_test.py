@@ -41,12 +41,22 @@ def test_audit_demo_runs_the_documented_walkthrough():
         "TX 3 committed",
         "Current state (read_data)",
         "Full audit trail (audit_data)",
+        "Audit trail (after TX 1 only)",
         "Time-travel: state as of TX 1",
     ):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
     # The tombstone is the point of the audit trail: bob is deleted in TX 3, so he
     # must be gone from the current state but present in the as-of-TX-1 read.
-    current, time_travel = stdout.split("Time-travel: state as of TX 1")
-    assert "bob" not in current.split("Current state (read_data)")[1].split("---")[0]
-    assert "bob" in time_travel
+    # Sliced between the two section headers, not on a bare "---": the headers are
+    # themselves wrapped in dashes, so splitting on "---" yielded a single space
+    # and the assertion held no matter what the demo printed. alice is the positive
+    # control that keeps an empty slice from passing.
+    current = stdout.split("--- Current state (read_data) ---")[1].split(
+        "--- Full audit trail"
+    )[0]
+    assert "alice" in current, current
+    assert "bob" not in current, current
+
+    time_travel = stdout.split("--- Time-travel: state as of TX 1 ---")[1]
+    assert "bob" in time_travel, time_travel

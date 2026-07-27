@@ -107,7 +107,8 @@ Each round, on each branch, inside one transaction:
 `greedy` and `epsilon` reallocate from their own running results. Then a
 cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
 and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
-defaults (3000 impressions, 25 per transaction, seed 20260727; ~50s) — the run
+defaults (3000 impressions, 25 per transaction, epsilon 0.15, seed
+20260727; ~50s) — the run
 reproduces, but nothing pins these particular figures, so treat them as a dated
 transcript rather than a contract:
 
