@@ -69,12 +69,17 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     """Per-branch ``(distinct objects, total bytes)`` of cold persist segments.
 
     White-box PG read: the gRPC API exposes no storage-footprint surface, and the
-    segment index is where ``object_uri`` / ``length`` are recorded.
+    segment index is where ``object_uri`` / ``size_bytes`` are recorded.
+
+    ``size_bytes`` is the column to sum, not ``length`` — ``length`` is the slice
+    length within a merged file and is written only by
+    ``compact_persist_segments``, so a freshly persisted segment (which owns its
+    whole object) reports 0 there.
     """
     parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
     rows = get_pg_driver().execute(
         SQL(
-            "SELECT branch_uuid, count(DISTINCT object_uri), coalesce(sum(length), 0) "
+            "SELECT branch_uuid, count(DISTINCT object_uri), coalesce(sum(size_bytes), 0) "
             "FROM {tbl} WHERE table_uuid = %s GROUP BY branch_uuid"
         ).format(tbl=Identifier(parent)),
         (table_uuid,),
@@ -154,7 +159,7 @@ def test_forks_share_one_copy_of_the_seeded_data():
     """
     demo = _load_demo()
     client = make_client()
-    prod = demo.seed_prod(client, _config(demo))
+    prod = demo.seed_prod(client)
 
     baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
     assert baseline == {}, f"nothing is persisted before the first fork, saw {baseline}"
