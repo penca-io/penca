@@ -177,9 +177,19 @@ def test_printers_emit_a_scoreboard_and_the_isolation_proof(capsys):
         assert policy_name in printed
 
     assert "prod is intact" in printed
-    assert f"{len(demo.POLICY_NAMES)} parallel universes" in printed, (
-        "the punchline must derive the branch count, not hardcode it"
-    )
+
+    # Patch POLICY_NAMES so the derived count differs from the real 3: comparing
+    # against len(POLICY_NAMES) on both sides passes for a hardcoded "3".
+    original = demo.POLICY_NAMES
+    demo.POLICY_NAMES = ("even", "greedy")
+    try:
+        capsys.readouterr()
+        demo.print_isolation(outcome)
+        assert "2 parallel universes" in capsys.readouterr().out, (
+            "the punchline must derive the branch count, not hardcode it"
+        )
+    finally:
+        demo.POLICY_NAMES = original
 
 
 def test_scoreboard_survives_a_branch_that_was_never_shown_anything(capsys):
@@ -511,7 +521,11 @@ def test_upsert_payloads_carry_only_the_touched_creatives():
     # would re-emit v000000.. every round and, since visitor_id is the impressions
     # primary key, silently REPLACE the previous round's log instead of appending.
     outcomes = [(7, "story", 1), (1, "banner", 0), (4, "story", 0)]
-    updated = demo.apply_outcomes({}, outcomes)
+    # Fold onto ALL creatives, not {}: with an empty base, updated's keys equal the
+    # touched set, so an implementation deriving touched from `updated` instead of
+    # from `outcomes` passes — while in the real drive_round updated always holds
+    # all four, and that regression would rewrite every creative's row each round.
+    updated = demo.apply_outcomes(_tallies(), outcomes)
 
     tallies = demo.tally_upserts(outcomes, updated)
     assert tallies.column("creative_id").to_pylist() == ["banner", "story"]

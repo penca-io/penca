@@ -227,10 +227,18 @@ def test_stub_exclusion_agrees_with_ruff_config():
     """
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     ruff_section = pyproject.split("[tool.ruff]", 1)[1].split("\n[", 1)[0]
+    # Keyed on `extend-exclude` specifically. Scraping any quoted line in the
+    # section passes for plain `exclude`, which is the regression the comment in
+    # pyproject.toml exists to prevent: `exclude` REPLACES ruff's built-in
+    # defaults, so node_modules stops being excluded there while this script still
+    # excludes it — the one tree where the two gates genuinely diverge.
+    assert "extend-exclude = [" in ruff_section, (
+        "pyproject must use extend-exclude, not exclude — exclude replaces ruff's "
+        f"built-in defaults. Section was:\n{ruff_section}"
+    )
+    entries = ruff_section.split("extend-exclude = [", 1)[1].split("]", 1)[0]
     excluded = {
-        line.strip().strip(',"')
-        for line in ruff_section.splitlines()
-        if line.strip().startswith('"')
+        line.strip().strip(',"') for line in entries.splitlines() if line.strip()
     }
 
     assert excluded, f"no extend-exclude entries parsed from:\n{ruff_section}"

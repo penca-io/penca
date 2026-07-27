@@ -206,9 +206,10 @@ def test_forks_share_one_copy_of_the_seeded_data():
     prod = demo.seed_prod(client)
 
     # try opens as soon as this test owns the catalog — seed_prod drops its own on
-    # failure (pinned by static_branch_demo_policy_test's
-    # test_a_failed_seed_transaction_aborts_then_drops_the_catalog), so the line
-    # above needs no cover. This test reaps on red and green alike; the divergence
+    # failure, so the line above needs no cover. Pinned across both halves of that
+    # failure envelope by static_branch_demo_policy_test's
+    # test_seed_prod_drops_the_catalog_it_created_when_setup_fails (pre-transaction)
+    # and test_a_failed_seed_transaction_aborts_then_drops_the_catalog (in-tx). This test reaps on red and green alike; the divergence
     # test above deliberately does the opposite and keeps its catalog on red, for
     # inspection.
     fork_uuids: list[str] = []
