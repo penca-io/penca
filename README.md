@@ -79,13 +79,60 @@ Two caveats to validate before trusting it for real work (tracked in [CHA-465](h
 
 ## Quick start
 
-Bring up the full stack and run the audit demo:
+**Branchable OLTP + OLAP on one open columnar copy of your data.**
+Open-source and self-hostable on object storage — no second system, no ETL.
 
 ```bash
 just penca-up                           # Postgres + SeaweedFS + 3 servicers + scheduler + Flight SQL gateway
 set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
-uv run python examples/audit_demo.py
+uv run python examples/branch_demo.py
 ```
+
+### `examples/branch_demo.py` — fork, transact, read back, discard
+
+Parallel universes for a live database. The demo seeds a `prod` catalog with ad
+creatives and a running conversion tally, then forks three branches off `main`
+and drives **one** shared, deterministic visitor feed through all three. Each
+visitor's response to each creative is fixed up front, so the branches see
+identical traffic and can only diverge on what they *do* with it.
+
+Each round, on each branch, inside one transaction:
+
+1. **read** that branch's own committed tallies — read-your-writes, on the same
+   copy it is transacting against;
+2. the allocation policy picks a creative from what it just read;
+3. **UPDATE** the tally row in place and append the impression rows, one commit.
+
+`even` splits traffic evenly and never reads the tallies — it is the foil.
+`greedy` and `epsilon` reallocate from their own running results. Then a
+cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
+and `main` is shown untouched. A representative run at the 3000-impression
+default (~50s):
+
+| branch    | impressions | conversions | rate   |
+|:----------|------------:|------------:|:-------|
+| `epsilon` |        3000 |         510 | 17.00% |
+| `greedy`  |        3000 |         417 | 13.90% |
+| `even`    |        3000 |         307 | 10.23% |
+
+`epsilon` keeps exploring and finds the genuinely best creative; `greedy` locks
+onto the second-best after one lucky round and never revisits it. Both beat the
+fixed split, because both steer on what they wrote.
+
+**Forking does not copy your data.** After the three forks, `main` holds its
+seeded rows in **one** object of **562 bytes**, unchanged by the second and third
+fork, and each branch stores **zero** objects and **zero** bytes of its own —
+while all three read the full seeded set. That is the "one copy" half of the
+headline, asserted in
+`tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`.
+
+Two honest caveats. The allocation policies are deliberately toy — the database
+mechanic is the point, not the bandit. And at this scale the fork itself is the
+hook: reading your transactional writes back *analytically* only outruns a
+row-store at real volume or on a query shape a row-store chokes on, which is not
+what a 3000-impression demo shows.
+
+### `examples/audit_demo.py` — time travel and the audit trail
 
 `audit_demo.py` walks through Penca's auditable-store semantics on a
 fresh `users(name PK, value)` table:
