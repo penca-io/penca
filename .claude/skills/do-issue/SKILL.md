@@ -74,8 +74,8 @@ Cheat sheet for the kata calls this skill makes:
 - `kata close <ref> --done --commit <sha> --message "<text>"` — close the task. `--done` requires **both** a `--message` (≥40 chars after normalization, describing scope + how it was verified) **and** typed evidence. `--commit <sha>` is the evidence for code tasks (repeatable). Orchestration tasks produce no commit but **still need evidence** — use `--reviewed <path>` (cleanup walk, repeatable), `--pr <url>` and/or `--test "just check"` (PR open). `--done` with neither message nor evidence is rejected mid-drain. (`--wontfix` is the opposite — it *rejects* evidence; close challenged/duplicate findings with `--wontfix --message "<justification>"`.)
 - `kata edit <ref> --blocked-by <other-ref>` — additive, repeatable. The dynamic-blocker mechanism — roborev / `/review-pr` / cleanup-pass enqueuers all extend in-flight `orch:*` tasks via this call.
 - `kata create --idempotency-key <key> -- ...` — idempotent create. Re-running with the same key + identical content is a no-op (`changed:false`). Re-running with the same key + different content errors with `idempotency_mismatch`; the caller must use stable content per key (the roborev hook does — `<short-sha>:<finding-index>` is content-stable per review).
-- Issue refs are `<project>#<short_id>` (e.g. `fabric#p6yp`) — the canonical form. `kata` also accepts ULIDs and numeric ids but qualified-id is what `--json` outputs and what TUI shows.
-- `kata delete --force --confirm "DELETE <qualified_id>"` — the help text says `"DELETE <short_id>"` but the daemon checks against `<qualified_id>` (`DELETE fabric#p6yp`). Same shape for `kata purge --confirm "PURGE <qualified_id>"`.
+- Issue refs are `<project>#<short_id>` (e.g. `penca#p6yp`) — the canonical form. `kata` also accepts ULIDs and numeric ids but qualified-id is what `--json` outputs and what TUI shows.
+- `kata delete --force --confirm "DELETE <qualified_id>"` — the help text says `"DELETE <short_id>"` but the daemon checks against `<qualified_id>` (`DELETE penca#p6yp`). Same shape for `kata purge --confirm "PURGE <qualified_id>"`.
 
 ## Step 1: Mark In Progress and digest the ticket
 

@@ -29,7 +29,7 @@ the logs in.
 #      RUST_LOG=info,penca=debug,penca_merge=trace,penca_storage_meta=trace
 
 # 2. run the workload (one query, a load loop, etc.), then summarize:
-docker logs penca-fabric-query-1 2>&1 \
+docker logs "${COMPOSE_PROJECT_NAME}-query-1" 2>&1 \
   | python3 scripts/telemetry/span_trace_table.py --prefix 2026-05-31T18:33:0 --totals
 
 # or from a captured logfile:
