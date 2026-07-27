@@ -80,7 +80,8 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     rows = get_pg_driver().execute(
         SQL(
             "SELECT branch_uuid, count(DISTINCT object_uri), coalesce(sum(size_bytes), 0) "
-            "FROM {tbl} WHERE table_uuid = %s GROUP BY branch_uuid"
+            "FROM {tbl} WHERE table_uuid = %s AND commit_micros IS NOT NULL "
+            "GROUP BY branch_uuid"
         ).format(tbl=Identifier(parent)),
         (table_uuid,),
     )
@@ -103,7 +104,10 @@ def test_shared_feed_is_deterministic():
         "every visitor needs one latent outcome per creative, so two branches "
         "showing the same creative to the same visitor agree"
     )
-    assert {value for outcomes in first for value in outcomes} <= {0, 1}
+    assert {value for outcomes in first for value in outcomes} == {0, 1}, (
+        "the feed must contain both outcomes; an all-zero feed would satisfy a "
+        "subset check while making the divergence test meaningless"
+    )
 
 
 def test_demo_forks_diverges_and_isolates_main():
@@ -208,6 +212,11 @@ def test_forks_share_one_copy_of_the_seeded_data():
             "every fork reads the full seeded set it stores none of"
         )
 
+    # This test forks by hand rather than through run_demo, so it owns the
+    # discard too.
+    for fork_uuid in fork_uuids:
+        client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
+
 
 def test_demo_script_runs_as_cli():
     """The script runs end-to-end with no manual setup beyond the sourced env."""
@@ -226,6 +235,10 @@ def test_demo_script_runs_as_cli():
         capture_output=True,
         text=True,
         check=False,
+        # capture_output streams nothing while it runs, so an unbounded wait on a
+        # wedged demo would hang the suite silently until the outer harness kills
+        # it. TimeoutExpired is the legible failure.
+        timeout=300,
     )
     assert result.returncode == 0, result.stderr[-4000:]
 
