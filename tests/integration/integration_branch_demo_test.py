@@ -46,6 +46,11 @@ def _load_demo() -> ModuleType:
         raise RuntimeError(msg)
 
     module = importlib.util.module_from_spec(spec)
+    # Register before executing: the demo's dataclasses are defined under
+    # `from __future__ import annotations`, and dataclasses resolves those string
+    # annotations through sys.modules[cls.__module__], which is None for a module
+    # that was built from a spec but never registered.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
     return module
