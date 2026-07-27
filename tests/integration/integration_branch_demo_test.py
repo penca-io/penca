@@ -196,11 +196,20 @@ def test_forks_share_one_copy_of_the_seeded_data():
     client = make_client()
     prod = demo.seed_prod(client)
 
-    baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
-    assert baseline == {}, f"nothing is persisted before the first fork, saw {baseline}"
-
+    # try opens immediately after the catalog exists. With it opening below the
+    # baseline assertion, a red baseline — or a raise out of the white-box PG read
+    # — stranded the prod_<hex> catalog, which is the leak this cleanup exists to
+    # close. This test cleans up on red *and* green; the divergence test above
+    # deliberately keeps its catalog on red for inspection. Two different policies,
+    # each stated where it applies, rather than one test silently implementing both
+    # depending on which assertion fired.
     fork_uuids: list[str] = []
     try:
+        baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
+        assert baseline == {}, (
+            f"nothing is persisted before the first fork, saw {baseline}"
+        )
+
         seeded = {creative_id for creative_id, _headline, _rate in demo.CREATIVES}
         main_footprint: tuple[int, int] | None = None
         for branch_name in ("even", "greedy", "epsilon"):

@@ -346,7 +346,10 @@ class _FailingClient:
 
         return SimpleNamespace(tx_uuid="tx")
 
-    def write_data(self, tx_uuid, mutation=None, *args, **kwargs) -> None:
+    # mutation is required, mirroring PencaClient.write_data's positional. With a
+    # None default, a call omitting the payload was a green pass everywhere except
+    # the one assertion that happened to check for it.
+    def write_data(self, tx_uuid, mutation, *args, **kwargs) -> None:
         # The mutation is in the key: without it, a loop writing mutations[0]
         # twice logs the same line twice and passes, while in the demo that would
         # drop either the tally UPDATE or the log append.
