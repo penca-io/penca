@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow as pa
+
 DEMO = Path(__file__).parents[2] / "examples/branch_demo.py"
 
 
@@ -300,6 +302,8 @@ class _FailingClient:
         fail_delete_catalog: bool = False,
         fail_abort_tx: bool = False,
         fail_write_data: bool = False,
+        fail_create_branch_on_call: int | None = None,
+        tallies: dict[str, tuple[int, int]] | None = None,
     ):
         # A fail_* flag with no exception to raise is a test that pins nothing —
         # the vacuity class this fake exists to avoid, one forgotten kwarg away.
@@ -310,6 +314,7 @@ class _FailingClient:
                 fail_delete_catalog,
                 fail_abort_tx,
                 fail_write_data,
+                fail_create_branch_on_call,
             )
         ), "a fail_* flag without raises never fails"
         # fail_delete_branch is a uuid, not a bool: True would compare equal to no
@@ -324,6 +329,13 @@ class _FailingClient:
         self.fail_delete_catalog = fail_delete_catalog
         self.fail_abort_tx = fail_abort_tx
         self.fail_write_data = fail_write_data
+        self.fail_create_branch_on_call = fail_create_branch_on_call
+        # What read_data serves back as the branch's committed tallies.
+        self.tallies = tallies or dict.fromkeys(
+            ("banner", "carousel", "story", "video"), (0, 0)
+        )
+        self.created_branches: list[str] = []
+        self.upserted_creatives: list[str] = []
         self.deleted: list[str] = []
         self.aborted: list[str] = []
         self.deleted_catalogs: list[str] = []
@@ -337,6 +349,7 @@ class _FailingClient:
 
     def delete_branch(self, catalog_uuid: str, branch_uuid: str) -> None:
         self.deleted.append(branch_uuid)
+        self.calls.append(f"delete_branch:{branch_uuid}")
         self._maybe_raise(branch_uuid == self.fail_delete_branch)
 
     def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
@@ -367,12 +380,43 @@ class _FailingClient:
         # twice logs the same line twice and passes, while in the demo that would
         # drop either the tally UPDATE or the log append.
         self.calls.append(f"write_data:{tx_uuid}:{mutation}")
+        if getattr(mutation, "table_uuid", None) == "creatives":
+            self.upserted_creatives = mutation.upserts.column("creative_id").to_pylist()
+
         self._maybe_raise(self.fail_write_data)
 
     def commit_tx(self, tx_uuid, *args, **kwargs):
         self.calls.append(f"commit_tx:{tx_uuid}")
 
         return SimpleNamespace(commit_seq_num=1)
+
+    def read_data(self, *args, **kwargs):
+        self.calls.append("read_data")
+        creative_ids = list(self.tallies)
+        if kwargs.get("columns") == ["creative_id", "converted"]:
+            return pa.table(
+                {"creative_id": creative_ids, "converted": [0] * len(creative_ids)}
+            )
+
+        return pa.table(
+            {
+                "creative_id": creative_ids,
+                "impressions": [self.tallies[c][0] for c in creative_ids],
+                "conversions": [self.tallies[c][1] for c in creative_ids],
+            }
+        )
+
+    def create_branch(self, branch_name, *args, **kwargs):
+        self.calls.append(f"create_branch:{branch_name}")
+        self.created_branches.append(branch_name)
+        self._maybe_raise(len(self.created_branches) == self.fail_create_branch_on_call)
+
+        return SimpleNamespace(branch_uuid=f"uuid-{branch_name}")
+
+    def list_branches(self, *args, **kwargs):
+        self.calls.append("list_branches")
+
+        return [SimpleNamespace(branch_name="main")]
 
     def delete_catalog(self, catalog_uuid: str) -> None:
         self.deleted_catalogs.append(catalog_uuid)
@@ -609,3 +653,144 @@ def test_commit_mutations_puts_every_mutation_in_one_transaction():
         "commit_tx:tx",
     ], f"one begin, both mutations on that tx, one commit; saw {client.calls}"
     assert seq == 1, "returns the commit's seq num"
+
+
+def _prod() -> object:
+    return demo.ProdContext(
+        catalog_uuid="cat",
+        main_branch_uuid="uuid-main",
+        schema_uuid="schema",
+        creatives_table_uuid="creatives",
+        impressions_table_uuid="impressions",
+        seed_commit_seq_num=1,
+    )
+
+
+def test_drive_round_reads_before_it_writes_and_allocates_from_the_read():
+    """CHA-517's hard design rule, as an interaction assertion.
+
+    No outcome assertion can pin this. apply_outcomes computes exactly what the
+    read returns, so replacing the per-round read_data with an in-process dict
+    carried across rounds yields a byte-identical scoreboard — read-your-writes
+    deleted outright, every other test still green.
+
+    What separates the two is observable only in the interaction: that a read
+    happens, that it precedes the transaction, and that the allocation used its
+    *content*. So the fake serves a tally the policy could not reach from zeros —
+    carousel measured clearly best, everything else measured worse. From zeros,
+    greedy takes banner on the untried tie-break.
+    """
+    client = _FailingClient(
+        tallies={
+            "banner": (50, 2),
+            "carousel": (50, 40),
+            "story": (50, 3),
+            "video": (50, 1),
+        }
+    )
+
+    demo.drive_round(
+        client,
+        _prod(),
+        ("greedy", "uuid-greedy"),
+        [0],
+        [[0, 0, 0, 0]],
+        random.Random(0),
+        0.0,
+    )
+
+    assert [call.split(":")[0] for call in client.calls] == [
+        "read_data",
+        "begin_tx",
+        "write_data",
+        "write_data",
+        "commit_tx",
+    ], f"the round must read committed state before opening the tx; saw {client.calls}"
+
+    assert client.upserted_creatives == ["carousel"], (
+        "the allocation must come from what the read returned — carousel is best "
+        "only in the served tallies, and from zeros greedy would take banner. "
+        f"Saw {client.upserted_creatives}"
+    )
+
+
+def test_run_demo_forks_drives_scores_then_discards_in_that_order():
+    """The wiring, which no outcome assertion reaches.
+
+    Pins that the forks are created before any round runs, that the discard
+    happens after the scoreboard reads, and that list_branches is consulted after
+    the deletes — the ordering round 2 flagged and this PR fixed, with nothing
+    else stopping its return.
+    """
+    client = _FailingClient()
+    config = demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
+
+    outcome = demo.run_demo(client, config)
+
+    kinds = [call.split(":")[0] for call in client.calls]
+    assert kinds.count("create_branch") == len(demo.POLICY_NAMES)
+    assert kinds.count("delete_branch") == len(demo.POLICY_NAMES)
+
+    last_fork = max(
+        index for index, kind in enumerate(kinds) if kind == "create_branch"
+    )
+    # First read, not first write: seed_prod's seeding write legitimately precedes
+    # the forks, while a round always opens with the read.
+    first_round_read = min(
+        index for index, kind in enumerate(kinds) if kind == "read_data"
+    )
+    first_delete = min(
+        index for index, kind in enumerate(kinds) if kind == "delete_branch"
+    )
+    last_read = max(index for index, kind in enumerate(kinds) if kind == "read_data")
+    list_index = kinds.index("list_branches")
+
+    assert last_fork < first_round_read, "every fork exists before any round reads"
+    # After, not before: main's isolation read deliberately follows the discard, so
+    # it pins that main survives deleting three forks that were reading its shared
+    # cold object — the reason those reads were moved past the finally.
+    assert last_read > first_delete, "main's isolation read must follow the discard"
+    assert first_delete < list_index, (
+        "list_branches must observe the post-discard state"
+    )
+    assert outcome.remaining_branches == ("main",)
+
+
+def test_fork_branches_discards_what_it_created_before_it_failed():
+    """The fork half of the unwind envelope, which had no test.
+
+    seed_prod's two halves each have one; this is the structurally identical third.
+    The second create_branch fails, so the first fork must already be discarded —
+    that is what makes "earlier ones live" testable rather than asserted.
+    """
+    client = _FailingClient(
+        raises=RuntimeError("second fork failed"), fail_create_branch_on_call=2
+    )
+
+    try:
+        demo.fork_branches(client, _prod())
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the fork failure must propagate")
+
+    assert client.deleted == [f"uuid-{demo.POLICY_NAMES[0]}"], (
+        f"the fork created before the failure must be discarded, saw {client.deleted}"
+    )
+
+
+def test_choose_creative_routes_epsilon_to_the_explorer():
+    """epsilon must not collapse to greedy in the dispatcher.
+
+    carousel is clearly best here, so a dispatch that fell through to pick_greedy
+    would return it every time regardless of the rng.
+    """
+    tallies = _all_measured()
+    explored = {
+        demo.choose_creative("epsilon", 0, tallies, random.Random(seed), 1.0)
+        for seed in range(40)
+    }
+
+    assert len(explored) > 1, (
+        f"always-explore must reach more than one creative, saw {explored}"
+    )

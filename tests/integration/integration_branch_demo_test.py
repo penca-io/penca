@@ -30,7 +30,10 @@ _DEMO_PATH = _REPO_ROOT / "examples" / "branch_demo.py"
 # policies pull clear of the fixed split. Pinned rather than derived so the
 # divergence assertion is reproducible run to run.
 _IMPRESSIONS = 240
-_ROUND_SIZE = 12
+# 11, not 12: 240 divides evenly by 12, so min(start + round_size, impressions) —
+# the partial-final-round clamp — never fired at any tested config. 11 gives 21
+# rounds with a 9-impression last one, exercising it on every run.
+_ROUND_SIZE = 11
 _SEED = 20260727
 
 
@@ -178,7 +181,10 @@ def test_demo_forks_diverges_and_isolates_main():
     # forks were reading, and it has to survive their deletion. delete_branch is
     # safe today (every enumeration pins branch_uuid), but a regression there would
     # otherwise still print a green demo.
-    assert all(tally == (0, 0) for tally in outcome.main_tallies.values()), (
+    # The whole expected map, not a predicate over whatever came back: all() is
+    # vacuously true for an empty read, so a main that VANISHED — the delete_branch
+    # regression this block exists to catch — would have passed.
+    assert outcome.main_tallies == dict.fromkeys(demo.CREATIVE_IDS, (0, 0)), (
         f"prod tallies must survive the discard untouched, saw {outcome.main_tallies}"
     )
     assert outcome.main_impression_rows == 0, "prod logged no impressions"
