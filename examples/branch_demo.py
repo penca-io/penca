@@ -274,13 +274,22 @@ def discard_branches(
     return failed
 
 
-def raise_for_undeleted(undeleted: Sequence[str], *, completed: bool) -> None:
-    """Fail a run that finished normally but could not discard its branches."""
+def raise_for_undeleted(
+    undeleted: Sequence[str], *, catalog_uuid: str, completed: bool
+) -> None:
+    """Fail a run that finished normally but could not discard its branches.
+
+    Deliberately does not say "the scoreboard above": this raises from
+    ``run_demo``'s ``finally``, so ``run_demo`` never returns and ``main`` never
+    reaches ``print_scoreboard`` — there is no scoreboard above. The catalog uuid
+    is named because ``delete_branch`` needs it, so the manual cleanup this asks
+    for is actually performable from the message.
+    """
     if undeleted and completed:
         msg = (
-            f"could not discard branches: {', '.join(undeleted)}. The run itself "
-            f"succeeded — the scoreboard above is valid; these branches are still "
-            f"live and need deleting by hand."
+            f"the run succeeded but these branches could not be discarded: "
+            f"{', '.join(undeleted)} — still live in catalog {catalog_uuid}, "
+            f"delete them by hand"
         )
         raise RuntimeError(msg)
 
@@ -730,7 +739,9 @@ def run_demo(
         # were thrown away". A frame-local flag rather than sys.exc_info(), which
         # reports an exception being handled anywhere up the stack — a caller that
         # invoked run_demo from inside an except block would suppress this raise.
-        raise_for_undeleted(undeleted, completed=completed)
+        raise_for_undeleted(
+            undeleted, catalog_uuid=prod.catalog_uuid, completed=completed
+        )
 
     # Main is read AFTER the discard on purpose. Read before it, "prod untouched"
     # only covers the run; read after, it also covers the thing this demo is

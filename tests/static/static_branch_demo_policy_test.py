@@ -327,7 +327,7 @@ class _FailingClient:
 
     def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
         self.aborted.append(tx_uuid)
-        self.calls.append("abort_tx")
+        self.calls.append(f"abort_tx:{tx_uuid}")
         self._maybe_raise(self.fail_abort_tx)
 
     def create_catalog(self, catalog_name: str, owner: str) -> tuple[str, str]:
@@ -346,8 +346,11 @@ class _FailingClient:
 
         return SimpleNamespace(tx_uuid="tx")
 
-    def write_data(self, tx_uuid, *args, **kwargs) -> None:
-        self.calls.append(f"write_data:{tx_uuid}")
+    def write_data(self, tx_uuid, mutation=None, *args, **kwargs) -> None:
+        # The mutation is in the key: without it, a loop writing mutations[0]
+        # twice logs the same line twice and passes, while in the demo that would
+        # drop either the tally UPDATE or the log append.
+        self.calls.append(f"write_data:{tx_uuid}:{mutation}")
         self._maybe_raise(self.fail_write_data)
 
     def commit_tx(self, tx_uuid, *args, **kwargs):
@@ -357,7 +360,7 @@ class _FailingClient:
 
     def delete_catalog(self, catalog_uuid: str) -> None:
         self.deleted_catalogs.append(catalog_uuid)
-        self.calls.append("delete_catalog")
+        self.calls.append(f"delete_catalog:{catalog_uuid}")
         self._maybe_raise(self.fail_delete_catalog)
 
 
@@ -430,17 +433,18 @@ def test_discard_catalog_does_not_propagate_a_delete_failure():
 def test_a_green_run_fails_when_a_branch_could_not_be_discarded():
     """The whole point of the flag: exiting 0 with live forks is not acceptable."""
     try:
-        demo.raise_for_undeleted(["epsilon"], completed=True)
+        demo.raise_for_undeleted(["epsilon"], catalog_uuid="cat", completed=True)
     except RuntimeError as exc:
         assert "epsilon" in str(exc)
+        assert "cat" in str(exc), "the catalog must be named so cleanup is doable"
     else:
         raise AssertionError("a completed run with undeleted branches must raise")
 
 
 def test_an_unwinding_run_keeps_the_original_exception():
     """While unwinding there is a real error to preserve, so stay quiet."""
-    demo.raise_for_undeleted(["epsilon"], completed=False)
-    demo.raise_for_undeleted([], completed=True)
+    demo.raise_for_undeleted(["epsilon"], catalog_uuid="cat", completed=False)
+    demo.raise_for_undeleted([], catalog_uuid="cat", completed=True)
 
 
 def test_allocate_round_calls_the_policy_once_per_visitor_in_order():
@@ -470,11 +474,12 @@ def test_allocate_round_calls_the_policy_once_per_visitor_in_order():
 def test_allocate_round_reads_each_visitors_own_latent_outcome():
     """The visitor → row, creative → column coupling.
 
-    Visitor 5 is deliberately neither its loop position (0) nor its creative
-    position (1), and only ``feed[5][1]`` is non-zero. So reading the row by loop
-    position yields ``feed[0][1] == 0`` and fails, and reading the column by
-    visitor index yields ``feed[5][5]`` and raises — both mis-indexings a weaker
-    fixture would let through.
+    Each visitor's own row has exactly one non-zero cell, at a column that is not
+    that visitor's loop position: ``feed[5][1]`` and ``feed[0][0]``. So reading the
+    row by loop position yields ``feed[0][1] == 0`` for the first and
+    ``feed[1][0] == 0`` for the second, and reading the column by visitor index
+    yields ``feed[5][5]`` and raises — both mis-indexings a weaker fixture would
+    let through, and both elements of the pair can now fail.
     """
     # Row 0 written separately from the `* 4` replication, which aliases one list.
     feed = [[1, 0, 0, 0]] + [[0, 0, 0, 0]] * 4 + [[0, 1, 0, 0]]
@@ -544,8 +549,16 @@ def test_a_failed_seed_transaction_aborts_then_drops_the_catalog():
     else:
         raise AssertionError("the write failure must propagate")
 
-    assert client.calls[-2:] == ["abort_tx", "delete_catalog"], (
-        f"abort the tx first, then drop the catalog; saw {client.calls}"
+    # Whole sequence, not a tail slice: the slice bought ordering but dropped the
+    # uuid identity and the exactly-once the two old per-method lists guaranteed.
+    # Exactly four calls in this order, with the uuids pinned. The write_data
+    # element is matched by prefix only: its mutation is a real Mutation whose repr
+    # embeds an entire Arrow table.
+    assert len(client.calls) == 4, f"each step exactly once; saw {client.calls}"
+    assert client.calls[0] == "begin_tx"
+    assert client.calls[1].startswith("write_data:tx:")
+    assert client.calls[2:] == ["abort_tx:tx", "delete_catalog:cat"], (
+        f"abort the tx, then drop the catalog; saw {client.calls}"
     )
 
 
@@ -569,8 +582,8 @@ def test_commit_mutations_puts_every_mutation_in_one_transaction():
 
     assert client.calls == [
         "begin_tx",
-        "write_data:tx",
-        "write_data:tx",
+        "write_data:tx:m1",
+        "write_data:tx:m2",
         "commit_tx:tx",
-    ], f"one begin, both writes on that tx, one commit; saw {client.calls}"
+    ], f"one begin, both mutations on that tx, one commit; saw {client.calls}"
     assert seq == 1, "returns the commit's seq num"

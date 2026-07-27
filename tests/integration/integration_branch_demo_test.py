@@ -130,10 +130,6 @@ def test_demo_forks_diverges_and_isolates_main():
 
     client = make_client()
     outcome = demo.run_demo(client, _config(demo))
-    # run_demo keeps the prod catalog on purpose — prod outliving its forks is the
-    # demo. The test created it, so the test cleans it up rather than leaking one
-    # per run onto a stack the rest of the suite shares.
-    _cleanup_catalog(client, outcome.catalog_uuid)
 
     by_name = {branch.branch_name: branch for branch in outcome.scoreboard}
     assert set(by_name) == {"even", "greedy", "epsilon"}
@@ -181,9 +177,15 @@ def test_demo_forks_diverges_and_isolates_main():
         f"all three forks must be discarded, saw {outcome.remaining_branches}"
     )
 
+    # After the assertions, and deliberately NOT in a finally: run_demo keeps the
+    # prod catalog by design (prod outliving its forks is the demo), so the test
+    # that created it cleans it up on success — while a red assertion leaves the
+    # catalog behind on purpose, for inspection.
+    _cleanup_catalog(client, outcome.catalog_uuid)
+
 
 def test_forks_share_one_copy_of_the_seeded_data():
-    """Forking three branches off the seeded catalog adds no stored bytes.
+    """Forking three branches off the seeded catalog adds no stored row data.
 
     CreateBranch flushes the *source* hot tier to cold once (CHA-273) and copies
     metadata only — never row data (CHA-178). So main's cold footprint is flat
@@ -285,3 +287,14 @@ def test_demo_script_runs_as_cli():
     stdout = result.stdout.lower()
     assert "scoreboard" in stdout, result.stdout[-2000:]
     assert "prod" in stdout, result.stdout[-2000:]
+
+    # The demo keeps its catalog by design, so the run leaks one unless the test
+    # cleans it up — and the uuid is only reachable because print_isolation names
+    # it, which makes this that line's only coverage.
+    kept = [
+        line.split(":", 1)[1].strip()
+        for line in result.stdout.splitlines()
+        if line.startswith("prod catalog (kept):")
+    ]
+    assert len(kept) == 1, f"expected one kept-catalog line, saw {kept}"
+    _cleanup_catalog(make_client(), kept[0])
