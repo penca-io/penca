@@ -3,10 +3,29 @@ name = "penca-workspace"
 version = "0.1.0"
 description = "Penca workspace root"
 requires-python = ">=3.10"
-dependencies = []
+# The workspace packages, so `uv run` and `uv sync` at the repo root install
+# them editable. Declaring them as `members` below is not enough — uv only
+# installs a workspace member that something actually depends on, so without
+# these a fresh clone gets no `penca_client` and `examples/branch_demo.py`
+# fails at import with ModuleNotFoundError.
+dependencies = [
+    "penca-client",
+    "penca-proto",
+    # `examples/` print their tables via `to_pandas().to_markdown()`, so these
+    # are runtime needs of the repo root, not dev tools. tabulate in
+    # particular is an *optional* pandas dependency, so `to_markdown()` raises
+    # ImportError without it — and it otherwise lives only in penca-client's
+    # dev group, which a plain root `uv sync` does not install.
+    "pandas>=2.3.3",
+    "tabulate>=0.10.0",
+]
 
 [tool.uv.workspace]
 members = ["packages/*"]
+
+[tool.uv.sources]
+penca-client = { workspace = true }
+penca-proto = { workspace = true }
 
 [dependency-groups]
 dev = [
