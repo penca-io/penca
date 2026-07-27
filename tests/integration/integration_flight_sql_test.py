@@ -19,6 +19,7 @@ import pyarrow.flight as paflight
 import pytest
 from adbc_driver_flightsql.dbapi import connect as flight_sql_connect
 from adbc_driver_manager.dbapi import Connection as AdbcConnection
+from grpc import insecure_channel
 from penca_client import Mutation
 from penca_client.client import PencaClient
 from penca_client.config import ClientSettings
@@ -33,7 +34,6 @@ from penca_client.naming import (
 from penca_proto.external.v1.lifecycle_pb2_grpc import LifecycleServiceStub
 from penca_proto.external.v1.query_pb2_grpc import QueryServiceStub
 from penca_proto.external.v1.write_pb2_grpc import WriteServiceStub
-from grpc import insecure_channel
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (

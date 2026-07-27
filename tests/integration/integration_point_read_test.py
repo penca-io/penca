@@ -33,6 +33,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 import pytest
+from grpc import RpcError, StatusCode, insecure_channel
 from penca_client import Mutation
 from penca_client._time import micros_to_datetime
 from penca_client.arrow import batch_to_ipc_bytes
@@ -41,7 +42,6 @@ from penca_client.errors import InvalidRequestError
 from penca_client.naming import delete_log_table, upsert_log_table
 from penca_proto.external.v1.query_pb2 import ReadDataRequest
 from penca_proto.external.v1.query_pb2_grpc import QueryServiceStub
-from grpc import RpcError, StatusCode, insecure_channel
 
 from .integration_flight_sql_test import _execute_update_steps_via
 from .integration_helpers import (

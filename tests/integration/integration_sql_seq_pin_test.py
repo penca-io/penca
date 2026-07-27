@@ -14,11 +14,11 @@ Run via ``just integration-test sql_seq_pin``.
 
 from __future__ import annotations
 
+from grpc import insecure_channel
 from penca_client.config import ClientSettings
 from penca_client.naming import commit_tx_log_partition
 from penca_proto.external.v1.query_pb2 import GetMaxCommitSeqNumRequest
 from penca_proto.external.v1.query_pb2_grpc import QueryServiceStub
-from grpc import insecure_channel
 from psycopg.sql import Identifier
 
 from .integration_helpers import get_pg_driver, make_client, setup_schema

@@ -29,6 +29,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
+from grpc import insecure_channel
 from penca_client import Mutation
 from penca_client.config import ClientSettings
 from penca_proto.external.v1.common_pb2 import IntegerRange, PaginationRequest
@@ -39,7 +40,6 @@ from penca_proto.external.v1.lifecycle_pb2 import (
 from penca_proto.external.v1.lifecycle_pb2_grpc import (
     LifecycleServiceStub,
 )
-from grpc import insecure_channel
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
