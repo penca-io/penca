@@ -148,3 +148,52 @@ def test_gitignored_paths_are_dropped_including_non_ascii_names(monkeypatch):
         unicode_path.unlink(missing_ok=True)
         if created_scratch:
             scratch.rmdir()
+
+
+def test_collect_paths_refuses_an_explicitly_named_generated_stub(monkeypatch):
+    """The composition, not just its pieces.
+
+    Dropping the ``is_excluded`` call from ``collect_paths`` leaves every
+    single-function test green while ``just format <a stub>`` rewrites generated
+    code, so the wiring needs its own check.
+    """
+    monkeypatch.chdir(REPO_ROOT)
+    stub = STUB_SUBTREE / "external/v1/common_pb2.py"
+    assert stub.is_file(), stub
+
+    assert checker.collect_paths([str(stub)]) == []
+    assert checker.collect_paths(["examples/branch_demo.py"]) == [
+        Path("examples/branch_demo.py")
+    ]
+
+
+def test_collect_paths_drops_gitignored_files_from_a_walked_directory(monkeypatch):
+    monkeypatch.chdir(REPO_ROOT)
+    scratch = REPO_ROOT / "tests/tdd"
+    created_scratch = not scratch.exists()
+    scratch.mkdir(exist_ok=True)
+    probe = scratch / "static_collect_probe.py"
+    probe.write_text("x = 1\n")
+    try:
+        collected = checker.collect_paths(["tests"])
+        assert not any("tdd" in str(path) for path in collected), (
+            f"gitignored scratch must not survive a walked directory: {collected}"
+        )
+        assert any(path.name.startswith("static_") for path in collected), (
+            "the walk must still have found the real static tests"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+        if created_scratch:
+            scratch.rmdir()
+
+
+def test_collect_paths_rejects_a_path_that_does_not_exist(monkeypatch):
+    """A mistyped scope must fail, not report success on nothing."""
+    monkeypatch.chdir(REPO_ROOT)
+    try:
+        checker.collect_paths(["tests/statik"])
+    except SystemExit as exc:
+        assert "tests/statik" in str(exc)
+    else:
+        raise AssertionError("a nonexistent scope must be fatal")

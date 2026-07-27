@@ -273,8 +273,53 @@ def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
         print(f"  (could not delete catalog {catalog_uuid}: {exc})")
 
 
+def commit_mutations(
+    client: PencaClient,
+    *,
+    catalog_uuid: str,
+    schema_uuid: str,
+    branch_uuid: str,
+    comment: str,
+    mutations: Sequence[Mutation],
+) -> int:
+    """Write every mutation in one transaction; return its ``commit_seq_num``.
+
+    The single owner of the begin → write → commit → abort-on-failure shape, so the
+    seeding write and the per-round write cannot drift apart. Multiple mutations in
+    one tx is the load-bearing part for a round: the tally UPDATE and the
+    impression-log append commit together or not at all.
+    """
+    tx = client.begin_tx(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+        author=AUTHOR,
+        comment=comment,
+    )
+    try:
+        for mutation in mutations:
+            client.write_data(
+                tx.tx_uuid,
+                mutation,
+                catalog_uuid=catalog_uuid,
+                schema_uuid=schema_uuid,
+                branch_uuid=branch_uuid,
+            )
+
+        committed = client.commit_tx(
+            tx.tx_uuid,
+            catalog_uuid=catalog_uuid,
+            branch_uuid=branch_uuid,
+        )
+    except BaseException:
+        abort_quietly(client, catalog_uuid, tx.tx_uuid, branch_uuid)
+        raise
+
+    return committed.commit_seq_num
+
+
 def create_ads_tables(
-    client: PencaClient, catalog_uuid: str, main_branch_uuid: str
+    client: PencaClient, *, catalog_uuid: str, main_branch_uuid: str
 ) -> tuple[str, str, str]:
     """Create the ``ads`` schema and both tables.
 
@@ -316,22 +361,20 @@ def create_ads_tables(
 
 def commit_seed_tallies(
     client: PencaClient,
+    *,
     catalog_uuid: str,
     main_branch_uuid: str,
     schema_uuid: str,
     creatives_table_uuid: str,
 ) -> int:
     """Commit the four creatives at zeroed tallies; return the commit's seq num."""
-    tx = client.begin_tx(
+    return commit_mutations(
+        client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
         branch_uuid=main_branch_uuid,
-        author=AUTHOR,
         comment="seed creatives with zeroed tallies",
-    )
-    try:
-        client.write_data(
-            tx.tx_uuid,
+        mutations=[
             Mutation(
                 table_uuid=creatives_table_uuid,
                 upserts=pa.table(
@@ -343,21 +386,9 @@ def commit_seed_tallies(
                     },
                     schema=CREATIVES_SCHEMA,
                 ),
-            ),
-            catalog_uuid=catalog_uuid,
-            schema_uuid=schema_uuid,
-            branch_uuid=main_branch_uuid,
-        )
-        committed = client.commit_tx(
-            tx.tx_uuid,
-            catalog_uuid=catalog_uuid,
-            branch_uuid=main_branch_uuid,
-        )
-    except BaseException:
-        abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
-        raise
-
-    return committed.commit_seq_num
+            )
+        ],
+    )
 
 
 def seed_prod(client: PencaClient) -> ProdContext:
@@ -367,10 +398,14 @@ def seed_prod(client: PencaClient) -> ProdContext:
     )
     try:
         schema_uuid, creatives_table_uuid, impressions_table_uuid = create_ads_tables(
-            client, catalog_uuid, main_branch_uuid
+            client, catalog_uuid=catalog_uuid, main_branch_uuid=main_branch_uuid
         )
         seed_commit_seq_num = commit_seed_tallies(
-            client, catalog_uuid, main_branch_uuid, schema_uuid, creatives_table_uuid
+            client,
+            catalog_uuid=catalog_uuid,
+            main_branch_uuid=main_branch_uuid,
+            schema_uuid=schema_uuid,
+            creatives_table_uuid=creatives_table_uuid,
         )
     except BaseException:
         # Everything below the create_catalog lives inside the catalog, so
@@ -552,42 +587,23 @@ def drive_round(
     outcomes = allocate_round(branch_name, visitor_indexes, tallies, feed, rng, epsilon)
     updated = apply_outcomes(tallies, outcomes)
 
-    tx = client.begin_tx(
+    commit_mutations(
+        client,
         catalog_uuid=prod.catalog_uuid,
         schema_uuid=prod.schema_uuid,
         branch_uuid=branch_uuid,
-        author=AUTHOR,
         comment=f"{branch_name}: {len(outcomes)} impressions",
-    )
-    try:
-        client.write_data(
-            tx.tx_uuid,
+        mutations=[
             Mutation(
                 table_uuid=prod.creatives_table_uuid,
                 upserts=tally_upserts(outcomes, updated),
             ),
-            catalog_uuid=prod.catalog_uuid,
-            schema_uuid=prod.schema_uuid,
-            branch_uuid=branch_uuid,
-        )
-        client.write_data(
-            tx.tx_uuid,
             Mutation(
                 table_uuid=prod.impressions_table_uuid,
                 upserts=impression_upserts(outcomes),
             ),
-            catalog_uuid=prod.catalog_uuid,
-            schema_uuid=prod.schema_uuid,
-            branch_uuid=branch_uuid,
-        )
-        client.commit_tx(
-            tx.tx_uuid,
-            catalog_uuid=prod.catalog_uuid,
-            branch_uuid=branch_uuid,
-        )
-    except BaseException:
-        abort_quietly(client, prod.catalog_uuid, tx.tx_uuid, branch_uuid)
-        raise
+        ],
+    )
 
     return outcomes
 

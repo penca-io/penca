@@ -234,18 +234,23 @@ def drop_gitignored(paths: list[Path]) -> list[Path]:
 
 
 def collect_paths(args: Sequence[str]) -> list[Path]:
-    """Resolve each argument to the ``.py`` files it names, minus the exclusions.
+    """Resolve each argument to the ``.py`` files it names.
 
-    An explicitly named file is subject to ``is_excluded`` too, not just walked
-    ones — otherwise ``--fix path/to/foo_pb2.py`` rewrites a generated stub.
+    A file argument is filtered through ``is_excluded``; a directory argument is
+    walked. Gitignored paths are dropped from both. An argument that names neither
+    is fatal: a formatting gate that silently collects nothing from a mistyped
+    scope reports success on code it never looked at.
     """
     paths: list[Path] = []
     for arg in args:
         path = Path(arg)
-        if path.is_file() and path.suffix == ".py" and not is_excluded(path):
-            paths.append(path)
+        if path.is_file() and path.suffix == ".py":
+            if not is_excluded(path):
+                paths.append(path)
         elif path.is_dir():
             paths.extend(walk_python_files(path))
+        else:
+            raise SystemExit(f"no such path: {arg}")
 
     return drop_gitignored(paths)
 

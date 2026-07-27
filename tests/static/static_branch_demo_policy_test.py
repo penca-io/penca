@@ -20,6 +20,7 @@ import importlib.util
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 DEMO = Path(__file__).parents[2] / "examples/branch_demo.py"
 
@@ -279,6 +280,7 @@ class _FailingClient:
         fail_create_schema: bool = False,
         fail_delete_catalog: bool = False,
         fail_abort_tx: bool = False,
+        fail_write_data: bool = False,
     ):
         # A fail_* flag with no exception to raise is a test that pins nothing —
         # the vacuity class this fake exists to avoid, one forgotten kwarg away.
@@ -288,6 +290,7 @@ class _FailingClient:
                 fail_create_schema,
                 fail_delete_catalog,
                 fail_abort_tx,
+                fail_write_data,
             )
         ), "a fail_* flag without raises never fails"
         # fail_delete_branch is a uuid, not a bool: True would compare equal to no
@@ -301,6 +304,7 @@ class _FailingClient:
         self.fail_create_schema = fail_create_schema
         self.fail_delete_catalog = fail_delete_catalog
         self.fail_abort_tx = fail_abort_tx
+        self.fail_write_data = fail_write_data
         self.deleted: list[str] = []
         self.aborted: list[str] = []
         self.deleted_catalogs: list[str] = []
@@ -324,6 +328,18 @@ class _FailingClient:
         self._maybe_raise(self.fail_create_schema)
 
         return "schema-uuid"
+
+    def create_table(self, *args, **kwargs) -> str:
+        return "table-uuid"
+
+    def begin_tx(self, *args, **kwargs):
+        return SimpleNamespace(tx_uuid="tx")
+
+    def write_data(self, *args, **kwargs) -> None:
+        self._maybe_raise(self.fail_write_data)
+
+    def commit_tx(self, *args, **kwargs):
+        return SimpleNamespace(commit_seq_num=1)
 
     def delete_catalog(self, catalog_uuid: str) -> None:
         self.deleted_catalogs.append(catalog_uuid)
@@ -477,3 +493,22 @@ def test_upsert_payloads_carry_only_the_touched_creatives():
     assert log.schema == demo.IMPRESSIONS_SCHEMA
     assert log.column("visitor_id").to_pylist() == ["v000000", "v000001", "v000002"]
     assert log.column("converted").to_pylist() == [1, 0, 0]
+
+
+def test_a_failed_seed_transaction_aborts_then_drops_the_catalog():
+    """Both halves of the unwind, in order, from one seed_prod call.
+
+    The create_schema failure path never reaches the transaction, so without this
+    the abort-then-discard ordering is unpinned: deleting commit_mutations'
+    except clause leaves the rest of the suite green.
+    """
+    client = _FailingClient(raises=RuntimeError("write failed"), fail_write_data=True)
+    try:
+        demo.seed_prod(client)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the write failure must propagate")
+
+    assert client.aborted == ["tx"], "the open tx must be aborted"
+    assert client.deleted_catalogs == ["cat"], "then the catalog must be dropped"
