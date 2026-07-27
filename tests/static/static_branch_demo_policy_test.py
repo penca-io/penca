@@ -176,11 +176,15 @@ def test_printers_emit_a_scoreboard_and_the_isolation_proof(capsys):
     )
 
 
-def test_scoreboard_survives_a_branch_that_was_never_shown_anything():
-    """A zero-impression branch must not divide by zero in the rate column."""
-    assert (
-        demo.conversion_rate(_synthetic_outcome(impressions=0).scoreboard[0]) == "n/a"
-    )
+def test_scoreboard_survives_a_branch_that_was_never_shown_anything(capsys):
+    """A zero-impression branch must not divide by zero in the rate column.
+
+    Goes through print_scoreboard, not conversion_rate: the ZeroDivisionError this
+    guards lived in the printer's comprehension, so re-inlining the division there
+    has to fail this test.
+    """
+    demo.print_scoreboard(_synthetic_outcome(impressions=0))
+    assert "n/a" in capsys.readouterr().out
 
 
 def _parse_args_with(argv: list[str]):
@@ -214,3 +218,34 @@ def test_parse_args_rejects_input_that_would_leave_debris():
             assert exit_code.code == 2, f"{argv} should exit 2 with a usage message"
         else:
             raise AssertionError(f"{argv} must be rejected before any RPC")
+
+
+def test_policy_rng_streams_are_independent_of_the_feed_and_of_each_other():
+    """The seeding claim, asserted through the demo's own policy_rngs.
+
+    A bare `seed + index` offset gave index 0 the same stream
+    build_visitor_feed's int seed produces, so a reading policy at that position
+    would explore against the very outcomes it is measuring.
+    """
+    config = demo.DemoConfig(
+        impressions=8,
+        round_size=4,
+        epsilon=demo.DEFAULT_EPSILON,
+        seed=demo.DEFAULT_SEED,
+    )
+    streams = {
+        policy_name: [rng.random() for _ in range(4)]
+        for policy_name, rng in demo.policy_rngs(config).items()
+    }
+    assert set(streams) == set(demo.POLICY_NAMES)
+
+    feed_stream = [random.Random(config.seed).random() for _ in range(4)]
+    for policy_name, stream in streams.items():
+        assert stream != feed_stream, (
+            f"{policy_name}'s stream must not match the one that built the feed"
+        )
+
+    distinct = {tuple(stream) for stream in streams.values()}
+    assert len(distinct) == len(demo.POLICY_NAMES), (
+        "each policy needs its own stream, or they explore in lockstep"
+    )

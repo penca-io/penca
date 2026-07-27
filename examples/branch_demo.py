@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -217,6 +217,41 @@ def choose_creative(
     raise ValueError(msg)
 
 
+def abort_quietly(
+    client: PencaClient, catalog_uuid: str, tx_uuid: str, branch_uuid: str
+) -> None:
+    """Best-effort abort of an open tx, never masking why we are unwinding.
+
+    An open penca tx is not inert: until it times out server-side it clamps cold
+    isolation and fences purge/GC on its branch. But the abort must not replace
+    the exception that triggered it — ``abort_tx`` raises FailedPrecondition if the
+    tx actually committed (a dropped commit response lands exactly there), and if
+    the write failed because the stack is unreachable the abort fails too.
+    ``Exception``, not ``BaseException``, so a second Ctrl-C still gets through.
+    """
+    try:
+        client.abort_tx(tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+    except Exception as exc:
+        print(f"  (could not abort tx {tx_uuid}: {exc})")
+
+
+def discard_branches(
+    client: PencaClient, catalog_uuid: str, branch_uuids: Iterable[str]
+) -> None:
+    """Delete every branch, attempting all of them even if one fails.
+
+    Guarded per branch for two reasons: one failure must not strand the rest, and
+    when this runs from a ``finally`` an unguarded raise would replace the
+    exception being propagated — and the usual reason a delete fails is that the
+    stack is unreachable, i.e. exactly the error worth keeping.
+    """
+    for branch_uuid in branch_uuids:
+        try:
+            client.delete_branch(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+        except Exception as exc:
+            print(f"  (could not delete branch {branch_uuid}: {exc})")
+
+
 def seed_prod(client: PencaClient) -> ProdContext:
     """Create the prod catalog, the two tables, and commit the zeroed tallies."""
     catalog_uuid, main_branch_uuid = client.create_catalog(
@@ -260,29 +295,33 @@ def seed_prod(client: PencaClient) -> ProdContext:
         author=AUTHOR,
         comment="seed creatives with zeroed tallies",
     )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(
-            table_uuid=creatives_table_uuid,
-            upserts=pa.table(
-                {
-                    "creative_id": list(CREATIVE_IDS),
-                    "headline": [HEADLINES[c] for c in CREATIVE_IDS],
-                    "impressions": [0] * len(CREATIVE_IDS),
-                    "conversions": [0] * len(CREATIVE_IDS),
-                },
-                schema=CREATIVES_SCHEMA,
+    try:
+        client.write_data(
+            tx.tx_uuid,
+            Mutation(
+                table_uuid=creatives_table_uuid,
+                upserts=pa.table(
+                    {
+                        "creative_id": list(CREATIVE_IDS),
+                        "headline": [HEADLINES[c] for c in CREATIVE_IDS],
+                        "impressions": [0] * len(CREATIVE_IDS),
+                        "conversions": [0] * len(CREATIVE_IDS),
+                    },
+                    schema=CREATIVES_SCHEMA,
+                ),
             ),
-        ),
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-    )
-    committed = client.commit_tx(
-        tx.tx_uuid,
-        catalog_uuid=catalog_uuid,
-        branch_uuid=main_branch_uuid,
-    )
+            catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
+            branch_uuid=main_branch_uuid,
+        )
+        committed = client.commit_tx(
+            tx.tx_uuid,
+            catalog_uuid=catalog_uuid,
+            branch_uuid=main_branch_uuid,
+        )
+    except BaseException:
+        abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
+        raise
 
     return ProdContext(
         catalog_uuid=catalog_uuid,
@@ -301,16 +340,23 @@ def fork_branches(client: PencaClient, prod: ProdContext) -> dict[str, str]:
     provably start from one identical view of prod, rather than from whatever the
     head happened to be when each call landed.
     """
-    return {
-        policy_name: client.create_branch(
-            policy_name,
-            AUTHOR,
-            f"fork {policy_name} off main",
-            commit_seq_num=prod.seed_commit_seq_num,
-            catalog_uuid=prod.catalog_uuid,
-        ).branch_uuid
-        for policy_name in POLICY_NAMES
-    }
+    created: dict[str, str] = {}
+    try:
+        for policy_name in POLICY_NAMES:
+            created[policy_name] = client.create_branch(
+                policy_name,
+                AUTHOR,
+                f"fork {policy_name} off main",
+                commit_seq_num=prod.seed_commit_seq_num,
+                catalog_uuid=prod.catalog_uuid,
+            ).branch_uuid
+    except BaseException:
+        # A failure on the second or third fork would otherwise leave the earlier
+        # ones live: run_demo's finally only covers branches it was handed.
+        discard_branches(client, prod.catalog_uuid, created.values())
+        raise
+
+    return created
 
 
 def read_tallies(
@@ -446,14 +492,7 @@ def drive_round(
             branch_uuid=branch_uuid,
         )
     except BaseException:
-        # An open penca tx is not inert: until it times out server-side it clamps
-        # cold isolation and fences purge/GC on this branch. Abort on any exit,
-        # Ctrl-C included, so a failed demo leaves nothing holding the stack.
-        client.abort_tx(
-            tx.tx_uuid,
-            catalog_uuid=prod.catalog_uuid,
-            branch_uuid=branch_uuid,
-        )
+        abort_quietly(client, prod.catalog_uuid, tx.tx_uuid, branch_uuid)
         raise
 
     return outcomes
@@ -480,6 +519,20 @@ def collect_branch_outcome(
     )
 
 
+def policy_rngs(config: DemoConfig) -> dict[str, random.Random]:
+    """One RNG per policy, so exploration is reproducible per branch.
+
+    Seeded on a ``"seed:name"`` string rather than ``seed + index``: a bare offset
+    gives index 0 the same stream ``build_visitor_feed``'s int seed produces, so a
+    reading policy at that position would explore against the very outcomes that
+    stream generated. A str seed cannot collide with the feed's int seed.
+    """
+    return {
+        policy_name: random.Random(f"{config.seed}:{policy_name}")
+        for policy_name in POLICY_NAMES
+    }
+
+
 def run_demo(
     client: PencaClient,
     config: DemoConfig,
@@ -495,16 +548,7 @@ def run_demo(
     feed = build_visitor_feed(config)
     prod = seed_prod(client)
     branches = fork_branches(client, prod)
-    # One RNG per policy, seeded off the run seed, so epsilon's exploration is
-    # reproducible and independent of how many rounds the other branches ran.
-    # Seeded on a "seed:name" string, not seed + index: a bare offset gives
-    # position 0 the same stream build_visitor_feed's int seed produced, which
-    # would couple a policy at that position to the very outcomes it explores
-    # against. A str seed cannot collide with the feed's int seed.
-    rngs = {
-        policy_name: random.Random(f"{config.seed}:{policy_name}")
-        for policy_name in POLICY_NAMES
-    }
+    rngs = policy_rngs(config)
 
     try:
         for round_index, start in enumerate(
@@ -540,12 +584,10 @@ def run_demo(
         ).num_rows
     finally:
         # finally, not straight-line: the docstring promises the forks are thrown
-        # away, and a failed run is exactly when leaving three live branches (and
-        # the prod_* catalog) behind would hurt most.
-        for branch_uuid in branches.values():
-            client.delete_branch(
-                catalog_uuid=prod.catalog_uuid, branch_uuid=branch_uuid
-            )
+        # away, and a failed run is exactly when leaving three live branches behind
+        # would hurt most. The prod_* catalog deliberately survives — prod
+        # outliving its forks is the thing being demonstrated.
+        discard_branches(client, prod.catalog_uuid, branches.values())
 
     remaining = tuple(
         sorted(
