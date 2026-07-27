@@ -146,6 +146,14 @@ def test_demo_forks_diverges_and_isolates_main():
     by_name = {branch.branch_name: branch for branch in outcome.scoreboard}
     assert set(by_name) == {"even", "greedy", "epsilon"}
 
+    # run_demo owns the ranking, not print_scoreboard, so it has to be asserted on
+    # the outcome — and only real differing conversions can tell ascending from
+    # descending. The acceptance criterion is a ranked scoreboard.
+    ranked = [branch.conversions for branch in outcome.scoreboard]
+    assert ranked == sorted(ranked, reverse=True), (
+        f"the scoreboard must be ranked best-first, saw {ranked}"
+    )
+
     even = by_name["even"].conversions
     assert by_name["greedy"].conversions > even, (
         f"greedy reads its own tallies and must beat the fixed split; "

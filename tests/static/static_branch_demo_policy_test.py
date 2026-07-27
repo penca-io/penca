@@ -223,6 +223,10 @@ def test_parse_args_accepts_the_defaults():
     assert config.impressions == demo.DEFAULT_IMPRESSIONS
     assert config.round_size == demo.DEFAULT_ROUND_SIZE
     assert config.seed == demo.DEFAULT_SEED
+    # epsilon was the one omitted: default=0.0 passes every other test and
+    # collapses the shipped epsilon branch into greedy on the exact command the
+    # README tells launch readers to run.
+    assert config.epsilon == demo.DEFAULT_EPSILON
 
 
 def test_parse_args_rejects_input_that_would_leave_debris():
@@ -303,6 +307,8 @@ class _FailingClient:
         fail_abort_tx: bool = False,
         fail_write_data: bool = False,
         fail_create_branch_on_call: int | None = None,
+        fail_read_data: bool = False,
+        fail_commit_tx: bool = False,
         tallies: dict[str, tuple[int, int]] | None = None,
     ):
         # A fail_* flag with no exception to raise is a test that pins nothing —
@@ -315,6 +321,8 @@ class _FailingClient:
                 fail_abort_tx,
                 fail_write_data,
                 fail_create_branch_on_call,
+                fail_read_data,
+                fail_commit_tx,
             )
         ), "a fail_* flag without raises never fails"
         # fail_delete_branch is a uuid, not a bool: True would compare equal to no
@@ -330,6 +338,8 @@ class _FailingClient:
         self.fail_abort_tx = fail_abort_tx
         self.fail_write_data = fail_write_data
         self.fail_create_branch_on_call = fail_create_branch_on_call
+        self.fail_read_data = fail_read_data
+        self.fail_commit_tx = fail_commit_tx
         # What read_data serves back as the branch's committed tallies.
         # Derived, not hardcoded: a change to CREATIVES would otherwise leave the
         # fake serving run_demo a stale candidate set.
@@ -390,11 +400,13 @@ class _FailingClient:
 
     def commit_tx(self, tx_uuid, *args, **kwargs):
         self.calls.append(f"commit_tx:{tx_uuid}")
+        self._maybe_raise(self.fail_commit_tx)
 
         return SimpleNamespace(commit_seq_num=1)
 
     def read_data(self, *args, **kwargs):
         self.calls.append("read_data")
+        self._maybe_raise(self.fail_read_data)
         creative_ids = list(self.tallies)
         if kwargs.get("columns") == ["creative_id", "converted"]:
             return pa.table(
@@ -823,4 +835,192 @@ def test_choose_creative_routes_epsilon_to_the_explorer():
 
     assert len(explored) > 1, (
         f"always-explore must reach more than one creative, saw {explored}"
+    )
+
+
+def _small_config():
+    return demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
+
+
+def test_a_failed_round_propagates_its_own_error_not_the_discard_error():
+    """The `completed` flag must start False.
+
+    Initialised True, a run that dies mid-round and then also fails a delete
+    reports "could not discard branches" instead of the read failure that actually
+    ended it — cleanup masking the cause, which is the whole reason for the flag.
+    """
+    client = _FailingClient(
+        raises=RuntimeError("round read failed"),
+        fail_read_data=True,
+        fail_delete_branch=f"uuid-{demo.POLICY_NAMES[0]}",
+    )
+
+    try:
+        demo.run_demo(client, _small_config())
+    except RuntimeError as exc:
+        assert "round read failed" in str(exc), (
+            f"the round failure must survive the cleanup, saw: {exc}"
+        )
+    else:
+        raise AssertionError("the round failure must propagate")
+
+
+def test_a_green_run_that_cannot_discard_fails_loudly():
+    """raise_for_undeleted must actually be called.
+
+    Deleting the call site leaves the helper's own test green while the demo exits
+    0 with live forks — and print_isolation would list them right above "N
+    parallel universes ran against it and were thrown away".
+    """
+    client = _FailingClient(
+        raises=RuntimeError("delete refused"),
+        fail_delete_branch=f"uuid-{demo.POLICY_NAMES[0]}",
+    )
+
+    try:
+        demo.run_demo(client, _small_config())
+    except RuntimeError as exc:
+        assert "could not be discarded" in str(exc), exc
+        assert demo.POLICY_NAMES[0] in str(exc), exc
+    else:
+        raise AssertionError("a green run with an undeleted branch must raise")
+
+
+def test_run_demo_drops_the_catalog_when_a_fork_fails():
+    """run_demo's own post-fork unwind, distinct from fork_branches' internal one.
+
+    fork_branches discards the forks it made; only run_demo's wrapper drops the
+    catalog, so deleting that leaves a prod_<hex> behind on every failed fork.
+    """
+    client = _FailingClient(
+        raises=RuntimeError("second fork failed"), fail_create_branch_on_call=2
+    )
+
+    try:
+        demo.run_demo(client, _small_config())
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the fork failure must propagate")
+
+    assert client.deleted_catalogs == ["cat"], (
+        f"a failed fork must not strand the catalog, saw {client.deleted_catalogs}"
+    )
+
+
+def test_a_failed_commit_still_aborts_the_transaction():
+    """commit_tx belongs inside commit_mutations' try.
+
+    Moved out, a commit that fails leaves the tx open — and an open penca tx
+    clamps cold isolation and fences purge/GC on its branch until it times out.
+    """
+    client = _FailingClient(raises=RuntimeError("commit refused"), fail_commit_tx=True)
+
+    try:
+        demo.commit_mutations(
+            client,
+            catalog_uuid="cat",
+            schema_uuid="schema",
+            branch_uuid="branch",
+            comment="one mutation",
+            mutations=["m1"],
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the commit failure must propagate")
+
+    assert client.aborted == ["tx"], (
+        f"a failed commit must still abort the tx, saw {client.aborted}"
+    )
+
+
+def test_scoreboard_prints_best_first_with_a_stable_creative_order(capsys):
+    """The printed artifact is the launch deliverable, so pin its order.
+
+    Substring presence alone survives flipping the sort — which prints the
+    scoreboard worst-first, against the acceptance criterion — and survives
+    dropping the per-creative tie-break, which is what makes the block
+    reproducible for a screenshot.
+    """
+    branches = tuple(
+        demo.BranchOutcome(
+            branch_name=name,
+            branch_uuid=f"uuid-{name}",
+            impressions=100,
+            conversions=conversions,
+            # Equal impressions, inserted in REVERSE id order: only the id
+            # tie-break can reorder them, because a stable sort on impressions
+            # alone preserves insertion order — and CREATIVE_IDS is itself
+            # alphabetical, so inserting in its own order would prove nothing.
+            per_creative=dict.fromkeys(reversed(demo.CREATIVE_IDS), (25, 1)),
+            log_conversions=conversions,
+            log_impressions=100,
+        )
+        for name, conversions in (("epsilon", 30), ("greedy", 20), ("even", 10))
+    )
+    outcome = demo.DemoOutcome(
+        catalog_uuid="cat",
+        scoreboard=branches,
+        main_tallies=dict.fromkeys(demo.CREATIVE_IDS, (0, 0)),
+        main_impression_rows=0,
+        remaining_branches=("main",),
+    )
+
+    demo.print_scoreboard(outcome)
+    printed = capsys.readouterr().out
+
+    ranks = [printed.index(name) for name in ("epsilon", "greedy", "even")]
+    assert ranks == sorted(ranks), (
+        f"the scoreboard must print best-first, saw {printed}"
+    )
+
+    allocation = printed.split("Where each branch spent")[1]
+    first_block = allocation.split("epsilon")[1:5]
+    seen = [line for line in "".join(first_block).splitlines() if line.strip()]
+    creative_order = [
+        creative
+        for creative in demo.CREATIVE_IDS
+        if any(creative in line for line in seen)
+    ]
+    positions = [
+        min(index for index, line in enumerate(seen) if creative in line)
+        for creative in creative_order
+    ]
+    assert positions == sorted(positions), (
+        f"tied creatives must print in creative_id order, saw {creative_order}"
+    )
+
+
+def test_main_wires_the_per_round_printer():
+    """main must pass on_round, or an asciinema shows a silent pause.
+
+    Nothing else reaches print_round: run_demo defaults it to None.
+    """
+    captured = {}
+
+    def fake_run_demo(client, config, on_round=None):
+        captured["on_round"] = on_round
+
+        return _synthetic_outcome()
+
+    original_run, original_client, original_argv = (
+        demo.run_demo,
+        demo.PencaClient,
+        sys.argv,
+    )
+    demo.run_demo = fake_run_demo
+    demo.PencaClient = SimpleNamespace(from_settings=lambda: _FailingClient())
+    sys.argv = ["branch_demo.py", "--impressions", "2", "--round-size", "2"]
+    try:
+        demo.main()
+    finally:
+        demo.run_demo, demo.PencaClient, sys.argv = (
+            original_run,
+            original_client,
+            original_argv,
+        )
+
+    assert captured["on_round"] is demo.print_round, (
+        f"main must wire print_round, saw {captured['on_round']}"
     )
