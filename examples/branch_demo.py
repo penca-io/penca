@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
-"""Shared visitor feed and allocation policies for Penca's branch demo.
+"""Branchable OLTP + OLAP on one open columnar copy of your data.
+
+Open-source and self-hostable on object storage — no second system, no ETL.
+
+Forks three branches off `main`, drives one shared deterministic visitor feed
+through all three, and lets each branch's ad-allocation policy read back its
+*own* committed tallies to steer the next round — transacting and reading
+analytically against the same copy of the data, in one loop. Then it scores the
+branches against each other and throws all three away; prod is never touched.
+
+`even` splits traffic evenly and reads nothing: it is the foil. `greedy` and
+`epsilon` reallocate from what they just wrote, which is the whole point. The
+policies are deliberately toy — the database mechanic is the product here, not
+the bandit.
 
 Requires Docker services running: just penca-up
 """
 
 from __future__ import annotations
 
+import argparse
 import random
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -501,3 +515,113 @@ def run_demo(
         main_impression_rows=main_impression_rows,
         remaining_branches=remaining,
     )
+
+
+def print_round(
+    round_index: int, policy_name: str, outcomes: Sequence[tuple[int, str, int]]
+) -> None:
+    """One line per branch-round, so the policies visibly diverge as it runs."""
+    shown = sorted({creative_id for _v, creative_id, _o in outcomes})
+    converted = sum(converted for _v, _c, converted in outcomes)
+    print(
+        f"  round {round_index:>4}  {policy_name:<8} -> {', '.join(shown):<34}"
+        f" {converted:>3} conversions"
+    )
+
+
+def print_scoreboard(outcome: DemoOutcome) -> None:
+    """Cross-branch scoreboard, then each branch's allocation."""
+    print("\n--- Cross-branch scoreboard (ranked) ---")
+    print(
+        pa.table(
+            {
+                "branch": [branch.branch_name for branch in outcome.scoreboard],
+                "impressions": [branch.impressions for branch in outcome.scoreboard],
+                "conversions": [branch.conversions for branch in outcome.scoreboard],
+                "rate": [
+                    f"{branch.conversions / branch.impressions:.2%}"
+                    for branch in outcome.scoreboard
+                ],
+            }
+        )
+        .to_pandas()
+        .to_markdown(index=False)
+    )
+
+    print("\n--- Where each branch spent its traffic ---")
+    rows = [
+        (branch.branch_name, creative_id, shown, converted)
+        for branch in outcome.scoreboard
+        for creative_id, (shown, converted) in sorted(
+            branch.per_creative.items(), key=lambda item: -item[1][0]
+        )
+    ]
+    print(
+        pa.table(
+            {
+                "branch": [row[0] for row in rows],
+                "creative": [row[1] for row in rows],
+                "impressions": [row[2] for row in rows],
+                "conversions": [row[3] for row in rows],
+            }
+        )
+        .to_pandas()
+        .to_markdown(index=False)
+    )
+
+
+def print_isolation(outcome: DemoOutcome) -> None:
+    """Prod's own state after the run, and the post-discard branch list."""
+    print("\n--- prod (main) after the run ---")
+    creative_ids = sorted(outcome.main_tallies)
+    print(
+        pa.table(
+            {
+                "creative": creative_ids,
+                "impressions": [outcome.main_tallies[c][0] for c in creative_ids],
+                "conversions": [outcome.main_tallies[c][1] for c in creative_ids],
+            }
+        )
+        .to_pandas()
+        .to_markdown(index=False)
+    )
+    print(f"\nprod impression log: {outcome.main_impression_rows} rows")
+    print(f"branches remaining after discard: {', '.join(outcome.remaining_branches)}")
+    print(
+        "\nprod is intact. Three parallel universes ran against it and were thrown away."
+    )
+
+
+def parse_args() -> DemoConfig:
+    parser = argparse.ArgumentParser(
+        description="Branchable OLTP + OLAP on one open columnar copy of your data."
+    )
+    parser.add_argument("--impressions", type=int, default=DEFAULT_IMPRESSIONS)
+    parser.add_argument("--round-size", type=int, default=DEFAULT_ROUND_SIZE)
+    parser.add_argument("--epsilon", type=float, default=DEFAULT_EPSILON)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    args = parser.parse_args()
+
+    return DemoConfig(
+        impressions=args.impressions,
+        round_size=args.round_size,
+        epsilon=args.epsilon,
+        seed=args.seed,
+    )
+
+
+def main() -> None:
+    config = parse_args()
+    print(
+        f"Forking {len(POLICY_NAMES)} branches off main, driving {config.impressions} "
+        f"shared impressions at {config.round_size} per transaction.\n"
+    )
+
+    outcome = run_demo(PencaClient.from_settings(), config, on_round=print_round)
+
+    print_scoreboard(outcome)
+    print_isolation(outcome)
+
+
+if __name__ == "__main__":
+    main()
