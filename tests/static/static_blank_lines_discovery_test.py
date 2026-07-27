@@ -237,11 +237,13 @@ def test_stub_exclusion_agrees_with_ruff_config():
         f"built-in defaults. Section was:\n{ruff_section}"
     )
     entries = ruff_section.split("extend-exclude = [", 1)[1].split("]", 1)[0]
-    # Quoted lines only: "any non-blank line" turns a comment inside the array into
-    # a bogus member and reds a legal pyproject edit. The plain-`exclude` mutant is
-    # already killed by the extend-exclude assertion above.
+    # Quoted lines only, with any trailing comment dropped first: "any non-blank
+    # line" turns a whole-line comment into a bogus member, and stripping before
+    # splitting leaves an inline `# why` attached to the entry. Either reds a legal
+    # pyproject edit. The plain-`exclude` mutant is killed by the assertion above,
+    # not by this parser, so it can afford to be tolerant.
     excluded = {
-        line.strip().strip(',"')
+        line.split("#", 1)[0].strip().strip(',"')
         for line in entries.splitlines()
         if line.strip().startswith('"')
     }
