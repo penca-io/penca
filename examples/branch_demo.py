@@ -139,10 +139,13 @@ def build_visitor_feed(config: DemoConfig) -> tuple[tuple[int, ...], ...]:
 def smoothed_rate(tally: tuple[int, int]) -> float:
     """Laplace-smoothed conversion rate for one creative's ``(shown, converted)``.
 
-    The +1/+2 prior scores an untried creative at 0.5 — above any rate this demo
-    can measure — so a greedy policy sweeps every creative once before it locks
-    on. Without the prior all four start at 0/0 and the tie-break alone decides,
-    which pins greedy to the first creative forever.
+    The +1/+2 prior scores an untried creative at 0.5, above any rate a creative
+    with real exposure can measure at this demo's true rates. So greedy is pulled
+    toward creatives it has not tried yet, and its exploration is driven by
+    evidence rather than by the id tie-break — without the prior all four start at
+    0/0 and the tie-break alone pins greedy to the first creative forever. This is
+    a bias, not a guaranteed one-pass sweep: a creative whose first exposure
+    converts scores above 0.5 and can be re-picked immediately.
     """
     shown, converted = tally
 
@@ -155,10 +158,19 @@ def pick_even(visitor_index: int) -> str:
 
 
 def pick_greedy(tallies: Mapping[str, tuple[int, int]]) -> str:
-    """Best smoothed rate so far, ties broken by ``creative_id`` for determinism."""
+    """Best smoothed rate so far, ties broken by ``creative_id`` for determinism.
+
+    Ranks over ``CREATIVE_IDS`` rather than over ``tallies``' keys, so the
+    candidate set matches the other two policies no matter what the read returned:
+    a creative missing from ``tallies`` counts as untried instead of becoming
+    unreachable for the rest of the run.
+    """
     ranked = sorted(
-        tallies,
-        key=lambda creative_id: (-smoothed_rate(tallies[creative_id]), creative_id),
+        CREATIVE_IDS,
+        key=lambda creative_id: (
+            -smoothed_rate(tallies.get(creative_id, (0, 0))),
+            creative_id,
+        ),
     )
 
     return ranked[0]
