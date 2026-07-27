@@ -35,6 +35,11 @@ def test_audit_demo_runs_the_documented_walkthrough():
     assert result.returncode == 0, result.stderr[-4000:]
 
     stdout = result.stdout
+    # Both audit sections must print the upsert/delete split the slices key on. A
+    # bare `"Deletes:" in stdout` would pass on either one alone, and the missing
+    # section would then surface as an unpack error rather than an assertion.
+    assert stdout.count("Deletes:") == 2, stdout[-2000:]
+
     for marker in (
         "TX 1 committed",
         "TX 2 committed",
@@ -46,9 +51,6 @@ def test_audit_demo_runs_the_documented_walkthrough():
         "--- Full audit trail (audit_data) ---",
         "--- Audit trail (after TX 1 only) ---",
         "--- Time-travel: state as of TX 1 ---",
-        # The upsert/delete split key the slices below use, checked here for the
-        # same reason as the dashed headers.
-        "Deletes:",
     ):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 

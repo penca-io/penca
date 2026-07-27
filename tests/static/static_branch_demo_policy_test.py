@@ -8,9 +8,11 @@ that runs before a merge covers the policies at all (roborev finding on
 ``static_kata_plan_html_test.py`` loads its generator, and pin only the
 Penca-owned decision logic: the tie-break that keeps a run reproducible, the
 prior that drives exploration off evidence rather than off the id ordering, the
-fixed-split foil's wraparound, the unknown-policy failure, and — against a
-hand-built ``DemoOutcome``, no engine needed — that the printers and the CLI's
-input validation hold up. No Docker, no fixtures, no penca services — runs under
+fixed-split foil's wraparound, the unknown-policy failure, the round pipeline
+(``allocate_round``'s one-call-per-visitor contract and its rng state,
+``apply_outcomes``' copy-fold, both upsert payloads), the cleanup helpers' promise
+not to mask the exception they are unwinding, and — against a hand-built
+``DemoOutcome``, no engine needed — the printers and the CLI's input validation. No Docker, no fixtures, no penca services — runs under
 ``just static-test branch_demo_policy`` and ``just check``.
 """
 
@@ -453,13 +455,20 @@ def test_allocate_round_calls_the_policy_once_per_visitor_in_order():
 
 
 def test_allocate_round_reads_each_visitors_own_latent_outcome():
-    feed = [[1, 0, 0, 0], [0, 0, 0, 0]]
-    got = demo.allocate_round("even", [0, 1], {}, feed, random.Random(0), 0.0)
+    """The visitor → row, creative → column coupling.
 
-    # pick_even sends visitor 0 to CREATIVE_IDS[0] and visitor 1 to CREATIVE_IDS[1].
+    Visitor 5 is deliberately neither its loop position (0) nor its creative
+    position (1), and only ``feed[5][1]`` is non-zero. So reading the row by loop
+    position yields ``feed[0][1] == 0`` and fails, and reading the column by
+    visitor index yields ``feed[5][5]`` and raises — both mis-indexings a weaker
+    fixture would let through.
+    """
+    feed = [[0, 0, 0, 0]] * 5 + [[0, 1, 0, 0]]
+    got = demo.allocate_round("even", [5, 0], {}, feed, random.Random(0), 0.0)
+
     assert got == (
-        (0, demo.CREATIVE_IDS[0], 1),
-        (1, demo.CREATIVE_IDS[1], 0),
+        (5, demo.CREATIVE_IDS[1], 1),
+        (0, demo.CREATIVE_IDS[0], 0),
     )
 
 
@@ -489,9 +498,15 @@ def test_upsert_payloads_carry_only_the_touched_creatives():
         )
     ) == {"banner": 1, "story": 2}
 
+    assert tallies.column("headline").to_pylist() == [
+        demo.HEADLINES["banner"],
+        demo.HEADLINES["story"],
+    ], "each row must carry its own creative's headline"
+
     log = demo.impression_upserts(outcomes)
     assert log.schema == demo.IMPRESSIONS_SCHEMA
     assert log.column("visitor_id").to_pylist() == ["v000000", "v000001", "v000002"]
+    assert log.column("creative_id").to_pylist() == ["story", "banner", "story"]
     assert log.column("converted").to_pylist() == [1, 0, 0]
 
 
