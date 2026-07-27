@@ -12,14 +12,25 @@ Usage:
 
 Without --fix, prints violations and exits non-zero if any found.
 With --fix, inserts missing blank lines in-place.
-If no paths are given, defaults to packages/penca-client/src/penca_client/.
+If no paths are given, defaults to the whole repo, matching `just lint` /
+`just format-check` and the repo-wide pre-commit hook.
 """
 
 from __future__ import annotations
 
 import ast
+import subprocess
 import sys
 from pathlib import Path
+
+# Never checked. The generated proto stubs must stay byte-identical to
+# `just compile-protos-py` output — the pre-commit hook excludes them, and this
+# script has no exclusion config of its own. The rest are build/venv trees that a
+# repo-root walk would otherwise pull in; ruff gets these from its own defaults.
+EXCLUDED_DIR_NAMES = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", "target", "build", "dist"}
+)
+EXCLUDED_SUBTREES = (Path("packages/penca-proto/src/penca_proto"),)
 
 COMPOUND_TYPES = (
     ast.If,
@@ -122,12 +133,50 @@ def process_file(file_path: Path, fix: bool) -> list[str]:
     return messages
 
 
+def is_excluded(path: Path) -> bool:
+    if EXCLUDED_DIR_NAMES & set(path.parts):
+        return True
+
+    parents = set(path.parents)
+
+    return any(subtree in parents for subtree in EXCLUDED_SUBTREES)
+
+
+def drop_gitignored(paths: list[Path]) -> list[Path]:
+    """Filter out gitignored paths, the way ruff's respect-gitignore does.
+
+    Without this, a repo-root walk picks up scratch trees like the gitignored
+    ``tests/tdd/``, so anyone with local scratch files would see
+    ``just format-check`` fail on code that is not in the repo. One batched
+    ``git check-ignore`` call rather than one per file.
+    """
+    if not paths:
+        return paths
+
+    result = subprocess.run(
+        ["git", "check-ignore", "--stdin"],
+        input="\n".join(str(path) for path in paths),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Exit 0 = some paths ignored, 1 = none ignored. Anything else is a real
+    # failure (not a git repo, git missing) and should not silently widen the set.
+    if result.returncode not in (0, 1):
+        msg = f"git check-ignore failed: {result.stderr.strip()}"
+        raise RuntimeError(msg)
+
+    ignored = {line for line in result.stdout.splitlines() if line}
+
+    return [path for path in paths if str(path) not in ignored]
+
+
 def main() -> int:
     fix = "--fix" in sys.argv
     args = [arg for arg in sys.argv[1:] if arg != "--fix"]
 
     if not args:
-        args = ["packages/penca-client/src/penca_client/"]
+        args = ["."]
 
     paths: list[Path] = []
     for arg in args:
@@ -135,10 +184,12 @@ def main() -> int:
         if path.is_file() and path.suffix == ".py":
             paths.append(path)
         elif path.is_dir():
-            paths.extend(sorted(path.rglob("*.py")))
+            paths.extend(
+                sorted(found for found in path.rglob("*.py") if not is_excluded(found))
+            )
 
     all_messages: list[str] = []
-    for file_path in paths:
+    for file_path in drop_gitignored(paths):
         all_messages.extend(process_file(file_path, fix))
 
     for message in all_messages:

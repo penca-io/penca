@@ -28,7 +28,11 @@ line-length = 88
 # explicitly (pre-commit and `ruff format <path>` both do), so committed
 # generated stubs stay byte-identical to `just compile-protos-py` output.
 force-exclude = true
-exclude = [
+# extend-exclude, not exclude: `exclude` REPLACES ruff's built-in default list,
+# which would drop .venv / build / dist / node_modules now that lint and format
+# discover from the repo root. Extending leaves the defaults in force rather than
+# resting the guarantee on .gitignore.
+extend-exclude = [
     "packages/penca-proto/src/penca_proto",
 ]
 
