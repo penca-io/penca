@@ -450,12 +450,26 @@ docker-ensure:
 # blocks non-interactive callers (CI, AI agents). Ensure Docker is
 # running before invoking this recipe.
 [arg("profile", long)]
-penca-up profile="test": vm-gc
+[arg("db", long)]
+penca-up profile="dev" db="": vm-gc
     #!/usr/bin/env bash
     set -euo pipefail
 
     compose_files="-f docker/compose.yml"
     env_file="--env-file docker/{{profile}}.env"
+
+    # --db <dir>: persist Postgres and the object store under a host directory
+    # instead of Docker-managed volumes, so the stack survives `penca-down` and
+    # can be used as a real database. Compose substitutes these into the volume
+    # short form, where a leading `/` makes it a bind mount; unset, the defaults
+    # in compose.yml keep the named volumes and nothing changes.
+    if [ -n "{{db}}" ]; then
+        db_dir="$(mkdir -p "{{db}}" && cd "{{db}}" && pwd)"
+        mkdir -p "$db_dir/pg" "$db_dir/s3"
+        export PENCA_PG_VOLUME="$db_dir/pg"
+        export PENCA_S3_VOLUME="$db_dir/s3"
+        echo "Persistent storage: $db_dir (pg/ and s3/)"
+    fi
     # Every service in both compose files is tagged with a profile (`infra`
     # or `penca-backend`), so a plain `docker compose up` would start
     # nothing. Activate both profiles for every invocation that acts on
@@ -504,6 +518,11 @@ penca-up profile="test": vm-gc
         docker/template.baseline.env > docker/.baseline.env
 
     echo "Profile: {{profile}}"
+    if [ -n "{{db}}" ]; then
+        echo "Storage: ${PENCA_PG_VOLUME%/pg} (persistent — survives penca-down)"
+    else
+        echo "Storage: docker volumes (wiped by penca-down)"
+    fi
     echo "Postgres on :$pg_port, SeaweedFS on :$s3_port"
     echo "Servicers — query:$query_port write:$write_port lifecycle:$lifecycle_port"
     echo "Flight SQL — penca-sql-server:$penca_sql_port"
@@ -516,7 +535,7 @@ penca-up profile="test": vm-gc
 # the stack is removed. The basename suffix keeps parallel worktrees
 # from clobbering each other.
 [arg("profile", long)]
-penca-down profile="test":
+penca-down profile="dev":
     #!/usr/bin/env bash
     set -euo pipefail
     log_dir="/tmp/penca-logs-$(basename "$PWD")"
@@ -543,7 +562,7 @@ penca-down profile="test":
 # postgres, seaweedfs, query, write, lifecycle,
 # penca-sql-server.
 [arg("profile", long)]
-penca-logs profile="test" *services:
+penca-logs profile="dev" *services:
     docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend logs -f {{services}}
 
 # Sync labels and projects to Linear. Requires LINEAR_API_KEY.
@@ -622,11 +641,15 @@ integration-test *services:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    just penca-up
+    # --profile=test, explicitly: random ports keep parallel worktrees from
+    # colliding, and the lifecycle scheduler is idle there so its tick loop
+    # cannot race the manual Persist/Snapshot/Purge calls these suites make.
+    # penca-up defaults to the dev profile, which is the opposite of both.
+    just penca-up --profile=test
     # `penca-down` dumps per-service logs to /tmp before teardown; trap
     # guarantees teardown whether pytest passes, fails, or the shell is
     # interrupted, while preserving pytest's exit code for CI.
-    trap 'just penca-down' EXIT
+    trap 'just penca-down --profile=test' EXIT
 
     # `.client.env` — the 6 PENCA_*_URL values for PencaClient.
     # `.baseline.env` — PENCA_DB_* for white-box tests that open a direct
@@ -734,8 +757,8 @@ perf-test *paths:
         export CARGO_PROFILE=profiling
     fi
 
-    just penca-up
-    trap 'just penca-down' EXIT
+    just penca-up --profile=test
+    trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && source docker/.baseline.env && set +a
 
@@ -897,8 +920,8 @@ tdd *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    just penca-up
-    trap 'just penca-down' EXIT
+    just penca-up --profile=test
+    trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && set +a
 

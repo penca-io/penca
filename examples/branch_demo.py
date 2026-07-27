@@ -52,11 +52,9 @@ DEFAULT_IMPRESSIONS = 3000
 DEFAULT_EPSILON = 0.15
 DEFAULT_SEED = 20260727
 # Impressions per transaction. Most of a statement's cost is fixed rather than
-# per-row — measured 2026-07-27 in this loop's exact envelope, the SELECT is
-# ~153ms, the tally upsert ~103ms, and the 25-row log append ~152ms, of which
-# only ~2ms/row scales with the payload. So this knob buys wall-clock, not
-# throughput: 25 puts the default run near 2m45s, and `--round-size 1` would
-# take many times that for the same 3000 impressions. It also sets
+# per-row, so this knob mostly buys wall-clock rather than throughput:
+# `--round-size 1` is the literal per-impression loop and works, but takes many
+# times longer for the same number of impressions. It also sets
 # *decision* granularity — a round's picks are all evaluated against the one
 # SELECT taken at its start, so greedy serves the same creative for a whole
 # round. TODO(CHA-525): batching a round's statements would cut this further.

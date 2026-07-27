@@ -45,7 +45,10 @@ services:
     ports:
       - "${PG_HOST_PORT}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Variable source so `just penca-up --db <dir>` can point this at a host
+      # path for persistent storage. A value starting with `/` is a bind mount;
+      # the default is the named volume, so plain `penca-up` is unchanged.
+      - ${PENCA_PG_VOLUME:-pgdata}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U penca -d penca"]
       interval: 2s
@@ -59,7 +62,7 @@ services:
     ports:
       - "${SEAWEEDFS_HOST_PORT}:8333"
     volumes:
-      - seaweedfsdata:/data
+      - ${PENCA_S3_VOLUME:-seaweedfsdata}:/data
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status"]

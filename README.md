@@ -88,6 +88,14 @@ set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
 uv run python examples/branch_demo.py
 ```
 
+Fixed ports (Postgres 5432, Flight SQL 50060), so you can point any Flight SQL
+driver at it. To keep your data across restarts, give it a directory — both
+Postgres and the object store write there, and it survives `just penca-down`:
+
+```bash
+just penca-up --db ./penca-data
+```
+
 ### `examples/branch_demo.py` — fork, transact, read back, discard
 
 Parallel universes for a live database. The demo seeds a `prod` catalog with ad
@@ -134,7 +142,7 @@ own running results. Then a
 cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
 and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
 defaults (3000 impressions, 25 per transaction, epsilon 0.15, seed
-20260727; ~2m45s) — the run
+20260727) — the run
 reproduces, but nothing pins these particular figures, so treat them as a dated
 transcript rather than a contract:
 
@@ -534,7 +542,7 @@ Run `just` to list every recipe (Just installation is in
 | `just lint` | Run ruff linter |
 | `just format` / `just format-check` | Run / check ruff formatter + blank-line fixer |
 | `just check` | Run Python lint + format check + unit tests + static checks, plus Rust clippy / fmt-check / test. Mirrors CI. |
-| `just penca-up [profile]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `profile` = `test` (default, random ports) or `dev` (fixed ports). Requires Docker. |
+| `just penca-up [--profile P] [--db DIR]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `--profile` = `dev` (default: fixed ports, lifecycle scheduler running) or `test` (random ports so parallel worktrees don't collide, scheduler idle so it can't race the suites' manual lifecycle calls). `--db DIR` persists Postgres and the object store under a host directory, so the stack survives `penca-down`. Requires Docker. |
 | `just penca-down [profile]` | Stop servicers + infra and remove volumes. |
 | `just integration-test [services]` | Start infra, run integration tests against the Rust services, tear down. Pass service names to scope: `just integration-test lifecycle query`. Requires Docker. |
 | `just perf-test [paths]` | Start infra, run performance tests against the Rust services, tear down. `paths` scope the run to one or more dirs/files under `tests/performance/` (e.g. `grpc`, `grpc/oltp_test.py`); omit to run everything. Captures each run to `.perf/results.jsonl` and writes a static HTML report (`.perf/report-<run_id>.html`) comparing it to history; pass `--record` to also persist the run into the SQLite history. Sources `docker/.baseline.env` for the direct-Postgres baseline. Requires Docker. |
