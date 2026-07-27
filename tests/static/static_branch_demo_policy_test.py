@@ -326,6 +326,9 @@ class _FailingClient:
                 fail_commit_tx,
             )
         ), "a fail_* flag without raises never fails"
+        assert tallies is None or branch_tallies is None, (
+            "branch_tallies supersedes tallies; pass one"
+        )
         # fail_delete_branch is a uuid, not a bool: True would compare equal to no
         # branch and pass green, and the sibling flags being bools makes that slip
         # plausible.
@@ -1044,6 +1047,19 @@ def test_main_wires_the_per_round_printer():
     )
 
 
+def _one_creative(conversions: int) -> dict[str, tuple[int, int]]:
+    """Ten impressions on the first creative, `conversions` of them converting.
+
+    Derived from CREATIVE_IDS rather than hardcoded, so a change to CREATIVES
+    cannot leave these tests serving run_demo a candidate set the policies no
+    longer rank over.
+    """
+    return {
+        **dict.fromkeys(demo.CREATIVE_IDS, (0, 0)),
+        demo.CREATIVE_IDS[0]: (10, conversions),
+    }
+
+
 def test_run_demo_ranks_the_scoreboard_best_first():
     """Ranked best-first, asserted in the suite branch-PR CI actually runs.
 
@@ -1053,24 +1069,9 @@ def test_run_demo_ranks_the_scoreboard_best_first():
     """
     client = _FailingClient(
         branch_tallies={
-            "uuid-even": {
-                "banner": (10, 1),
-                "carousel": (0, 0),
-                "story": (0, 0),
-                "video": (0, 0),
-            },
-            "uuid-greedy": {
-                "banner": (10, 5),
-                "carousel": (0, 0),
-                "story": (0, 0),
-                "video": (0, 0),
-            },
-            "uuid-epsilon": {
-                "banner": (10, 9),
-                "carousel": (0, 0),
-                "story": (0, 0),
-                "video": (0, 0),
-            },
+            "uuid-even": _one_creative(1),
+            "uuid-greedy": _one_creative(5),
+            "uuid-epsilon": _one_creative(9),
         }
     )
 
@@ -1082,3 +1083,31 @@ def test_run_demo_ranks_the_scoreboard_best_first():
         f"{[(b.branch_name, b.conversions) for b in outcome.scoreboard]}"
     )
     assert len(set(ranked)) == len(ranked), "the fixture must give distinct totals"
+
+
+def test_a_tied_scoreboard_breaks_on_branch_name():
+    """The tie-break half of the sort key, which distinct totals never consult.
+
+    greedy and epsilon are tied, and their insertion order (POLICY_NAMES) is
+    reverse-alphabetical — so a stable sort without the branch_name key yields
+    greedy before epsilon. A tie between even and greedy would prove nothing,
+    since insertion order there is already alphabetical.
+    """
+    client = _FailingClient(
+        branch_tallies={
+            "uuid-even": _one_creative(1),
+            "uuid-greedy": _one_creative(9),
+            "uuid-epsilon": _one_creative(9),
+        }
+    )
+
+    outcome = demo.run_demo(client, _small_config())
+
+    assert [branch.branch_name for branch in outcome.scoreboard] == [
+        "epsilon",
+        "greedy",
+        "even",
+    ], (
+        "tied branches must order by name, keeping the screenshot reproducible; saw "
+        f"{[(b.branch_name, b.conversions) for b in outcome.scoreboard]}"
+    )
