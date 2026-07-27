@@ -310,6 +310,7 @@ class _FailingClient:
         fail_read_data: bool = False,
         fail_commit_tx: bool = False,
         tallies: dict[str, tuple[int, int]] | None = None,
+        branch_tallies: dict[str, dict[str, tuple[int, int]]] | None = None,
     ):
         # A fail_* flag with no exception to raise is a test that pins nothing —
         # the vacuity class this fake exists to avoid, one forgotten kwarg away.
@@ -342,8 +343,11 @@ class _FailingClient:
         self.fail_commit_tx = fail_commit_tx
         # What read_data serves back as the branch's committed tallies.
         # Derived, not hardcoded: a change to CREATIVES would otherwise leave the
-        # fake serving run_demo a stale candidate set.
+        # fake serving run_demo a stale candidate set. Values may be a flat map
+        # served to every branch, or keyed on branch_uuid to give each its own —
+        # which is what lets a static test give the branches distinct totals.
         self.tallies = tallies or dict.fromkeys(demo.CREATIVE_IDS, (0, 0))
+        self.branch_tallies = branch_tallies
         self.created_branches: list[str] = []
         self.fork_seq_nums: list[int | None] = []
         self.last_upserted_creatives: list[str] = []
@@ -407,7 +411,17 @@ class _FailingClient:
     def read_data(self, *args, **kwargs):
         self.calls.append("read_data")
         self._maybe_raise(self.fail_read_data)
-        creative_ids = list(self.tallies)
+        # branch_tallies gives each branch its own map, which is what lets a static
+        # test hand the branches distinct totals. A branch it does not name — main,
+        # for the isolation read — gets zeros.
+        if self.branch_tallies is None:
+            served = self.tallies
+        else:
+            served = self.branch_tallies.get(
+                str(kwargs.get("branch_uuid")), dict.fromkeys(demo.CREATIVE_IDS, (0, 0))
+            )
+
+        creative_ids = list(served)
         if kwargs.get("columns") == ["creative_id", "converted"]:
             return pa.table(
                 {"creative_id": creative_ids, "converted": [0] * len(creative_ids)}
@@ -416,8 +430,8 @@ class _FailingClient:
         return pa.table(
             {
                 "creative_id": creative_ids,
-                "impressions": [self.tallies[c][0] for c in creative_ids],
-                "conversions": [self.tallies[c][1] for c in creative_ids],
+                "impressions": [served[c][0] for c in creative_ids],
+                "conversions": [served[c][1] for c in creative_ids],
             }
         )
 
@@ -671,6 +685,10 @@ def test_commit_mutations_puts_every_mutation_in_one_transaction():
     assert seq == 1, "returns the commit's seq num"
 
 
+def _small_config():
+    return demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
+
+
 def _prod():
     return demo.ProdContext(
         catalog_uuid="cat",
@@ -739,9 +757,8 @@ def test_run_demo_forks_drives_scores_then_discards_in_that_order():
     else stopping its return.
     """
     client = _FailingClient()
-    config = demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
 
-    outcome = demo.run_demo(client, config)
+    outcome = demo.run_demo(client, _small_config())
 
     kinds = [call.split(":")[0] for call in client.calls]
     assert kinds.count("create_branch") == len(demo.POLICY_NAMES)
@@ -838,10 +855,6 @@ def test_choose_creative_routes_epsilon_to_the_explorer():
     )
 
 
-def _small_config():
-    return demo.DemoConfig(impressions=2, round_size=2, epsilon=0.0, seed=1)
-
-
 def test_a_failed_round_propagates_its_own_error_not_the_discard_error():
     """The `completed` flag must start False.
 
@@ -865,7 +878,7 @@ def test_a_failed_round_propagates_its_own_error_not_the_discard_error():
         raise AssertionError("the round failure must propagate")
 
 
-def test_a_green_run_that_cannot_discard_fails_loudly():
+def test_run_demo_raises_when_a_green_run_cannot_discard():
     """raise_for_undeleted must actually be called.
 
     Deleting the call site leaves the helper's own test green while the demo exits
@@ -881,7 +894,9 @@ def test_a_green_run_that_cannot_discard_fails_loudly():
         demo.run_demo(client, _small_config())
     except RuntimeError as exc:
         assert "could not be discarded" in str(exc), exc
-        assert demo.POLICY_NAMES[0] in str(exc), exc
+        # The uuid, not the policy name: raise_for_undeleted reports branch uuids,
+        # and this fake's uuids merely happen to embed the name.
+        assert f"uuid-{demo.POLICY_NAMES[0]}" in str(exc), exc
     else:
         raise AssertionError("a green run with an undeleted branch must raise")
 
@@ -976,8 +991,11 @@ def test_scoreboard_prints_best_first_with_a_stable_creative_order(capsys):
     )
 
     allocation = printed.split("Where each branch spent")[1]
-    first_block = allocation.split("epsilon")[1:5]
-    seen = [line for line in "".join(first_block).splitlines() if line.strip()]
+    # By line prefix, not split arithmetic: "epsilon" appears once per creative
+    # row, so splitting on it and taking a slice silently ranged over greedy's and
+    # even's rows too.
+    seen = [line for line in allocation.splitlines() if line.startswith("| epsilon")]
+    assert seen, allocation
     creative_order = [
         creative
         for creative in demo.CREATIVE_IDS
@@ -1024,3 +1042,43 @@ def test_main_wires_the_per_round_printer():
     assert captured["on_round"] is demo.print_round, (
         f"main must wire print_round, saw {captured['on_round']}"
     )
+
+
+def test_run_demo_ranks_the_scoreboard_best_first():
+    """Ranked best-first, asserted in the suite branch-PR CI actually runs.
+
+    The integration test asserts this end to end, but branch PRs skip that job. A
+    static run needs branch-distinct totals or the comparison is vacuous, so the
+    fake is keyed on branch_uuid here.
+    """
+    client = _FailingClient(
+        branch_tallies={
+            "uuid-even": {
+                "banner": (10, 1),
+                "carousel": (0, 0),
+                "story": (0, 0),
+                "video": (0, 0),
+            },
+            "uuid-greedy": {
+                "banner": (10, 5),
+                "carousel": (0, 0),
+                "story": (0, 0),
+                "video": (0, 0),
+            },
+            "uuid-epsilon": {
+                "banner": (10, 9),
+                "carousel": (0, 0),
+                "story": (0, 0),
+                "video": (0, 0),
+            },
+        }
+    )
+
+    outcome = demo.run_demo(client, _small_config())
+
+    ranked = [branch.conversions for branch in outcome.scoreboard]
+    assert ranked == sorted(ranked, reverse=True), (
+        f"the scoreboard must be ranked best-first, saw "
+        f"{[(b.branch_name, b.conversions) for b in outcome.scoreboard]}"
+    )
+    assert len(set(ranked)) == len(ranked), "the fixture must give distinct totals"
