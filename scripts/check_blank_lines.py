@@ -22,6 +22,7 @@ import ast
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 # Never checked. The generated proto stubs must stay byte-identical to
@@ -232,13 +233,12 @@ def drop_gitignored(paths: list[Path]) -> list[Path]:
     return [path for path in paths if str(path) not in ignored]
 
 
-def main() -> int:
-    fix = "--fix" in sys.argv
-    args = [arg for arg in sys.argv[1:] if arg != "--fix"]
+def collect_paths(args: Sequence[str]) -> list[Path]:
+    """Resolve each argument to the ``.py`` files it names, minus the exclusions.
 
-    if not args:
-        args = ["."]
-
+    An explicitly named file is subject to ``is_excluded`` too, not just walked
+    ones — otherwise ``--fix path/to/foo_pb2.py`` rewrites a generated stub.
+    """
     paths: list[Path] = []
     for arg in args:
         path = Path(arg)
@@ -247,8 +247,18 @@ def main() -> int:
         elif path.is_dir():
             paths.extend(walk_python_files(path))
 
+    return drop_gitignored(paths)
+
+
+def main() -> int:
+    fix = "--fix" in sys.argv
+    args = [arg for arg in sys.argv[1:] if arg != "--fix"]
+
+    if not args:
+        args = ["."]
+
     all_messages: list[str] = []
-    for file_path in drop_gitignored(paths):
+    for file_path in collect_paths(args):
         all_messages.extend(process_file(file_path, fix))
 
     for message in all_messages:
