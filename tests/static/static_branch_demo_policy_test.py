@@ -178,6 +178,9 @@ def test_printers_emit_a_scoreboard_and_the_isolation_proof(capsys):
     for policy_name in demo.POLICY_NAMES:
         assert policy_name in printed
 
+    # The evidence, not only the conclusion: deleting the remaining-branches line
+    # outright left "prod is intact" printing right above nothing.
+    assert "branches remaining after discard: main" in printed, printed
     assert "prod is intact" in printed
 
     # Patch POLICY_NAMES so the derived count differs from the real 3 — comparing
@@ -1215,7 +1218,11 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     demo.print_round(
         7,
         "epsilon",
-        ((3, demo.CREATIVE_IDS[1], 1), (4, demo.CREATIVE_IDS[2], 0)),
+        (
+            (3, demo.CREATIVE_IDS[1], 1),
+            (4, demo.CREATIVE_IDS[1], 0),
+            (5, demo.CREATIVE_IDS[2], 0),
+        ),
     )
 
     printed = capsys.readouterr().out
@@ -1227,12 +1234,77 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     # what it actually served, so `shown = [outcomes[0][1]]` — dropping everything
     # after the first — must not pass.
     assert f"{demo.CREATIVE_IDS[1]}, {demo.CREATIVE_IDS[2]}" in printed, printed
+    # And deduped: the fixture serves CREATIVE_IDS[1] twice. Without the set,
+    # a real --round-size 25 round renders "story, story, ..." twenty-five times
+    # and blows the column on all 360 lines of the asciinema.
+    assert printed.count(demo.CREATIVE_IDS[1]) == 1, printed
     # The conversion count too: `converted = 0` survived otherwise, and the count
     # is the only number in the line that changes as the run progresses. Anchored
     # on the leading space that `{converted:>3}` guarantees, since "1 conversions"
     # is itself a substring of "11 conversions" — what a count mutant prints once
     # the round size passes ten.
     assert " 1 conversions" in printed, printed
+
+
+def test_scoreboard_prints_the_numbers_it_was_handed(capsys):
+    """The printed values, not just their order — the launch artifact itself.
+
+    The order-and-tie-break test deliberately equalises `shown` across all four
+    creatives to isolate the id tie-break, which leaves the primary sort key
+    `-item[1][0]` exercised by nothing, and asserts no printed number at all. Six
+    mutants lived there: ranking the allocation ascending, ranking it by
+    conversions, swapping the impressions/conversions columns in either table, and
+    inverting or reformatting `conversion_rate` (which prints 666.67% instead of
+    15.00%, right at the top of the screenshot).
+
+    So: impressions and conversions that rank the creatives *differently*, and
+    every cell asserted by value.
+    """
+    # Ranked by impressions: [1], [2], [3], [0]. By conversions: [0], [2], [3], [1]
+    # — the exact reverse at both ends, so either mis-key reorders visibly.
+    per_creative = dict(
+        zip(demo.CREATIVE_IDS, ((10, 5), (40, 1), (30, 4), (20, 2)), strict=True)
+    )
+    branches = (
+        demo.BranchOutcome(
+            branch_name="epsilon",
+            branch_uuid="uuid-epsilon",
+            impressions=200,
+            conversions=30,
+            per_creative=per_creative,
+            log_conversions=30,
+            log_impressions=200,
+        ),
+    )
+    outcome = demo.DemoOutcome(
+        catalog_uuid="cat",
+        scoreboard=branches,
+        main_tallies=dict.fromkeys(demo.CREATIVE_IDS, (0, 0)),
+        main_impression_rows=0,
+        remaining_branches=("main",),
+    )
+
+    demo.print_scoreboard(outcome)
+    printed = capsys.readouterr().out
+    ranked, allocation = printed.split("Where each branch spent")
+
+    def cells(block):
+        return [
+            [cell.strip() for cell in line.strip().strip("|").split("|")]
+            for line in block.splitlines()
+            if line.startswith("| epsilon")
+        ]
+
+    # 200 impressions / 30 conversions, in that column order, and the rate as a
+    # percentage: inverted it reads 666.67%, and `:.2f` reads 0.15.
+    assert cells(ranked) == [["epsilon", "200", "30", "15.00%"]], ranked
+
+    assert cells(allocation) == [
+        ["epsilon", demo.CREATIVE_IDS[1], "40", "1"],
+        ["epsilon", demo.CREATIVE_IDS[2], "30", "4"],
+        ["epsilon", demo.CREATIVE_IDS[3], "20", "2"],
+        ["epsilon", demo.CREATIVE_IDS[0], "10", "5"],
+    ], allocation
 
 
 def test_the_best_creative_is_not_the_first_by_id():

@@ -257,14 +257,18 @@ def test_forks_share_one_copy_of_the_seeded_data():
             # Exactly one object: this is the "one copy of your data" claim the
             # README makes, so pin the count. Safe at any segment cap — the seeded
             # table is four rows in one commit, orders of magnitude under both the
-            # 1 MiB test cap and the 64 MiB default. The byte total is deliberately
-            # only checked as non-zero and flat; it moves with writer version and
-            # compression, so pinning it would be brittle without adding meaning.
+            # 1 MiB test cap and the 64 MiB default. The byte total is checked only
+            # as non-zero and flat: it is a `RowCostModel` sum over the segment's
+            # rows (see the docstring above), so it would in fact be stable enough
+            # to pin — but pinning an in-memory Arrow footprint would assert the
+            # cost model's arithmetic, not this test's subject, which is that the
+            # forks add no second copy.
             assert observed[0] == 1, (
                 f"main's seeded rows must live in exactly one object, saw {observed}"
             )
             assert observed[1] > 0, (
-                f"main's cold footprint must carry bytes after a fork, saw {observed}"
+                f"main's in-memory segment footprint must be non-zero after a fork, "
+                f"saw {observed}"
             )
             if main_footprint is None:
                 main_footprint = observed
