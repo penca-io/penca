@@ -41,8 +41,7 @@ def test_audit_demo_runs_the_documented_walkthrough():
     client = make_client()
     before = _demo_catalogs(client)
 
-    # try opens before the subprocess: audit_demo.py creates its catalog before it
-    # prints anything, so a TimeoutExpired on a wedged run has already stranded one.
+    # subprocess.run is inside the try, so a TimeoutExpired is reaped too.
     try:
         result = subprocess.run(
             [sys.executable, str(_DEMO_PATH)],
