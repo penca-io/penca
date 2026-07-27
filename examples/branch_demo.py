@@ -692,6 +692,12 @@ def run_demo(
         # Symmetry with seed_prod: a failure here leaves the same prod_<hex>
         # catalog a failed seed would have dropped. fork_branches already discards
         # whatever forks it managed to create.
+        #
+        # Deliberately the last point at which the catalog is dropped. Once the
+        # rounds start, prod holds committed state that is the whole subject of the
+        # demo, so a mid-run failure KEEPS the catalog for inspection — the forks
+        # are still discarded by run_demo's finally, and print_isolation names the
+        # catalog so it can be cleaned up by hand.
         discard_catalog(client, prod.catalog_uuid)
         raise
 

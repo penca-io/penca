@@ -19,11 +19,28 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .integration_helpers import make_client
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_PATH = _REPO_ROOT / "examples" / "audit_demo.py"
 
 
+def _demo_catalogs(client) -> set[str]:
+    return {
+        catalog.catalog_name
+        for catalog in client.list_catalogs()
+        if catalog.catalog_name.startswith("demo_")
+    }
+
+
 def test_audit_demo_runs_the_documented_walkthrough():
+    # audit_demo.py names its catalog demo_<hex> and never deletes it, and unlike
+    # branch_demo it does not print the uuid — so diffing the catalog list is the
+    # only way to reap it, and without that the suite leaks one per run onto a
+    # stack every other test shares.
+    client = make_client()
+    before = _demo_catalogs(client)
+
     result = subprocess.run(
         [sys.executable, str(_DEMO_PATH)],
         cwd=_REPO_ROOT,
@@ -93,3 +110,11 @@ def test_audit_demo_runs_the_documented_walkthrough():
     time_travel = stdout.split("--- Time-travel: state as of TX 1 ---")[1]
     assert "bob" in time_travel, time_travel
     assert "charlie" not in time_travel, time_travel
+
+    created = _demo_catalogs(client) - before
+    assert len(created) == 1, f"expected exactly one new demo_ catalog, saw {created}"
+    for catalog_name in created:
+        try:
+            client.delete_catalog(catalog_name=catalog_name)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask a failure
+            print(f"(could not delete catalog {catalog_name}: {exc})")

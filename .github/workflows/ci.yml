@@ -97,6 +97,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages
       - run: uv run pytest packages/penca-client/tests/unit/ -x -q
+      # tests/static/ is Docker-free and is what gives non-package code
+      # (examples/, scripts/) any pre-merge coverage at all — branch PRs skip the
+      # integration job, so without this line those suites only ever ran locally
+      # via `just check`.
+      - run: uv run pytest tests/static/ -x -q
 
   rust-check:
     name: Rust clippy + fmt + test

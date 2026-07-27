@@ -254,10 +254,17 @@ def test_forks_share_one_copy_of_the_seeded_data():
             )
     finally:
         # finally, not straight-line: a red run is exactly when leaving live state
-        # behind hurts most, and later tests share this stack. Deleting the catalog
-        # subsumes the three branch deletes, covers a partial fork set, and — unlike
-        # the fork loop this replaced — also stops the prod_<hex> catalog leaking
-        # once per run.
+        # behind hurts most, and later tests share this stack.
+        #
+        # Both calls, in this order — a catalog delete does NOT subsume the branch
+        # deletes. `MetadataManager::delete_catalog` resolves main and cascades the
+        # PG metadata from there; the per-branch object-storage deletes are
+        # `delete_branch`'s job alone. That is harmless here only because this test
+        # asserts the forks own zero segments, which is exactly the assertion a
+        # future storage-footprint edit would change.
+        for fork_uuid in fork_uuids:
+            client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
+
         _cleanup_catalog(client, prod.catalog_uuid)
 
 
