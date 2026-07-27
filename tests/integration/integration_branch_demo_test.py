@@ -75,6 +75,10 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     length within a merged file and is written only by
     ``compact_persist_segments``, so a freshly persisted segment (which owns its
     whole object) reports 0 there.
+
+    Committed rows only: persist is two-phase, and the read planner gates
+    visibility on a segment's own ``commit_micros``. A crashed phase-2 leaves rows
+    no read can ever see, which a footprint claim must not count.
     """
     parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
     rows = get_pg_driver().execute(
@@ -143,6 +147,13 @@ def test_demo_forks_diverges_and_isolates_main():
             f"impressions log disagree ({branch.conversions} vs "
             f"{branch.log_conversions}) — they commit in one tx and cannot diverge"
         )
+        assert branch.log_impressions == _IMPRESSIONS, (
+            f"{branch.branch_name}: the impressions log holds "
+            f"{branch.log_impressions} rows, expected {_IMPRESSIONS}. visitor_id is "
+            f"the log's primary key, so append-only is a property of the visitor "
+            f"ranges being disjoint — an overlapping range replaces rows instead, "
+            f"and only the row count catches it"
+        )
 
     assert all(tally == (0, 0) for tally in outcome.main_tallies.values()), (
         f"prod tallies must be untouched, saw {outcome.main_tallies}"
@@ -168,54 +179,56 @@ def test_forks_share_one_copy_of_the_seeded_data():
     baseline = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
     assert baseline == {}, f"nothing is persisted before the first fork, saw {baseline}"
 
-    seeded = {creative_id for creative_id, _headline, _rate in demo.CREATIVES}
     fork_uuids: list[str] = []
-    main_footprint: tuple[int, int] | None = None
-    for branch_name in ("even", "greedy", "epsilon"):
-        branch = client.create_branch(
-            branch_name,
-            "cha-517",
-            "fork",
-            commit_seq_num=prod.seed_commit_seq_num,
-            catalog_uuid=prod.catalog_uuid,
-        )
-        fork_uuids.append(branch.branch_uuid)
-
-        stats = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
-        observed = stats.get(prod.main_branch_uuid)
-        assert observed is not None, "the fork must flush main's hot tier to cold"
-        assert observed[0] > 0 and observed[1] > 0, (
-            f"main's cold footprint must be non-empty after a fork, saw {observed}"
-        )
-        if main_footprint is None:
-            main_footprint = observed
-        else:
-            assert observed == main_footprint, (
-                "forking again must not duplicate or re-flush main's cold bytes; "
-                f"{main_footprint} -> {observed}"
+    try:
+        seeded = {creative_id for creative_id, _headline, _rate in demo.CREATIVES}
+        main_footprint: tuple[int, int] | None = None
+        for branch_name in ("even", "greedy", "epsilon"):
+            branch = client.create_branch(
+                branch_name,
+                "cha-517",
+                "fork",
+                commit_seq_num=prod.seed_commit_seq_num,
+                catalog_uuid=prod.catalog_uuid,
             )
+            fork_uuids.append(branch.branch_uuid)
+
+            stats = _segment_stats(prod.catalog_uuid, prod.creatives_table_uuid)
+            observed = stats.get(prod.main_branch_uuid)
+            assert observed is not None, "the fork must flush main's hot tier to cold"
+            assert observed[0] > 0 and observed[1] > 0, (
+                f"main's cold footprint must be non-empty after a fork, saw {observed}"
+            )
+            if main_footprint is None:
+                main_footprint = observed
+            else:
+                assert observed == main_footprint, (
+                    "forking again must not duplicate or re-flush main's cold bytes; "
+                    f"{main_footprint} -> {observed}"
+                )
+
+            for fork_uuid in fork_uuids:
+                assert fork_uuid not in stats, (
+                    f"fork {fork_uuid} must store zero segments of its own, "
+                    f"saw {stats[fork_uuid]}"
+                )
 
         for fork_uuid in fork_uuids:
-            assert fork_uuid not in stats, (
-                f"fork {fork_uuid} must store zero segments of its own, "
-                f"saw {stats[fork_uuid]}"
+            got = client.read_data(
+                catalog_uuid=prod.catalog_uuid,
+                schema_uuid=prod.schema_uuid,
+                table_uuid=prod.creatives_table_uuid,
+                branch_uuid=fork_uuid,
             )
-
-    for fork_uuid in fork_uuids:
-        got = client.read_data(
-            catalog_uuid=prod.catalog_uuid,
-            schema_uuid=prod.schema_uuid,
-            table_uuid=prod.creatives_table_uuid,
-            branch_uuid=fork_uuid,
-        )
-        assert set(got.column("creative_id").to_pylist()) == seeded, (
-            "every fork reads the full seeded set it stores none of"
-        )
-
-    # This test forks by hand rather than through run_demo, so it owns the
-    # discard too.
-    for fork_uuid in fork_uuids:
-        client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
+            assert set(got.column("creative_id").to_pylist()) == seeded, (
+                "every fork reads the full seeded set it stores none of"
+            )
+    finally:
+        # finally, not straight-line: a red run is exactly when leaving live
+        # branches behind hurts most, and later tests share this stack. Iterating
+        # fork_uuids covers a partial fork set.
+        for fork_uuid in fork_uuids:
+            client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=fork_uuid)
 
 
 def test_demo_script_runs_as_cli():

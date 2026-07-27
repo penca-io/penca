@@ -1,4 +1,4 @@
-"""Static checks for the launch demo's allocation policies (CHA-517).
+"""Static checks for the launch demo's policies, printers, and CLI (CHA-517).
 
 ``examples/branch_demo.py``'s policy layer is infra-free, but the only other
 tests that touch the module are Docker-gated integration tests — and branch-PR
@@ -8,9 +8,10 @@ that runs before a merge covers the policies at all (roborev finding on
 ``static_kata_plan_html_test.py`` loads its generator, and pin only the
 Penca-owned decision logic: the tie-break that keeps a run reproducible, the
 prior that drives exploration off evidence rather than off the id ordering, the
-fixed-split foil's wraparound, and the unknown-policy failure. No Docker, no
-fixtures, no penca services — runs under ``just static-test branch_demo_policy``
-and ``just check``.
+fixed-split foil's wraparound, the unknown-policy failure, and — against a
+hand-built ``DemoOutcome``, no engine needed — that the printers and the CLI's
+input validation hold up. No Docker, no fixtures, no penca services — runs under
+``just static-test branch_demo_policy`` and ``just check``.
 """
 
 from __future__ import annotations
@@ -48,9 +49,10 @@ def _tallies(**overrides: tuple[int, int]) -> dict[str, tuple[int, int]]:
     }
 
 
-def test_untried_outranks_any_measured_rate():
-    """The Laplace prior scores an untried creative above any rate a shown
-    creative can actually measure here, so exploration is driven by evidence."""
+def test_untried_outranks_a_creative_with_real_exposure():
+    """Once a creative has meaningful exposure it cannot outrank an untried one, so
+    exploration follows evidence. Deliberately not the strong form: a creative
+    whose single first impression converts scores 0.667, above the untried 0.5."""
     untried = demo.smoothed_rate((0, 0))
     assert untried == 0.5
 
@@ -74,11 +76,20 @@ def test_greedy_prefers_the_better_measured_creative():
     assert demo.pick_greedy(_all_measured()) == "carousel"
 
 
-def test_greedy_tie_break_is_deterministic_and_id_ordered():
-    """Every creative equal — the pick must be stable across calls and be the
-    lowest id, or a run stops reproducing."""
-    picks = {demo.pick_greedy(_tallies()) for _ in range(20)}
-    assert picks == {min(demo.CREATIVE_IDS)}
+def test_greedy_tie_break_picks_the_lowest_id_not_the_first_declared():
+    """With every creative tied, the id key must decide — not declaration order.
+
+    CREATIVE_IDS is patched so the two differ. Ranking over the fixed tuple is
+    what makes the pick reproducible, so with the real fixture (where "banner" is
+    both lowest-id and first-declared) dropping the secondary key would still
+    return "banner" and this test would prove nothing.
+    """
+    original = demo.CREATIVE_IDS
+    demo.CREATIVE_IDS = ("video", "banner")
+    try:
+        assert demo.pick_greedy({"video": (0, 0), "banner": (0, 0)}) == "banner"
+    finally:
+        demo.CREATIVE_IDS = original
 
 
 def test_greedy_considers_creatives_missing_from_the_tallies():
@@ -117,3 +128,89 @@ def test_unknown_policy_fails_fast():
         assert "bandit" in str(exc)
     else:
         raise AssertionError("an unknown policy name must raise ValueError")
+
+
+def _synthetic_outcome(impressions: int = 100):
+    """A DemoOutcome with no engine behind it, for the printers."""
+    per_creative = {
+        creative_id: (impressions // len(demo.CREATIVE_IDS), index)
+        for index, creative_id in enumerate(demo.CREATIVE_IDS)
+    }
+    conversions = sum(converted for _shown, converted in per_creative.values())
+    branches = tuple(
+        demo.BranchOutcome(
+            branch_name=policy_name,
+            branch_uuid=f"uuid-{policy_name}",
+            impressions=impressions,
+            conversions=conversions,
+            per_creative=per_creative,
+            log_conversions=conversions,
+            log_impressions=impressions,
+        )
+        for policy_name in demo.POLICY_NAMES
+    )
+
+    return demo.DemoOutcome(
+        catalog_uuid="uuid-catalog",
+        scoreboard=branches,
+        main_tallies=dict.fromkeys(demo.CREATIVE_IDS, (0, 0)),
+        main_impression_rows=0,
+        remaining_branches=("main",),
+    )
+
+
+def test_printers_emit_a_scoreboard_and_the_isolation_proof(capsys):
+    outcome = _synthetic_outcome()
+    demo.print_round(0, "epsilon", ((0, demo.CREATIVE_IDS[0], 1),))
+    demo.print_scoreboard(outcome)
+    demo.print_isolation(outcome)
+
+    printed = capsys.readouterr().out
+    assert "scoreboard" in printed.lower()
+    for policy_name in demo.POLICY_NAMES:
+        assert policy_name in printed
+
+    assert "prod is intact" in printed
+    assert f"{len(demo.POLICY_NAMES)} parallel universes" in printed, (
+        "the punchline must derive the branch count, not hardcode it"
+    )
+
+
+def test_scoreboard_survives_a_branch_that_was_never_shown_anything():
+    """A zero-impression branch must not divide by zero in the rate column."""
+    assert (
+        demo.conversion_rate(_synthetic_outcome(impressions=0).scoreboard[0]) == "n/a"
+    )
+
+
+def _parse_args_with(argv: list[str]):
+    original = sys.argv
+    sys.argv = ["branch_demo.py", *argv]
+    try:
+        return demo.parse_args()
+    finally:
+        sys.argv = original
+
+
+def test_parse_args_accepts_the_defaults():
+    config = _parse_args_with([])
+    assert config.impressions == demo.DEFAULT_IMPRESSIONS
+    assert config.round_size == demo.DEFAULT_ROUND_SIZE
+    assert config.seed == demo.DEFAULT_SEED
+
+
+def test_parse_args_rejects_input_that_would_leave_debris():
+    """These all used to fail only after a catalog and three branches existed."""
+    for argv in (
+        ["--impressions", "0"],
+        ["--round-size", "0"],
+        ["--round-size", "-5"],
+        ["--epsilon", "1.5"],
+        ["--epsilon", "-0.1"],
+    ):
+        try:
+            _parse_args_with(argv)
+        except SystemExit as exit_code:
+            assert exit_code.code == 2, f"{argv} should exit 2 with a usage message"
+        else:
+            raise AssertionError(f"{argv} must be rejected before any RPC")

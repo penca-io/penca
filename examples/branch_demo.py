@@ -104,9 +104,12 @@ class BranchOutcome:
     impressions: int
     conversions: int
     per_creative: Mapping[str, tuple[int, int]]
-    # Conversions re-derived from the append-only impressions log. Must equal
-    # `conversions`: the tally UPDATE and the log append commit in one tx.
+    # Re-derived from the append-only impressions log. Must equal `conversions`
+    # and `impressions`: the tally UPDATE and the log append commit in one tx.
+    # The row count is the one that catches an overlapping visitor range
+    # replacing log rows instead of appending, since visitor_id is the PK.
     log_conversions: int
+    log_impressions: int
 
 
 @dataclass(frozen=True)
@@ -158,12 +161,13 @@ def pick_even(visitor_index: int) -> str:
 
 
 def pick_greedy(tallies: Mapping[str, tuple[int, int]]) -> str:
-    """Best smoothed rate so far, ties broken by ``creative_id`` for determinism.
+    """Best smoothed rate so far; among ties, the lowest ``creative_id``.
 
     Ranks over ``CREATIVE_IDS`` rather than over ``tallies``' keys, so the
     candidate set matches the other two policies no matter what the read returned:
     a creative missing from ``tallies`` counts as untried instead of becoming
-    unreachable for the rest of the run.
+    unreachable for the rest of the run. That fixed tuple is what makes the pick
+    reproducible; the ``creative_id`` key only decides *which* tied creative wins.
     """
     ranked = sorted(
         CREATIVE_IDS,
@@ -218,9 +222,13 @@ def seed_prod(client: PencaClient) -> ProdContext:
     catalog_uuid, main_branch_uuid = client.create_catalog(
         f"prod_{uuid4().hex[:8]}", AUTHOR
     )
+    # branch_uuid explicitly on every call: omitting it falls back to the
+    # client's constructor-configured default branch, which need not be the
+    # "main" of this brand-new catalog.
     schema_uuid = client.create_schema(
         "ads",
         catalog_uuid=catalog_uuid,
+        branch_uuid=main_branch_uuid,
         author=AUTHOR,
         comment="create ads schema",
     )
@@ -230,6 +238,7 @@ def seed_prod(client: PencaClient) -> ProdContext:
         primary_keys=["creative_id"],
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
+        branch_uuid=main_branch_uuid,
         author=AUTHOR,
         comment="create creatives table",
     )
@@ -239,6 +248,7 @@ def seed_prod(client: PencaClient) -> ProdContext:
         primary_keys=["visitor_id"],
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
+        branch_uuid=main_branch_uuid,
         author=AUTHOR,
         comment="create impressions table",
     )
@@ -381,7 +391,7 @@ def drive_round(
 
     updated = dict(tallies)
     for _visitor_index, creative_id, converted in outcomes:
-        shown, conversions = updated[creative_id]
+        shown, conversions = updated.get(creative_id, (0, 0))
         updated[creative_id] = (shown + 1, conversions + converted)
 
     touched = sorted({creative_id for _v, creative_id, _c in outcomes})
@@ -392,46 +402,59 @@ def drive_round(
         author=AUTHOR,
         comment=f"{branch_name}: {len(outcomes)} impressions",
     )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(
-            table_uuid=prod.creatives_table_uuid,
-            upserts=pa.table(
-                {
-                    "creative_id": touched,
-                    "headline": [HEADLINES[c] for c in touched],
-                    "impressions": [updated[c][0] for c in touched],
-                    "conversions": [updated[c][1] for c in touched],
-                },
-                schema=CREATIVES_SCHEMA,
+    try:
+        client.write_data(
+            tx.tx_uuid,
+            Mutation(
+                table_uuid=prod.creatives_table_uuid,
+                upserts=pa.table(
+                    {
+                        "creative_id": touched,
+                        "headline": [HEADLINES[c] for c in touched],
+                        "impressions": [updated[c][0] for c in touched],
+                        "conversions": [updated[c][1] for c in touched],
+                    },
+                    schema=CREATIVES_SCHEMA,
+                ),
             ),
-        ),
-        catalog_uuid=prod.catalog_uuid,
-        schema_uuid=prod.schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(
-            table_uuid=prod.impressions_table_uuid,
-            upserts=pa.table(
-                {
-                    "visitor_id": [f"v{v:06d}" for v, _c, _o in outcomes],
-                    "creative_id": [creative_id for _v, creative_id, _o in outcomes],
-                    "converted": [converted for _v, _c, converted in outcomes],
-                },
-                schema=IMPRESSIONS_SCHEMA,
+            catalog_uuid=prod.catalog_uuid,
+            schema_uuid=prod.schema_uuid,
+            branch_uuid=branch_uuid,
+        )
+        client.write_data(
+            tx.tx_uuid,
+            Mutation(
+                table_uuid=prod.impressions_table_uuid,
+                upserts=pa.table(
+                    {
+                        "visitor_id": [f"v{v:06d}" for v, _c, _o in outcomes],
+                        "creative_id": [
+                            creative_id for _v, creative_id, _o in outcomes
+                        ],
+                        "converted": [converted for _v, _c, converted in outcomes],
+                    },
+                    schema=IMPRESSIONS_SCHEMA,
+                ),
             ),
-        ),
-        catalog_uuid=prod.catalog_uuid,
-        schema_uuid=prod.schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.commit_tx(
-        tx.tx_uuid,
-        catalog_uuid=prod.catalog_uuid,
-        branch_uuid=branch_uuid,
-    )
+            catalog_uuid=prod.catalog_uuid,
+            schema_uuid=prod.schema_uuid,
+            branch_uuid=branch_uuid,
+        )
+        client.commit_tx(
+            tx.tx_uuid,
+            catalog_uuid=prod.catalog_uuid,
+            branch_uuid=branch_uuid,
+        )
+    except BaseException:
+        # An open penca tx is not inert: until it times out server-side it clamps
+        # cold isolation and fences purge/GC on this branch. Abort on any exit,
+        # Ctrl-C included, so a failed demo leaves nothing holding the stack.
+        client.abort_tx(
+            tx.tx_uuid,
+            catalog_uuid=prod.catalog_uuid,
+            branch_uuid=branch_uuid,
+        )
+        raise
 
     return outcomes
 
@@ -453,6 +476,7 @@ def collect_branch_outcome(
         conversions=sum(converted for _, converted in per_creative.values()),
         per_creative=per_creative,
         log_conversions=sum(log.column("converted").to_pylist()),
+        log_impressions=log.num_rows,
     )
 
 
@@ -473,45 +497,55 @@ def run_demo(
     branches = fork_branches(client, prod)
     # One RNG per policy, seeded off the run seed, so epsilon's exploration is
     # reproducible and independent of how many rounds the other branches ran.
+    # Seeded on a "seed:name" string, not seed + index: a bare offset gives
+    # position 0 the same stream build_visitor_feed's int seed produced, which
+    # would couple a policy at that position to the very outcomes it explores
+    # against. A str seed cannot collide with the feed's int seed.
     rngs = {
-        policy_name: random.Random(config.seed + position)
-        for position, policy_name in enumerate(POLICY_NAMES)
+        policy_name: random.Random(f"{config.seed}:{policy_name}")
+        for policy_name in POLICY_NAMES
     }
 
-    for round_index, start in enumerate(
-        range(0, config.impressions, config.round_size)
-    ):
-        visitor_indexes = range(
-            start, min(start + config.round_size, config.impressions)
-        )
-        for policy_name in POLICY_NAMES:
-            outcomes = drive_round(
-                client,
-                prod,
-                (policy_name, branches[policy_name]),
-                visitor_indexes,
-                feed,
-                rngs[policy_name],
-                config.epsilon,
+    try:
+        for round_index, start in enumerate(
+            range(0, config.impressions, config.round_size)
+        ):
+            visitor_indexes = range(
+                start, min(start + config.round_size, config.impressions)
             )
-            if on_round is not None:
-                on_round(round_index, policy_name, outcomes)
+            for policy_name in POLICY_NAMES:
+                outcomes = drive_round(
+                    client,
+                    prod,
+                    (policy_name, branches[policy_name]),
+                    visitor_indexes,
+                    feed,
+                    rngs[policy_name],
+                    config.epsilon,
+                )
+                if on_round is not None:
+                    on_round(round_index, policy_name, outcomes)
 
-    scoreboard = sorted(
-        (
-            collect_branch_outcome(client, prod, (policy_name, branch_uuid))
-            for policy_name, branch_uuid in branches.items()
-        ),
-        key=lambda outcome: (-outcome.conversions, outcome.branch_name),
-    )
+        scoreboard = sorted(
+            (
+                collect_branch_outcome(client, prod, (policy_name, branch_uuid))
+                for policy_name, branch_uuid in branches.items()
+            ),
+            key=lambda outcome: (-outcome.conversions, outcome.branch_name),
+        )
 
-    main_tallies = read_tallies(client, prod, prod.main_branch_uuid)
-    main_impression_rows = read_impression_log(
-        client, prod, prod.main_branch_uuid
-    ).num_rows
-
-    for branch_uuid in branches.values():
-        client.delete_branch(catalog_uuid=prod.catalog_uuid, branch_uuid=branch_uuid)
+        main_tallies = read_tallies(client, prod, prod.main_branch_uuid)
+        main_impression_rows = read_impression_log(
+            client, prod, prod.main_branch_uuid
+        ).num_rows
+    finally:
+        # finally, not straight-line: the docstring promises the forks are thrown
+        # away, and a failed run is exactly when leaving three live branches (and
+        # the prod_* catalog) behind would hurt most.
+        for branch_uuid in branches.values():
+            client.delete_branch(
+                catalog_uuid=prod.catalog_uuid, branch_uuid=branch_uuid
+            )
 
     remaining = tuple(
         sorted(
@@ -541,6 +575,14 @@ def print_round(
     )
 
 
+def conversion_rate(branch: BranchOutcome) -> str:
+    """Formatted rate, tolerant of a branch that was never shown anything."""
+    if branch.impressions == 0:
+        return "n/a"
+
+    return f"{branch.conversions / branch.impressions:.2%}"
+
+
 def print_scoreboard(outcome: DemoOutcome) -> None:
     """Cross-branch scoreboard, then each branch's allocation."""
     print("\n--- Cross-branch scoreboard (ranked) ---")
@@ -550,10 +592,7 @@ def print_scoreboard(outcome: DemoOutcome) -> None:
                 "branch": [branch.branch_name for branch in outcome.scoreboard],
                 "impressions": [branch.impressions for branch in outcome.scoreboard],
                 "conversions": [branch.conversions for branch in outcome.scoreboard],
-                "rate": [
-                    f"{branch.conversions / branch.impressions:.2%}"
-                    for branch in outcome.scoreboard
-                ],
+                "rate": [conversion_rate(branch) for branch in outcome.scoreboard],
             }
         )
         .to_pandas()
@@ -565,7 +604,11 @@ def print_scoreboard(outcome: DemoOutcome) -> None:
         (branch.branch_name, creative_id, shown, converted)
         for branch in outcome.scoreboard
         for creative_id, (shown, converted) in sorted(
-            branch.per_creative.items(), key=lambda item: -item[1][0]
+            # creative_id breaks ties: `even` shows all four an equal number of
+            # times, and without it their order comes from whatever row order
+            # read_data returned, so identical input could print differently.
+            branch.per_creative.items(),
+            key=lambda item: (-item[1][0], item[0]),
         )
     ]
     print(
@@ -600,7 +643,8 @@ def print_isolation(outcome: DemoOutcome) -> None:
     print(f"\nprod impression log: {outcome.main_impression_rows} rows")
     print(f"branches remaining after discard: {', '.join(outcome.remaining_branches)}")
     print(
-        "\nprod is intact. Three parallel universes ran against it and were thrown away."
+        f"\nprod is intact. {len(POLICY_NAMES)} parallel universes ran against it "
+        f"and were thrown away."
     )
 
 
@@ -613,6 +657,17 @@ def parse_args() -> DemoConfig:
     parser.add_argument("--epsilon", type=float, default=DEFAULT_EPSILON)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     args = parser.parse_args()
+    # Validate before main() opens a client: every one of these otherwise fails
+    # *after* seed_prod and fork_branches have created a catalog and three
+    # branches, so a typo'd flag would leave debris behind a stack trace.
+    if args.impressions < 1:
+        parser.error("--impressions must be at least 1")
+
+    if args.round_size < 1:
+        parser.error("--round-size must be at least 1")
+
+    if not 0.0 <= args.epsilon <= 1.0:
+        parser.error("--epsilon must be between 0.0 and 1.0")
 
     return DemoConfig(
         impressions=args.impressions,
