@@ -19,6 +19,7 @@ If no paths are given, defaults to the whole repo, matching `just lint` /
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -133,13 +134,63 @@ def process_file(file_path: Path, fix: bool) -> list[str]:
     return messages
 
 
-def is_excluded(path: Path) -> bool:
-    if EXCLUDED_DIR_NAMES & set(path.parts):
+def normalized(path: Path) -> Path:
+    """Working-directory-relative form, so absolute and relative paths compare.
+
+    Both recipes and the hook run from the repo root. Without this, an absolute
+    invocation never matches the repo-relative ``EXCLUDED_SUBTREES`` entries and
+    the generated-stub guard silently does nothing.
+    """
+    resolved = path.resolve()
+
+    try:
+        return resolved.relative_to(Path.cwd().resolve())
+    except ValueError:
+        return resolved
+
+
+def is_excluded_dir(directory: Path) -> bool:
+    relative = normalized(directory)
+    if EXCLUDED_DIR_NAMES & set(relative.parts):
         return True
 
-    parents = set(path.parents)
+    return any(
+        relative == subtree or subtree in relative.parents
+        for subtree in EXCLUDED_SUBTREES
+    )
 
-    return any(subtree in parents for subtree in EXCLUDED_SUBTREES)
+
+def is_excluded(path: Path) -> bool:
+    """True for a file inside an excluded tree.
+
+    Applied to explicitly named files too, not just walked ones: otherwise
+    ``--fix packages/penca-proto/.../foo_pb2.py`` rewrites a generated stub, which
+    is exactly the byte-identity this guard exists to protect. ruff's
+    ``force-exclude`` is unconditional the same way.
+    """
+    return is_excluded_dir(path.parent)
+
+
+def walk_python_files(root: Path) -> list[Path]:
+    """Every ``.py`` file under ``root``, pruning excluded trees as it descends.
+
+    ``os.walk`` with in-place ``dirnames`` pruning rather than ``rglob``: rglob
+    scandirs every directory before a filter can see the results, so a repo-root
+    run would stat the whole of ``.venv`` and ``target/`` — gigabytes, hundreds of
+    thousands of entries — only to discard them. This gate is on ``just check``'s
+    hot path, and CI creates ``.venv`` at the repo root before running it.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in EXCLUDED_DIR_NAMES]
+        current = Path(dirpath)
+        if is_excluded_dir(current):
+            dirnames[:] = []
+            continue
+
+        found.extend(current / name for name in filenames if name.endswith(".py"))
+
+    return sorted(found)
 
 
 def drop_gitignored(paths: list[Path]) -> list[Path]:
@@ -149,24 +200,33 @@ def drop_gitignored(paths: list[Path]) -> list[Path]:
     ``tests/tdd/``, so anyone with local scratch files would see
     ``just format-check`` fail on code that is not in the repo. One batched
     ``git check-ignore`` call rather than one per file.
+
+    NUL-delimited both ways: without ``-z`` git renders paths through
+    ``core.quotePath``, so a non-ASCII filename comes back escaped, never matches,
+    and survives the filter into a ``--fix`` rewrite.
     """
     if not paths:
         return paths
 
-    result = subprocess.run(
-        ["git", "check-ignore", "--stdin"],
-        input="\n".join(str(path) for path in paths),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-z", "--stdin"],
+            input="\0".join(str(path) for path in paths),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        msg = "git is required to skip gitignored paths, and is not on PATH"
+        raise RuntimeError(msg) from exc
+
     # Exit 0 = some paths ignored, 1 = none ignored. Anything else is a real
-    # failure (not a git repo, git missing) and should not silently widen the set.
+    # failure (not a git repo) and should not silently widen the set.
     if result.returncode not in (0, 1):
         msg = f"git check-ignore failed: {result.stderr.strip()}"
         raise RuntimeError(msg)
 
-    ignored = {line for line in result.stdout.splitlines() if line}
+    ignored = {entry for entry in result.stdout.split("\0") if entry}
 
     return [path for path in paths if str(path) not in ignored]
 
@@ -182,11 +242,11 @@ def main() -> int:
     for arg in args:
         path = Path(arg)
         if path.is_file() and path.suffix == ".py":
-            paths.append(path)
+            if not is_excluded(path):
+                paths.append(path)
+
         elif path.is_dir():
-            paths.extend(
-                sorted(found for found in path.rglob("*.py") if not is_excluded(found))
-            )
+            paths.extend(walk_python_files(path))
 
     all_messages: list[str] = []
     for file_path in drop_gitignored(paths):

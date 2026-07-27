@@ -322,12 +322,12 @@ lint:
 # Run ruff formatter + blank line fixer
 format path=".":
     uv run ruff format {{path}}
-    python scripts/check_blank_lines.py --fix
+    python scripts/check_blank_lines.py --fix {{path}}
 
 # Check formatting without modifying files
 format-check path=".":
     uv run ruff format --check {{path}}
-    python scripts/check_blank_lines.py
+    python scripts/check_blank_lines.py {{path}}
 
 # Run Python unit tests (no infra required).
 test *args:
