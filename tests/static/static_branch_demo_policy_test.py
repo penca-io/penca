@@ -264,41 +264,59 @@ def test_policy_rng_streams_are_independent_of_the_feed_and_of_each_other():
 
 
 class _FailingClient:
-    """Minimal stand-in: records calls, raises what the test asks it to."""
+    """Minimal stand-in: records calls, raises where the test asks it to.
 
-    def __init__(self, raises=None, fail_on=None):
+    One predicate per method rather than a single shared ``fail_on`` selector. The
+    shared version meant opposite things on different methods — ``None`` was "never
+    fail" for one and "always fail" for another — and overloaded the branch-uuid
+    namespace with a sentinel string.
+    """
+
+    def __init__(
+        self,
+        raises: BaseException | None = None,
+        fail_delete_branch: str | None = None,
+        fail_create_schema: bool = False,
+        fail_delete_catalog: bool = False,
+        fail_abort_tx: bool = False,
+    ):
         self.raises = raises
-        self.fail_on = fail_on
+        self.fail_delete_branch = fail_delete_branch
+        self.fail_create_schema = fail_create_schema
+        self.fail_delete_catalog = fail_delete_catalog
+        self.fail_abort_tx = fail_abort_tx
         self.deleted: list[str] = []
         self.aborted: list[str] = []
         self.deleted_catalogs: list[str] = []
 
+    def _maybe_raise(self, should_fail: bool) -> None:
+        if should_fail and self.raises is not None:
+            raise self.raises
+
     def delete_branch(self, catalog_uuid: str, branch_uuid: str) -> None:
         self.deleted.append(branch_uuid)
-        if self.raises is not None and branch_uuid == self.fail_on:
-            raise self.raises
+        self._maybe_raise(branch_uuid == self.fail_delete_branch)
 
     def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
         self.aborted.append(tx_uuid)
-        if self.raises is not None and self.fail_on in (None, tx_uuid):
-            raise self.raises
+        self._maybe_raise(self.fail_abort_tx)
 
     def create_catalog(self, catalog_name: str, owner: str) -> tuple[str, str]:
         return "cat", "main-uuid"
 
     def create_schema(self, *args, **kwargs) -> str:
-        if self.raises is not None and self.fail_on in (None, "schema"):
-            raise self.raises
+        self._maybe_raise(self.fail_create_schema)
 
         return "schema-uuid"
 
     def delete_catalog(self, catalog_uuid: str) -> None:
         self.deleted_catalogs.append(catalog_uuid)
+        self._maybe_raise(self.fail_delete_catalog)
 
 
 def test_discard_branches_attempts_every_branch_and_reports_the_failures():
     """One failure must not strand the branches after it."""
-    client = _FailingClient(raises=RuntimeError("boom"), fail_on="b")
+    client = _FailingClient(raises=RuntimeError("boom"), fail_delete_branch="b")
     failed = demo.discard_branches(client, "cat", ["a", "b", "c"])
 
     assert client.deleted == ["a", "b", "c"], "every branch must be attempted"
@@ -312,14 +330,14 @@ def test_discard_branches_reports_nothing_when_every_delete_lands():
 
 def test_abort_quietly_does_not_replace_the_exception_being_unwound():
     """A failing abort must not become the error the reader sees."""
-    client = _FailingClient(raises=RuntimeError("abort failed"))
+    client = _FailingClient(raises=RuntimeError("abort failed"), fail_abort_tx=True)
     demo.abort_quietly(client, "cat", "tx", "branch")
     assert client.aborted == ["tx"]
 
 
 def test_cleanup_helpers_let_a_second_ctrl_c_through():
     """They catch Exception, not BaseException, so an interrupt still propagates."""
-    client = _FailingClient(raises=KeyboardInterrupt(), fail_on="a")
+    client = _FailingClient(raises=KeyboardInterrupt(), fail_delete_branch="a")
     try:
         demo.discard_branches(client, "cat", ["a"])
     except KeyboardInterrupt:
@@ -328,7 +346,12 @@ def test_cleanup_helpers_let_a_second_ctrl_c_through():
         raise AssertionError("KeyboardInterrupt must not be swallowed")
 
     try:
-        demo.abort_quietly(_FailingClient(raises=KeyboardInterrupt()), "c", "tx", "b")
+        demo.abort_quietly(
+            _FailingClient(raises=KeyboardInterrupt(), fail_abort_tx=True),
+            "c",
+            "tx",
+            "b",
+        )
     except KeyboardInterrupt:
         pass
     else:
@@ -337,7 +360,7 @@ def test_cleanup_helpers_let_a_second_ctrl_c_through():
 
 def test_seed_prod_drops_the_catalog_it_created_when_setup_fails():
     """A failed seed must not strand a prod_<hex> catalog on a shared stack."""
-    client = _FailingClient(raises=RuntimeError("no schema"), fail_on="schema")
+    client = _FailingClient(raises=RuntimeError("no schema"), fail_create_schema=True)
     try:
         demo.seed_prod(client)
     except RuntimeError:
@@ -351,7 +374,8 @@ def test_seed_prod_drops_the_catalog_it_created_when_setup_fails():
 
 
 def test_discard_catalog_does_not_propagate_a_delete_failure():
-    client = _FailingClient(raises=RuntimeError("boom"))
+    """The delete really fails here — otherwise this pins only uuid forwarding."""
+    client = _FailingClient(raises=RuntimeError("boom"), fail_delete_catalog=True)
     demo.discard_catalog(client, "cat")
     assert client.deleted_catalogs == ["cat"]
 

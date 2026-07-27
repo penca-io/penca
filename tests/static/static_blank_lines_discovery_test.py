@@ -85,7 +85,6 @@ def test_the_walk_never_descends_into_an_excluded_tree(tmp_path, monkeypatch):
     (tmp_path / "src/keep.py").write_text("x = 1\n")
     for excluded in (".venv", "target", "__pycache__"):
         (tmp_path / excluded).mkdir()
-        (tmp_path / excluded / "nested").mkdir()
         (tmp_path / excluded / "skip.py").write_text("x = 1\n")
 
     visited: list[str] = []
@@ -104,10 +103,16 @@ def test_the_walk_never_descends_into_an_excluded_tree(tmp_path, monkeypatch):
     # Liveness first: without it a glob-based implementation records no visits and
     # the "never descended" check below passes on an empty list.
     assert visited, "walk_python_files must walk with os.walk, not glob and filter"
-    for excluded in (".venv", "target", "__pycache__"):
-        assert not any(excluded in dirpath for dirpath in visited), (
-            f"the walk descended into {excluded}: {visited}"
-        )
+    # Tree-relative parts, not a substring of the absolute path: pytest's basetemp
+    # can itself sit under a directory named `target`, which would fail this on a
+    # correct implementation — the wrong failure mode for a suite about path
+    # anchoring.
+    descended = {
+        part
+        for dirpath in visited
+        for part in Path(dirpath).relative_to(tmp_path).parts
+    }
+    assert not descended & {".venv", "target", "__pycache__"}, visited
 
 
 def test_gitignored_paths_are_dropped_including_non_ascii_names(monkeypatch):

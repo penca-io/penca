@@ -39,10 +39,13 @@ def test_audit_demo_runs_the_documented_walkthrough():
         "TX 1 committed",
         "TX 2 committed",
         "TX 3 committed",
-        "Current state (read_data)",
-        "Full audit trail (audit_data)",
-        "Audit trail (after TX 1 only)",
-        "Time-travel: state as of TX 1",
+        # Dashed forms: the same strings the slices below key on, so a change to
+        # the demo's header decoration fails here with the loop's message rather
+        # than as an IndexError in a slice.
+        "--- Current state (read_data) ---",
+        "--- Full audit trail (audit_data) ---",
+        "--- Audit trail (after TX 1 only) ---",
+        "--- Time-travel: state as of TX 1 ---",
     ):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
@@ -58,5 +61,19 @@ def test_audit_demo_runs_the_documented_walkthrough():
     assert "alice" in current, current
     assert "bob" not in current, current
 
+    # The time-filtered audit really filtered: bob's only upsert is TX 1, so after
+    # TX 1 he appears among the deletes and not among the upserts — unlike the full
+    # trail, where he is in both. charlie (inserted TX 2) is the positive control.
+    after = stdout.split("--- Audit trail (after TX 1 only) ---")[1].split(
+        "--- Time-travel"
+    )[0]
+    after_upserts, after_deletes = after.split("Deletes:")
+    assert "charlie" in after_upserts, after
+    assert "bob" not in after_upserts, after
+    assert "bob" in after_deletes, after
+
+    # bob present catches as_of being ignored; charlie absent catches it resolving
+    # to the wrong commit, since he does not exist until TX 2.
     time_travel = stdout.split("--- Time-travel: state as of TX 1 ---")[1]
     assert "bob" in time_travel, time_travel
+    assert "charlie" not in time_travel, time_travel
