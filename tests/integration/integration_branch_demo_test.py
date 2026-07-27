@@ -205,9 +205,11 @@ def test_forks_share_one_copy_of_the_seeded_data():
     client = make_client()
     prod = demo.seed_prod(client)
 
-    # try opens as soon as the catalog exists, so every assertion below is covered
-    # by the cleanup. This test reaps on red and green alike; the divergence test
-    # above deliberately does the opposite and keeps its catalog on red, for
+    # try opens as soon as this test owns the catalog — seed_prod drops its own on
+    # failure (pinned by static_branch_demo_policy_test's
+    # test_a_failed_seed_transaction_aborts_then_drops_the_catalog), so the line
+    # above needs no cover. This test reaps on red and green alike; the divergence
+    # test above deliberately does the opposite and keeps its catalog on red, for
     # inspection.
     fork_uuids: list[str] = []
     try:
