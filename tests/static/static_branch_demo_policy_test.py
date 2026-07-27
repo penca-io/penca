@@ -1002,9 +1002,13 @@ def test_scoreboard_prints_best_first_with_a_stable_creative_order(capsys):
     # even's rows too.
     seen = [line for line in allocation.splitlines() if line.startswith("| epsilon")]
     assert seen, allocation
+    # sorted(), not declaration order: the allocation block breaks ties on the
+    # creative_id key, so the expected order is lexicographic. The two coincide
+    # only because CREATIVES happens to be listed alphabetically, and this test
+    # is precisely the one that must survive a reorder.
     creative_order = [
         creative
-        for creative in demo.CREATIVE_IDS
+        for creative in sorted(demo.CREATIVE_IDS)
         if any(creative in line for line in seen)
     ]
     positions = [
@@ -1161,7 +1165,11 @@ def test_run_demo_reports_every_branch_round_to_the_callback():
     """
     seen: list[tuple[int, str, tuple[str, ...]]] = []
     client = _FailingClient()
-    config = demo.DemoConfig(impressions=4, round_size=2, epsilon=0.0, seed=1)
+    # Deliberately non-dividing: 5 impressions at 2 per round makes the final
+    # round partial, so run_demo's clamp and the oracle's mirror of it are both
+    # on the executed path. At 4/2 the clamp is unreachable and a run_demo with
+    # it deleted stays green.
+    config = demo.DemoConfig(impressions=5, round_size=2, epsilon=0.0, seed=1)
 
     demo.run_demo(
         client,
@@ -1229,11 +1237,13 @@ def test_print_round_emits_the_branch_and_its_creatives(capsys):
     assert printed.strip(), "print_round must emit a line"
     assert "7" in printed, printed
     assert "epsilon" in printed, printed
-    assert demo.CREATIVE_IDS[1] in printed, printed
     # Both creatives, joined as the line renders them: the round's line reports
     # what it actually served, so `shown = [outcomes[0][1]]` — dropping everything
-    # after the first — must not pass.
-    assert f"{demo.CREATIVE_IDS[1]}, {demo.CREATIVE_IDS[2]}" in printed, printed
+    # after the first — must not pass. Sorted the way the line sorts, so a
+    # CREATIVES reorder (which the rate test explicitly permits) does not fail a
+    # correctly rendered line.
+    expected_pair = ", ".join(sorted((demo.CREATIVE_IDS[1], demo.CREATIVE_IDS[2])))
+    assert expected_pair in printed, printed
     # And deduped: the fixture serves CREATIVE_IDS[1] twice. Without the set,
     # a real --round-size 25 round renders "story, story, ..." twenty-five times
     # and blows the column on all 360 lines of the asciinema.
