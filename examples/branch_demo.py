@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -237,19 +238,33 @@ def abort_quietly(
 
 def discard_branches(
     client: PencaClient, catalog_uuid: str, branch_uuids: Iterable[str]
-) -> None:
-    """Delete every branch, attempting all of them even if one fails.
+) -> list[str]:
+    """Delete every branch, attempting all of them; return the ones that failed.
 
     Guarded per branch for two reasons: one failure must not strand the rest, and
     when this runs from a ``finally`` an unguarded raise would replace the
     exception being propagated — and the usual reason a delete fails is that the
-    stack is unreachable, i.e. exactly the error worth keeping.
+    stack is unreachable, i.e. exactly the error worth keeping. Returning the
+    failures rather than swallowing them lets the caller decide, which matters on
+    the success path where there is no exception worth protecting.
     """
+    failed: list[str] = []
     for branch_uuid in branch_uuids:
         try:
             client.delete_branch(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
         except Exception as exc:
             print(f"  (could not delete branch {branch_uuid}: {exc})")
+            failed.append(branch_uuid)
+
+    return failed
+
+
+def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
+    """Best-effort delete of a catalog, for unwinding a half-built seed."""
+    try:
+        client.delete_catalog(catalog_uuid=catalog_uuid)
+    except Exception as exc:
+        print(f"  (could not delete catalog {catalog_uuid}: {exc})")
 
 
 def seed_prod(client: PencaClient) -> ProdContext:
@@ -257,70 +272,78 @@ def seed_prod(client: PencaClient) -> ProdContext:
     catalog_uuid, main_branch_uuid = client.create_catalog(
         f"prod_{uuid4().hex[:8]}", AUTHOR
     )
-    # branch_uuid explicitly on every call: omitting it falls back to the
-    # client's constructor-configured default branch, which need not be the
-    # "main" of this brand-new catalog.
-    schema_uuid = client.create_schema(
-        "ads",
-        catalog_uuid=catalog_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create ads schema",
-    )
-    creatives_table_uuid = client.create_table(
-        "creatives",
-        CREATIVES_SCHEMA,
-        primary_keys=["creative_id"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create creatives table",
-    )
-    impressions_table_uuid = client.create_table(
-        "impressions",
-        IMPRESSIONS_SCHEMA,
-        primary_keys=["visitor_id"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="create impressions table",
-    )
-
-    tx = client.begin_tx(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch_uuid,
-        author=AUTHOR,
-        comment="seed creatives with zeroed tallies",
-    )
     try:
-        client.write_data(
-            tx.tx_uuid,
-            Mutation(
-                table_uuid=creatives_table_uuid,
-                upserts=pa.table(
-                    {
-                        "creative_id": list(CREATIVE_IDS),
-                        "headline": [HEADLINES[c] for c in CREATIVE_IDS],
-                        "impressions": [0] * len(CREATIVE_IDS),
-                        "conversions": [0] * len(CREATIVE_IDS),
-                    },
-                    schema=CREATIVES_SCHEMA,
-                ),
-            ),
+        # branch_uuid explicitly on every call: omitting it falls back to the
+        # client's constructor-configured default branch, which need not be the
+        # "main" of this brand-new catalog.
+        schema_uuid = client.create_schema(
+            "ads",
+            catalog_uuid=catalog_uuid,
+            branch_uuid=main_branch_uuid,
+            author=AUTHOR,
+            comment="create ads schema",
+        )
+        creatives_table_uuid = client.create_table(
+            "creatives",
+            CREATIVES_SCHEMA,
+            primary_keys=["creative_id"],
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
             branch_uuid=main_branch_uuid,
+            author=AUTHOR,
+            comment="create creatives table",
         )
-        committed = client.commit_tx(
-            tx.tx_uuid,
+        impressions_table_uuid = client.create_table(
+            "impressions",
+            IMPRESSIONS_SCHEMA,
+            primary_keys=["visitor_id"],
             catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
             branch_uuid=main_branch_uuid,
+            author=AUTHOR,
+            comment="create impressions table",
         )
+
+        tx = client.begin_tx(
+            catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
+            branch_uuid=main_branch_uuid,
+            author=AUTHOR,
+            comment="seed creatives with zeroed tallies",
+        )
+        try:
+            client.write_data(
+                tx.tx_uuid,
+                Mutation(
+                    table_uuid=creatives_table_uuid,
+                    upserts=pa.table(
+                        {
+                            "creative_id": list(CREATIVE_IDS),
+                            "headline": [HEADLINES[c] for c in CREATIVE_IDS],
+                            "impressions": [0] * len(CREATIVE_IDS),
+                            "conversions": [0] * len(CREATIVE_IDS),
+                        },
+                        schema=CREATIVES_SCHEMA,
+                    ),
+                ),
+                catalog_uuid=catalog_uuid,
+                schema_uuid=schema_uuid,
+                branch_uuid=main_branch_uuid,
+            )
+            committed = client.commit_tx(
+                tx.tx_uuid,
+                catalog_uuid=catalog_uuid,
+                branch_uuid=main_branch_uuid,
+            )
+        except BaseException:
+            abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
+            raise
     except BaseException:
-        abort_quietly(client, catalog_uuid, tx.tx_uuid, main_branch_uuid)
+        # Everything below the create_catalog — the schema, both tables, the seed
+        # tx — is inside the catalog, so dropping it unwinds the whole partial
+        # seed. Without this each failed attempt strands another prod_<hex>
+        # catalog on a shared stack, and retries accumulate them.
+        discard_catalog(client, catalog_uuid)
         raise
 
     return ProdContext(
@@ -587,7 +610,14 @@ def run_demo(
         # away, and a failed run is exactly when leaving three live branches behind
         # would hurt most. The prod_* catalog deliberately survives — prod
         # outliving its forks is the thing being demonstrated.
-        discard_branches(client, prod.catalog_uuid, branches.values())
+        undeleted = discard_branches(client, prod.catalog_uuid, branches.values())
+        # Only swallow while unwinding. On a green run a failed delete must not
+        # degrade to a printed line: the demo would exit 0 with live forks, and
+        # print_isolation would list them directly above "N parallel universes …
+        # were thrown away".
+        if undeleted and sys.exc_info()[1] is None:
+            msg = f"could not discard branches: {', '.join(undeleted)}"
+            raise RuntimeError(msg)
 
     remaining = tuple(
         sorted(

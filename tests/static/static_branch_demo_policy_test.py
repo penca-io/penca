@@ -239,6 +239,18 @@ def test_policy_rng_streams_are_independent_of_the_feed_and_of_each_other():
     }
     assert set(streams) == set(demo.POLICY_NAMES)
 
+    # Derive the feed's stream from build_visitor_feed itself rather than
+    # rebuilding random.Random(seed) by hand: a change to the feed's seeding must
+    # fail here, not silently invalidate the comparison.
+    feed_rng = random.Random(config.seed)
+    expected_first_row = tuple(
+        int(feed_rng.random() < rate) for *_head, rate in demo.CREATIVES
+    )
+    assert demo.build_visitor_feed(config)[0] == expected_first_row, (
+        "the feed is no longer drawn from random.Random(seed) in CREATIVES order; "
+        "update this test's model of it before trusting the comparison below"
+    )
+
     feed_stream = [random.Random(config.seed).random() for _ in range(4)]
     for policy_name, stream in streams.items():
         assert stream != feed_stream, (
@@ -249,3 +261,62 @@ def test_policy_rng_streams_are_independent_of_the_feed_and_of_each_other():
     assert len(distinct) == len(demo.POLICY_NAMES), (
         "each policy needs its own stream, or they explore in lockstep"
     )
+
+
+class _FailingClient:
+    """Minimal stand-in: records calls, raises what the test asks it to."""
+
+    def __init__(self, raises=None, fail_on=None):
+        self.raises = raises
+        self.fail_on = fail_on
+        self.deleted: list[str] = []
+        self.aborted: list[str] = []
+
+    def delete_branch(self, catalog_uuid: str, branch_uuid: str) -> None:
+        self.deleted.append(branch_uuid)
+        if self.raises is not None and branch_uuid == self.fail_on:
+            raise self.raises
+
+    def abort_tx(self, tx_uuid: str, catalog_uuid: str, branch_uuid: str) -> None:
+        self.aborted.append(tx_uuid)
+        if self.raises is not None:
+            raise self.raises
+
+
+def test_discard_branches_attempts_every_branch_and_reports_the_failures():
+    """One failure must not strand the branches after it."""
+    client = _FailingClient(raises=RuntimeError("boom"), fail_on="b")
+    failed = demo.discard_branches(client, "cat", ["a", "b", "c"])
+
+    assert client.deleted == ["a", "b", "c"], "every branch must be attempted"
+    assert failed == ["b"]
+
+
+def test_discard_branches_reports_nothing_when_every_delete_lands():
+    client = _FailingClient()
+    assert demo.discard_branches(client, "cat", ["a", "b"]) == []
+
+
+def test_abort_quietly_does_not_replace_the_exception_being_unwound():
+    """A failing abort must not become the error the reader sees."""
+    client = _FailingClient(raises=RuntimeError("abort failed"))
+    demo.abort_quietly(client, "cat", "tx", "branch")
+    assert client.aborted == ["tx"]
+
+
+def test_cleanup_helpers_let_a_second_ctrl_c_through():
+    """They catch Exception, not BaseException, so an interrupt still propagates."""
+    client = _FailingClient(raises=KeyboardInterrupt(), fail_on="a")
+    try:
+        demo.discard_branches(client, "cat", ["a"])
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("KeyboardInterrupt must not be swallowed")
+
+    try:
+        demo.abort_quietly(_FailingClient(raises=KeyboardInterrupt()), "c", "tx", "b")
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("KeyboardInterrupt must not be swallowed")
