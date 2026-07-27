@@ -24,3 +24,7 @@ metadata:
 - `create_branch` — crates/penca-api/src/write/mod.rs:777 (CHA-515 guard goes here).
 - `enumerate_base_cold_source` — crates/penca-api/src/query/meta_plan.rs:1005 (TODO(CHA-509) recursion point).
 - `fold_in_base_cold_source` — crates/penca-merge/src/lib.rs (read-side fold).
+
+**Two facts carried over from the folded-in duplicate (restored 2026-07-27 — deleting that file dropped them):**
+- **[[CHA-514]]'s descendant-audit-below-fork hazard applies even under single-level main-only forking** — a direct child of `main` auditing below its own fork point still needs `main`'s pre-fork history — so CHA-514 is **NOT** blocked on [[CHA-509]]. This is a scheduling claim about a live ticket and is not derivable from the code.
+- **[[CHA-433]]'s PR #317 merge carries this single-level base-cold source unchanged** — it unioned it with the retention floor and added no recursion.

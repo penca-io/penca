@@ -257,7 +257,10 @@ def seed_prod(client: PencaClient) -> ProdContext:
             schema=CREATIVES_SCHEMA,
         )
         tx = client.begin_tx(
-            catalog_uuid=catalog_uuid, branch_uuid=main_uuid, author=AUTHOR
+            catalog_uuid=catalog_uuid,
+            branch_uuid=main_uuid,
+            author=AUTHOR,
+            comment="seed creatives with zeroed tallies",
         )
         try:
             client.write_data(
@@ -373,7 +376,10 @@ def run_rounds(
     only on policy. Everything each branch does here is SQL on its own
     connection.
     """
-    rngs = {name: random.Random(f"{config.seed}:{name}") for name in POLICY_NAMES}
+    # Keyed off the branches actually passed in, not POLICY_NAMES: `branches` is
+    # a parameter, so a caller driving a subset (or anything else) would other-
+    # wise KeyError here instead of just running what it asked for.
+    rngs = {name: random.Random(f"{config.seed}:{name}") for name in branches}
 
     for round_index, start in enumerate(
         range(0, config.impressions, config.round_size)
@@ -406,7 +412,7 @@ def run_rounds(
             #    optional here, it is the only way the number can be right.
             updated = dict(tallies)
             for _visitor, creative_id, converted in outcomes:
-                shown, hits = updated[creative_id]
+                shown, hits = updated.get(creative_id, (0, 0))
                 updated[creative_id] = (shown + 1, hits + converted)
 
             served = sorted({creative_id for _v, creative_id, _c in outcomes})
@@ -526,18 +532,22 @@ def run_demo(
     """Fork, drive the shared feed through every branch, score, then discard."""
     feed = build_visitor_feed(config)
     prod = seed_prod(client)
+    branch_uuids: dict[str, str] = {}
+    branches: dict[str, PencaClient] = {}
     try:
         branch_uuids = fork_branches(client, prod)
+        # One pinned connection per branch: three branches is literally three
+        # endpoints, which is the shape a reader would use.
+        branches = {name: connect(prod.catalog_name, name) for name in POLICY_NAMES}
     except BaseException:
-        # The last point at which the catalog is dropped. Once the rounds start,
-        # prod holds committed state that is the subject of the demo, so a
-        # mid-run failure KEEPS the catalog for inspection.
+        # Setup, so leave no debris: nothing has been demonstrated yet, and a
+        # connection failure is exactly what a misconfigured reader hits — one
+        # stranded catalog per attempt would pile up fast. Contrast the rounds
+        # below, where a failure deliberately KEEPS the catalog, because by then
+        # prod holds committed state that is the subject of the demo.
+        discard_branches(client, prod.catalog_uuid, list(branch_uuids.values()))
         discard_catalog(client, prod.catalog_uuid)
         raise
-
-    # One pinned connection per branch: three branches is literally three
-    # endpoints, which is the shape a reader would use.
-    branches = {name: connect(prod.catalog_name, name) for name in POLICY_NAMES}
 
     completed = False
     try:
@@ -551,6 +561,12 @@ def run_demo(
         )
         completed = True
     finally:
+        for branch_name, conn in branches.items():
+            try:
+                conn.close()
+            except Exception as exc:
+                print(f"  (could not close the {branch_name} connection: {exc})")
+
         # finally, not straight-line: a failed run is exactly when leaving three
         # live branches behind would hurt most. The prod_* catalog deliberately
         # survives — prod outliving its forks is the thing being demonstrated.
@@ -572,21 +588,29 @@ def run_demo(
     # untouched" only covers the run; read after, it also covers main's one
     # shared cold object surviving the deletion of three forks that read it.
     main_conn = connect(prod.catalog_name, "main")
-    main_log = main_conn.execute_query(
-        f"SELECT count(*) AS rows FROM {prod.impressions}"
-    )
-
-    return DemoOutcome(
-        catalog_uuid=prod.catalog_uuid,
-        scoreboard=tuple(scoreboard),
-        main_tallies=read_tallies(main_conn, prod),
-        main_impression_rows=main_log.column("rows")[0].as_py(),
-        remaining_branches=tuple(
+    try:
+        main_log = main_conn.execute_query(
+            f"SELECT count(*) AS rows FROM {prod.impressions}"
+        )
+        main_tallies = read_tallies(main_conn, prod)
+        remaining = tuple(
             sorted(
                 branch.branch_name
                 for branch in client.list_branches(catalog_uuid=prod.catalog_uuid)
             )
-        ),
+        )
+    finally:
+        try:
+            main_conn.close()
+        except Exception as exc:
+            print(f"  (could not close the main connection: {exc})")
+
+    return DemoOutcome(
+        catalog_uuid=prod.catalog_uuid,
+        scoreboard=tuple(scoreboard),
+        main_tallies=main_tallies,
+        main_impression_rows=main_log.column("rows")[0].as_py(),
+        remaining_branches=remaining,
     )
 
 

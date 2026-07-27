@@ -1630,10 +1630,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "psycopg", extra = ["binary", "pool"] },
-    { name = "tabulate" },
 ]
 
 [package.metadata]
@@ -1649,11 +1646,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "pandas", specifier = ">=2.3.3" },
-    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.3" },
-    { name = "tabulate", specifier = ">=0.10.0" },
-]
+dev = [{ name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.3" }]
 
 [[package]]
 name = "penca-proto"
@@ -1675,6 +1668,7 @@ dependencies = [
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "penca-client" },
     { name = "penca-proto" },
+    { name = "pyarrow" },
     { name = "tabulate" },
 ]
 
@@ -1699,6 +1693,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "penca-client", editable = "packages/penca-client" },
     { name = "penca-proto", editable = "packages/penca-proto" },
+    { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "tabulate", specifier = ">=0.10.0" },
 ]
 
