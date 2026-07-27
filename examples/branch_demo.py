@@ -428,6 +428,69 @@ def read_impression_log(
     )
 
 
+def allocate_round(
+    policy_name: str,
+    visitor_indexes: Sequence[int],
+    tallies: Mapping[str, tuple[int, int]],
+    feed: Sequence[Sequence[int]],
+    rng: random.Random,
+    epsilon: float,
+) -> tuple[tuple[int, str, int], ...]:
+    """Decide one round: per visitor, a creative and that visitor's outcome.
+
+    Draws from ``rng`` once per visitor, in visitor order — an allocation that
+    consumed it differently would shift epsilon's whole stream and change the
+    scoreboard at a fixed seed.
+    """
+    outcomes: list[tuple[int, str, int]] = []
+    for visitor_index in visitor_indexes:
+        creative_id = choose_creative(policy_name, visitor_index, tallies, rng, epsilon)
+        converted = feed[visitor_index][CREATIVE_POSITION[creative_id]]
+        outcomes.append((visitor_index, creative_id, converted))
+
+    return tuple(outcomes)
+
+
+def apply_outcomes(
+    tallies: Mapping[str, tuple[int, int]],
+    outcomes: Sequence[tuple[int, str, int]],
+) -> dict[str, tuple[int, int]]:
+    """Fold a round's outcomes onto a copy of the tallies."""
+    updated = dict(tallies)
+    for _visitor_index, creative_id, converted in outcomes:
+        shown, conversions = updated.get(creative_id, (0, 0))
+        updated[creative_id] = (shown + 1, conversions + converted)
+
+    return updated
+
+
+def tally_batch(
+    touched: Sequence[str], updated: Mapping[str, tuple[int, int]]
+) -> pa.Table:
+    """The ``creatives`` upsert payload — same primary keys, new running totals."""
+    return pa.table(
+        {
+            "creative_id": list(touched),
+            "headline": [HEADLINES[creative_id] for creative_id in touched],
+            "impressions": [updated[creative_id][0] for creative_id in touched],
+            "conversions": [updated[creative_id][1] for creative_id in touched],
+        },
+        schema=CREATIVES_SCHEMA,
+    )
+
+
+def impression_batch(outcomes: Sequence[tuple[int, str, int]]) -> pa.Table:
+    """The ``impressions`` append payload, one row per visitor served."""
+    return pa.table(
+        {
+            "visitor_id": [f"v{visitor:06d}" for visitor, _c, _o in outcomes],
+            "creative_id": [creative_id for _v, creative_id, _o in outcomes],
+            "converted": [converted for _v, _c, converted in outcomes],
+        },
+        schema=IMPRESSIONS_SCHEMA,
+    )
+
+
 def drive_round(
     client: PencaClient,
     prod: ProdContext,
@@ -439,37 +502,18 @@ def drive_round(
 ) -> tuple[tuple[int, str, int], ...]:
     """Run one round on one branch; return its ``(visitor, creative, converted)``.
 
-    This is the load-bearing loop. The read is of the branch's *own* committed
-    state, so the allocation is steered by what this branch's previous rounds
-    wrote — on the same copy of the data it is transacting against. The tally
-    UPDATE and the log append share one transaction, so a scoreboard read can
-    never catch them disagreeing.
+    This is the load-bearing loop: read → allocate → write. The read is of the
+    branch's *own* committed state, so the allocation is steered by what this
+    branch's previous rounds wrote — on the same copy of the data it is transacting
+    against. The tally UPDATE and the log append share one transaction, so a
+    scoreboard read can never catch them disagreeing.
     """
     branch_name, branch_uuid = branch
     tallies = read_tallies(client, prod, branch_uuid)
-
-    picks = tuple(
-        (
-            visitor_index,
-            choose_creative(branch_name, visitor_index, tallies, rng, epsilon),
-        )
-        for visitor_index in visitor_indexes
-    )
-    outcomes = tuple(
-        (
-            visitor_index,
-            creative_id,
-            feed[visitor_index][CREATIVE_POSITION[creative_id]],
-        )
-        for visitor_index, creative_id in picks
-    )
-
-    updated = dict(tallies)
-    for _visitor_index, creative_id, converted in outcomes:
-        shown, conversions = updated.get(creative_id, (0, 0))
-        updated[creative_id] = (shown + 1, conversions + converted)
-
+    outcomes = allocate_round(branch_name, visitor_indexes, tallies, feed, rng, epsilon)
+    updated = apply_outcomes(tallies, outcomes)
     touched = sorted({creative_id for _v, creative_id, _c in outcomes})
+
     tx = client.begin_tx(
         catalog_uuid=prod.catalog_uuid,
         schema_uuid=prod.schema_uuid,
@@ -482,15 +526,7 @@ def drive_round(
             tx.tx_uuid,
             Mutation(
                 table_uuid=prod.creatives_table_uuid,
-                upserts=pa.table(
-                    {
-                        "creative_id": touched,
-                        "headline": [HEADLINES[c] for c in touched],
-                        "impressions": [updated[c][0] for c in touched],
-                        "conversions": [updated[c][1] for c in touched],
-                    },
-                    schema=CREATIVES_SCHEMA,
-                ),
+                upserts=tally_batch(touched, updated),
             ),
             catalog_uuid=prod.catalog_uuid,
             schema_uuid=prod.schema_uuid,
@@ -500,16 +536,7 @@ def drive_round(
             tx.tx_uuid,
             Mutation(
                 table_uuid=prod.impressions_table_uuid,
-                upserts=pa.table(
-                    {
-                        "visitor_id": [f"v{v:06d}" for v, _c, _o in outcomes],
-                        "creative_id": [
-                            creative_id for _v, creative_id, _o in outcomes
-                        ],
-                        "converted": [converted for _v, _c, converted in outcomes],
-                    },
-                    schema=IMPRESSIONS_SCHEMA,
-                ),
+                upserts=impression_batch(outcomes),
             ),
             catalog_uuid=prod.catalog_uuid,
             schema_uuid=prod.schema_uuid,
