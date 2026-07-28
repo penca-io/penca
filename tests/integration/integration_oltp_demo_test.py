@@ -41,7 +41,7 @@ _REPS = 5
 _TARGET_ID = _ROWS // 2
 _TARGET_OWNER = f"owner_{_TARGET_ID:06d}"
 _ROW_SECTION = "--- The row we looked up ---"
-_LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per seek) ---"
+_LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per lookup) ---"
 
 # A pandas/tabulate cell holding a millisecond figure: "| 1.23 |", "|  0.4 |".
 # Lookahead on the closing pipe so adjacent cells share their delimiter —

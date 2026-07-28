@@ -3,21 +3,27 @@
 
 One feature: fetch a single row by its primary key. The interesting part is
 where the row lives. A columnar layout is built for scans, so the fair question
-to ask of a lakehouse is whether a single-row seek is still a seek once the data
-has been persisted and snapshotted into open columnar files — this script drives
-the table to that steady state first, then times the lookup and prints what it
-measured on your machine.
+to ask of a lakehouse is whether fetching one row is still cheap once the data
+has been persisted, snapshotted AND purged into open columnar files — all three,
+because persist alone leaves the rows still queryable from the hot tier, and the
+read plan's hot/cold fence is the purge watermark. This script drives the table
+to that steady state first, then times the lookup.
 
-The same seek is shown two ways: through the gRPC client, and as ordinary SQL
-over Flight SQL. They are not the same amount of work per call — `ReadData` is a
-single RPC, while the SQL arm parses, plans and takes the ADBC driver's
-prepared-statement round trip before reaching the same read path. That is a
-mechanism difference, not a verdict; the numbers are yours, measured live, and
-nothing is baked into this file.
+The same row is fetched two ways, and they are deliberately not the same
+request. The gRPC arm sends `ids=`, a primary-key restriction the server
+resolves to a row identity and looks up directly. The SQL arm sends
+`WHERE account_id = ...` over Flight SQL, a predicate the engine has to plan and
+then evaluate against the columnar data. So the two numbers are not one
+operation over two transports — they are a keyed fetch and a filtered read, and
+that difference is most of the gap between them. The SQL arm additionally pays
+the ADBC driver's prepared-statement round trip, which is on the client side of
+the wire.
 
-Seeding and the persist/snapshot step use the gRPC client, because neither bulk
-loading a table nor driving the lifecycle is something SQL can express. The
-lookup itself is shown both ways, because that is the subject.
+Both numbers are measured live on your machine; nothing is baked into this file.
+
+Seeding and the lifecycle steps use the gRPC client, because neither bulk
+loading a table nor driving persist/snapshot/purge is something SQL can express.
+The lookup itself is shown both ways, because that is the subject.
 
 Requires Docker services running: just penca-up
 """
@@ -66,11 +72,11 @@ def time_lookups(lookup, reps: int) -> tuple[float, pa.Table]:
 
     One untimed call first: the first request on a connection pays for session
     setup and the table-identifier resolve, which are one-off costs and not what
-    a per-seek figure should be reporting.
+    a per-lookup figure should be reporting.
 
-    Returns the result as well as the timing so the caller can show *what* the
-    seek found — a latency figure for a lookup that quietly returned nothing
-    would be worse than no figure at all.
+    Returns the result as well as the timing so the caller can check *what* came
+    back — a latency figure for a lookup that quietly returned nothing would be
+    worse than no figure at all.
     """
     lookup()
 
@@ -133,7 +139,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    # The middle of the key range, so the seek is not trivially the first or
+    # The middle of the key range, so the lookup is not trivially the first or
     # last row in any layout the storage happens to choose.
     target_id = args.rows // 2
 
@@ -257,7 +263,7 @@ def main() -> None:
         print("\n--- The row we looked up ---")
         print(found.to_pandas().to_markdown(index=False))
 
-        print("\n--- Point lookup latency on cold columnar (mean per seek) ---")
+        print("\n--- Point lookup latency on cold columnar (mean per lookup) ---")
         print_table(
             {
                 "path": ["gRPC", "SQL"],
@@ -266,9 +272,10 @@ def main() -> None:
         )
         print(
             f"\nOne row out of {args.rows}, out of open columnar files on object "
-            f"storage. The gRPC arm asks for the row by primary key and the "
-            f"engine goes and gets it; the SQL arm sends a predicate, which the "
-            f"engine has to plan before it can do the same."
+            f"storage. The gRPC arm named the row by primary key and the engine "
+            f"looked it up; the SQL arm sent a predicate, which the engine "
+            f"planned and then evaluated over the data. Two different requests, "
+            f"which is most of why the two numbers differ."
         )
     finally:
         # finally, not straight-line: a failed run is exactly when leaving a
