@@ -171,7 +171,7 @@ pub struct LifecycleServiceConfig {
     /// `SCHEDULER_TICK_INTERVAL_SECONDS` (shared env, like
     /// `QUERY_TIMEOUT_SECONDS`). Floors the expired-begin ledger-GC grace so it
     /// never drops a tx's bookkeeping before Purge has re-swept the tx's hot
-    /// rows (ADR 0027 §5). Negative ⇒ scheduler disabled ⇒ contributes no
+    /// rows (ADR 0027 §5). Non-positive ⇒ scheduler disabled ⇒ contributes no
     /// floor (the hot-grace window stands alone).
     pub scheduler_tick_interval_seconds: i64,
     /// Persist-loop cadence, in seconds. Will read
@@ -458,6 +458,10 @@ mod tests {
         assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_seconds(), 0);
         assert_eq!(lifecycle_config(-1, 30).purge_sweep_interval_seconds(), 30);
         assert_eq!(lifecycle_config(5, -1).purge_sweep_interval_seconds(), 5);
+        // Zero is "disabled" here too — the two crates must agree on that, or
+        // the floor would credit a loop the scheduler never runs.
+        assert_eq!(lifecycle_config(0, -1).purge_sweep_interval_seconds(), 0);
+        assert_eq!(lifecycle_config(0, 30).purge_sweep_interval_seconds(), 30);
     }
 
     /// The binary assigns this straight to

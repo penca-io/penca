@@ -28,12 +28,14 @@ pub struct SchedulerConfig {
     pub tick_interval_seconds: i64,
 
     /// Cadence of the persist loop — hot→cold memory relief, so it wants a
-    /// SHORT interval. Negative disables that loop alone.
+    /// SHORT interval. Non-positive disables that loop alone
+    /// (see [`interval_from_seconds`]).
     pub persist_tick_interval_seconds: i64,
 
     /// Cadence of the snapshot loop — compaction plus Purge and tx-log GC,
-    /// cheaper to amortize, so it wants a LONGER interval. Negative disables
-    /// that loop alone; the two are independent.
+    /// cheaper to amortize, so it wants a LONGER interval. Non-positive
+    /// disables that loop alone (see [`interval_from_seconds`]); the two are
+    /// independent.
     pub snapshot_tick_interval_seconds: i64,
 
     /// Max `table_uuid`s requested per list-tables page. The scheduler
@@ -69,6 +71,12 @@ impl SchedulerConfig {
         }
     }
 
+    /// TODO(CHA-513): deleted by the config split, along with
+    /// `tick_interval_seconds`. Until then this is the only path `main` drives,
+    /// and it still spells "disabled" as `< 0` rather than delegating to
+    /// [`interval_from_seconds`] — so a deployment override of `0` is still the
+    /// backoff-free hot loop that helper exists to prevent. Delegate or delete;
+    /// do not let the two rules outlive the red phase.
     pub fn tick_interval(&self) -> Option<Duration> {
         if self.tick_interval_seconds < 0 {
             None
@@ -150,6 +158,22 @@ mod tests {
     /// one of them is disabled.
     #[test]
     fn the_two_intervals_are_independent() {
+        // Zero must reach the accessors through the helper — an accessor wired
+        // to the legacy `< 0` rule instead would pass every `-1` case.
+        let persist_zero = config(0, 30);
+        assert_eq!(persist_zero.persist_tick_interval(), None);
+        assert_eq!(
+            persist_zero.snapshot_tick_interval(),
+            Some(Duration::from_secs(30))
+        );
+
+        let snapshot_zero = config(1, 0);
+        assert_eq!(
+            snapshot_zero.persist_tick_interval(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(snapshot_zero.snapshot_tick_interval(), None);
+
         let both_on = config(1, 30);
         assert_eq!(both_on.persist_tick_interval(), Some(Duration::from_secs(1)));
         assert_eq!(

@@ -161,13 +161,13 @@ impl Scheduler {
     /// sweep that re-enumerates the table (see "Failure semantics" on
     /// the module doc for when a table is re-enumerated).
     ///
-    /// When `tick_interval` is `None` (configured via
-    /// `SCHEDULER_TICK_INTERVAL_SECONDS < 0`), the scheduler logs a
-    /// warning and idles forever without firing any lifecycle ops.
+    /// When `tick_interval` is `None` (a non-positive configured cadence),
+    /// the scheduler logs a warning and idles forever without firing any
+    /// lifecycle ops.
     pub async fn run(&mut self) -> ! {
         let Some(interval) = self.tick_interval else {
             tracing::warn!(
-                "scheduler disabled: SCHEDULER_TICK_INTERVAL_SECONDS < 0, \
+                "scheduler disabled: tick interval is non-positive, \
                  no lifecycle ops will fire"
             );
             std::future::pending::<()>().await;
