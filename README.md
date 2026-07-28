@@ -675,12 +675,13 @@ injected by `docker/compose.yml`. Server-side configs live in
 | `WRITE_DEFAULT_TX_TIMEOUT_SECONDS`, `WRITE_MAX_TX_TIMEOUT_SECONDS` | write | Tx TTL bounds |
 | `LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES` | lifecycle | Compaction ceiling |
 | `LIFECYCLE_SEGMENT_READ_CONCURRENCY` | lifecycle | Max in-flight cold-segment reads during snapshot's merge_read (memory-safety cap) |
-| `HOT_PURGE_GRACE_SECONDS` | lifecycle | Hot-purge grace window; the expired-begin ledger GC waits `max(SCHEDULER_TICK_INTERVAL_SECONDS, this)` before dropping a timed-out tx's ledger (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)) |
+| `HOT_PURGE_GRACE_SECONDS` | lifecycle | Hot-purge grace window; the expired-begin ledger GC waits `max(SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS, SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS, this)` before dropping a timed-out tx's ledger (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)). The max over both cadences is a conservative bound — Purge rides the snapshot loop today, but the loop-to-op assignment is not an invariant |
 | `QUERY_SERVICE_ADDR`, `WRITE_SERVICE_ADDR` | sql-server | Upstream gRPC addresses (Query for catalog/table metadata reads, Write for DML) |
 | `SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY` | sql-server | Per-connection Flight SQL logical-plan cache size (CHA-355; `0` disables) |
 | `SQL_SERVER_DEFAULT_CATALOG`, `SQL_SERVER_DEFAULT_SCHEMA`, `SQL_SERVER_DEFAULT_BRANCH` | sql-server | Per-session pinned catalog + unqualified-DML defaults |
 | `QUERY_SERVICE_ADDR`, `LIFECYCLE_SERVICE_ADDR` | scheduler | Upstream gRPC addresses for the autonomous tick loop |
-| `SCHEDULER_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Purge sweep cadence (negative = boot then idle forever); lifecycle reads it too, to floor the expired-begin ledger-GC grace (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)) — both MUST agree |
+| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Persist sweep cadence (**non-positive** = that loop boots then idles forever); lifecycle reads it too, to floor the expired-begin ledger-GC grace (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)) — both services MUST agree |
+| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Snapshot + Purge + tx-log GC sweep cadence (**non-positive** = that loop boots then idles forever); same ledger-GC floor contract, both services MUST agree |
 | `SCHEDULER_LIST_PAGE_SIZE` | scheduler | List-tables page size |
 
 The Python `PencaClient` reads the channel URLs:

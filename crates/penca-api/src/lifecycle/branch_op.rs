@@ -3,9 +3,9 @@
 //! [`LifecycleManager::persist_branch`], [`LifecycleManager::snapshot_branch`],
 //! and [`LifecycleManager::persist_and_snapshot_branch`] loop the per-table
 //! [`persist`](LifecycleManager::persist) / [`snapshot`](LifecycleManager::snapshot)
-//! primitives over every MODIFIED table on a `(catalog, branch)`, all bounded at
-//! the one fork commit `T` — so the whole catalog-wide flush captures a single
-//! consistent snapshot at the fork point. Each returns `T`'s [`Watermark`].
+//! primitives over a `(catalog, branch)`'s dirty set, all bounded at the one fork
+//! commit `T` — so the whole catalog-wide flush captures a single consistent
+//! snapshot at the fork point. Each returns `T`'s [`Watermark`].
 //!
 //! `T` is a commit-order position ([`Watermark`] — no tx_uuid). It is either
 //! supplied by the caller in `BranchOpRequest.target` (CreateBranch's write path
@@ -15,12 +15,18 @@
 //! position is what lets CreateBranch seed the child from the exact fork seq
 //! (CHA-487) instead of a racy `MAX` re-read.
 //!
-//! Only MODIFIED tables are enumerated (via [`LifecycleManager::list_modified_tables`],
-//! as the scheduler does) — an already-persisted table is already durable, and a
-//! table whose only writes are past `T` is a no-op under the per-table
-//! `target_micros = T.commit_micros` bound. Fails fast on the first per-table
-//! error: the flush is synchronous inside CreateBranch, so a partial flush must
-//! surface, not silently succeed.
+//! The Persist side enumerates only MODIFIED tables (via
+//! [`LifecycleManager::list_modified_tables`], as the scheduler does) — an
+//! already-persisted table is already durable, and a table whose only writes are
+//! past `T` is a no-op under the per-table `target_micros = T.commit_micros`
+//! bound. The Snapshot side enumerates PERSISTED tables instead, so a table
+//! persisted then dropped from hot is still re-snapshotted.
+//!
+//! [`LifecycleManager::persist_branch`] and [`LifecycleManager::snapshot_branch`]
+//! fail fast on the first per-table error: the flush is synchronous inside
+//! CreateBranch, so a partial flush must surface, not silently succeed.
+//! [`LifecycleManager::persist_and_snapshot_branch`] instead continues on error —
+//! see its doc.
 
 use std::collections::HashMap;
 
@@ -106,7 +112,7 @@ impl LifecycleManager {
         Ok(watermark)
     }
 
-    /// Snapshot (all-cold merge) every MODIFIED table on the `(catalog, branch)`
+    /// Snapshot (all-cold merge) every PERSISTED table on the `(catalog, branch)`
     /// named by `request`. Returns the fork [`Watermark`] `T`. Snapshot bounds
     /// itself at each table's latest committed persist, so no per-table micros
     /// bound is threaded here (mirrors the scheduler's `snapshot_one`).
@@ -149,10 +155,13 @@ impl LifecycleManager {
         Ok(watermark)
     }
 
-    /// Persist then Snapshot every MODIFIED table on the `(catalog, branch)`
-    /// named by `request`, per table (non-atomic). Returns the fork
-    /// [`Watermark`] `T`. Drives the scheduler's per-tick sweep (CHA-273 rework
-    /// IMPL-R3).
+    /// Persist every MODIFIED table, then Snapshot every PERSISTED table, on the
+    /// `(catalog, branch)` named by `request`, per table (non-atomic). Returns
+    /// the fork [`Watermark`] `T`.
+    ///
+    /// The two phases enumerate **distinct dirty-sets** — Persist the hot-modified
+    /// set, Snapshot the post-persist persisted set. See the inline note on the
+    /// Snapshot phase for why.
     ///
     /// **Continue-on-error**, matching the old `ops::persist_and_snapshot` shape
     /// the scheduler relied on: a per-table failure is logged and the loop

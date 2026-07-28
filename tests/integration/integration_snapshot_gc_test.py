@@ -31,7 +31,8 @@ re-enqueue coverage returns.
 
 All tests share the integration suite's ``QUERY_TIMEOUT_SECONDS=2``
 grace override from ``docker/test.env``. The lifecycle scheduler is
-disabled in the test profile (``SCHEDULER_TICK_INTERVAL_SECONDS=-1``),
+disabled in the test profile
+(``SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS=-1``),
 so snapshot counts are fully test-driven.
 
 Run via ``just integration-test snapshot_gc``.

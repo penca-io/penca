@@ -82,7 +82,8 @@ N_TRANSACTIONS = int(os.environ.get("PGBENCH_TX", "1000"))
 SEED = int(os.environ.get("PGBENCH_SEED", "42"))
 # CHA-501: drain the hot log every N committed transactions (persist→snapshot→
 # purge the four data tables), standing in for the production scheduler tick the
-# perf profile disables (SCHEDULER_TICK_INTERVAL_SECONDS=-1) while keeping the
+# perf profile disables (SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS=-1)
+# while keeping the
 # other perf tests scheduler-off + deterministic. Default 100 keeps the per-RMW
 # hot stack shallow without dominating the run; 0 disables (the raw no-GC case).
 PGBENCH_DRAIN_EVERY = int(os.environ.get("PGBENCH_DRAIN_EVERY", "100"))

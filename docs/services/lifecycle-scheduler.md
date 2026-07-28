@@ -16,21 +16,41 @@ This is the v0 implementation per [CHA-154](https://linear.app/chapala/issue/CHA
 single replica, no leader election, no compaction, no operator-facing
 admin RPCs. Multi-replica safety and compaction are future work.
 
-## Tick loop
+## Tick loops
 
-Every `SCHEDULER_TICK_INTERVAL_SECONDS`:
+Two independently-paced loops. Persist is the hot→cold memory-relief sweep and
+must not fall behind; Snapshot, Purge and tx-log GC are compaction and cleanup,
+cheaper to amortize over a longer cadence. A single interval forced one
+compromise between the two.
+
+The loops share no mutable state: the persist loop is stateless because
+`PersistBranch` resolves its own dirty set server-side, and the snapshot loop
+owns the entire per-branch watermark map.
 
 ```text
+// Persist loop — every SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS
+for each catalog (QueryService::ListCatalogs):
+  for each branch in catalog (QueryService::ListBranches):
+    LifecycleService::PersistBranch(catalog, branch)
+sleep(SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS)
+```
+
+```text
+// Snapshot loop — every SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS
 for each catalog (QueryService::ListCatalogs):
   for each branch in catalog (QueryService::ListBranches):
     now = system clock micros
 
-    // Tables with new committed writes since the last tick
+    // Enumerates the PERSISTED set server-side (CHA-509), not the
+    // hot-modified set, so a table persisted-then-purged is still
+    // re-snapshotted.
+    LifecycleService::SnapshotBranch(catalog, branch)
+
+    // Tables with new committed OR aborted writes since the last sweep
     modified = paginate LifecycleService::ListModifiedTables(
                  catalog, branch, modified_at=[last_modified_tick, now))
     for T in modified:
-      LifecycleService::Persist(catalog, branch, T)
-      LifecycleService::Snapshot(catalog, branch, T)
+      LifecycleService::Purge(catalog, branch, T)
     last_modified_tick[catalog, branch] = now
 
     // Tables whose latest persist has cleared the universal grace
@@ -47,9 +67,21 @@ for each catalog (QueryService::ListCatalogs):
     // (CHA-221). Unconditional per tick — the RPC's own empty-set
     // fast-path is the no-op gate, no scheduler watermark needed.
     LifecycleService::PurgeTxLog(catalog, branch)
-
-sleep(SCHEDULER_TICK_INTERVAL_SECONDS)
+sleep(SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS)
 ```
+
+### Why Purge rides the snapshot loop
+
+Purge's committed axis targets `Pu = W_snap`, read from the latest committed
+snapshot watermark behind a strict-advance gate, so it cannot advance unless a
+Snapshot has run — on a fast persist tick it would compute no advance and
+early-return, costing an RPC and buying nothing.
+
+Accepted trade-off: Purge's other two axes (expired-begin cleanup and abort
+cleanup) have no dependence on `W_snap` and so now reclaim at the snapshot
+cadence rather than the persist one. Both reclaim invisible garbage — aborted
+rows and timed-out open txs serve no reads — and ADR 0027 §5 already gives
+expired-begin ledger GC a wall-clock grace.
 
 ### Dual enumeration
 
@@ -120,7 +152,8 @@ All values are required from environment variables; defaults live in
 |---|---|
 | `QUERY_SERVICE_ADDR` | gRPC URL of the `query` service (catalog/branch discovery) |
 | `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service (per-table `Persist`/`Snapshot`/`Purge`) |
-| `SCHEDULER_TICK_INTERVAL_SECONDS` | Time between the end of one tick and the start of the next. Compose default `5s`; the `dev` profile pins `1s` (CHA-517 — an interactive stack should not accumulate unpersisted hot data) and the `test` profile pins `-1`, i.e. boot and idle, so the tick loop cannot race a suite's manual lifecycle calls. |
+| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | Time between the end of one persist tick and the start of the next. Compose default `5s`; the `dev` profile pins `1s` (CHA-517 — an interactive stack should not accumulate unpersisted hot data). **Non-positive** disables the persist loop alone: boot and idle. |
+| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | Same, for the snapshot loop (Snapshot + Purge + PurgeTxLog). Compose default `30s`; the `dev` profile pins `5s`. **Non-positive** disables the snapshot loop alone. The `test` profile pins **both** to `-1` so neither loop can race a suite's manual lifecycle calls. |
 | `SCHEDULER_LIST_PAGE_SIZE` | Max `table_uuid`s requested per list-tables page. The scheduler drains every page before moving on. |
 | `QUERY_TIMEOUT_SECONDS` | Universal grace window in seconds. MUST equal the value the `query` + `lifecycle` services read from the same env var (ADR 0019). The scheduler uses it to bound the `ListPersistedTables` upper edge at `now - QUERY_TIMEOUT_SECONDS`. |
 
@@ -132,7 +165,9 @@ logged and skipped. Every lifecycle op is idempotent, so transient
 failures self-heal on the next sweep that re-enumerates the table.
 
 The scheduler does NOT use gRPC retries or backoff. The tick cadence
-(`SCHEDULER_TICK_INTERVAL_SECONDS`) is the natural retry interval —
+(`SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` for Persist,
+`SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` for Snapshot, Purge and tx-log GC)
+is the natural retry interval —
 adding intra-tick retries would interfere with the tick loop's
 single-replica progress guarantee.
 
