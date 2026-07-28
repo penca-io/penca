@@ -1705,6 +1705,34 @@ mod tests {
         .unwrap()
     }
 
+    /// A resolved batch whose user columns may be NULL — the shape the tombstone
+    /// arm actually produces (CHA-524). `make_resolved_batch_flagged` gives its
+    /// `is_delete = true` rows real values, which production never does: the
+    /// delete log carries no user columns, so once a Snapshot fences the row's
+    /// upsert out of the hot `latest` CTE the arm emits NULLs.
+    ///
+    /// Constructing this against `resolved_schema` is itself the regression lock
+    /// — re-tightening the carrier's user columns makes `try_new` fail here.
+    fn make_resolved_batch_nullable(
+        row_uuids: &[&str],
+        names: &[Option<&str>],
+        values: &[Option<i32>],
+        committed_ats: &[i64],
+        is_deletes: &[bool],
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            resolved_schema(&test_user_schema()),
+            vec![
+                Arc::new(StringArray::from(row_uuids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(committed_ats.to_vec())),
+                Arc::new(arrow::array::BooleanArray::from(is_deletes.to_vec())),
+            ],
+        )
+        .expect("the resolve carrier must accept NULL user columns")
+    }
+
     fn make_snapshot_batch(row_uuids: &[&str], names: &[&str], values: &[i32]) -> RecordBatch {
         let schema = snapshot_read_schema(&test_user_schema());
         RecordBatch::try_new(
@@ -2700,6 +2728,69 @@ mod tests {
             "segment with stats [0,299] should be pruned by `l.value > 999`; got reads = {:?}",
             dl.recorded_snapshot_reads()
         );
+    }
+
+    /// CHA-524: a tombstone whose user columns are NULL — production's actual
+    /// shape once a Snapshot has fenced the row's upsert out of `latest` — must
+    /// flow through the read, not abort it. The table declares `name`/`value`
+    /// non-nullable (`test_user_schema`), which is exactly the condition that
+    /// used to make `RecordBatch::try_new` reject the resolve and wedge every
+    /// later read.
+    ///
+    /// The schema assertion is the half that distinguishes this fix from the
+    /// silent-corruption alternative: relaxing the OUTPUT contract too would
+    /// also make the read succeed, while handing clients an all-nullable schema
+    /// for a table they declared strict.
+    #[tokio::test]
+    async fn null_carrying_tombstone_resolves_without_wedging_the_read() {
+        let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("s1")]);
+        let schema = test_user_schema();
+        let dl = MockDlDriver::default()
+            .with_resolved(make_resolved_batch_nullable(
+                &["u1", "d1"],
+                &[Some("a"), None],
+                &[Some(1), None],
+                &[100, 150],
+                &[false, true],
+            ))
+            .with_snapshot("s1", make_snapshot_batch(&["s-row"], &["s"], &[9]));
+
+        let batches = collect_stream(stream_all_cold(MergeReadRequest {
+            segment_order: SegmentOrder::ByCompletion,
+            plan: &plan,
+            driver: &MockDriver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &ReadSnapshot::AsOfMicros(2_000),
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 2,
+            snapshot_prune_min_segments: 0,
+        }))
+        .await
+        .expect("a NULL-carrying tombstone must not abort the read");
+
+        let emitted = all_row_uuids(&batches);
+        assert!(
+            !emitted.contains(&"d1".to_string()),
+            "the tombstone must be dropped from the live delta; got {emitted:?}"
+        );
+        assert!(
+            emitted.contains(&"u1".to_string()),
+            "the live row must survive; got {emitted:?}"
+        );
+        assert!(
+            dl.recorded_scan_exclusion().contains(&"d1".to_string()),
+            "the tombstone must still shadow its snapshot version"
+        );
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                snapshot_read_schema(&test_user_schema()),
+                "the strict output contract must survive the carrier's relaxation"
+            );
+        }
     }
 
     // ----- CHA-427: stream_all_cold ≡ stream_merged on all-cold plans ----
