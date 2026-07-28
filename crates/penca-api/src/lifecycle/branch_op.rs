@@ -127,28 +127,18 @@ impl LifecycleManager {
         let table_uuids = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
-        let mut failed = 0usize;
-        for table_uuid in &table_uuids {
-            if let Err(e) = self
-                .persist(
-                    pool,
-                    hot,
-                    dl_driver,
-                    writer,
-                    &persist_request(&catalog_uuid, &branch_uuid, table_uuid, &watermark),
-                )
-                .await
-            {
-                failed += 1;
-                tracing::warn!(
-                    catalog = %catalog_uuid,
-                    branch = %branch_uuid,
-                    table = %table_uuid,
-                    error = %e,
-                    "branch Persist failed; continuing"
-                );
-            }
-        }
+        let failed = self
+            .persist_each(
+                pool,
+                hot,
+                dl_driver,
+                writer,
+                &catalog_uuid,
+                &branch_uuid,
+                &table_uuids,
+                &watermark,
+            )
+            .await;
         Ok(branch_op_watermark(
             &catalog_uuid,
             &branch_uuid,
@@ -196,28 +186,17 @@ impl LifecycleManager {
         let table_uuids = self
             .list_all_persisted_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
-        let mut failed = 0usize;
-        for table_uuid in &table_uuids {
-            if let Err(e) = self
-                .snapshot(
-                    pool,
-                    readers,
-                    dl_driver,
-                    writer,
-                    &snapshot_request(&catalog_uuid, &branch_uuid, table_uuid),
-                )
-                .await
-            {
-                failed += 1;
-                tracing::warn!(
-                    catalog = %catalog_uuid,
-                    branch = %branch_uuid,
-                    table = %table_uuid,
-                    error = %e,
-                    "branch Snapshot failed; continuing"
-                );
-            }
-        }
+        let failed = self
+            .snapshot_each(
+                pool,
+                readers,
+                dl_driver,
+                writer,
+                &catalog_uuid,
+                &branch_uuid,
+                &table_uuids,
+            )
+            .await;
         Ok(branch_op_watermark(
             &catalog_uuid,
             &branch_uuid,
@@ -300,15 +279,75 @@ impl LifecycleManager {
         let modified = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
+        let mut failed = self
+            .persist_each(
+                pool,
+                hot,
+                dl_driver,
+                writer,
+                &catalog_uuid,
+                &branch_uuid,
+                &modified,
+                &watermark,
+            )
+            .await;
+        let persisted = self
+            .list_all_persisted_table_uuids(pool, &catalog_uuid, &branch_uuid)
+            .await?;
+        failed += self
+            .snapshot_each(
+                pool,
+                readers,
+                dl_driver,
+                writer,
+                &catalog_uuid,
+                &branch_uuid,
+                &persisted,
+            )
+            .await;
+        Ok(branch_op_watermark(
+            &catalog_uuid,
+            &branch_uuid,
+            watermark,
+            failed,
+            modified.len() + persisted.len(),
+            "PersistAndSnapshot",
+        ))
+    }
+
+    /// Persist each table in an already-enumerated set, returning how many
+    /// failed. A per-table failure is logged and the loop continues — see the
+    /// module doc for why aborting would starve the branch.
+    ///
+    /// Takes the set rather than enumerating it: the three callers differ in
+    /// which dirty set they sweep, and `persist_and_snapshot_branch` sums this
+    /// count with [`Self::snapshot_each`]'s before deciding whether to withhold
+    /// the watermark, so the decision stays with the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_each<L, W>(
+        &self,
+        pool: &PgDriver,
+        hot: &HotStorageClient,
+        dl_driver: &L,
+        writer: &W,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+        table_uuids: &[String],
+        watermark: &Watermark,
+    ) -> usize
+    where
+        L: DlDriver + ?Sized,
+        W: FormatWriter,
+    {
         let mut failed = 0usize;
-        for table_uuid in &modified {
+        for table_uuid in table_uuids {
             if let Err(e) = self
                 .persist(
                     pool,
                     hot,
                     dl_driver,
                     writer,
-                    &persist_request(&catalog_uuid, &branch_uuid, table_uuid, &watermark),
+                    &persist_request(catalog_uuid, branch_uuid, table_uuid, watermark),
                 )
                 .await
             {
@@ -318,21 +357,41 @@ impl LifecycleManager {
                     branch = %branch_uuid,
                     table = %table_uuid,
                     error = %e,
-                    "branch Persist failed; skipping Snapshot, continuing"
+                    "branch Persist failed; continuing"
                 );
             }
         }
-        let persisted = self
-            .list_all_persisted_table_uuids(pool, &catalog_uuid, &branch_uuid)
-            .await?;
-        for table_uuid in &persisted {
+        failed
+    }
+
+    /// Snapshot each table in an already-enumerated set, returning how many
+    /// failed. Sibling of [`Self::persist_each`]; see it for why the two are not
+    /// one parameterized function.
+    #[allow(clippy::too_many_arguments)]
+    async fn snapshot_each<R, L, W>(
+        &self,
+        pool: &PgDriver,
+        readers: &HashMap<i32, R>,
+        dl_driver: &L,
+        writer: &W,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+        table_uuids: &[String],
+    ) -> usize
+    where
+        R: FormatReader,
+        L: DlDriver + ?Sized,
+        W: FormatWriter,
+    {
+        let mut failed = 0usize;
+        for table_uuid in table_uuids {
             if let Err(e) = self
                 .snapshot(
                     pool,
                     readers,
                     dl_driver,
                     writer,
-                    &snapshot_request(&catalog_uuid, &branch_uuid, table_uuid),
+                    &snapshot_request(catalog_uuid, branch_uuid, table_uuid),
                 )
                 .await
             {
@@ -346,14 +405,7 @@ impl LifecycleManager {
                 );
             }
         }
-        Ok(branch_op_watermark(
-            &catalog_uuid,
-            &branch_uuid,
-            watermark,
-            failed,
-            modified.len() + persisted.len(),
-            "PersistAndSnapshot",
-        ))
+        failed
     }
 
     /// Shared skeleton entry: resolve the `(catalog, branch)` the branch op
