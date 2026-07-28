@@ -104,6 +104,17 @@ unresolved-attribute = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
+# The parallel/serial split selects on a bare string, so a typo'd mark
+# (`serail`) would otherwise degrade to a warning and drop a side-channel
+# reader into the `-n auto` phase — an intermittent race instead of an error.
+#
+# The `filterwarnings` line is what actually enforces that: `--strict-markers`
+# alone resolves to true here but still only warns on an unknown mark, so
+# promoting the warning is the mechanism that fails collection. Both are kept —
+# strict marking is the declaration of intent and errors on the `-m` path.
+# `serial` is the only non-builtin mark in the repo, so nothing else is caught.
+addopts = ["--strict-markers"]
+filterwarnings = ["error::pytest.PytestUnknownMarkWarning"]
 markers = [
     "serial: tests that read a process-global side channel (container stdout via container_log/poll_log_for, or pg_stat_statements reset+count) and must run in the serial phase, isolated from the -n auto parallel phase. Temporary — removed when CHA-519 lands the structured per-request seam.",
 ]
