@@ -173,13 +173,7 @@ impl SnapshotLoop {
     /// `ORDER BY MAX(commit_micros) ASC`. Both failure arms are logged, and
     /// either way this pass continues so Purge still runs and the watermarks
     /// still advance.
-    #[tracing::instrument(
-        skip_all,
-        fields(
-            catalog = %catalog.catalog_uuid,
-            branch = %branch.branch_uuid,
-        ),
-    )]
+    #[tracing::instrument(skip_all)]
     async fn snapshot_branch(&mut self, catalog: &Catalog, branch: &Branch) {
         match self
             .lifecycle
@@ -223,8 +217,6 @@ impl SnapshotLoop {
     #[tracing::instrument(
         skip_all,
         fields(
-            catalog = %catalog.catalog_uuid,
-            branch = %branch.branch_uuid,
             window_start = wm.last_modified_tick,
             window_end = now,
         ),
@@ -272,8 +264,6 @@ impl SnapshotLoop {
     #[tracing::instrument(
         skip_all,
         fields(
-            catalog = %catalog.catalog_uuid,
-            branch = %branch.branch_uuid,
             window_start = wm.last_purge_tick,
             window_end = tracing::field::Empty,
         ),
