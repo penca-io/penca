@@ -67,7 +67,7 @@ impl PersistLoop {
 
     /// One persist sweep over every `(catalog, branch)`.
     #[tracing::instrument(skip_all, err)]
-    pub async fn tick(&mut self) -> Result<(), SchedulerError> {
+    async fn tick(&mut self) -> Result<(), SchedulerError> {
         let catalogs = discovery::list_all_catalogs(&mut self.query, self.list_page_size).await?;
         for catalog in catalogs {
             let branches = discovery::list_all_branches(
