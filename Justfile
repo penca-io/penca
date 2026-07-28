@@ -807,7 +807,36 @@ integration-test *services:
     set -a && source docker/test.env && source docker/.client.env && source docker/.baseline.env && set +a
 
     if [ -z "{{services}}" ]; then
-        uv run pytest tests/integration/integration_*.py -s
+        # Two disjoint phases against the one stack. The `serial` tests assert
+        # on process-global state — container stdout log windows and
+        # pg_stat_statements counters — so they need the side channels quiet,
+        # which means running them alone rather than merely one-at-a-time.
+        # (`--dist loadgroup` only serializes the group internally; it would
+        # still run them concurrently with the parallel phase.) The marks and
+        # this split both go away with CHA-519.
+        #
+        # No `-s` in the parallel phase: N workers interleave into noise, and
+        # nothing depends on it — the scrapers read `docker logs`, not pytest's
+        # capture, and they all run in phase 2 anyway.
+        #
+        # `--maxprocesses` caps `-n auto` because all workers share ONE stack;
+        # uncapped, a many-core runner exhausts Postgres connections and OOMs
+        # the servicers.
+        parallel_rc=0
+        uv run pytest tests/integration/integration_*.py \
+            -m "not serial" -n auto --maxprocesses 8 || parallel_rc=$?
+        # Runs even when phase 1 failed, so one invocation reports every
+        # failure rather than hiding phase 2 behind phase 1's exit.
+        serial_rc=0
+        uv run pytest tests/integration/integration_*.py -m "serial" -s || serial_rc=$?
+        # Surface the first non-zero. Written as a full `if` rather than
+        # `[ ... ] && rc=...`, whose non-zero test would trip `set -e`.
+        rc="$parallel_rc"
+        if [ "$rc" -eq 0 ]; then
+            rc="$serial_rc"
+        fi
+
+        exit "$rc"
     else
         files=""
         for svc in {{services}}; do
