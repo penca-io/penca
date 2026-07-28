@@ -819,9 +819,13 @@ integration-test *services:
         # nothing depends on it — the scrapers read `docker logs`, not pytest's
         # capture, and they all run in phase 2 anyway.
         #
-        # `--maxprocesses` caps `-n auto` because all workers share ONE stack;
-        # uncapped, a many-core runner exhausts Postgres connections and OOMs
-        # the servicers.
+        # `--maxprocesses` is a ceiling for big DEV machines, where `-n auto`
+        # would otherwise point dozens of workers at the one shared stack and
+        # thrash it. It is inert in CI: `ubuntu-latest` is 4-core, so `-n auto`
+        # already lands under the cap. Postgres is not the limit either —
+        # max_connections is 100 and the servicer pools are bounded server-side
+        # (PG_POOL_MAX=4 each, ~20 total), so worker count buys only the few
+        # direct connections the white-box tests open.
         parallel_rc=0
         uv run pytest tests/integration/integration_*.py \
             -m "not serial" -n auto --maxprocesses 8 || parallel_rc=$?
