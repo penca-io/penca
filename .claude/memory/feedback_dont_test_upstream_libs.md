@@ -1,5 +1,5 @@
 ---
-name: feedback-dont-test-upstream-libs
+name: feedback_dont_test_upstream_libs
 description: Don't write integration tests whose assertions are mostly upstream library behavior. Test the Penca-owned logic; cover the rest with grep/structural checks.
 metadata:
   type: feedback

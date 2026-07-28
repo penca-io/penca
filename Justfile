@@ -276,62 +276,115 @@ init-agent-tools: init-build-tools
 clean-agent-tools cha branch:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Both list commands cap their output — `roborev list --limit` defaults to
-    # 50 and `kata list --limit` to 200 — so listing once and iterating leaves
-    # everything past the cap behind while still exiting 0. CHA-517 hit this:
-    # 69 open roborev jobs, 50 closed, 19 silently stranded. Loop until the
-    # list comes back empty rather than passing a bigger --limit, so there is
-    # no magic constant to drift from the tool's default.
+    # Both list commands cap their output — `roborev list` at 50, `kata list` at
+    # 200 — so listing once and iterating leaves everything past the cap behind
+    # while still exiting 0. CHA-517 hit this: 69 open roborev jobs, 50 closed,
+    # 19 silently stranded. So page until a pass has nothing new to try, taking
+    # each tool's own default page size rather than naming a constant here that
+    # would drift from it.
     #
-    # Failures are counted and reported rather than aborting: `set -e` plus a
-    # loop body would drop the rest of the batch on one bad id, which is the
-    # same silent under-clean by another route. The pass-made-no-progress guard
-    # is what stops an unclosable job spinning forever.
+    # Three properties this has to hold, each learned by getting it wrong:
+    #
+    #   Liveness — two independent ways a pass can make no progress, and both
+    #   must stop it. An id that keeps failing is remembered and skipped, so a
+    #   pass eventually attempts nothing and returns. An id the tool reports it
+    #   *succeeded* on but that is still listed next pass (stale daemon, an id
+    #   resolving to another scope, a soft-delete the listing does not reflect)
+    #   is caught by the listing, since exit status says it worked. Guarding on
+    #   only one of these hangs on the other; comparing listing text instead
+    #   fails on a mere reorder.
+    #
+    #   A listing failure is a failure — never an empty worklist. Swallowing it
+    #   would exit 0 having cleaned nothing, which is the exact silent
+    #   under-clean this recipe exists to prevent.
+    #
+    #   Honest counts — a failing id is re-listed every pass, so counting
+    #   attempts reports one stranded item several times. Failed ids are
+    #   recorded per drain and skipped, so the count is of distinct items.
     failures=0
 
-    while :; do
-        ids="$(roborev list --branch "{{branch}}" --open --limit 200 --json 2>/dev/null \
-            | jq -r '.[]?.id')"
-        [ -z "$ids" ] && break
+    list_roborev_jobs() {
+        roborev list --branch "{{branch}}" --open --json | jq -r '.[]?.id'
+    }
 
-        closed_this_pass=0
-        for job in $ids; do
-            if roborev close "$job" >/dev/null 2>&1; then
-                closed_this_pass=$((closed_this_pass + 1))
-            else
-                echo "  (could not close roborev job $job)" >&2
+    close_roborev_job() {
+        roborev close "$1"
+    }
+
+    list_kata_tasks() {
+        kata list --label "{{cha}}" --status closed --json | jq -r '.issues[]?.qualified_id'
+    }
+
+    delete_kata_task() {
+        kata delete "$1" --force --confirm "DELETE $1"
+    }
+
+    # Function names rather than eval'd command strings, so tool output is never
+    # re-parsed as shell source. The `for id in $ids` split below is deliberate
+    # and is the one place ids are word-split: both tools emit one bare id per
+    # line with no whitespace or globbing characters, which is what makes the
+    # split safe and the quoting everywhere else load-bearing.
+    drain() {
+        local kind="$1" list_fn="$2" act_fn="$3"
+        local failed="" acted="" ids id err attempted
+
+        while :; do
+            if ! ids="$("$list_fn")"; then
+                # Not "nothing cleaned": the listing runs every pass, so this
+                # can land after several successful ones. What is certain is
+                # that the remainder is unknown and untouched.
+                echo "  (could not list remaining items to $kind — some may be left)" >&2
                 failures=$((failures + 1))
+                return
             fi
+
+            [ -z "$ids" ] && return
+
+            attempted=0
+            for id in $ids; do
+                case " $failed " in *" $id "*) continue ;; esac
+
+                # Acted on successfully last pass and still listed: the action
+                # is a no-op for this item, so retrying it forever is the one
+                # way this loop can fail to terminate. Exit status cannot detect
+                # it — the tool said it worked — so the listing is the evidence.
+                case " $acted " in
+                    *" $id "*)
+                        echo "  (could not $kind $id: reported success but it is still listed)" >&2
+                        failed="$failed $id"
+                        failures=$((failures + 1))
+                        continue
+                        ;;
+                esac
+
+                attempted=1
+                if err="$("$act_fn" "$id" 2>&1 >/dev/null)"; then
+                    acted="$acted $id"
+                else
+                    # Keep the tool's own explanation — "daemon unreachable",
+                    # "unknown id" — which is the whole diagnostic value here.
+                    echo "  (could not $kind $id: $err)" >&2
+                    failed="$failed $id"
+                    failures=$((failures + 1))
+                fi
+            done
+
+            # Every remaining id has already failed, so another pass is futile.
+            [ "$attempted" -eq 0 ] && return
         done
+    }
 
-        [ "$closed_this_pass" -eq 0 ] && break
-    done
+    drain "close roborev job" list_roborev_jobs close_roborev_job
+    drain "delete kata task" list_kata_tasks delete_kata_task
 
-    while :; do
-        refs="$(kata list --label "{{cha}}" --status closed --limit 200 --json \
-            | jq -r '.issues[]?.qualified_id')"
-        [ -z "$refs" ] && break
-
-        deleted_this_pass=0
-        for ref in $refs; do
-            if kata delete "$ref" --force --confirm "DELETE $ref" >/dev/null 2>&1; then
-                deleted_this_pass=$((deleted_this_pass + 1))
-            else
-                echo "  (could not delete kata task $ref)" >&2
-                failures=$((failures + 1))
-            fi
-        done
-
-        [ "$deleted_this_pass" -eq 0 ] && break
-    done
-
-    # Exit non-zero on any failure: the whole point of this recipe is that state
-    # does not accumulate, and reporting success while leaving some behind is
-    # the bug this fixes.
+    # Exit non-zero on any failure: the point of this recipe is that state does
+    # not accumulate, and reporting success while leaving some behind is the bug
+    # it exists to prevent.
     if [ "$failures" -gt 0 ]; then
         echo "clean-agent-tools: $failures item(s) could not be cleaned" >&2
         exit 1
     fi
+
 
 # Launch the Headroom context-compression proxy (CHA-465). Opt-in: run
 # this in a separate shell, then start Claude Code with
