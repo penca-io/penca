@@ -1,10 +1,13 @@
 """Smoke test for ``examples/oltp_demo.py`` (CHA-527).
 
 The demo's claim is that a primary-key seek is still a seek once the rows live in
-open columnar files — it drives the table cold with persist + snapshot, then
-times the lookup over both the gRPC client and Flight SQL. That is two numbers a
-reader is invited to trust, so what needs coverage is that both are really
-measured and that the seek actually found the row it claims to have found.
+open columnar files — it drives the table cold with persist + snapshot + purge,
+then times the lookup over both the gRPC client and Flight SQL. That is two
+numbers a reader is invited to trust, so what needs coverage is that both are
+really measured, that the seek returned exactly the row it sought, and that the
+tier transition the word "cold" depends on actually ran. Purge is the load-bearing
+step there: persist alone leaves the rows queryable from hot, so without it a
+"cold" read still carries a hot arm.
 
 Deliberately a subprocess smoke test rather than an import-and-assert: the demo
 is a flat ``main()`` that prints, with no seam to call into, and adding one
@@ -37,15 +40,19 @@ _REPS = 5
 # _ROWS changes.
 _TARGET_ID = _ROWS // 2
 _TARGET_OWNER = f"owner_{_TARGET_ID:06d}"
-# id 0 — seeded, but not the row the demo asks for. The negative control: without
-# it, a lookup that returned the whole table would satisfy the positive check.
-_NON_TARGET_OWNER = "owner_000000"
-
 _ROW_SECTION = "--- The row we looked up ---"
 _LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per seek) ---"
 
 # A pandas/tabulate cell holding a millisecond figure: "| 1.23 |", "|  0.4 |".
-_MS_CELL = re.compile(r"\|\s*\d+\.?\d*\s*\|")
+# Lookahead on the closing pipe so adjacent cells share their delimiter —
+# re.findall does not overlap, so consuming it would hide every second cell.
+_MS_CELL = re.compile(r"\|\s*\d+\.?\d*\s*(?=\|)")
+# A table body row: starts with a pipe then a digit. Excludes the header and the
+# alignment rule, so counting these counts rows rather than punctuation.
+_BODY_ROW = re.compile(r"^\|\s*[\w.-]+\s*\|.*\d", re.MULTILINE)
+# The demo's lifecycle line. Persist alone leaves rows queryable from hot, so
+# "cold" is only true once purge has run — this is the marker that says it did.
+_TIER_LINE = "Persisting, snapshotting and purging to cold columnar storage..."
 
 
 def _demo_catalogs(client) -> set[str]:
@@ -109,7 +116,7 @@ def _assert_walkthrough(result) -> None:
     assert result.returncode == 0, result.stderr[-4000:]
 
     stdout = result.stdout
-    for marker in (_ROW_SECTION, _LATENCY_SECTION):
+    for marker in (_TIER_LINE, _ROW_SECTION, _LATENCY_SECTION):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
     _assert_found_the_right_row(stdout)
@@ -134,9 +141,15 @@ def _assert_found_the_right_row(stdout: str) -> None:
         f"the lookup must return account {_TARGET_ID} ({_TARGET_OWNER}); "
         f"section was:\n{row_section}"
     )
-    assert _NON_TARGET_OWNER not in row_section, (
-        f"the lookup returned {_NON_TARGET_OWNER} as well — this is a point "
-        f"seek, not a scan; section was:\n{row_section}"
+    # Exactly one body row, rather than the absence of one sentinel id. A
+    # sentinel only catches a scan that happens to include that id, and it
+    # silently stops catching anything at all if the demo ever seeds from 1
+    # instead of 0 — the string it looks for would simply never be printed.
+    # Counting rows is independent of both the id scheme and _ROWS.
+    body_rows = _BODY_ROW.findall(row_section)
+    assert len(body_rows) == 1, (
+        f"a point lookup returns exactly one row; saw {len(body_rows)} in:\n"
+        f"{row_section}"
     )
 
 
@@ -147,7 +160,9 @@ def _assert_both_arms_measured(stdout: str) -> None:
     0. Checking the labels AND the count of millisecond cells catches both a
     missing arm and an arm that printed a placeholder instead of a number.
     """
-    latency_section = stdout.split(_LATENCY_SECTION)[1]
+    # Bounded at the trailing prose, not open to end-of-stdout: an unbounded
+    # slice lets text printed after the table satisfy both checks below.
+    latency_section = stdout.split(_LATENCY_SECTION)[1].split("\n\n")[0]
 
     lowered = latency_section.lower()
     for label in ("grpc", "sql"):
