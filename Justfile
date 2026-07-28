@@ -821,8 +821,10 @@ integration-test *services:
         # and ANSI-strips the container's whole stdout on EVERY call, and
         # `poll_log_for` repeats that every 100ms for up to 5s per assertion.
         # The services log at debug with no size cap, so scraping after the
-        # parallel phase means paying a worst-case buffer each time: 19m for 56
-        # tests measured that way. Going first costs nothing.
+        # parallel phase means paying a worst-case buffer each time: measured
+        # 19m for 56 tests that way, against ~11m for the same files' work back
+        # when the suite was fully serial. The gap is buffer cost, not what
+        # these tests inherently take. Going first costs nothing.
         serial_rc=0
         uv run pytest tests/integration/integration_*.py -m "serial" -s || serial_rc=$?
 
@@ -854,16 +856,28 @@ integration-test *services:
         # side-channel test skipped, gate green. The marks distinguish the two
         # cases and self-disarm when CHA-519 lands.
         #
-        # grep globs internally rather than taking a shell-expanded list: an
-        # unexpanded glob becomes a literal filename, grep exits 2, and the `if`
-        # reads that as "no marks left" — the one direction this must not fail.
-        # integration_helpers.py is excluded because it names the marker in
-        # prose, which would keep the guard armed after CHA-519.
+        # Matches the mark SYNTAX, not the bare string, so prose naming the
+        # marker (integration_helpers.py documents it) doesn't keep the guard
+        # armed after CHA-519 — no per-file exclusion needed, which also keeps
+        # this consistent with the static check, which scans every module the
+        # phases collect. grep globs internally so an unexpanded shell glob
+        # can't become a literal filename. Its exit 2 (scan failed) is kept
+        # distinct from 1 (no marks): only the latter may apply the tolerance.
         if [ "$serial_rc" -eq 5 ]; then
-            if grep -rq --include='integration_*.py' \
-                --exclude='integration_helpers.py' \
-                'pytest\.mark\.serial' tests/integration/; then
+            set +e
+            grep -rqE --include='integration_*.py' \
+                '^[[:space:]]*(@pytest\.mark\.serial|pytestmark[[:space:]]*=.*pytest\.mark\.serial)' \
+                tests/integration/
+            grep_rc=$?
+            set -e
+
+            if [ "$grep_rc" -eq 0 ]; then
                 echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
+                exit 1
+            fi
+
+            if [ "$grep_rc" -ne 1 ]; then
+                echo "could not scan tests/integration for serial marks (grep exit $grep_rc)" >&2
                 exit 1
             fi
 

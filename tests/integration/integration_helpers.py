@@ -636,9 +636,10 @@ def container_log(service: str) -> str:
     per-request seam.
 
     ``tests/static/static_serial_marker_test.py`` is what keeps that true, by
-    walking the call graph: anything that reaches this function is covered. A
-    helper that shells out to ``docker logs`` itself, rather than calling
-    here, is not — add it to that test's root set by hand.
+    walking the call graph. It resolves callees by name within one module, so
+    a plain call reaching here is covered; a call through an alias or a
+    dynamic attribute, or a helper that shells out to ``docker logs`` itself,
+    is not — add those to that test's root set by hand.
     """
     project = os.environ["COMPOSE_PROJECT_NAME"]
     container = f"{project}-{service}-1"
