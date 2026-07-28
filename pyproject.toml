@@ -35,6 +35,7 @@ dev = [
     "matplotlib>=3.10.9",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
+    "pytest-xdist>=3.6",
     "ruff>=0.15.0",
     "streamlit>=1.58.0",
     "ty>=0.0.15",
@@ -103,3 +104,6 @@ unresolved-attribute = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
+markers = [
+    "serial: tests that read a process-global side channel (container stdout via container_log/poll_log_for, or pg_stat_statements reset+count) and must run in the serial phase, isolated from the -n auto parallel phase. Temporary — removed when CHA-519 lands the structured per-request seam.",
+]
