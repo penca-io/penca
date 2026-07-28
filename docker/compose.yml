@@ -226,11 +226,13 @@ services:
       LIFECYCLE_SEGMENT_READ_CONCURRENCY: "4"
       QUERY_TIMEOUT_SECONDS: "${QUERY_TIMEOUT_SECONDS:-900}"
       # CHA-444 (ADR 0027): hot-purge grace window. The expired-begin
-      # ledger GC uses max(SCHEDULER_TICK_INTERVAL_SECONDS, this) as its
-      # grace; the tick MUST match the scheduler's value (shared, like
-      # QUERY_TIMEOUT_SECONDS) so the floor reflects the real Purge cadence.
+      # ledger GC floors its grace at max(persist tick, snapshot tick, this),
+      # so both cadences MUST match the scheduler's values (shared, like
+      # QUERY_TIMEOUT_SECONDS). The max is a conservative bound: Purge rides
+      # the snapshot loop today, but CHA-502 may move it.
       HOT_PURGE_GRACE_SECONDS: "${HOT_PURGE_GRACE_SECONDS:-60}"
-      SCHEDULER_TICK_INTERVAL_SECONDS: "${SCHEDULER_TICK_INTERVAL_SECONDS:-5}"
+      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-5}"
+      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-30}"
       OBJECT_STORAGE_PROVIDER: s3
       OBJECT_STORAGE_BUCKET: penca
       OBJECT_STORAGE_FORMAT: lance
@@ -262,11 +264,14 @@ services:
       QUERY_SERVICE_ADDR: http://query:50052
       LIFECYCLE_SERVICE_ADDR: http://lifecycle:50054
       # Default tick: 5s — keeps the unattended-happy-path latency
-      # bounded without burning cycles. Both shipped profiles override it
-      # (CHA-517): `dev` pins 1s so an interactive stack does not sit on
-      # unpersisted hot data, and `test` pins -1 (boot and idle) so the
-      # tick loop cannot race a suite's manual Persist/Snapshot/Purge.
-      SCHEDULER_TICK_INTERVAL_SECONDS: "${SCHEDULER_TICK_INTERVAL_SECONDS:-5}"
+      # bounded without burning cycles. Persist is the hot->cold relief sweep
+      # and wants the shorter cadence; snapshot amortizes compaction, Purge and
+      # tx-log GC over a longer one. Both shipped profiles override them
+      # (CHA-517): `dev` pins persist to 1s so an interactive stack does not sit
+      # on unpersisted hot data, and `test` pins both to -1 (boot and idle) so
+      # neither loop can race a suite's manual Persist/Snapshot/Purge.
+      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-5}"
+      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-30}"
       SCHEDULER_LIST_PAGE_SIZE: "${SCHEDULER_LIST_PAGE_SIZE:-100}"
       # Universal grace window (ADR 0019) — MUST equal the lifecycle
       # + query servicers' value. The scheduler bounds its

@@ -19,14 +19,6 @@ pub struct SchedulerConfig {
     pub query_addr: String,
     pub lifecycle_addr: String,
 
-    /// Time between the end of one tick and the start of the next.
-    /// Negative values disable the tick loop: the scheduler binary
-    /// boots, logs a warning, and idles forever — useful for the
-    /// integration test profile, which asserts RPC behavior directly
-    /// and doesn't want the autonomous loop racing manual lifecycle
-    /// calls.
-    pub tick_interval_seconds: i64,
-
     /// Cadence of the persist loop — hot→cold memory relief, so it wants a
     /// SHORT interval. Non-positive disables that loop alone
     /// (see [`interval_from_seconds`]).
@@ -53,35 +45,17 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     pub fn from_env() -> Self {
-        let tick_interval_seconds = required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
         Self {
             query_addr: required_env("QUERY_SERVICE_ADDR"),
             lifecycle_addr: required_env("LIFECYCLE_SERVICE_ADDR"),
-            tick_interval_seconds,
-            // TODO(CHA-513): both loops alias the single legacy var so the stack
-            // keeps booting until the config split retires it for
-            // SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS.
-            // `LifecycleServiceConfig::from_env` carries the same alias — the two
-            // crates and docker/{compose.yml,dev.env,test.env} MUST flip in one
-            // commit, or `required_env_parsed` panics at boot on the retired name.
-            persist_tick_interval_seconds: tick_interval_seconds,
-            snapshot_tick_interval_seconds: tick_interval_seconds,
+            persist_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS",
+            ),
+            snapshot_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS",
+            ),
             list_page_size: required_env_parsed("SCHEDULER_LIST_PAGE_SIZE"),
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
-        }
-    }
-
-    /// TODO(CHA-513): deleted by the config split, along with
-    /// `tick_interval_seconds`. Until then this is the only path `main` drives,
-    /// and it still spells "disabled" as `< 0` rather than delegating to
-    /// [`interval_from_seconds`] — so a deployment override of `0` is still the
-    /// backoff-free hot loop that helper exists to prevent. Delegate or delete;
-    /// do not let the two rules outlive the red phase.
-    pub fn tick_interval(&self) -> Option<Duration> {
-        if self.tick_interval_seconds < 0 {
-            None
-        } else {
-            Some(Duration::from_secs(self.tick_interval_seconds as u64))
         }
     }
 
@@ -114,8 +88,12 @@ impl SchedulerConfig {
 /// lifecycle service. Splitting one cadence knob into two doubles the chance of
 /// a stray `0` reaching a deployment env file, and "sweep as fast as possible"
 /// is not a mode anyone wants — so `<= 0` has exactly one meaning, "off".
-fn interval_from_seconds(_seconds: i64) -> Option<Duration> {
-    todo!("CHA-513: seconds <= 0 -> None, otherwise Some(Duration::from_secs(seconds))")
+fn interval_from_seconds(seconds: i64) -> Option<Duration> {
+    if seconds <= 0 {
+        None
+    } else {
+        Some(Duration::from_secs(seconds as u64))
+    }
 }
 
 #[cfg(test)]
@@ -126,7 +104,6 @@ mod tests {
         SchedulerConfig {
             query_addr: String::new(),
             lifecycle_addr: String::new(),
-            tick_interval_seconds: 0,
             persist_tick_interval_seconds: persist,
             snapshot_tick_interval_seconds: snapshot,
             list_page_size: 100,

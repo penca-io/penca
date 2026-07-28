@@ -167,34 +167,21 @@ pub struct LifecycleServiceConfig {
     /// uses it as its grace; CHA-466's memory-shedding `Pu <= P - hot_grace`
     /// ceiling reuses the same knob.
     pub hot_purge_grace_seconds: i64,
-    /// Purge sweep cadence, in seconds — MUST equal the scheduler's
-    /// `SCHEDULER_TICK_INTERVAL_SECONDS` (shared env, like
-    /// `QUERY_TIMEOUT_SECONDS`). Floors the expired-begin ledger-GC grace so it
-    /// never drops a tx's bookkeeping before Purge has re-swept the tx's hot
-    /// rows (ADR 0027 §5). Non-positive ⇒ scheduler disabled ⇒ contributes no
-    /// floor (the hot-grace window stands alone).
-    pub scheduler_tick_interval_seconds: i64,
-    /// Persist-loop cadence, in seconds. Will read
-    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` and MUST then equal the
-    /// scheduler's value; today it still aliases the legacy var — see
-    /// `from_env`.
+    /// Persist-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` (shared env, like
+    /// `QUERY_TIMEOUT_SECONDS`). Floors the expired-begin ledger-GC grace
+    /// together with the snapshot cadence — see
+    /// [`Self::purge_sweep_interval_seconds`]. Non-positive ⇒ that loop is
+    /// disabled and contributes no floor.
     pub persist_tick_interval_seconds: i64,
-    /// Snapshot-loop cadence, in seconds. Will read
-    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` and MUST then equal the
-    /// scheduler's value; today it still aliases the legacy var — see
-    /// `from_env`.
+    /// Snapshot-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS`. Non-positive ⇒ that loop is
+    /// disabled and contributes no floor.
     pub snapshot_tick_interval_seconds: i64,
 }
 
 impl LifecycleServiceConfig {
     pub fn from_env() -> Self {
-        // TODO(CHA-513): both split cadences alias the legacy var until the
-        // config split retires it for SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS.
-        // `SchedulerConfig::from_env` carries the same alias — the two crates and
-        // docker/{compose.yml,dev.env,test.env} MUST flip in one commit, or
-        // `required_env_parsed` panics whichever binary reads the retired name at boot.
-        let scheduler_tick_interval_seconds =
-            required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
         Self {
             database_url: required_env("DATABASE_URL"),
             bind_addr: required_env("BIND_ADDR"),
@@ -204,9 +191,12 @@ impl LifecycleServiceConfig {
             segment_read_concurrency: required_env_parsed("LIFECYCLE_SEGMENT_READ_CONCURRENCY"),
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
             hot_purge_grace_seconds: required_env_parsed("HOT_PURGE_GRACE_SECONDS"),
-            scheduler_tick_interval_seconds,
-            persist_tick_interval_seconds: scheduler_tick_interval_seconds,
-            snapshot_tick_interval_seconds: scheduler_tick_interval_seconds,
+            persist_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS",
+            ),
+            snapshot_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS",
+            ),
         }
     }
 
@@ -232,7 +222,9 @@ impl LifecycleServiceConfig {
     ///
     /// Clamped at 0: a disabled loop (non-positive) contributes no floor.
     pub fn purge_sweep_interval_seconds(&self) -> i64 {
-        todo!("CHA-513: max(persist_tick_interval_seconds, snapshot_tick_interval_seconds, 0)")
+        self.persist_tick_interval_seconds
+            .max(self.snapshot_tick_interval_seconds)
+            .max(0)
     }
 
     /// [`Self::purge_sweep_interval_seconds`] in micros — the exact value
@@ -424,11 +416,6 @@ mod tests {
             segment_read_concurrency: NonZeroU32::new(1).unwrap(),
             query_timeout_seconds: 900,
             hot_purge_grace_seconds: 60,
-            // Dominant on purpose: the legacy field must NOT feed the floor, so
-            // any implementation that folds it into the max blows every case
-            // below rather than passing while the retired knob stays
-            // load-bearing.
-            scheduler_tick_interval_seconds: 9_999,
             persist_tick_interval_seconds: persist,
             snapshot_tick_interval_seconds: snapshot,
         }

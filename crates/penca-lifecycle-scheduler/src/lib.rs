@@ -3,7 +3,9 @@
 //!
 //! ## Tick loop
 //!
-//! Every `SCHEDULER_TICK_INTERVAL_SECONDS`:
+//! Every `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` (the single loop still
+//! drives all three ops; `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` is parsed
+//! but unused until the two-loop split — TODO(CHA-513)):
 //!
 //! ```text
 //! for each catalog (ListCatalogs):
