@@ -319,15 +319,21 @@ clean-agent-tools cha branch:
         kata delete "$1" --force --confirm "DELETE $1"
     }
 
-    # Function names rather than eval'd command strings: the ids come from tool
-    # output and must not be re-parsed as shell source.
+    # Function names rather than eval'd command strings, so tool output is never
+    # re-parsed as shell source. The `for id in $ids` split below is deliberate
+    # and is the one place ids are word-split: both tools emit one bare id per
+    # line with no whitespace or globbing characters, which is what makes the
+    # split safe and the quoting everywhere else load-bearing.
     drain() {
         local kind="$1" list_fn="$2" act_fn="$3"
         local failed="" acted="" ids id err attempted
 
         while :; do
             if ! ids="$("$list_fn")"; then
-                echo "  (could not list items to $kind — nothing cleaned)" >&2
+                # Not "nothing cleaned": the listing runs every pass, so this
+                # can land after several successful ones. What is certain is
+                # that the remainder is unknown and untouched.
+                echo "  (could not list remaining items to $kind — some may be left)" >&2
                 failures=$((failures + 1))
                 return
             fi
