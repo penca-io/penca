@@ -13,8 +13,7 @@ metadata:
 **Where filing IS expected — no need to re-ask:**
 
 - **Deferred scope at an approved plan gate.** [[feedback_followup_tickets_before_impl_todo_pointers]] says to mint follow-up tickets at plan approval, before implementation, so the first commit can cite a real CHA-NNN. That is not in tension with this rule: the plan the user approved *enumerated* the deferrals, so the approval already covers them.
-- **A ticket or skill whose own text mandates the split** — e.g. CHA-517 said "stage 2 → its own ticket when stage 1 ships". Say so when reporting, rather than filing silently.
-- **A rule the ticket itself sets**, e.g. CHA-517's "engine bugs found by this work go to separate tickets, never folded into this PR".
+- **A ticket or skill whose own text mandates it** — either by naming the split ("stage 2 → its own ticket when stage 1 ships") or by setting a standing rule ("engine bugs found by this work go to separate tickets, never folded into this PR"). Both are CHA-517; both are the ticket instructing you, so both are covered. Say so when reporting, rather than filing silently.
 
 **How to apply:** outside those cases, report the finding and end with "want me to file it?". If the answer is no, the finding still belongs in the report — the user can act on it without a ticket existing.
 
