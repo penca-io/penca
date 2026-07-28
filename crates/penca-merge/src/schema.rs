@@ -246,6 +246,57 @@ pub(crate) const CANONICAL_TX_METADATA_TAIL: &[(&str, DataType, bool)] = &[
     ("commit_seq_num", DataType::Int64, false),
 ];
 
+/// Carrier-shaped fixtures shared by this crate's test modules.
+///
+/// Both live here, beside [`resolved_schema`], because they are positionally
+/// coupled to its column order — a new carrier column is then one edit, not a
+/// set of per-module copies that drift into opaque `try_new` arity errors.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    /// Both user columns are NON-nullable on purpose: that is the condition
+    /// under which the tombstone arm's NULLs used to abort the read (CHA-524),
+    /// so relaxing it here would silently retire the regression locks.
+    pub(crate) fn test_user_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]))
+    }
+
+    /// A resolved batch whose user columns may be NULL — the shape the tombstone
+    /// arm actually produces: the delete log carries no user columns, so once a
+    /// Snapshot fences the row's upsert out of the hot `latest` CTE the arm
+    /// emits NULLs.
+    ///
+    /// Constructing against [`super::resolved_schema`] is itself the regression
+    /// lock: re-tightening the carrier's user columns makes `try_new` fail here.
+    pub(crate) fn resolved_batch_nullable(
+        row_uuids: &[&str],
+        names: &[Option<&str>],
+        values: &[Option<i32>],
+        commit_micros: &[i64],
+        is_deletes: &[bool],
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            super::resolved_schema(&test_user_schema()),
+            vec![
+                Arc::new(StringArray::from(row_uuids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(commit_micros.to_vec())),
+                Arc::new(BooleanArray::from(is_deletes.to_vec())),
+            ],
+        )
+        .expect("the resolve carrier must accept NULL user columns")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

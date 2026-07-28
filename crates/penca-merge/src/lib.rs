@@ -1282,7 +1282,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::common::DFSchema;
@@ -1662,12 +1662,7 @@ mod tests {
 
     // ----- Fixtures ------------------------------------------------------
 
-    fn test_user_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-        ]))
-    }
+    use super::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
 
     /// A resolved batch of live (`is_delete = false`) upsert rows — the common
     /// case (CHA-368: the resolve is now `is_delete`-flagged).
@@ -1691,43 +1686,13 @@ mod tests {
         committed_ats: &[i64],
         is_deletes: &[bool],
     ) -> RecordBatch {
-        make_resolved_batch_nullable(
+        resolved_batch_nullable(
             row_uuids,
             &names.iter().copied().map(Some).collect::<Vec<_>>(),
             &values.iter().copied().map(Some).collect::<Vec<_>>(),
             committed_ats,
             is_deletes,
         )
-    }
-
-    /// A resolved batch whose user columns may be NULL — the shape the tombstone
-    /// arm actually produces (CHA-524): the delete log carries no user columns,
-    /// so once a Snapshot fences the row's upsert out of the hot `latest` CTE
-    /// the arm emits NULLs.
-    ///
-    /// The single carrier-shaped fixture in this module —
-    /// [`make_resolved_batch_flagged`] and [`make_resolved_batch`] both delegate
-    /// here, so adding a carrier column is one edit, not three that drift.
-    /// Constructing against `resolved_schema` is itself the regression lock:
-    /// re-tightening the carrier's user columns makes `try_new` fail here.
-    fn make_resolved_batch_nullable(
-        row_uuids: &[&str],
-        names: &[Option<&str>],
-        values: &[Option<i32>],
-        committed_ats: &[i64],
-        is_deletes: &[bool],
-    ) -> RecordBatch {
-        RecordBatch::try_new(
-            resolved_schema(&test_user_schema()),
-            vec![
-                Arc::new(StringArray::from(row_uuids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(committed_ats.to_vec())),
-                Arc::new(arrow::array::BooleanArray::from(is_deletes.to_vec())),
-            ],
-        )
-        .expect("the resolve carrier must accept NULL user columns")
     }
 
     fn make_snapshot_batch(row_uuids: &[&str], names: &[&str], values: &[i32]) -> RecordBatch {
@@ -2743,7 +2708,7 @@ mod tests {
         let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("s1")]);
         let schema = test_user_schema();
         let dl = MockDlDriver::default()
-            .with_resolved(make_resolved_batch_nullable(
+            .with_resolved(resolved_batch_nullable(
                 &["u1", "d1"],
                 &[Some("a"), None],
                 &[Some(1), None],

@@ -36,8 +36,16 @@ STRICT_SCHEMA = pa.schema(
 
 
 def _rows(table):
-    """``{name: value}`` — order-independent, since reads carry no ORDER BY."""
-    return dict(zip(*table.to_pydict().values(), strict=True))
+    """Sorted ``(name, value)`` pairs.
+
+    Order-independent because the merge SQL carries no final ORDER BY — PK
+    order is a snapshot-layout side effect, not a read contract. A *list*, not
+    a dict: folding to `{pk: value}` would also discard cardinality, and a row
+    emitted twice (once from the snapshot stream, once from the resolved delta,
+    when the exclusion set misses its ``row_uuid``) is the characteristic
+    failure of the very merge path under test.
+    """
+    return sorted(zip(*table.to_pydict().values(), strict=True))
 
 
 def _seed_catalog(client, table_names):
@@ -225,7 +233,7 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     # Order-independent: the merge SQL carries no final ORDER BY, so row order
     # is a snapshot-layout side effect (PK-sorted segments), not a read contract.
     first = survivors()
-    assert _rows(first) == {"b": 2, "c": 3}
+    assert _rows(first) == [("b", 2), ("c", 3)]
     assert first.schema == STRICT_SCHEMA, (
         "read_data must keep the declared non-nullability"
     )
@@ -241,5 +249,5 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     delete_row("b")
 
     second = survivors()
-    assert _rows(second) == {"c": 3}
+    assert _rows(second) == [("c", 3)]
     assert second.schema == STRICT_SCHEMA
