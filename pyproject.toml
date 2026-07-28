@@ -108,12 +108,21 @@ testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
 # (`serail`) would otherwise degrade to a warning and drop a side-channel
 # reader into the `-n auto` phase — an intermittent race instead of an error.
 #
-# The `filterwarnings` line is what actually enforces that: `--strict-markers`
-# alone resolves to true here but still only warns on an unknown mark, so
-# promoting the warning is the mechanism that fails collection. Both are kept —
-# strict marking is the declaration of intent and errors on the `-m` path.
-# `serial` is the only non-builtin mark in the repo, so nothing else is caught.
-addopts = ["--strict-markers"]
+# It must be the ini form. `addopts = ["--strict-markers"]` is inert on pytest
+# 9: the flag only appends to `override_ini`, but `Config.parse` builds
+# `_inicfg` from the command line before injecting `addopts`, and never
+# recomputes it — so the `MarkGenerator` check reads the unset default. The ini
+# key below is read from `_inicfg` and does fail collection.
+#
+# `filterwarnings` is belt-and-braces for the same typo. It is kept because it
+# is independent, but it is the weaker of the two: it reports a warning
+# traceback rather than "'serail' not found in `markers`", and a stray `-W` or
+# `@pytest.mark.filterwarnings` can switch it off.
+#
+# Neither guards the `-m` EXPRESSION — `-m "not serail"` silently matches
+# everything. That gap is why the recipe's phases must not both be allowed to
+# collect zero tests.
+strict_markers = true
 filterwarnings = ["error::pytest.PytestUnknownMarkWarning"]
 markers = [
     "serial: tests that read a process-global side channel (container stdout via container_log/poll_log_for, or pg_stat_statements reset+count) and must run in the serial phase, isolated from the -n auto parallel phase. Temporary — removed when CHA-519 lands the structured per-request seam.",

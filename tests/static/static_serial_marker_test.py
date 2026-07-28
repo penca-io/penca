@@ -40,8 +40,17 @@ ROOT_SIDE_CHANNEL_HELPERS = frozenset(
         "poll_log_for",
         "reset_pg_stat",
         "count_stmts_referencing",
+        # Called by every scraper and nothing else, so it is the clearest tell
+        # even when a test reaches the counters by raw SQL.
+        "ensure_pg_stat_statements",
     }
 )
+
+# Reaching the side channel without going through a helper at all — e.g.
+# ``SELECT ... FROM pg_stat_statements`` inline, as
+# integration_cha368_filter_engine_test.py does. Matched against string
+# literals so those functions are roots in their own right.
+SIDE_CHANNEL_LITERALS = ("pg_stat_statements", "docker logs")
 
 
 def _called_names(node: ast.AST) -> set[str]:
@@ -69,9 +78,14 @@ def _has_serial_mark(node: ast.AST) -> bool:
     return False
 
 
-def _module_is_serial(tree: ast.Module) -> bool:
-    """True when the module sets ``pytestmark`` to (or including) ``serial``."""
-    for node in tree.body:
+def _body_sets_serial_pytestmark(body: list[ast.stmt]) -> bool:
+    """True when ``body`` assigns ``pytestmark`` to (or including) ``serial``.
+
+    Applies to a module body and to a class body — a class-level
+    ``pytestmark`` is the natural way to mark a class without decorating it,
+    and missing it would report a spurious failure.
+    """
+    for node in body:
         if not isinstance(node, ast.Assign):
             continue
 
@@ -87,24 +101,80 @@ def _module_is_serial(tree: ast.Module) -> bool:
     return False
 
 
+def _is_fixture(node: ast.AST) -> bool:
+    for decorator in getattr(node, "decorator_list", []):
+        for attr in ast.walk(decorator):
+            if isinstance(attr, ast.Attribute) and attr.attr == "fixture":
+                return True
+
+    return False
+
+
+def _coupled_fixtures(tree: ast.Module, coupled: set[str]) -> set[str]:
+    """Fixture names among ``coupled``.
+
+    Coupling otherwise propagates only along call edges, so a fixture that
+    scrapes would obligate nothing of the tests requesting it by parameter
+    name — and hoisting a ``since = len(container_log(...))`` preamble into a
+    fixture is the obvious next refactor of these files. That direction fails
+    open, so it is worth closing.
+    """
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in coupled
+        and _is_fixture(node)
+    }
+
+
+def _requests_fixture(node: ast.AST, fixtures: set[str]) -> bool:
+    args = getattr(node, "args", None)
+    if args is None:
+        return False
+
+    names = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+    return bool(names & fixtures)
+
+
+def _touches_side_channel_literal(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+            if any(lit in child.value for lit in SIDE_CHANNEL_LITERALS):
+                return True
+
+    return False
+
+
 def _coupled_functions(tree: ast.Module, roots: frozenset[str]) -> set[str]:
     """Names of functions in ``tree`` that reach ``roots``, transitively.
 
     Fixed-point rather than one pass: a test may call a helper that calls a
-    helper. Names are module-unique enough in this suite that a flat map is
-    sufficient and keeps the check readable.
+    helper.
+
+    Names are NOT unique within a module — the Flight SQL suite defines
+    ``_exec_query`` in three classes, and the write suite defines ``_setup``
+    twice. So a name maps to every definition sharing it and their callees are
+    unioned: an over-broad match costs a spurious mark, while keying on the
+    last definition would silently drop a scraping sibling out of the result,
+    which is the direction that fails quiet.
     """
-    functions: dict[str, ast.AST] = {}
+    definitions: dict[str, list[ast.AST]] = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions[node.name] = node
+            definitions.setdefault(node.name, []).append(node)
 
-    coupled: set[str] = set()
+    coupled = {
+        name
+        for name, nodes in definitions.items()
+        if any(_touches_side_channel_literal(n) for n in nodes)
+    }
     while True:
         newly_found = {
             name
-            for name, node in functions.items()
-            if name not in coupled and _called_names(node) & (roots | coupled)
+            for name, nodes in definitions.items()
+            if name not in coupled
+            and any(_called_names(n) & (roots | coupled) for n in nodes)
         }
         if not newly_found:
             return coupled
@@ -138,22 +208,36 @@ def test_every_side_channel_test_is_marked_serial():
     helpers = _side_channel_helpers()
     unmarked: list[str] = []
 
-    for path in sorted(INTEGRATION.glob("integration_*_test.py")):
+    # Glob what the recipe's phases actually select (`integration_*.py`), not
+    # `integration_*_test.py`, so a module named outside the `_test` convention
+    # is still collected by both phases AND scanned here.
+    for path in sorted(INTEGRATION.glob("integration_*.py")):
+        if path.name in {"integration_helpers.py", "__init__.py"}:
+            continue
+
         tree = ast.parse(path.read_text())
-        if _module_is_serial(tree):
+        if _body_sets_serial_pytestmark(tree.body):
             continue
 
         coupled = _coupled_functions(tree, helpers)
+        fixtures = _coupled_fixtures(tree, coupled)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
 
-            if not node.name.startswith("test") or node.name not in coupled:
+            if not node.name.startswith("test"):
+                continue
+
+            if node.name not in coupled and not _requests_fixture(node, fixtures):
                 continue
 
             enclosing = _enclosing_class(tree, node)
             if _has_serial_mark(node) or (
-                enclosing is not None and _has_serial_mark(enclosing)
+                enclosing is not None
+                and (
+                    _has_serial_mark(enclosing)
+                    or _body_sets_serial_pytestmark(enclosing.body)
+                )
             ):
                 continue
 
