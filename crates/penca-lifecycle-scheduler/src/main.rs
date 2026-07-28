@@ -1,4 +1,4 @@
-use penca_lifecycle_scheduler::{Scheduler, SchedulerConfig};
+use penca_lifecycle_scheduler::{PersistLoop, Scheduler, SchedulerConfig, SnapshotLoop};
 use penca_proto::external::v1::lifecycle_service_client::LifecycleServiceClient;
 use penca_proto::external::v1::query_service_client::QueryServiceClient;
 use tonic::transport::Channel;
@@ -18,16 +18,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = QueryServiceClient::new(query_channel);
     let lifecycle = LifecycleServiceClient::new(lifecycle_channel);
 
-    // TODO(CHA-513): the single tick loop still drives Persist + Snapshot +
-    // Purge together, so it runs at the persist (shorter) cadence — the sweep
-    // that must not fall behind. The snapshot cadence is parsed and reported but
-    // unused until the two-loop split consumes it.
-    let mut scheduler = Scheduler::new(
-        query,
-        lifecycle,
-        config.persist_tick_interval(),
-        config.list_page_size(),
-        config.grace_window_micros(),
+    // Each loop gets its own client pair; tonic clients clone cheaply over one
+    // Channel, which is what lets the two run without shared mutable state.
+    let scheduler = Scheduler::new(
+        PersistLoop::new(
+            query.clone(),
+            lifecycle.clone(),
+            config.persist_tick_interval(),
+            config.list_page_size(),
+        ),
+        SnapshotLoop::new(
+            query,
+            lifecycle,
+            config.snapshot_tick_interval(),
+            config.list_page_size(),
+            config.grace_window_micros(),
+        ),
     );
 
     tracing::info!(

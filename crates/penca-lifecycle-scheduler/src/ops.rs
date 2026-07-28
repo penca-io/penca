@@ -1,11 +1,11 @@
 //! Per-table lifecycle op: Purge.
 //!
-//! Persist + Snapshot moved to the server-side `PersistAndSnapshotBranch` RPC
-//! (CHA-273); Purge stays a per-table client call. It logs and swallows
-//! `tonic::Status` errors — the scheduler's per-branch watermark advances
-//! regardless; retry happens implicitly when the table re-enters a future
-//! enumeration window. See the "Failure semantics" section on `crate`'s module
-//! doc.
+//! Persist and Snapshot are server-side per-branch RPCs; Purge stays a per-table
+//! client call, driven from both of the snapshot loop's purge passes. It logs
+//! and swallows `tonic::Status` errors — the caller's per-branch watermark
+//! advances regardless; retry happens implicitly when the table re-enters a
+//! future enumeration window. See the "Failure semantics" section on `crate`'s
+//! module doc.
 
 use penca_proto::external::v1::PurgeRequest;
 use penca_proto::external::v1::lifecycle_service_client::LifecycleServiceClient;
@@ -17,9 +17,9 @@ use tonic::transport::Channel;
 /// `ListPersistedTables` window — i.e., when its next committed
 /// persist clears the universal grace gate.
 ///
-/// CHA-273 rework: Persist + Snapshot are no longer a per-table client chain
-/// here — the scheduler drives `PersistAndSnapshotBranch` once per branch (the
-/// loop moved server-side into `LifecycleManager`). Purge stays per-table.
+/// Persist and Snapshot are not per-table client chains — each is one
+/// server-side RPC per branch (the loop lives in `LifecycleManager`). Purge
+/// stays per-table until CHA-502 moves it too.
 #[tracing::instrument(
     skip_all,
     fields(
