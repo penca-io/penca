@@ -596,6 +596,8 @@ def poll_log_for(
     lands once. Absence assertions must NOT use an unpolled window; use the
     flush-barrier + exact-count pattern (see
     ``integration_direct_point_read_test.py``).
+
+    Callers MUST be marked ``@pytest.mark.serial`` — see ``container_log``.
     """
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
@@ -625,8 +627,13 @@ def container_log(service: str) -> str:
     two streams would let bytes insert before the offset and fold in an
     earlier test's event.)
 
-    pytest runs serially in this suite (no xdist), so a stdout-offset
-    snapshot taken right before a query isolates that query's log window.
+    The offset window is only sound because every caller is marked
+    ``@pytest.mark.serial`` and so runs outside the ``-n auto`` phase. The
+    suite itself is no longer serial: a concurrent worker driving the same
+    service interleaves its lines into this container's stdout, and they land
+    *after* the offset, inside the window. So calling this obligates the
+    marker — CHA-519 removes both, replacing the scrape with a structured
+    per-request seam.
     """
     project = os.environ["COMPOSE_PROJECT_NAME"]
     container = f"{project}-{service}-1"

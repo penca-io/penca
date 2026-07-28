@@ -54,10 +54,8 @@ def _force_cold_snapshot(client, ctx) -> None:
     client.snapshot(**kw)
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 class TestSnapshotListCache:
     def test_snapshot_list_cache_hit_cuts_pg_read(self):
@@ -272,10 +270,8 @@ class TestSnapshotListCache:
         )
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 class TestHotExistenceGate:
     """The hot existence-gate (phase-1 predicate-parity probe) lets a read with
@@ -450,10 +446,8 @@ class TestDecompositionParity:
         )
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 class TestSystemTableResolveCache:
     """CHA-472 red-tests — extend the CHA-441 snapshot-list cache to the

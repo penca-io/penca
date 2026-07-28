@@ -39,10 +39,8 @@ from .integration_helpers import (
 )
 from .integration_point_read_test import _sql_steps_via
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 pytestmark = pytest.mark.serial
 
 # name (PK) + a Utf8 non-PK column to index + an int64 payload.

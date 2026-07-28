@@ -5487,10 +5487,8 @@ def _await_statement_cache_event(
     return window
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanReuse:
@@ -5538,10 +5536,8 @@ class TestFlightSqlPlanReuse:
         )
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 class TestFlightSqlPlanReuseMiss:
     """CHA-355 cache-miss path. Not parametrized over `driver`: the
@@ -5751,10 +5747,8 @@ def _count_grpc_handler_closes(window: str, span_name: str, branch_uuid: str) ->
     )
 
 
-# Serialized: asserts on process-global white-box state (container stdout log
-# windows / pg_stat_statements counters) that a concurrent worker would
-# pollute. Runs in the serial phase, not under -n auto.
-# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
 @pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanningResolutionCount:

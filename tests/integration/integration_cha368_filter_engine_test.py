@@ -131,10 +131,8 @@ def _count_exclusion_probes(pg, upsert_log: str) -> int:
 class TestSingleFilterEngine:
     """CHA-368: DataFusion is the sole user-filter engine; PG never filters."""
 
-    # Serialized: asserts on process-global white-box state (container stdout log
-    # windows / pg_stat_statements counters) that a concurrent worker would
-    # pollute. Runs in the serial phase, not under -n auto.
-    # TODO(CHA-519): drop this mark once the structured per-request seam lands.
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
     @pytest.mark.serial
     def test_all_hot_resolve_reads_unfiltered_delta(self):
         """RT-1: an all-hot filtered read must make Postgres return the full
@@ -218,10 +216,8 @@ class TestSingleFilterEngine:
             f"got {result.num_rows} — the residual likely skipped later batches"
         )
 
-    # Serialized: asserts on process-global white-box state (container stdout log
-    # windows / pg_stat_statements counters) that a concurrent worker would
-    # pollute. Runs in the serial phase, not under -n auto.
-    # TODO(CHA-519): drop this mark once the structured per-request seam lands.
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
     @pytest.mark.serial
     def test_mixed_read_retires_exclusion_probe(self):
         """RT-3: a mixed hot+cold read must not fire the hot exclusion probe
