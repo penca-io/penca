@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Branchable OLTP + OLAP on one open columnar copy of your data.
+"""A disposable sandbox per agent, on one open columnar copy of your data.
 
 Open-source and self-hostable on object storage — no second system, no ETL.
 
-Forks three branches off `main`, drives one shared deterministic visitor feed
-through all three, and lets each branch's ad-allocation policy read back its
-*own* committed tallies to steer the next round. Then it scores the branches
-against each other and throws all three away; prod is never touched.
+Three agents, three strategies, one production dataset. Each gets its own branch
+off `main`: it reads and writes real committed state, in place, isolated from the
+other two, and no data was copied to give it that. At the end their results are
+compared against each other and all three branches are thrown away; prod is
+never touched.
+
+Concretely: forks three branches off `main`, drives one shared deterministic
+visitor feed through all three, and lets each branch's ad-allocation policy read
+back its *own* committed tallies to steer the next round — read, decide, write,
+repeat, which is the shape agentic work actually takes.
 
 The round loop is ordinary SQL. Each branch is one connection — branch selection
 binds at handshake and is immutable for the connection's lifetime, the way a
@@ -24,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -549,19 +554,21 @@ def run_demo(
     branch_uuids: dict[str, str] = {}
     branches: dict[str, PencaClient] = {}
     try:
-        forked_at = time.perf_counter()
         branch_uuids = fork_branches(client, prod)
-        forked_ms = (time.perf_counter() - forked_at) * 1000
-        # The differentiated claim, measured on the reader's own machine rather
-        # than asserted: forking is a metadata operation, so it is fast and it
-        # copies nothing — the forks read main's storage until they write their
-        # own. No byte figure, because the client has no segment API and this
-        # example will not reach into Postgres to get one;
-        # tests/integration/integration_branch_demo_test.py proves the no-copy
-        # half directly (main holds exactly one object, each fork holds zero).
+        # The differentiated claim, stated without a duration on purpose. A fork
+        # is a metadata operation, but `create_branch` first flushes whatever the
+        # parent still holds in its hot tier so the fork point is entirely in
+        # cold storage — so a timing here measures the parent's unflushed backlog,
+        # not the fork. Once the lifecycle scheduler has persisted, the same fork
+        # is effectively free; printing a number that swings with scheduler timing
+        # would misrepresent it in both directions.
+        #
+        # No byte figure either: the client exposes no segment API and this
+        # example will not reach into Postgres for one. The no-copy claim is
+        # proven directly in integration_sandbox_demo_test.py, where main holds
+        # exactly one object and each fork holds zero.
         print(
-            f"Forked {len(branch_uuids)} branches off main in {forked_ms:.0f}ms — "
-            f"no data copied.\n"
+            f"Forked {len(branch_uuids)} branches off main — no data copied.\n"
             f"Each one starts from main's committed rows and shares its storage "
             f"until it writes.\n"
         )

@@ -465,16 +465,16 @@ penca-up profile="dev" db="": vm-gc
     # short form, where a leading `/` makes it a bind mount; unset, the defaults
     # in compose.yml keep the named volumes and nothing changes.
     if [ -n "{{db}}" ]; then
-        db_dir="$(mkdir -p "{{db}}" && cd "{{db}}" && pwd)"
-        mkdir -p "$db_dir/pg" "$db_dir/s3"
-        export PENCA_PG_VOLUME="$db_dir/pg"
-        export PENCA_S3_VOLUME="$db_dir/s3"
+        # Resolve WITHOUT creating anything (`realpath -m` tolerates a missing
+        # path), because the repo check below refuses — and a refusal must not
+        # leave the very directories it is refusing to use.
+        db_dir="$(realpath -m "{{db}}")"
+
         # The Docker build context is the repo root (`context: ..` in
-        # compose.yml), so a data directory inside the repo gets shipped to the
-        # daemon on every build — a live Postgres datadir plus the whole object
-        # store — and it shows up in `git status` too. Warn rather than refuse:
-        # it is the caller's disk, and .gitignore/.dockerignore cover the name
-        # the README used to suggest.
+        # compose.yml), so a data directory inside the repo would be shipped to
+        # the daemon on every build. Refuse rather than warn: penca-up builds by
+        # default and Postgres creates its datadir mode 0700 owned by a container
+        # uid, so the next build cannot read the context and FAILS outright.
         repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
         if [ -n "$repo_root" ]; then
             case "$db_dir/" in
@@ -491,6 +491,10 @@ penca-up profile="dev" db="": vm-gc
                     ;;
             esac
         fi
+
+        mkdir -p "$db_dir/pg" "$db_dir/s3"
+        export PENCA_PG_VOLUME="$db_dir/pg"
+        export PENCA_S3_VOLUME="$db_dir/s3"
         echo "Persistent storage: $db_dir (pg/ and s3/)"
     fi
     # Every service in both compose files is tagged with a profile (`infra`

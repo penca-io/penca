@@ -1,6 +1,6 @@
 """Static checks for the launch demo's policy layer and SQL wiring (CHA-517).
 
-``examples/branch_demo.py``'s decision layer is infra-free, but the only other
+``examples/sandbox_demo.py``'s decision layer is infra-free, but the only other
 tests that touch it are Docker-gated integration tests — and branch-PR CI skips
 the integration job (it is merge-queue only). So without these, nothing that
 runs before a merge covers the policies at all.
@@ -16,7 +16,7 @@ are a launch cosmetic — a broken one is visible in the first second of running
 the demo, which is not a failure mode worth a mutation-tested assertion each.
 
 No Docker, no fixtures, no penca services — runs under ``just static-test
-branch_demo_policy`` and ``just check``.
+sandbox_demo_policy`` and ``just check``.
 """
 
 from __future__ import annotations
@@ -29,11 +29,11 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 
-DEMO = Path(__file__).parents[2] / "examples/branch_demo.py"
+DEMO = Path(__file__).parents[2] / "examples/sandbox_demo.py"
 
 
 def _load_demo():
-    spec = importlib.util.spec_from_file_location("branch_demo", DEMO)
+    spec = importlib.util.spec_from_file_location("sandbox_demo", DEMO)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     # Register before executing: the demo's dataclasses are defined under
@@ -500,6 +500,25 @@ def test_run_demo_forks_drives_scores_then_discards_in_that_order():
     )
 
 
+def test_run_demo_announces_the_fork_and_claims_no_copy(capsys):
+    """The fork line is user-facing copy making a substantive claim, so pin it.
+
+    Deleting the print, or dropping the "no data copied" half, leaves every other
+    test green — and that sentence is the demo's differentiated claim against
+    "just use a snapshot". Deliberately does NOT pin a duration: a fork's cost is
+    the parent's unflushed hot backlog, so timing it would swing with scheduler
+    state.
+    """
+    demo.run_demo(_FakeAdmin(), _small_config(), connect=_connect_factory([]))
+    printed = capsys.readouterr().out
+
+    assert f"Forked {len(demo.POLICY_NAMES)} branches off main" in printed, printed
+    assert "no data copied" in printed, printed
+    assert "shares its storage" in printed, printed
+    # No milliseconds: a duration here would report the flush, not the fork.
+    assert "ms" not in printed.split("no data copied")[0].split("Forked")[-1], printed
+
+
 def test_run_demo_reports_every_branch_round_to_the_callback():
     """on_round must fire per branch per round, with that round's own outcomes.
 
@@ -721,7 +740,7 @@ def test_seed_prod_drops_the_catalog_it_created_when_setup_fails():
 
 def _parse_args_with(argv: list[str]):
     original = sys.argv
-    sys.argv = ["branch_demo.py", *argv]
+    sys.argv = ["sandbox_demo.py", *argv]
     try:
         return demo.parse_args()
     finally:

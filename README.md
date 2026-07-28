@@ -85,7 +85,7 @@ Open-source and self-hostable on object storage — no second system, no ETL.
 ```bash
 just penca-up                           # Postgres + SeaweedFS + 3 servicers + scheduler + Flight SQL gateway
 set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
-uv run python examples/branch_demo.py
+uv run python examples/sandbox_demo.py
 ```
 
 Fixed ports (Postgres 5432, Flight SQL 50060), bound to loopback, so you can
@@ -97,13 +97,27 @@ Postgres and the object store write there, and it survives `just penca-down`:
 just penca-up --db ~/.penca/data
 ```
 
-### `examples/branch_demo.py` — fork, transact, read back, discard
+### `examples/sandbox_demo.py` — a disposable sandbox per agent
 
-Parallel universes for a live database. The demo seeds a `prod` catalog with ad
-creatives and a running conversion tally, then forks three branches off `main`
-and drives **one** shared, deterministic visitor feed through all three. Each
-visitor's response to each creative is fixed up front, so the branches see
-identical traffic and can only diverge on what they *do* with it.
+**Give each agent its own copy of production, then throw it away.**
+
+Three agents need to try three different strategies against the same live data.
+You do not want three copies of the database, you do not want them touching prod,
+and you do want to compare what they actually did. So fork a branch per agent:
+each one reads and writes real committed state, in place, isolated from the
+others — and none of them copied any data to get it.
+
+The demo seeds a `prod` catalog with ad creatives and a running conversion tally,
+forks three branches off `main`, and drives **one** shared, deterministic visitor
+feed through all three. Each visitor's response to each creative is fixed up
+front, so the branches see identical traffic and can only diverge on what they
+*do* with it — which is what makes the final scoreboard a fair comparison of
+strategies rather than of luck.
+
+Each agent's loop is the shape agentic work actually takes: read the current
+state, decide, write, repeat — reading back its *own* uncommitted-a-moment-ago
+writes, on the same copy it is transacting against. That feedback loop is the
+thing you cannot get from a read replica or a nightly extract.
 
 The round loop is **ordinary SQL over Flight SQL** — each branch is one
 connection, and branch selection binds at handshake and is immutable for the
@@ -171,7 +185,7 @@ of its own — while all three read the full seeded set. (`create_branch` does c
 per-branch *metadata* — schema and table entries — by design; what it never copies
 is the rows.)
 Those are the assertions in
-`tests/integration/integration_branch_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
+`tests/integration/integration_sandbox_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
 and they are the "one copy" half of the headline. (Penca records an in-memory Arrow footprint per segment rather than the
 object's size on disk, so there is no stored-byte figure to quote here — the
 load-bearing claim is the object count.)

@@ -69,7 +69,7 @@ def test_build_and_venv_trees_are_excluded_wherever_they_appear(monkeypatch):
     ):
         assert checker.is_excluded(candidate), candidate
 
-    assert not checker.is_excluded(Path("examples/branch_demo.py"))
+    assert not checker.is_excluded(Path("examples/sandbox_demo.py"))
     assert not checker.is_excluded(Path("tests/static/x.py"))
 
 
@@ -129,7 +129,7 @@ def test_gitignored_paths_are_dropped_including_non_ascii_names(monkeypatch):
     scratch.mkdir(exist_ok=True)
     ascii_path = scratch / "static_probe.py"
     unicode_path = scratch / "static_probé.py"
-    tracked = Path("examples/branch_demo.py")
+    tracked = Path("examples/sandbox_demo.py")
     ascii_path.write_text("x = 1\n")
     unicode_path.write_text("x = 1\n")
     try:
@@ -162,8 +162,8 @@ def test_collect_paths_refuses_an_explicitly_named_generated_stub(monkeypatch):
     assert stub.is_file(), stub
 
     assert checker.collect_paths([str(stub)]) == []
-    assert checker.collect_paths(["examples/branch_demo.py"]) == [
-        Path("examples/branch_demo.py")
+    assert checker.collect_paths(["examples/sandbox_demo.py"]) == [
+        Path("examples/sandbox_demo.py")
     ]
 
 

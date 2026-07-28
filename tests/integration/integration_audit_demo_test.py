@@ -35,7 +35,7 @@ def _demo_catalogs(client) -> set[str]:
 
 def test_audit_demo_runs_the_documented_walkthrough():
     # audit_demo.py names its catalog demo_<hex> and never deletes it, and unlike
-    # branch_demo it does not print the uuid — so diffing the catalog list is the
+    # sandbox_demo it does not print the uuid — so diffing the catalog list is the
     # only way to reap it, and without that the suite leaks one per run onto a
     # stack every other test shares.
     client = make_client()

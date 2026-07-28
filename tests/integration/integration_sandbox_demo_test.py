@@ -1,13 +1,13 @@
 """Integration tests for CHA-517 — the Show HN launch demo.
 
-``examples/branch_demo.py`` forks three branches off ``main``, drives one shared
+``examples/sandbox_demo.py`` forks three branches off ``main``, drives one shared
 deterministic visitor feed through all three, and lets each branch's allocation
 policy read back its *own* committed tallies to steer the next round. These tests
 pin the four claims the launch post makes: the feed is shared and reproducible,
 the read-your-writes policies pull clear of the fixed-split foil, forking does not
 multiply stored bytes, and ``main`` comes out untouched with the forks discarded.
 
-Run via ``just integration-test branch_demo``.
+Run via ``just integration-test sandbox_demo``.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from psycopg.sql import SQL, Identifier
 from .integration_helpers import get_pg_driver, make_client
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEMO_PATH = _REPO_ROOT / "examples" / "branch_demo.py"
+_DEMO_PATH = _REPO_ROOT / "examples" / "sandbox_demo.py"
 
 # Small enough to keep the suite quick, large enough that the read-your-writes
 # policies pull clear of the fixed split. Pinned rather than derived so the
@@ -38,12 +38,12 @@ _SEED = 20260727
 
 
 def _load_demo() -> ModuleType:
-    """Import ``examples/branch_demo.py`` by path.
+    """Import ``examples/sandbox_demo.py`` by path.
 
     ``examples/`` is not a package, and pytest puts ``tests/`` — not the repo
     root — on ``sys.path``, so neither a plain nor a relative import resolves.
     """
-    spec = importlib.util.spec_from_file_location("branch_demo", _DEMO_PATH)
+    spec = importlib.util.spec_from_file_location("sandbox_demo", _DEMO_PATH)
     if spec is None or spec.loader is None:
         msg = f"cannot build an import spec for {_DEMO_PATH}"
         raise RuntimeError(msg)
@@ -226,7 +226,7 @@ def test_forks_share_one_copy_of_the_seeded_data():
 
     # try opens as soon as this test owns the catalog — seed_prod drops its own on
     # failure, so the line above needs no cover. Pinned across both halves of that
-    # failure envelope by static_branch_demo_policy_test's
+    # failure envelope by static_sandbox_demo_policy_test's
     # test_seed_prod_drops_the_catalog_it_created_when_setup_fails (pre-transaction)
     # and test_a_failed_seed_transaction_aborts_then_drops_the_catalog (in-tx).
     # This test reaps on red and green alike; the divergence
