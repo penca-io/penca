@@ -783,6 +783,8 @@ fetch-jdbc-driver:
 # Requires Docker daemon. Uses the test profile (random ports) by default,
 # safe for parallel worktrees. Pass service names to run specific tests:
 #   just integration-test lifecycle query
+# Lower the parallel phase's worker ceiling (default 4) on a constrained box:
+#   PENCA_TEST_JOBS=2 just integration-test
 integration-test *services:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -837,23 +839,29 @@ integration-test *services:
         # deadline that surfaces as RESOURCE_EXHAUSTED in whatever read-path
         # test happened to be running, which reads like a product bug rather
         # than contention. So stay at or under the servicers' own concurrency.
-        # Inert on CI (ubuntu-latest is 4-core for public repos); the override
-        # is for dev machines, in either direction.
+        # Inert on CI (ubuntu-latest is 4-core for public repos). PENCA_TEST_JOBS
+        # only lowers the ceiling — `--maxprocesses` bounds `-n auto` from above,
+        # so it can never buy more workers than the machine has cores.
+        #
+        # Runs even when the serial phase failed, so one invocation reports
+        # every failure rather than hiding this phase behind the other's exit.
         parallel_rc=0
         uv run pytest tests/integration/integration_*.py \
             -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
 
-        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
-        # which is indistinguishable from collecting nothing. That is a real
-        # green-suite-fails-red trap: CHA-519 removes the last `serial` mark, so
-        # phase 1 will one day legitimately select zero tests. Same for anyone
-        # who drops the last mark while iterating.
+        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects
+        # everything, which is indistinguishable from collecting nothing.
+        # Tolerated for the SERIAL phase only, where selecting zero is a real
+        # future state: CHA-519 removes the last `serial` mark, and anyone
+        # dropping it while iterating hits the same thing.
+        #
+        # Deliberately NOT tolerated for the parallel phase, which is the whole
+        # suite in CI — swallowing 5 there would turn "the integration suite ran
+        # nothing" into a green required check. Note `-m` EXPRESSIONS are
+        # unvalidated (`-m "not serail"` matches everything and strict marking
+        # does not catch it), so zero-collection is a live typo away.
         if [ "$serial_rc" -eq 5 ]; then
             serial_rc=0
-        fi
-
-        if [ "$parallel_rc" -eq 5 ]; then
-            parallel_rc=0
         fi
 
         # Surface the first non-zero. Written as a full `if` rather than
