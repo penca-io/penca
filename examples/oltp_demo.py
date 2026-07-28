@@ -83,6 +83,19 @@ def time_lookups(lookup, reps: int) -> tuple[float, pa.Table]:
     return (elapsed / reps) * 1000, found
 
 
+def check_found(found: pa.Table, target_id: int, arm: str) -> None:
+    """Fail the run unless this arm returned exactly the row it asked for."""
+    got = found.column("account_id").to_pylist()
+    if got != [target_id]:
+        msg = f"the {arm} lookup returned account_ids {got}, expected [{target_id}]"
+        raise RuntimeError(msg)
+
+
+def _watermark(response, field: str) -> str:
+    """A lifecycle watermark, or ``none`` when the call was a no-op."""
+    return str(getattr(response, field)) if response.HasField(field) else "none"
+
+
 def print_table(columns: dict[str, list]) -> None:
     print(pa.table(columns).to_pandas().to_markdown(index=False))
 
@@ -127,9 +140,6 @@ def main() -> None:
     client = PencaClient.from_settings()
     catalog_name = f"demo_{uuid4().hex[:8]}"
     catalog_uuid, main_branch_uuid = client.create_catalog(catalog_name, AUTHOR)
-    # Rebind the client's default catalog so the calls below target it rather
-    # than falling back to the bootstrap "public" catalog.
-    client.catalog = catalog_name
 
     sql = None
     try:
@@ -167,18 +177,41 @@ def main() -> None:
         # tier under CI and the cold tier for a reader — the same script
         # reporting two different things. Driving it here also lets the output
         # below say which tier the number belongs to.
-        print("Persisting and snapshotting to cold columnar storage...")
-        client.persist(
+        #
+        # Purge is the load-bearing third step, not a tidy-up. Persist copies
+        # rows to cold but leaves them queryable from hot; the hot/cold
+        # visibility cutoff for the read plan is `purged_at_micros`, so without
+        # this the reads below would still attach a hot arm and "cold" would be
+        # a mislabel. Purge can only advance as far as the snapshot, hence the
+        # order.
+        print("Persisting, snapshotting and purging to cold columnar storage...")
+        persisted = client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
             table_uuid=table_uuid,
             branch_uuid=main_branch_uuid,
         )
-        client.snapshot(
+        snapshotted = client.snapshot(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
             table_uuid=table_uuid,
             branch_uuid=main_branch_uuid,
+        )
+        purged = client.purge(
+            catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
+            table_uuid=table_uuid,
+            branch_uuid=main_branch_uuid,
+        )
+        # Printed, not asserted. Each of these is no-op-capable, and on a stack
+        # whose lifecycle scheduler is running it may legitimately have done the
+        # work already — so an unset watermark here is not proof of failure. The
+        # smoke test runs against a profile with the scheduler idle, where these
+        # calls do the work and the values must be present.
+        print(
+            f"  persisted_at={_watermark(persisted, 'persisted_at_micros')}"
+            f"  snapshotted_at={_watermark(snapshotted, 'snapshotted_at_micros')}"
+            f"  purged_at={_watermark(purged, 'purged_at_micros')}"
         )
 
         fqn = f"{catalog_name}.{SCHEMA_NAME}.{TABLE_NAME}"
@@ -187,13 +220,25 @@ def main() -> None:
             f"WHERE account_id = {target_id}"
         )
 
+        # `ids`, not `filter`. This is the primary-key point-lookup restriction:
+        # the server derives the row identity itself and probes for it. A
+        # `filter="account_id = N"` would instead read the columnar data and
+        # evaluate a predicate over it — a scan, however small, which is the
+        # opposite of what this script claims to show. On a snapshot-only plan
+        # with no value filter this is the shape that skips query planning
+        # altogether.
+        ids = pa.table(
+            {"account_id": [target_id]},
+            schema=pa.schema([ACCOUNTS_SCHEMA.field("account_id")]),
+        )
+
         def grpc_lookup() -> pa.Table:
             return client.read_data(
                 catalog_uuid=catalog_uuid,
                 schema_uuid=schema_uuid,
                 table_uuid=table_uuid,
                 branch_uuid=main_branch_uuid,
-                filter=f"account_id = {target_id}",
+                ids=ids,
             )
 
         # One Flight SQL connection, pinned to this catalog at handshake the way
@@ -202,7 +247,12 @@ def main() -> None:
 
         print(f"\nLooking up account {target_id} ({args.reps}x per arm)...")
         grpc_ms, found = time_lookups(grpc_lookup, args.reps)
-        sql_ms, _ = time_lookups(lambda: sql.execute_query(select), args.reps)
+        sql_ms, sql_found = time_lookups(lambda: sql.execute_query(select), args.reps)
+        # Every arm, not just the one printed below. A lookup that quietly
+        # returned nothing would otherwise post a flatteringly fast number and
+        # exit 0 — and the faster it got, the more wrong it would be.
+        check_found(found, target_id, "gRPC")
+        check_found(sql_found, target_id, "SQL")
 
         print("\n--- The row we looked up ---")
         print(found.to_pandas().to_markdown(index=False))
@@ -215,8 +265,10 @@ def main() -> None:
             }
         )
         print(
-            f"\nOne row out of {args.rows}, seeked straight out of open columnar "
-            f"files on object storage — no scan of the table to find it."
+            f"\nOne row out of {args.rows}, out of open columnar files on object "
+            f"storage. The gRPC arm asks for the row by primary key and the "
+            f"engine goes and gets it; the SQL arm sends a predicate, which the "
+            f"engine has to plan before it can do the same."
         )
     finally:
         # finally, not straight-line: a failed run is exactly when leaving a
