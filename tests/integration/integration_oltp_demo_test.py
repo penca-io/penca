@@ -1,11 +1,10 @@
 """Smoke test for ``examples/oltp_demo.py`` (CHA-527).
 
-The demo's claim is that a primary-key seek stays a seek after the rows land in
-cold columnar storage — it times the same lookup on the hot tier, drives the
-table cold with persist + snapshot, and times it again, over both the gRPC
-client and Flight SQL. That is four numbers a reader is invited to trust, so
-what needs coverage is that all four are really measured and that the seek
-actually found the row it claims to have found.
+The demo's claim is that a primary-key seek is still a seek once the rows live in
+open columnar files — it drives the table cold with persist + snapshot, then
+times the lookup over both the gRPC client and Flight SQL. That is two numbers a
+reader is invited to trust, so what needs coverage is that both are really
+measured and that the seek actually found the row it claims to have found.
 
 Deliberately a subprocess smoke test rather than an import-and-assert: the demo
 is a flat ``main()`` that prints, with no seam to call into, and adding one
@@ -43,7 +42,7 @@ _TARGET_OWNER = f"owner_{_TARGET_ID:06d}"
 _NON_TARGET_OWNER = "owner_000000"
 
 _ROW_SECTION = "--- The row we looked up ---"
-_LATENCY_SECTION = "--- Point lookup latency (mean per seek) ---"
+_LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per seek) ---"
 
 # A pandas/tabulate cell holding a millisecond figure: "| 1.23 |", "|  0.4 |".
 _MS_CELL = re.compile(r"\|\s*\d+\.?\d*\s*\|")
@@ -57,7 +56,7 @@ def _demo_catalogs(client) -> set[str]:
     }
 
 
-def test_oltp_demo_seeks_one_row_on_both_paths_and_both_tiers():
+def test_oltp_demo_seeks_one_row_on_both_paths_against_cold_columnar():
     client = make_client()
     before = _demo_catalogs(client)
 
@@ -114,7 +113,7 @@ def _assert_walkthrough(result) -> None:
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
     _assert_found_the_right_row(stdout)
-    _assert_four_measured_arms(stdout)
+    _assert_both_arms_measured(stdout)
 
 
 def _assert_found_the_right_row(stdout: str) -> None:
@@ -141,25 +140,24 @@ def _assert_found_the_right_row(stdout: str) -> None:
     )
 
 
-def _assert_four_measured_arms(stdout: str) -> None:
-    """Both surfaces, both tiers, each with a real measurement.
+def _assert_both_arms_measured(stdout: str) -> None:
+    """Both surfaces, each with a real measurement.
 
-    The demo's whole claim is the hot-vs-cold comparison across gRPC and SQL, so
-    a run that quietly skipped an arm would print a smaller table and still exit
+    A run that quietly skipped an arm would print a smaller table and still exit
     0. Checking the labels AND the count of millisecond cells catches both a
     missing arm and an arm that printed a placeholder instead of a number.
     """
     latency_section = stdout.split(_LATENCY_SECTION)[1]
 
     lowered = latency_section.lower()
-    for label in ("grpc", "sql", "hot", "cold"):
+    for label in ("grpc", "sql"):
         assert label in lowered, (
             f"the latency table must name the {label!r} arm; table was:\n"
             f"{latency_section[:2000]}"
         )
 
     measured = _MS_CELL.findall(latency_section)
-    assert len(measured) >= 4, (
-        f"expected four measured arms (gRPC/SQL x hot/cold), saw "
+    assert len(measured) >= 2, (
+        f"expected a measurement for each arm (gRPC and SQL), saw "
         f"{len(measured)} numeric cells in:\n{latency_section[:2000]}"
     )
