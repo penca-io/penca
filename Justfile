@@ -851,16 +851,24 @@ integration-test *services:
 
         # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects
         # everything, which is indistinguishable from collecting nothing.
-        # Tolerated for the SERIAL phase only, where selecting zero is a real
-        # future state: CHA-519 removes the last `serial` mark, and anyone
-        # dropping it while iterating hits the same thing.
         #
-        # Deliberately NOT tolerated for the parallel phase, which is the whole
-        # suite in CI — swallowing 5 there would turn "the integration suite ran
-        # nothing" into a green required check. Note `-m` EXPRESSIONS are
-        # unvalidated (`-m "not serail"` matches everything and strict marking
-        # does not catch it), so zero-collection is a live typo away.
+        # Never tolerated for the parallel phase — that is the whole suite in
+        # CI, so swallowing 5 would turn "the integration suite ran nothing"
+        # into a green required check.
+        #
+        # Tolerated for the serial phase ONLY once no `serial` mark is left,
+        # i.e. after CHA-519. The exit code alone cannot say why the phase was
+        # empty: `-m` expressions are unvalidated, so a mistyped `-m "seriall"`
+        # also collects zero — and phase 2's separately-typed `-m "not serial"`
+        # would still exclude those tests, silently skipping every side-channel
+        # test with the gate green. Checking the marks distinguishes the two,
+        # and self-disarms when CHA-519 lands.
         if [ "$serial_rc" -eq 5 ]; then
+            if grep -rq 'pytest\.mark\.serial' tests/integration/integration_*.py; then
+                echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
+                exit 1
+            fi
+
             serial_rc=0
         fi
 
