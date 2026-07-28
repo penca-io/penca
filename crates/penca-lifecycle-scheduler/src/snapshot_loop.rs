@@ -114,7 +114,7 @@ impl SnapshotLoop {
     }
 
     /// One snapshot/purge sweep over every `(catalog, branch)`.
-    #[tracing::instrument(skip_all, err)]
+    #[tracing::instrument(name = "snapshot_tick", skip_all, err)]
     async fn tick(&mut self) -> Result<(), SchedulerError> {
         let catalogs = discovery::list_all_catalogs(&mut self.query, self.list_page_size).await?;
         for catalog in catalogs {
