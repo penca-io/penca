@@ -7,7 +7,7 @@ metadata:
   originSessionId: 00166a15-baf2-4849-88f2-84b2c08812a4
 ---
 
-Rust builds go through sccache (v0.15, `rustc-wrapper` in `~/.cargo/config.toml`) backed by S3 bucket `fabric-sccache` (us-west-1, 180-day object expiry). Installed/configured by `just init-build-tools` (dependency of `init-agent-tools`, reached by `just bootstrap`). Verified 2026-06-11: clean full-workspace build = ~120 s at 100% hit rate vs 1 h+ cold.
+Rust builds go through sccache (v0.15, `rustc-wrapper` in `~/.cargo/config.toml`) backed by S3 bucket **`fabric-sccache`** (us-west-1, 180-day object expiry). **Still `fabric-sccache` after the CHA-520 `fabric`→`penca` rename** — verified 2026-07-27 in `~/.config/sccache/config`. CHA-520 listed the bucket as in scope but it was not renamed, and it should not be "fixed" casually: renaming it forks every cache key and forces a cold rebuild across all VMs. Installed/configured by `just init-build-tools` (dependency of `init-agent-tools`, reached by `just bootstrap`). Verified 2026-06-11: clean full-workspace build = ~120 s at 100% hit rate vs 1 h+ cold.
 
 Gotchas:
 

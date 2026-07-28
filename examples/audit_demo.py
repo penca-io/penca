@@ -7,7 +7,7 @@ Requires Docker services running: just penca-up
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client import PencaClient, Mutation
+from penca_client import Mutation, PencaClient
 from penca_client._time import micros_to_datetime
 
 SCHEMA = pa.schema(

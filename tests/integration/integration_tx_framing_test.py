@@ -29,10 +29,10 @@ from uuid import UUID, uuid4
 
 import pyarrow as pa
 import pytest
+from google.protobuf import descriptor_pool
 from penca_client import Mutation
 from penca_client._time import micros_to_datetime
 from penca_client.client import PencaClient
-from google.protobuf import descriptor_pool
 
 from .integration_helpers import (
     USER_SCHEMA,

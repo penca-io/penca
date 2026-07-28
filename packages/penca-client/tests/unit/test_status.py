@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from grpc import RpcError, StatusCode
 from penca_client.errors import (
     ApiError,
     FailedPreconditionError,
@@ -11,7 +12,6 @@ from penca_client.errors import (
     QueryTimeoutError,
 )
 from penca_client.status import rpc_error_to_api_error
-from grpc import RpcError, StatusCode
 
 
 class _FakeRpcError(RpcError):

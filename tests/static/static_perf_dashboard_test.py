@@ -2,8 +2,10 @@
 
 The dashboard is the optional interactive surface over the SQLite history:
 ``streamlit run scripts/perf/dashboard.py``. These structural guards pin that
-streamlit/pandas are *dev* dependencies (scoped to the dependency group, so they
-can't pass as runtime deps — they're heavy and dashboard-only), the
+streamlit stays a *dev* dependency (heavy and dashboard-only, so it must not
+ship) while pandas is a runtime one — CHA-517 moved it, because ``examples/``
+print through ``to_pandas().to_markdown()``, and having it declared in both
+places meant the ``fresh-clone`` CI job could not pin it at all. Also that the
 ``perf-dashboard`` recipe exists, and the script exposes a
 ``load_dataframe(db_path)`` data accessor distinct from the streamlit UI entry
 point. No Docker, no penca services. Runs under ``just static-test
@@ -74,10 +76,28 @@ def _toml_section(toml_text: str, header: str) -> str:
     return rest if end == -1 else rest[:end]
 
 
-def test_streamlit_and_pandas_are_dev_dependencies():
-    dev = _toml_section(_read("pyproject.toml"), "dependency-groups")
-    assert "streamlit" in dev
-    assert "pandas" in dev
+def test_the_dashboards_deps_are_declared_where_they_belong():
+    """streamlit stays dev-only; pandas is now a real runtime dependency.
+
+    The dashboard is a dev tool, so streamlit must not ship. pandas backs it
+    too, but `examples/` also print through `to_pandas().to_markdown()`, so it
+    moved to the root project's dependencies (CHA-517) — it was previously
+    declared in both places, which meant the fresh-clone CI job could not
+    actually pin it: a plain `uv sync` installs the default dev group as well,
+    so the dev copy masked a missing runtime declaration.
+    """
+    pyproject = _read("pyproject.toml")
+    dev = _toml_section(pyproject, "dependency-groups")
+    runtime = _toml_section(pyproject, "project")
+
+    assert "streamlit" in dev, "the dashboard is a dev tool and must not ship"
+    assert "streamlit" not in runtime
+    assert "pandas" in runtime, (
+        "examples/ import pandas at runtime, so it belongs in dependencies"
+    )
+    assert "pandas" not in dev, (
+        "declared twice, the dev copy masks a missing runtime declaration"
+    )
 
 
 def test_perf_dashboard_recipe_exists():

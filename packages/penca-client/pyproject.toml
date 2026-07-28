@@ -34,7 +34,5 @@ penca-proto = { workspace = true }
 # pure-Python implementation which needs libpq on the system, and
 # `uv sync` leaves the worktree venv unable to even import psycopg.
 dev = [
-    "pandas>=2.3.3",
     "psycopg[binary,pool]>=3.3.3",
-    "tabulate>=0.10.0",
 ]

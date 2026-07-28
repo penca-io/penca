@@ -79,12 +79,129 @@ Two caveats to validate before trusting it for real work (tracked in [CHA-465](h
 
 ## Quick start
 
-Bring up the full stack and run the audit demo:
+**Branchable OLTP + OLAP on one open columnar copy of your data.**
+Open-source and self-hostable on object storage — no second system, no ETL.
 
 ```bash
 just penca-up                           # Postgres + SeaweedFS + 3 servicers + scheduler + Flight SQL gateway
 set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
-uv run python examples/audit_demo.py
+uv run python examples/sandbox_demo.py
+```
+
+Fixed ports (Postgres 5432, Flight SQL 50060), bound to loopback, so you can
+point any Flight SQL driver on this machine at it — drop the `127.0.0.1:` prefix
+in `docker/dev.env` if you want it reachable from your network. To keep your data across restarts, give it a directory — both
+Postgres and the object store write there, and it survives `just penca-down`:
+
+```bash
+just penca-up --db ~/.penca/data
+```
+
+### `examples/sandbox_demo.py` — a disposable sandbox per agent
+
+**Give each agent its own copy of production, then throw it away.**
+
+Three agents need to try three different strategies against the same live data.
+You do not want three copies of the database, you do not want them touching prod,
+and you do want to compare what they actually did. So fork a branch per agent:
+each one reads and writes real committed state, in place, isolated from the
+others — and none of them copied any data to get it.
+
+The demo seeds a `prod` catalog with ad creatives and a running conversion tally,
+forks three branches off `main`, and drives **one** shared, deterministic visitor
+feed through all three. Each visitor's response to each creative is fixed up
+front, so the branches see identical traffic and can only diverge on what they
+*do* with it — which is what makes the final scoreboard a fair comparison of
+strategies rather than of luck.
+
+Each agent's loop is the shape agentic work actually takes: read the current
+state, decide, write, repeat — each round reading back the writes it *committed*
+a moment ago, on the same copy it is transacting against. (Committed, not
+uncommitted: the read is taken before the transaction opens. Nothing here relies
+on reading your own dirty writes.) That feedback loop is the thing you cannot get
+from a read replica or a nightly extract.
+
+The round loop is **ordinary SQL over Flight SQL** — each branch is one
+connection, and branch selection binds at handshake and is immutable for the
+connection's lifetime, the way a Postgres connection is to one database. So a
+branch is reachable as a plain SQL endpoint, and these are the statements any
+Flight SQL driver would send:
+
+```sql
+-- 1. read this branch's own committed tallies (read-your-writes,
+--    on the same copy it is about to transact against)
+SELECT creative_id, impressions, conversions FROM prod_a1b2c3d4.ads.creatives;
+
+-- 2. the allocation policy picks creatives from what it just read, then:
+BEGIN;
+INSERT INTO prod_a1b2c3d4.ads.creatives (creative_id, headline, impressions, conversions)
+VALUES ('carousel', 'One copy of your data. Both workloads.', 425, 94)
+ON CONFLICT (creative_id) DO UPDATE
+  SET impressions = EXCLUDED.impressions, conversions = EXCLUDED.conversions;
+INSERT INTO prod_a1b2c3d4.ads.impressions (visitor_id, creative_id, converted)
+VALUES ('v000401', 'carousel', 1), ('v000402', 'carousel', 0);
+COMMIT;
+```
+
+The tally upsert and the log append share one transaction, so the two can never
+disagree. The `SELECT` is of committed state and sits just before `BEGIN`, not
+inside it; reading inside the open transaction would take a slower path and buy
+the demo nothing.
+
+Setup — creating the catalog, the tables and the three forks — uses the gRPC
+client, because forking pins to the seed's `commit_seq_num` and SQL does not
+hand that back. Everything in the loop above is SQL.
+
+Every branch reads its tallies each round — the tally is cumulative, so writing it
+is a read-modify-write. `even` is the foil because it ignores *what the read said*,
+splitting on the visitor index alone; `greedy` and `epsilon` reallocate from their
+own running results. Then a
+cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
+and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
+defaults (3000 impressions, 25 per transaction, epsilon 0.15, seed
+20260727) — the run
+reproduces, but nothing pins these particular figures, so treat them as a dated
+transcript rather than a contract:
+
+| branch    | impressions | conversions | rate   |
+|:----------|------------:|------------:|:-------|
+| `greedy`  |        3000 |         417 | 13.90% |
+| `epsilon` |        3000 |         383 | 12.77% |
+| `even`    |        3000 |         307 | 10.23% |
+
+Both reading policies beat the fixed split, because both steer on what they wrote
+— and neither finds the genuinely best creative. `greedy` and `epsilon` each
+converge on `story` (true rate 0.14) rather than `carousel` (0.22); `epsilon` spends
+158 of its 3000 impressions on `carousel` and still does not switch, and its extra
+exploration costs it slightly against pure `greedy`. That is what toy policies look
+like, and it is the honest version of the claim: the read-your-writes loop is what
+separates these branches from the foil, not the quality of the allocator. How fast
+greedy commits is also partly an artifact of `--round-size`, which sets decision
+granularity as well as write granularity — a round's picks are all evaluated
+against the read taken at its start.
+
+**Forking does not copy your row data.** Measured on the seeded `creatives`
+table: after the three forks, `main` holds its rows in **exactly one** cold object,
+unchanged by the second and third fork, and each branch owns **zero** cold objects
+of its own — while all three read the full seeded set. (`create_branch` does copy
+per-branch *metadata* — schema and table entries — by design; what it never copies
+is the rows.)
+Those are the assertions in
+`tests/integration/integration_sandbox_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
+and they are the "one copy" half of the headline. (Penca records an in-memory Arrow footprint per segment rather than the
+object's size on disk, so there is no stored-byte figure to quote here — the
+load-bearing claim is the object count.)
+
+Two honest caveats. The allocation policies are deliberately toy — the database
+mechanic is the point, not the bandit. And at this scale the fork itself is the
+hook: reading your transactional writes back *analytically* only outruns a
+row-store at real volume or on a query shape a row-store chokes on, which is not
+what a 3000-impression demo shows.
+
+### `examples/audit_demo.py` — time travel and the audit trail
+
+```bash
+uv run python examples/audit_demo.py    # same sourced env, no extra setup
 ```
 
 `audit_demo.py` walks through Penca's auditable-store semantics on a
@@ -442,7 +559,7 @@ Run `just` to list every recipe (Just installation is in
 | `just lint` | Run ruff linter |
 | `just format` / `just format-check` | Run / check ruff formatter + blank-line fixer |
 | `just check` | Run Python lint + format check + unit tests + static checks, plus Rust clippy / fmt-check / test. Mirrors CI. |
-| `just penca-up [profile]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `profile` = `test` (default, random ports) or `dev` (fixed ports). Requires Docker. |
+| `just penca-up [--profile P] [--db DIR]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `--profile` = `dev` (default: fixed ports, lifecycle scheduler running) or `test` (random ports so parallel worktrees don't collide, scheduler idle so it can't race the suites' manual lifecycle calls). `--db DIR` persists Postgres and the object store under a host directory, so the stack survives `penca-down`. Requires Docker. |
 | `just penca-down [profile]` | Stop servicers + infra and remove volumes. |
 | `just integration-test [services]` | Start infra, run integration tests against the Rust services, tear down. Pass service names to scope: `just integration-test lifecycle query`. Requires Docker. |
 | `just perf-test [paths]` | Start infra, run performance tests against the Rust services, tear down. `paths` scope the run to one or more dirs/files under `tests/performance/` (e.g. `grpc`, `grpc/oltp_test.py`); omit to run everything. Captures each run to `.perf/results.jsonl` and writes a static HTML report (`.perf/report-<run_id>.html`) comparing it to history; pass `--record` to also persist the run into the SQLite history. Sources `docker/.baseline.env` for the direct-Postgres baseline. Requires Docker. |

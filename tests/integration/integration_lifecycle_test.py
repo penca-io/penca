@@ -13,6 +13,7 @@ from uuid import uuid4
 import psycopg
 import pyarrow as pa
 import pytest
+from grpc import RpcError, StatusCode, insecure_channel
 from penca_client import Mutation
 from penca_client.naming import (
     COMPACT_SEGMENT_METADATA,
@@ -25,7 +26,6 @@ from penca_client.naming import (
     table_snapshot_uuid,
     upsert_log_table,
 )
-from grpc import RpcError, StatusCode, insecure_channel
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (

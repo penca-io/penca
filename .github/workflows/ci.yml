@@ -82,8 +82,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages
-      - run: uv run ruff check packages/penca-client/src/penca_client/
-      - run: uv run ruff format --check packages/
+      # Repo-wide, matching `just lint` / `just format-check` and the pre-commit
+      # hook. A narrower scope here let examples/ and tests/ drift out of
+      # compliance while CI stayed green.
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: python scripts/check_blank_lines.py
 
   python-unit:
@@ -94,6 +97,44 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages
       - run: uv run pytest packages/penca-client/tests/unit/ -x -q
+      # tests/static/ is Docker-free and is what gives non-package code
+      # (examples/, scripts/) any pre-merge coverage at all — branch PRs skip the
+      # integration job, so without this line those suites only ever ran locally
+      # via `just check`.
+      - run: uv run pytest tests/static/ -x -q
+
+  fresh-clone:
+    name: Fresh clone can run the examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # Deliberately a PLAIN `uv sync` — no --all-packages. Every other job uses
+      # --all-packages, which installs each workspace member plus its dev group,
+      # so all of them masked a root pyproject that declared no dependency on
+      # penca-client at all: a fresh clone got no `penca_client` and the README's
+      # very first command died at import. Same for tabulate, which pandas needs
+      # for to_markdown() and treats as optional. This job is the only thing that
+      # sees what a reader following the quick start actually gets.
+      - run: uv sync
+      - run: |
+          uv run python - <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+
+          # Import every example by path, exactly as `uv run python examples/x.py`
+          # resolves them, and render a table through the pandas/tabulate path the
+          # printers use. No services needed: this catches packaging, not behaviour.
+          import pyarrow as pa
+          print(pa.table({"ok": [1]}).to_pandas().to_markdown(index=False))
+
+          for example in sorted(Path("examples").glob("*.py")):
+              spec = importlib.util.spec_from_file_location(example.stem, example)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              print(f"imported {example}")
+          PY
 
   rust-check:
     name: Rust clippy + fmt + test
@@ -214,7 +255,7 @@ jobs:
     # output as '' and silently skips, losing the post-merge net with no signal
     # — so fail the gate instead. Its `skipped` result on PR/merge_group is
     # tolerated by the success|skipped case below.
-    needs: [changes, python-lint, python-unit, rust-check, integration]
+    needs: [changes, python-lint, python-unit, fresh-clone, rust-check, integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -223,12 +264,14 @@ jobs:
           echo "changes=${{ needs.changes.result }}"
           echo "python-lint=${{ needs.python-lint.result }}"
           echo "python-unit=${{ needs.python-unit.result }}"
+          echo "fresh-clone=${{ needs.fresh-clone.result }}"
           echo "rust-check=${{ needs.rust-check.result }}"
           echo "integration=${{ needs.integration.result }}"
           for result in \
             "${{ needs.changes.result }}" \
             "${{ needs.python-lint.result }}" \
             "${{ needs.python-unit.result }}" \
+            "${{ needs.fresh-clone.result }}" \
             "${{ needs.rust-check.result }}" \
             "${{ needs.integration.result }}"; do
             case "$result" in
