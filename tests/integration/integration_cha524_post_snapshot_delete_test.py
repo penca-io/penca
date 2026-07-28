@@ -19,6 +19,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 
 from .integration_helpers import make_client
@@ -32,6 +33,11 @@ STRICT_SCHEMA = pa.schema(
         pa.field("value", pa.int64(), nullable=False),
     ]
 )
+
+
+def _rows(table):
+    """``{name: value}`` — order-independent, since reads carry no ORDER BY."""
+    return dict(zip(*table.to_pydict().values(), strict=True))
 
 
 def _seed_catalog(client, table_names):
@@ -124,11 +130,20 @@ def test_list_tables_survives_post_snapshot_delete_table():
     assert surviving() == ["t1"], "compacted end state"
 
 
-def test_delete_catalog_survives_post_snapshot_delete_table():
+@pytest.mark.parametrize(
+    "flush_tombstone", [False, True], ids=["above-fence", "flushed"]
+)
+def test_delete_catalog_survives_post_snapshot_delete_table(flush_tombstone):
     """DeleteCatalog must reap the catalog, not wedge on its own tombstones.
 
     The ticket's headline symptom: every retry failed identically, so the
     catalog and its cold objects could never be reaped.
+
+    Both states matter and neither subsumes the other. ``above-fence`` is the
+    state the ticket reports — the tombstone still in the hot log — and is the
+    only one that puts the NULL-carrying row on DeleteCatalog's own read path.
+    ``flushed`` is where an operator retrying a long-wedged catalog actually
+    finds it, after the scheduler has compacted the tombstone away.
     """
     client = make_client()
     catalog_uuid, main_branch, schema_uuid, _ = _seed_catalog(client, ["t1", "t2"])
@@ -138,12 +153,10 @@ def test_delete_catalog_survives_post_snapshot_delete_table():
         branch_uuid=main_branch,
         schema_uuid=schema_uuid,
     )
-    # Flush the tombstone too: an operator retrying a wedged delete is doing it
-    # against a catalog the scheduler has long since swept, so that is the state
-    # the headline symptom must be pinned in.
-    client.persist_and_snapshot_branch(
-        catalog_uuid=catalog_uuid, branch_uuid=main_branch
-    )
+    if flush_tombstone:
+        client.persist_and_snapshot_branch(
+            catalog_uuid=catalog_uuid, branch_uuid=main_branch
+        )
 
     client.delete_catalog(catalog_uuid=catalog_uuid)
 
@@ -209,21 +222,24 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     # fail here. The schema assertion pins the other half — the strict output
     # contract must survive, since relaxing it too would have turned this bug
     # into silent corruption rather than a loud one.
+    # Order-independent: the merge SQL carries no final ORDER BY, so row order
+    # is a snapshot-layout side effect (PK-sorted segments), not a read contract.
     first = survivors()
-    assert first.to_pydict() == {"name": ["b", "c"], "value": [2, 3]}
+    assert _rows(first) == {"b": 2, "c": 3}
     assert first.schema == STRICT_SCHEMA, (
         "read_data must keep the declared non-nullability"
     )
 
-    # Flush, then delete again. `b`'s upsert now lives ONLY in cold (the first
-    # snapshot compacted it out of hot), so this second tombstone is the case
-    # where the resolve genuinely has no `latest` row to source user columns
-    # from — the same shape, one tier down.
+    # Round 2 adds a second snapshot generation: `c` survives having been
+    # carried forward through the prior compaction, and the new tombstone is
+    # resolved against that carried-forward segment rather than a first-
+    # generation one. (The tier configuration is the same as round 1 — the
+    # seed upsert was already cold-only once the first snapshot fenced it.)
     client.persist_and_snapshot_branch(
         catalog_uuid=catalog_uuid, branch_uuid=main_branch
     )
     delete_row("b")
 
     second = survivors()
-    assert second.to_pydict() == {"name": ["c"], "value": [3]}
+    assert _rows(second) == {"c": 3}
     assert second.schema == STRICT_SCHEMA

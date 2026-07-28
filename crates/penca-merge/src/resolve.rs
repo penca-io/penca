@@ -464,7 +464,70 @@ fn dedup_by_row_uuid(batch: &RecordBatch) -> Result<RecordBatch, MergeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::fold_cold_seq_upper;
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    use super::{compose_resolved_and_exclusion, fold_cold_seq_upper};
+    use crate::schema::resolved_schema;
+
+    /// Non-nullable on both user columns — the condition under which the
+    /// tombstone arm's NULLs used to abort the read (CHA-524).
+    fn strict_user_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]))
+    }
+
+    fn resolved_row(
+        row_uuid: &str,
+        name: Option<&str>,
+        value: Option<i32>,
+        commit_micros: i64,
+        is_delete: bool,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            resolved_schema(&strict_user_schema()),
+            vec![
+                Arc::new(StringArray::from(vec![row_uuid])),
+                Arc::new(StringArray::from(vec![name])),
+                Arc::new(Int32Array::from(vec![value])),
+                Arc::new(Int64Array::from(vec![commit_micros])),
+                Arc::new(BooleanArray::from(vec![is_delete])),
+            ],
+        )
+        .expect("the resolve carrier must accept NULL user columns")
+    }
+
+    /// CHA-524, the production shape: the tombstone is in HOT (committed after
+    /// the snapshot) while its upsert is already COLD, so the hot arm's
+    /// `deletes d LEFT JOIN latest l` finds no `latest` row and emits NULL user
+    /// columns. Both batches are non-empty here, so — unlike the all-cold path,
+    /// where `union_latest` short-circuits on the empty hot side — this drives
+    /// the NULLs through `concat_batches` against the carrier schema and then
+    /// through the cross-tier `dedup_by_row_uuid`.
+    #[test]
+    fn hot_null_tombstone_beats_cold_upsert_and_feeds_the_exclusion_set() {
+        let schema = resolved_schema(&strict_user_schema());
+        let hot = resolved_row("r1", None, None, 200, true);
+        let cold = resolved_row("r1", Some("a"), Some(1), 100, false);
+
+        let (resolved, exclusion) = compose_resolved_and_exclusion(&schema, &hot, &cold)
+            .expect("a NULL-carrying hot tombstone must not abort the composition");
+
+        assert_eq!(
+            resolved.num_rows(),
+            0,
+            "the newer tombstone must shadow the cold upsert out of the live delta"
+        );
+        assert!(
+            exclusion.contains("r1"),
+            "the tombstone must still shadow its snapshot version"
+        );
+    }
 
     // CHA-443 (IMPL-5): the cold seq upper folds the tier fence `W_persist`
     // with the `AsOfSeq` visibility cap into one inclusive `<= min(..)` bound.

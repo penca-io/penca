@@ -1691,28 +1691,25 @@ mod tests {
         committed_ats: &[i64],
         is_deletes: &[bool],
     ) -> RecordBatch {
-        let schema = resolved_schema(&test_user_schema());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(row_uuids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(committed_ats.to_vec())),
-                Arc::new(arrow::array::BooleanArray::from(is_deletes.to_vec())),
-            ],
+        make_resolved_batch_nullable(
+            row_uuids,
+            &names.iter().copied().map(Some).collect::<Vec<_>>(),
+            &values.iter().copied().map(Some).collect::<Vec<_>>(),
+            committed_ats,
+            is_deletes,
         )
-        .unwrap()
     }
 
     /// A resolved batch whose user columns may be NULL — the shape the tombstone
-    /// arm actually produces (CHA-524). `make_resolved_batch_flagged` gives its
-    /// `is_delete = true` rows real values, which production never does: the
-    /// delete log carries no user columns, so once a Snapshot fences the row's
-    /// upsert out of the hot `latest` CTE the arm emits NULLs.
+    /// arm actually produces (CHA-524): the delete log carries no user columns,
+    /// so once a Snapshot fences the row's upsert out of the hot `latest` CTE
+    /// the arm emits NULLs.
     ///
-    /// Constructing this against `resolved_schema` is itself the regression lock
-    /// — re-tightening the carrier's user columns makes `try_new` fail here.
+    /// The single carrier-shaped fixture in this module —
+    /// [`make_resolved_batch_flagged`] and [`make_resolved_batch`] both delegate
+    /// here, so adding a carrier column is one edit, not three that drift.
+    /// Constructing against `resolved_schema` is itself the regression lock:
+    /// re-tightening the carrier's user columns makes `try_new` fail here.
     fn make_resolved_batch_nullable(
         row_uuids: &[&str],
         names: &[Option<&str>],
