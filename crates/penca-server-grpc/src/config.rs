@@ -174,6 +174,12 @@ pub struct LifecycleServiceConfig {
     /// rows (ADR 0027 §5). Negative ⇒ scheduler disabled ⇒ contributes no
     /// floor (the hot-grace window stands alone).
     pub scheduler_tick_interval_seconds: i64,
+    /// Persist-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS`.
+    pub persist_tick_interval_seconds: i64,
+    /// Snapshot-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS`.
+    pub snapshot_tick_interval_seconds: i64,
 }
 
 impl LifecycleServiceConfig {
@@ -188,7 +194,27 @@ impl LifecycleServiceConfig {
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
             hot_purge_grace_seconds: required_env_parsed("HOT_PURGE_GRACE_SECONDS"),
             scheduler_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
+            // Transitional: both read the legacy var until the config split
+            // retires it. See the scheduler crate's matching note.
+            persist_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
+            snapshot_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
         }
+    }
+
+    /// Worst-case gap between consecutive Purge sweeps, in seconds — the
+    /// scheduler-cadence half of the expired-begin ledger-GC grace floor
+    /// (ADR 0027 §5); `purge_tx_log` supplies the `hot_purge_grace_seconds`
+    /// half, so the effective floor is the max of all three.
+    ///
+    /// Takes the max of BOTH loop cadences rather than whichever loop happens
+    /// to drive Purge: the two are independently env-controlled and nothing
+    /// enforces an ordering between them, so assuming one dominates would
+    /// silently under-wait the ledger GC. Over-waiting is the safe direction —
+    /// under-waiting strands a timed-out tx's hot rows forever.
+    ///
+    /// Clamped at 0: a disabled loop (negative) contributes no floor.
+    pub fn purge_sweep_interval_seconds(&self) -> i64 {
+        todo!("CHA-513: max(persist_tick_interval_seconds, snapshot_tick_interval_seconds, 0)")
     }
 }
 
@@ -356,5 +382,50 @@ impl ObjectStorageConfig {
             StorageBackend::S3(s3) => format!("s3://{}", s3.bucket),
             StorageBackend::Local { path } => format!("file://{}", path),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle_config(persist: i64, snapshot: i64) -> LifecycleServiceConfig {
+        LifecycleServiceConfig {
+            database_url: String::new(),
+            bind_addr: String::new(),
+            pg_pool_min: 1,
+            pg_pool_max: 1,
+            default_max_segment_bytes: 1,
+            segment_read_concurrency: NonZeroU32::new(1).unwrap(),
+            query_timeout_seconds: 900,
+            hot_purge_grace_seconds: 60,
+            scheduler_tick_interval_seconds: 0,
+            persist_tick_interval_seconds: persist,
+            snapshot_tick_interval_seconds: snapshot,
+        }
+    }
+
+    /// The ledger-GC floor must not assume `snapshot > persist`. Both cadences
+    /// are independently env-controlled, so the floor takes their max —
+    /// under-waiting strands a timed-out tx's hot rows forever (ADR 0027 §5).
+    #[test]
+    fn purge_sweep_interval_is_order_independent() {
+        // The load-bearing case: persist configured LONGER than snapshot.
+        assert_eq!(
+            lifecycle_config(10, 5).purge_sweep_interval_seconds(),
+            10,
+            "floor must follow the slower loop even when persist dominates"
+        );
+        assert_eq!(lifecycle_config(5, 30).purge_sweep_interval_seconds(), 30);
+        assert_eq!(lifecycle_config(5, 5).purge_sweep_interval_seconds(), 5);
+    }
+
+    /// A disabled loop (negative cadence) contributes no floor; the hot-grace
+    /// window then stands alone. Both disabled is the integration-test profile.
+    #[test]
+    fn disabled_loops_contribute_no_floor() {
+        assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_seconds(), 0);
+        assert_eq!(lifecycle_config(-1, 30).purge_sweep_interval_seconds(), 30);
+        assert_eq!(lifecycle_config(5, -1).purge_sweep_interval_seconds(), 5);
     }
 }
