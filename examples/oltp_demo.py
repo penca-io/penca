@@ -5,17 +5,18 @@ One feature: fetch a single row by its primary key. The interesting part is
 where the row lives. A columnar layout is built for scans, so the fair question
 to ask of a lakehouse is whether fetching one row is still cheap once the data
 has been persisted, snapshotted AND purged into open columnar files — all three,
-because persist alone leaves the rows still queryable from the hot tier and the
-read plan's hot/cold fence is the purge watermark, while purge itself can only
-advance as far as the snapshot. This script drives the table to that steady
-state first, then times the lookup.
+because persist leaves the rows physically in the hot tier, so the read plan
+still attaches a hot arm to every lookup. Purge is what deletes them, and only
+then is the read all-cold, which is the shape worth timing. Purge can advance no
+further than the snapshot, which is why snapshot sits between the two. This
+script drives the table to that steady state first, then times the lookup.
 
 The same row is fetched two ways, and they converge. The gRPC arm sends `ids=`,
 a primary-key restriction the server resolves to a row identity. The SQL arm
 sends `WHERE account_id = ...` over Flight SQL, and the gateway extracts that
 primary-key equality into the *same* `ids` restriction — the WHERE fragment is
-dropped entirely rather than evaluated over the data — so both arms land on the
-same keyed read. Neither one scans.
+then not pushed with the read, so nothing evaluates it over the columnar files —
+so both arms land on the same keyed read. Neither one scans.
 
 What the SQL arm pays on top is the SQL itself: parsing and logical planning on
 each execution, and the driver's extra round trips to get the plan and then the
@@ -187,11 +188,12 @@ def main() -> None:
         # below say which tier the number belongs to.
         #
         # Purge is the load-bearing third step, not a tidy-up. Persist copies
-        # rows to cold but leaves them queryable from hot; the hot/cold
-        # visibility cutoff for the read plan is `purged_at_micros`, so without
-        # this the reads below would still attach a hot arm and "cold" would be
-        # a mislabel. Purge can only advance as far as the snapshot, hence the
-        # order.
+        # rows to cold but leaves them in the hot tables, and the plan attaches a
+        # hot arm whenever any hot row exists — so without this the reads below
+        # would be hot+cold and "cold" would be a mislabel. It is the delete that
+        # matters here, not the watermark: the hot/cold fence is already at the
+        # snapshot before purge runs. Purge can advance no further than the
+        # snapshot, hence the order.
         print("Persisting, snapshotting and purging to cold columnar storage...")
         persisted = client.persist(
             catalog_uuid=catalog_uuid,
@@ -276,8 +278,9 @@ def main() -> None:
             f"\nOne row out of {args.rows}, out of open columnar files on object "
             f"storage. Both arms made the same keyed read — the SQL arm's "
             f"primary-key equality is extracted into the same restriction the "
-            f"gRPC arm sends — so the difference between the numbers is what the "
-            f"SQL round trip costs, not different work."
+            f"gRPC arm sends. What the SQL arm pays on top is the SQL itself: "
+            f"parsing and planning on each execution, plus the driver's extra "
+            f"round trips."
         )
     finally:
         # finally, not straight-line: a failed run is exactly when leaving a

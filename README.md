@@ -224,16 +224,18 @@ uv run python examples/oltp_demo.py    # same sourced env, no extra setup
 A columnar layout is built for scans, so the fair question to ask of a lakehouse
 is what happens to a single-row primary-key lookup once the data has left the
 hot tier. The script seeds a table, drives it all the way cold — persist,
-snapshot, **and purge**, because persist alone leaves the rows still queryable
-from hot — and only then times the lookup.
+snapshot, **and purge**, because persist leaves the rows physically in hot and
+the plan attaches a hot arm while any remain; purge is the delete that makes the
+read all-cold — and only then times the lookup.
 
 It fetches the row two ways, and they converge. The gRPC arm sends `ids=`, a
 primary-key restriction the engine resolves to a row identity. The SQL arm sends
 `WHERE account_id = …` over Flight SQL, and the gateway extracts that
 primary-key equality into the **same** `ids` restriction — the `WHERE` fragment
-is dropped rather than evaluated over the data — so both arms land on the same
-keyed read. Neither scans. What the SQL arm pays on top is parsing and logical
-planning on each execution, plus the driver's extra round trips.
+is then not pushed with the read, so nothing evaluates it over the columnar
+files — so both arms land on the same keyed read. Neither scans. What the SQL
+arm pays on top is parsing and planning on each execution, plus the driver's
+extra round trips.
 
 **No figures are printed here on purpose.** Every number the demo shows is
 measured on your machine when you run it — hardware, container limits and object

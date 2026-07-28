@@ -85,12 +85,9 @@ def _index_section() -> str:
 def _is_runnable_example(name: str) -> bool:
     """A file a reader would actually run, so a README entry is warranted.
 
-    The `_` prefix is the escape hatch: a future `__init__.py` or shared private
-    module is not something a reader runs, so the index is not required to name
-    it. Applied to the REQUIRED set only — the stale check deliberately does not
-    filter, and instead compares against every file on disk, so that an index
-    entry naming a private module that exists is tolerated while one naming a
-    file that is gone is still reported.
+    A future `__init__.py` or shared private module is not something a reader
+    runs, so the index is not required to name it. See `_indexed_examples` for
+    why the stale check deliberately does not apply this.
     """
     return not name.startswith("_")
 

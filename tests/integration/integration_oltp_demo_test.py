@@ -50,9 +50,9 @@ _MS_CELL = re.compile(r"\|\s*\d+\.?\d*\s*(?=\|)")
 # The demo's lifecycle line. Kept as a cheap presence check, but it is only an
 # announcement — _assert_tier_transition below is what actually pins the move.
 _TIER_LINE = "Persisting, snapshotting and purging to cold columnar storage..."
-# The watermarks the demo prints straight after it. Each renders as `none` when
-# its lifecycle call was a no-op, which on the scheduler-idle test profile means
-# the call did not happen.
+# The watermarks the demo prints straight after it. A real one is a number; an
+# unset one renders as a non-numeric placeholder, which on the scheduler-idle
+# test profile means the lifecycle call behind it did not happen.
 _WATERMARKS = ("persisted_at", "snapshotted_at", "purged_at")
 # Captures label -> value from the demo's watermark line, so the assertion can
 # require the label's PRESENCE before judging its value. A bare
@@ -155,8 +155,8 @@ def _assert_tier_transition(stdout: str) -> None:
     snapshot and purge calls while keeping it would leave every other assertion
     here green. The watermarks are the real signal, and the demo prints them for
     exactly this check: on the test profile the lifecycle scheduler is idle, so
-    these calls are the only thing that can move them and `none` means one did
-    not run.
+    these calls are the only thing that can move them, and a watermark that is
+    not a number means one did not run.
 
     Purge is the load-bearing one. Persist copies rows to cold but leaves them
     queryable from hot, so without a purge that advanced, every "cold" number in
@@ -176,10 +176,13 @@ def _assert_tier_transition(stdout: str) -> None:
     # string became "unset" or "-", which is the same drift the label check
     # above exists to prevent — a real watermark is a number.
     no_ops = [field for field in _WATERMARKS if not printed[field].isdigit()]
+    # Report the offending values: a non-numeric watermark means either the
+    # lifecycle call was a no-op or the demo changed how it prints them, and the
+    # predicate cannot tell those apart. The value can.
     assert not no_ops, (
-        f"{no_ops} carry no numeric watermark, so the lifecycle calls behind "
-        f"them were no-ops and the rows are not where the output says they "
-        f"are:\n{stdout[-2000:]}"
+        f"{[(field, printed[field]) for field in no_ops]} carry no numeric "
+        f"watermark — either the lifecycle call was a no-op, or the demo "
+        f"stopped printing raw micros:\n{stdout[-2000:]}"
     )
 
 
