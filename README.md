@@ -97,6 +97,21 @@ Postgres and the object store write there, and it survives `just penca-down`:
 just penca-up --db ~/.penca/data
 ```
 
+## Examples
+
+Everything under `examples/` runs against a `just penca-up` stack with the
+client env sourced, and nothing else. One composite story, then a family of
+single-feature scripts you can read end to end in a minute:
+
+| Script | Shows |
+|---|---|
+| `examples/sandbox_demo.py` | The flagship. Fork a branch per agent, transact on each in place, compare them, throw them away — prod untouched. |
+| `examples/oltp_demo.py` | A single-row primary-key lookup against cold columnar storage, timed over both the gRPC client and Flight SQL. |
+| `examples/audit_demo.py` | Version history and time travel on one table: `read_data`, `audit_data`, and reading the table as it was at an earlier commit. |
+
+Each is standalone and copy-pasteable — they deliberately repeat their setup
+rather than sharing a helper module, so you can lift one file and run it.
+
 ### `examples/sandbox_demo.py` — a disposable sandbox per agent
 
 **Give each agent its own copy of production, then throw it away.**
@@ -197,6 +212,30 @@ mechanic is the point, not the bandit. And at this scale the fork itself is the
 hook: reading your transactional writes back *analytically* only outruns a
 row-store at real volume or on a query shape a row-store chokes on, which is not
 what a 3000-impression demo shows.
+
+### `examples/oltp_demo.py` — a point lookup that stays a point lookup
+
+**One row out of a hundred thousand, straight out of columnar files.**
+
+```bash
+uv run python examples/oltp_demo.py    # same sourced env, no extra setup
+```
+
+A columnar layout is built for scans, so the fair question to ask of a lakehouse
+is what happens to a single-row primary-key lookup once the data has left the
+hot tier. The script seeds a table, drives it all the way cold — persist,
+snapshot, **and purge**, because persist alone leaves the rows still queryable
+from hot — and only then times the lookup.
+
+It runs the same lookup two ways. The gRPC arm asks for the row by primary key
+(`ids=`), so the engine resolves the row identity and goes and gets it. The SQL
+arm sends `WHERE account_id = …` over Flight SQL, which the engine has to plan
+before it can do the same. That is a mechanism difference, and it is why the two
+numbers differ; closing the gap is active work.
+
+**No figures are printed here on purpose.** Every number the demo shows is
+measured on your machine when you run it — hardware, container limits and object
+store all move it. Run it and read your own.
 
 ### `examples/audit_demo.py` — time travel and the audit trail
 
