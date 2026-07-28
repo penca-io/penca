@@ -276,14 +276,62 @@ init-agent-tools: init-build-tools
 clean-agent-tools cha branch:
     #!/usr/bin/env bash
     set -euo pipefail
-    roborev list --branch "{{branch}}" --open --json 2>/dev/null \
-        | jq -r '.[]?.id' \
-        | while read job; do
-            roborev close "$job" >/dev/null
-          done
-    for ref in $(kata list --label "{{cha}}" --status closed --json | jq -r '.issues[]?.qualified_id'); do
-        kata delete "$ref" --force --confirm "DELETE $ref"
+    # Both list commands cap their output — `roborev list --limit` defaults to
+    # 50 and `kata list --limit` to 200 — so listing once and iterating leaves
+    # everything past the cap behind while still exiting 0. CHA-517 hit this:
+    # 69 open roborev jobs, 50 closed, 19 silently stranded. Loop until the
+    # list comes back empty rather than passing a bigger --limit, so there is
+    # no magic constant to drift from the tool's default.
+    #
+    # Failures are counted and reported rather than aborting: `set -e` plus a
+    # loop body would drop the rest of the batch on one bad id, which is the
+    # same silent under-clean by another route. The pass-made-no-progress guard
+    # is what stops an unclosable job spinning forever.
+    failures=0
+
+    while :; do
+        ids="$(roborev list --branch "{{branch}}" --open --limit 200 --json 2>/dev/null \
+            | jq -r '.[]?.id')"
+        [ -z "$ids" ] && break
+
+        closed_this_pass=0
+        for job in $ids; do
+            if roborev close "$job" >/dev/null 2>&1; then
+                closed_this_pass=$((closed_this_pass + 1))
+            else
+                echo "  (could not close roborev job $job)" >&2
+                failures=$((failures + 1))
+            fi
+        done
+
+        [ "$closed_this_pass" -eq 0 ] && break
     done
+
+    while :; do
+        refs="$(kata list --label "{{cha}}" --status closed --limit 200 --json \
+            | jq -r '.issues[]?.qualified_id')"
+        [ -z "$refs" ] && break
+
+        deleted_this_pass=0
+        for ref in $refs; do
+            if kata delete "$ref" --force --confirm "DELETE $ref" >/dev/null 2>&1; then
+                deleted_this_pass=$((deleted_this_pass + 1))
+            else
+                echo "  (could not delete kata task $ref)" >&2
+                failures=$((failures + 1))
+            fi
+        done
+
+        [ "$deleted_this_pass" -eq 0 ] && break
+    done
+
+    # Exit non-zero on any failure: the whole point of this recipe is that state
+    # does not accumulate, and reporting success while leaving some behind is
+    # the bug this fixes.
+    if [ "$failures" -gt 0 ]; then
+        echo "clean-agent-tools: $failures item(s) could not be cleaned" >&2
+        exit 1
+    fi
 
 # Launch the Headroom context-compression proxy (CHA-465). Opt-in: run
 # this in a separate shell, then start Claude Code with
