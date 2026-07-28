@@ -3,8 +3,9 @@
 //! [`LifecycleManager::persist_branch`], [`LifecycleManager::snapshot_branch`],
 //! and [`LifecycleManager::persist_and_snapshot_branch`] loop the per-table
 //! [`persist`](LifecycleManager::persist) / [`snapshot`](LifecycleManager::snapshot)
-//! primitives over a `(catalog, branch)`'s dirty set. Each returns `T`'s
-//! [`Watermark`].
+//! primitives over a `(catalog, branch)`'s dirty set. Each returns `Some(T)`
+//! when every table succeeded and `None` when any did not — see the
+//! continue-on-error paragraph below.
 //!
 //! Only the **Persist** side is bounded at `T` (`persist_request` sets
 //! `target_micros = T.commit_micros`), which is what makes a fork flush capture
@@ -113,8 +114,11 @@ impl LifecycleManager {
         // and depend on the cold tx_log join to reattach them, so the tx_log
         // covering `<= T` must be durable before any data segment referencing
         // those seqs is visible (else `audit_data(include_tx_metadata)` would
-        // join a tx_log missing those rows). Fail-fast: CreateBranch needs an
-        // all-or-nothing fork flush.
+        // join a tx_log missing those rows). Fails fast because it is a
+        // prerequisite for EVERY table on the branch, not per-table best-effort
+        // work — unlike the data-table loop below, there is no partial success
+        // worth keeping. (CreateBranch's all-or-nothing property comes from its
+        // own watermark-presence check, not from this `?`.)
         self.persist_tx_log(
             pool,
             writer,
@@ -319,10 +323,14 @@ impl LifecycleManager {
     /// failed. A per-table failure is logged and the loop continues — see the
     /// module doc for why aborting would starve the branch.
     ///
-    /// Takes the set rather than enumerating it: the three callers differ in
-    /// which dirty set they sweep, and `persist_and_snapshot_branch` sums this
-    /// count with [`Self::snapshot_each`]'s before deciding whether to withhold
-    /// the watermark, so the decision stays with the caller.
+    /// Takes the set rather than enumerating it because the caller needs the
+    /// count: `persist_and_snapshot_branch` sums this against
+    /// [`Self::snapshot_each`]'s before deciding whether to withhold the
+    /// watermark, so the decision cannot move in here.
+    ///
+    /// Kept separate from [`Self::snapshot_each`] rather than parameterized —
+    /// they call different primitives with different argument sets, so unifying
+    /// would need a closure or a mode flag.
     #[allow(clippy::too_many_arguments)]
     async fn persist_each<L, W>(
         &self,
@@ -365,8 +373,8 @@ impl LifecycleManager {
     }
 
     /// Snapshot each table in an already-enumerated set, returning how many
-    /// failed. Sibling of [`Self::persist_each`]; see it for why the two are not
-    /// one parameterized function.
+    /// failed. Sibling of [`Self::persist_each`], which carries the shared
+    /// rationale for the set parameter and for keeping the two separate.
     #[allow(clippy::too_many_arguments)]
     async fn snapshot_each<R, L, W>(
         &self,
@@ -628,4 +636,55 @@ fn watermark_from_row(row: &PgRow) -> Result<Watermark, ApiError> {
         commit_seq_num,
         commit_micros,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watermark() -> Watermark {
+        Watermark {
+            commit_seq_num: 42,
+            commit_micros: 1_700_000_000_000_000,
+        }
+    }
+
+    /// The all-succeeded path returns the fork position the op was bounded at.
+    #[test]
+    fn no_failures_yields_the_watermark() {
+        let got = branch_op_watermark(&Uuid::nil(), &Uuid::nil(), watermark(), 0, 3, "Persist");
+
+        assert_eq!(got, Some(watermark()));
+    }
+
+    /// A withheld watermark is the ONLY partial-completion signal on
+    /// `BranchOpResponse` — CreateBranch aborts the fork on absence, and both
+    /// scheduler loops warn on it. One failure is enough to withhold; a caller
+    /// must not be able to read "mostly succeeded" as success.
+    #[test]
+    fn any_failure_withholds_the_watermark() {
+        for (failed, total) in [(1, 3), (2, 3), (3, 3), (1, 1)] {
+            assert_eq!(
+                branch_op_watermark(
+                    &Uuid::nil(),
+                    &Uuid::nil(),
+                    watermark(),
+                    failed,
+                    total,
+                    "Persist"
+                ),
+                None,
+                "{failed}/{total} failures must withhold"
+            );
+        }
+    }
+
+    /// An empty dirty set is success, not partial completion — a branch with
+    /// nothing to flush must still hand CreateBranch a usable fork position.
+    #[test]
+    fn an_empty_sweep_yields_the_watermark() {
+        let got = branch_op_watermark(&Uuid::nil(), &Uuid::nil(), watermark(), 0, 0, "Snapshot");
+
+        assert_eq!(got, Some(watermark()));
+    }
 }
