@@ -418,7 +418,20 @@ The pre/post diff (not the absolute count) is what determines whether to re-arm 
 
 The project default is no subagents; this invocation is the explicit in-session exception. Fresh-eyes review is the one place fan-out earns its keep — the main session's context is anchored to the design decisions it just made, which is exactly the framing a reviewer needs to be free of. Do **not** also run `/review-pr` yourself in the main session.
 
-**Source-labeled findings (`roborev`, `review-pr`, `cleanup-pass`, `agent-discovered`)** — same as `impl`: implement, commit, close. Priority drives them ahead of orchestration tasks.
+**Source-labeled findings (`roborev`, `review-pr`, `cleanup-pass`, `agent-discovered`)** — triage first, then either implement-commit-close or close `--wontfix`. Priority drives them ahead of orchestration tasks.
+
+Findings are **input to your judgment, not a work queue to execute**. Every commit fires roborev, so a fix commit spawns a review of the fix; draining uncritically is how a ticket converges slowly or not at all. Two checks before touching code:
+
+1. **Is it already superseded?** Reviews lag commits — a finding filed against commit N is frequently fixed by commit N+1 before you claim it. Verify the cited line still says what the finding quotes. If it doesn't, close `--wontfix` naming the commit that superseded it.
+2. **Is it worth doing?** Judge the finding on its merits, exactly as you would a human reviewer's comment.
+
+**Fix it when** it is a correctness or safety issue at any severity; a gate break (fmt, clippy, lint); a factually wrong claim in a comment, doc, or commit message (wrong line reference, retired rationale, invented figure, a doc contradicting the code beside it); a stale reference the live graph disproves; or a cheap consistency fix that makes a rule uniform across siblings.
+
+**Close `--wontfix` when** the finding asks for a distinction that does not exist in production (disambiguating callers where only one is reachable); proposes churn whose only benefit is uniformity for its own sake; asks for a test whose cost is disproportionate to what it pins (an integration test needing deliberately corrupted state to induce one log line) — though check first whether a *pure function* inside the mechanism is trivially unit-testable, which is the case most often missed; re-opens a decision the ticket already settled deliberately; or reverses a change an earlier finding in this same drain explicitly asked for.
+
+The `--wontfix` message is a review response, not a dismissal — state the reasoning a reviewer would need to disagree with you. "Not worth it" is not a justification; "disambiguates two callers, only one of which has a production caller, and the previous round asked for this text to be unified" is.
+
+**Halt and surface instead of deciding** when a finding overturns an approved-plan non-goal or a stated design decision. That is a course-changing issue, and the user owns it — do not silently expand scope, and do not silently ship the flaw either.
 
 ### Doc-only tickets
 
