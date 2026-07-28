@@ -62,33 +62,53 @@ def _index_section() -> str:
     named in some unrelated paragraph (the Quick start's run command, say) would
     otherwise satisfy the index assertion without the index listing it at all.
     """
-    readme = _README.read_text(encoding="utf-8")
+    # Fences come out of the WHOLE file first, before anything else reads it.
+    # Stripping them last leaves two ordering hazards: a `## Examples` line
+    # inside an earlier fenced block would anchor the search in the wrong place,
+    # and a `## ` inside a fence within the section would cut it mid-block,
+    # stranding an unbalanced fence that can no longer be stripped.
+    readme = _FENCED_BLOCK.sub("", _README.read_text(encoding="utf-8"))
     start = _INDEX_START.search(readme)
     assert start is not None, (
-        f"README.md has no examples index section (expected a {_INDEX_HEADING!r} "
-        f"heading on its own line). It is the entry point for the examples "
-        f"family — see CHA-527."
+        f"README.md has no examples index section. Expected a line that is "
+        f"exactly {_INDEX_HEADING!r}, with nothing after it. It is the entry "
+        f"point for the examples family — see CHA-527."
     )
 
     # End at the next h2 so per-script `###` subsections stay inside the section.
     tail = readme[start.end() :]
     end = _NEXT_H2.search(tail)
-    section = tail[: end.start()] if end else tail
 
-    return _FENCED_BLOCK.sub("", section)
+    return tail[: end.start()] if end else tail
+
+
+def _is_runnable_example(name: str) -> bool:
+    """A file a reader would actually run, so a README entry is warranted.
+
+    The `_` prefix is the escape hatch: a future `__init__.py` or shared private
+    module is not something a reader runs. Applied to BOTH sides of the
+    comparison — filtering only discovery would make an index entry for a
+    private module fail as "names examples that do not exist", pointing at a
+    file that is sitting right there.
+    """
+    return not name.startswith("_")
 
 
 def _discovered_examples() -> set[str]:
-    """The runnable examples — every `*.py` under examples/ except private ones.
-
-    The `_` prefix is the escape hatch: a future `__init__.py` or shared private
-    module is not something a reader runs, so requiring a README entry for it
-    would be noise.
-    """
+    """The runnable examples on disk."""
     return {
         path.name
         for path in _EXAMPLES_DIR.glob("*.py")
-        if not path.name.startswith("_")
+        if _is_runnable_example(path.name)
+    }
+
+
+def _indexed_examples() -> set[str]:
+    """The runnable examples named in the README's index section."""
+    return {
+        name
+        for name in _EXAMPLE_MENTION.findall(_index_section())
+        if _is_runnable_example(name)
     }
 
 
@@ -106,7 +126,7 @@ def test_examples_dir_is_not_empty():
 def test_index_names_every_example():
     """Every script in examples/ appears in the README's index section."""
     discovered = _discovered_examples()
-    indexed = set(_EXAMPLE_MENTION.findall(_index_section()))
+    indexed = _indexed_examples()
 
     missing = discovered - indexed
     assert not missing, (
@@ -123,7 +143,7 @@ def test_index_names_no_missing_example():
     of leaving a dead entry pointing a reader at a file that is gone.
     """
     discovered = _discovered_examples()
-    indexed = set(_EXAMPLE_MENTION.findall(_index_section()))
+    indexed = _indexed_examples()
 
     stale = indexed - discovered
     assert not stale, (
