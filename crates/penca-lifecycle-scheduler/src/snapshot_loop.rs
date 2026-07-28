@@ -292,8 +292,11 @@ impl SnapshotLoop {
     /// Purge every table in an already-enumerated set.
     ///
     /// Takes the set because the two sweeps differ in shape, not just data —
-    /// different listing RPC, window, guard and watermark. Owns no watermark
-    /// state; advancing the enumeration window is the caller's job.
+    /// different listing RPC, window, guard and watermark.
+    ///
+    /// Owns no watermark state: the windows tile only when the same function
+    /// that used a bound as its upper edge writes it back, so advancing them
+    /// must stay with the callers.
     async fn purge_each(&mut self, catalog: &Catalog, branch: &Branch, table_uuids: &[String]) {
         for table_uuid in table_uuids {
             ops::purge_one(

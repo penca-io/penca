@@ -5,7 +5,7 @@
 
 ## Purpose
 
-Drives `Persist → Snapshot → Purge` across every branch on two periodic
+Drives `Persist → Snapshot → Purge` across every branch on two periodic timers
 timer so the hot → cold → snapshotted → purged pipeline runs
 autonomously. Without the scheduler, Penca only advances lifecycle
 state when an operator (or embedded-mode caller) invokes the RPCs
@@ -160,7 +160,7 @@ All values are required from environment variables; defaults live in
 | Variable | Purpose |
 |---|---|
 | `QUERY_SERVICE_ADDR` | gRPC URL of the `query` service (catalog/branch discovery) |
-| `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service (`PersistBranch`/`SnapshotBranch` plus per-table `Purge`) |
+| `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service — the branch ops, `Purge`, `PurgeTxLog`, and the `ListModifiedTables`/`ListPersistedTables` dirty-set RPCs |
 | `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | Time between the end of one persist tick and the start of the next. Compose default `5s`; the `dev` profile pins `1s` (CHA-517 — an interactive stack should not accumulate unpersisted hot data). **Non-positive** disables the persist loop alone: boot and idle. |
 | `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | Same, for the snapshot loop (Snapshot + Purge + PurgeTxLog). Compose default `30s`; the `dev` profile pins `5s`. **Non-positive** disables the snapshot loop alone. The `test` profile pins **both** to `-1` so neither loop can race a suite's manual lifecycle calls. |
 | `SCHEDULER_LIST_PAGE_SIZE` | Max `table_uuid`s requested per list-tables page. The scheduler drains every page before moving on. |
@@ -180,16 +180,22 @@ A branch op that skipped at least one table signals partial completion by
 withholding its response watermark; the scheduler logs that, and callers
 needing an all-or-nothing flush (CreateBranch) treat it as an error.
 
-Every lifecycle op is idempotent, but the two sides re-enumerate differently, so
-"self-heals on the next sweep" is not uniform:
+Every lifecycle op is idempotent, and both branch ops re-enumerate
+**unwindowed** — `list_all_modified_table_uuids` and
+`list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound. So
+a table that fails stays in its dirty set and is retried on every subsequent
+tick, with no dependence on receiving further writes:
 
-- **Snapshot** self-heals unconditionally. A table that failed to snapshot keeps
-  its committed persist row with no snapshot past it, so it stays in
-  `ListPersistedTables` and is retried every snapshot tick until it succeeds.
-- **Persist** self-heals only on further traffic. A table that failed to persist
-  re-enters `ListModifiedTables` when it next receives a committed or aborted
-  write; a table that then goes idle is not retried, and its hot rows wait. This
-  is the v0 gap durable per-table retry queues would close.
+- a failed Snapshot keeps its committed persist row with no snapshot past it, so
+  it stays in `ListPersistedTables`;
+- a failed Persist keeps its `tx_table_log` rows, which only `PurgeTxLog` clears
+  and which it cannot reach until Purge advances — so it stays in
+  `ListModifiedTables`.
+
+The windowed enumerations belong to the scheduler's own **Purge** passes, which
+do carry `[last_tick, now)` bounds. There, a one-off failure on a table that then
+goes idle is not retried until the table re-enters a future window — the v0 gap
+durable per-table retry queues would close.
 
 The scheduler does NOT use gRPC retries or backoff. The tick cadence
 (`SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` for Persist,
