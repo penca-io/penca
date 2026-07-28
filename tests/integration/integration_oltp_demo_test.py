@@ -158,9 +158,12 @@ def _assert_tier_transition(stdout: str) -> None:
     these calls are the only thing that can move them, and a watermark that is
     not a number means one did not run.
 
-    Purge is the load-bearing one. Persist copies rows to cold but leaves them
-    queryable from hot, so without a purge that advanced, every "cold" number in
-    this run is a hot read wearing a cold label.
+    Purge is the load-bearing one, and for the reason the demo gives: persist
+    leaves the rows in the hot tables, so the plan keeps attaching a hot arm
+    until purge deletes them. The watermark this asserts on is the observable
+    proxy for that delete — it commits atomically with it — not the cause.
+    Without it, every "cold" number in the run is a hot read wearing a cold
+    label.
     """
     printed = dict(_WATERMARK_VALUE.findall(stdout))
 
