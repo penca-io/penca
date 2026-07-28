@@ -76,15 +76,15 @@ def _commit(client, *, catalog_uuid, branch_uuid, schema_uuid, mutation):
     client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
 
 
-def _delete_t2_after_snapshot(client, *, catalog_uuid, main_branch, schema_uuid):
+def _delete_t2_after_snapshot(client, *, catalog_uuid, branch_uuid, schema_uuid):
     """Snapshot main, then drop ``t2`` — the tombstone lands above the fence."""
     client.persist_and_snapshot_branch(
-        catalog_uuid=catalog_uuid, branch_uuid=main_branch
+        catalog_uuid=catalog_uuid, branch_uuid=branch_uuid
     )
     client.delete_table(
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
-        branch_uuid=main_branch,
+        branch_uuid=branch_uuid,
         table_name="t2",
         author="test",
         comment="CHA-524",
@@ -98,7 +98,7 @@ def test_list_tables_survives_post_snapshot_delete_table():
     _delete_t2_after_snapshot(
         client,
         catalog_uuid=catalog_uuid,
-        main_branch=main_branch,
+        branch_uuid=main_branch,
         schema_uuid=schema_uuid,
     )
 
@@ -110,15 +110,18 @@ def test_list_tables_survives_post_snapshot_delete_table():
             )
         ]
 
-    assert surviving() == ["t1"], "tombstone above the fence (hot resolve arm)"
+    assert surviving() == ["t1"], "tombstone above the fence"
 
-    # Flush again so the tombstone itself lands in cold — the state a real
-    # deployment reaches within one scheduler tick, resolved by the cold arm.
+    # Snapshot is itself a cold merge-on-read, so this flush — not the re-read —
+    # is what drives the resolve over the tombstone; it would fail loudly if the
+    # carrier schema regressed. It also compacts the tombstone away (snapshot
+    # segments carry no `is_delete`), so the re-read pins the end state a real
+    # deployment reaches within one scheduler tick.
     client.persist_and_snapshot_branch(
         catalog_uuid=catalog_uuid, branch_uuid=main_branch
     )
 
-    assert surviving() == ["t1"], "tombstone flushed to cold (cold resolve arm)"
+    assert surviving() == ["t1"], "compacted end state"
 
 
 def test_delete_catalog_survives_post_snapshot_delete_table():
@@ -132,8 +135,14 @@ def test_delete_catalog_survives_post_snapshot_delete_table():
     _delete_t2_after_snapshot(
         client,
         catalog_uuid=catalog_uuid,
-        main_branch=main_branch,
+        branch_uuid=main_branch,
         schema_uuid=schema_uuid,
+    )
+    # Flush the tombstone too: an operator retrying a wedged delete is doing it
+    # against a catalog the scheduler has long since swept, so that is the state
+    # the headline symptom must be pinned in.
+    client.persist_and_snapshot_branch(
+        catalog_uuid=catalog_uuid, branch_uuid=main_branch
     )
 
     client.delete_catalog(catalog_uuid=catalog_uuid)
@@ -161,28 +170,26 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
         mutation=Mutation(
             table_uuid=table_uuid,
             upserts=pa.table(
-                {"name": ["a", "b"], "value": [1, 2]}, schema=STRICT_SCHEMA
+                {"name": ["a", "b", "c"], "value": [1, 2, 3]}, schema=STRICT_SCHEMA
             ),
         ),
     )
 
-    client.persist_and_snapshot_branch(
-        catalog_uuid=catalog_uuid, branch_uuid=main_branch
-    )
-    _commit(
-        client,
-        catalog_uuid=catalog_uuid,
-        branch_uuid=main_branch,
-        schema_uuid=schema_uuid,
-        mutation=Mutation(
-            table_uuid=table_uuid,
-            # Derived, not re-declared: a drifting pk type would otherwise fail
-            # the delete on a type mismatch instead of exercising this path.
-            deletes=pa.table(
-                {"name": ["a"]}, schema=pa.schema([STRICT_SCHEMA.field("name")])
+    def delete_row(name):
+        _commit(
+            client,
+            catalog_uuid=catalog_uuid,
+            branch_uuid=main_branch,
+            schema_uuid=schema_uuid,
+            mutation=Mutation(
+                table_uuid=table_uuid,
+                # Derived, not re-declared: a drifting pk type would otherwise
+                # fail the delete on a type mismatch instead of exercising this.
+                deletes=pa.table(
+                    {"name": [name]}, schema=pa.schema([STRICT_SCHEMA.field("name")])
+                ),
             ),
-        ),
-    )
+        )
 
     def survivors():
         return client.read_data(
@@ -192,22 +199,31 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
             branch_uuid=main_branch,
         )
 
-    # Assert the whole row, not just the pk: the defect is non-key user columns
-    # arriving NULL, so a fix that kept row `b` with a NULL `value` must fail
-    # here. The schema assertion pins the other half — the strict output
-    # contract must survive, since relaxing it would turn this bug into silent
-    # corruption rather than a loud one.
-    hot = survivors()
-    assert hot.to_pydict() == {"name": ["b"], "value": [2]}
-    assert hot.schema == STRICT_SCHEMA, (
-        "read_data must keep the declared non-nullability"
-    )
-
-    # And again once the tombstone itself is flushed to cold.
     client.persist_and_snapshot_branch(
         catalog_uuid=catalog_uuid, branch_uuid=main_branch
     )
+    delete_row("a")
 
-    cold = survivors()
-    assert cold.to_pydict() == {"name": ["b"], "value": [2]}
-    assert cold.schema == STRICT_SCHEMA
+    # Assert the whole row, not just the pk: the defect is non-key user columns
+    # arriving NULL, so a fix that kept the survivors with a NULL `value` must
+    # fail here. The schema assertion pins the other half — the strict output
+    # contract must survive, since relaxing it too would have turned this bug
+    # into silent corruption rather than a loud one.
+    first = survivors()
+    assert first.to_pydict() == {"name": ["b", "c"], "value": [2, 3]}
+    assert first.schema == STRICT_SCHEMA, (
+        "read_data must keep the declared non-nullability"
+    )
+
+    # Flush, then delete again. `b`'s upsert now lives ONLY in cold (the first
+    # snapshot compacted it out of hot), so this second tombstone is the case
+    # where the resolve genuinely has no `latest` row to source user columns
+    # from — the same shape, one tier down.
+    client.persist_and_snapshot_branch(
+        catalog_uuid=catalog_uuid, branch_uuid=main_branch
+    )
+    delete_row("b")
+
+    second = survivors()
+    assert second.to_pydict() == {"name": ["c"], "value": [3]}
+    assert second.schema == STRICT_SCHEMA
