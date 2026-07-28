@@ -51,15 +51,19 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     pub fn from_env() -> Self {
+        let tick_interval_seconds = required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
         Self {
             query_addr: required_env("QUERY_SERVICE_ADDR"),
             lifecycle_addr: required_env("LIFECYCLE_SERVICE_ADDR"),
-            tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
-            // Transitional: both loops read the single legacy var so the stack
-            // keeps booting between this red commit and the config split that
-            // retires it for SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS.
-            persist_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
-            snapshot_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
+            tick_interval_seconds,
+            // TODO(CHA-513): both loops alias the single legacy var so the stack
+            // keeps booting until the config split retires it for
+            // SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS.
+            // `LifecycleServiceConfig::from_env` carries the same alias — the two
+            // crates and docker/{compose.yml,dev.env,test.env} MUST flip in one
+            // commit, or `required_env_parsed` panics at boot on the retired name.
+            persist_tick_interval_seconds: tick_interval_seconds,
+            snapshot_tick_interval_seconds: tick_interval_seconds,
             list_page_size: required_env_parsed("SCHEDULER_LIST_PAGE_SIZE"),
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
         }

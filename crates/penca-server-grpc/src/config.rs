@@ -174,16 +174,26 @@ pub struct LifecycleServiceConfig {
     /// rows (ADR 0027 §5). Negative ⇒ scheduler disabled ⇒ contributes no
     /// floor (the hot-grace window stands alone).
     pub scheduler_tick_interval_seconds: i64,
-    /// Persist-loop cadence, in seconds — MUST equal the scheduler's
-    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS`.
+    /// Persist-loop cadence, in seconds. Will read
+    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` and MUST then equal the
+    /// scheduler's value; today it still aliases the legacy var — see
+    /// `from_env`.
     pub persist_tick_interval_seconds: i64,
-    /// Snapshot-loop cadence, in seconds — MUST equal the scheduler's
-    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS`.
+    /// Snapshot-loop cadence, in seconds. Will read
+    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` and MUST then equal the
+    /// scheduler's value; today it still aliases the legacy var — see
+    /// `from_env`.
     pub snapshot_tick_interval_seconds: i64,
 }
 
 impl LifecycleServiceConfig {
     pub fn from_env() -> Self {
+        // TODO(CHA-513): both split cadences alias the legacy var until the
+        // config split retires it for SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS.
+        // `SchedulerConfig::from_env` carries the same alias — the two crates and
+        // docker/{compose.yml,dev.env,test.env} MUST flip in one commit, or
+        // `required_env_parsed` panics whichever binary reads the retired name at boot.
+        let scheduler_tick_interval_seconds = required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
         Self {
             database_url: required_env("DATABASE_URL"),
             bind_addr: required_env("BIND_ADDR"),
@@ -193,11 +203,9 @@ impl LifecycleServiceConfig {
             segment_read_concurrency: required_env_parsed("LIFECYCLE_SEGMENT_READ_CONCURRENCY"),
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
             hot_purge_grace_seconds: required_env_parsed("HOT_PURGE_GRACE_SECONDS"),
-            scheduler_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
-            // Transitional: both read the legacy var until the config split
-            // retires it. See the scheduler crate's matching note.
-            persist_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
-            snapshot_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
+            scheduler_tick_interval_seconds,
+            persist_tick_interval_seconds: scheduler_tick_interval_seconds,
+            snapshot_tick_interval_seconds: scheduler_tick_interval_seconds,
         }
     }
 
@@ -206,15 +214,30 @@ impl LifecycleServiceConfig {
     /// (ADR 0027 §5); `purge_tx_log` supplies the `hot_purge_grace_seconds`
     /// half, so the effective floor is the max of all three.
     ///
-    /// Takes the max of BOTH loop cadences rather than whichever loop happens
-    /// to drive Purge: the two are independently env-controlled and nothing
-    /// enforces an ordering between them, so assuming one dominates would
-    /// silently under-wait the ledger GC. Over-waiting is the safe direction —
-    /// under-waiting strands a timed-out tx's hot rows forever.
+    /// Takes the max of BOTH loop cadences as a **conservative bound**, not
+    /// because either alone would be wrong today. Purge currently rides the
+    /// snapshot loop, so the snapshot cadence alone is the exact worst-case gap;
+    /// the max is chosen because the loop-to-op assignment is not an invariant —
+    /// CHA-502 moves Purge server-side behind `PurgeBranch`/`PurgeCatalog`, and a
+    /// floor that encoded "snapshot owns Purge" would have to be re-pointed by
+    /// hand, silently under-waiting if anyone forgot. Over-waiting is the safe
+    /// direction: under-waiting strands a timed-out tx's hot rows forever.
     ///
-    /// Clamped at 0: a disabled loop (negative) contributes no floor.
+    /// Retention consequence, deliberate: the ledger-GC grace now floors at the
+    /// snapshot cadence (deployment default 30s) rather than the single 5s knob,
+    /// so timed-out txs' `commit_tx_log` bookkeeping is held ~6x longer before
+    /// GC. That is the cost of decoupling the cadences.
+    ///
+    /// Clamped at 0: a disabled loop (non-positive) contributes no floor.
     pub fn purge_sweep_interval_seconds(&self) -> i64 {
         todo!("CHA-513: max(persist_tick_interval_seconds, snapshot_tick_interval_seconds, 0)")
+    }
+
+    /// [`Self::purge_sweep_interval_seconds`] in micros — the exact value
+    /// `LifecycleManager::purge_sweep_interval_micros` takes, so the binary's
+    /// wiring is one field assignment with no arithmetic of its own.
+    pub fn purge_sweep_interval_micros(&self) -> i64 {
+        self.purge_sweep_interval_seconds() * 1_000_000
     }
 }
 
@@ -399,7 +422,11 @@ mod tests {
             segment_read_concurrency: NonZeroU32::new(1).unwrap(),
             query_timeout_seconds: 900,
             hot_purge_grace_seconds: 60,
-            scheduler_tick_interval_seconds: 0,
+            // Dominant on purpose: the legacy field must NOT feed the floor, so
+            // any implementation that folds it into the max blows every case
+            // below rather than passing while the retired knob stays
+            // load-bearing.
+            scheduler_tick_interval_seconds: 9_999,
             persist_tick_interval_seconds: persist,
             snapshot_tick_interval_seconds: snapshot,
         }
@@ -422,10 +449,30 @@ mod tests {
 
     /// A disabled loop (negative cadence) contributes no floor; the hot-grace
     /// window then stands alone. Both disabled is the integration-test profile.
+    ///
+    /// The `(5, -1)` case floors on the persist cadence even though Purge rides
+    /// the snapshot loop today — that is the conservative bound doing its job,
+    /// not a claim that the persist loop issues Purge.
     #[test]
     fn disabled_loops_contribute_no_floor() {
         assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_seconds(), 0);
         assert_eq!(lifecycle_config(-1, 30).purge_sweep_interval_seconds(), 30);
         assert_eq!(lifecycle_config(5, -1).purge_sweep_interval_seconds(), 5);
+    }
+
+    /// The binary assigns this straight to
+    /// `LifecycleManager::purge_sweep_interval_micros`, so the seconds→micros
+    /// conversion is pinned here rather than living unwatched in `main`.
+    #[test]
+    fn purge_sweep_micros_tracks_both_cadences() {
+        assert_eq!(
+            lifecycle_config(10, 5).purge_sweep_interval_micros(),
+            10_000_000
+        );
+        assert_eq!(
+            lifecycle_config(5, 30).purge_sweep_interval_micros(),
+            30_000_000
+        );
+        assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_micros(), 0);
     }
 }
