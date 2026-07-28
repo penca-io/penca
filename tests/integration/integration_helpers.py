@@ -635,8 +635,11 @@ def container_log(service: str) -> str:
     marker — CHA-519 removes both, replacing the scrape with a structured
     per-request seam.
 
-    ``tests/static/static_serial_marker_test.py`` is what keeps that true; it
-    walks the call graph, so a wrapper added to this module is covered too.
+    ``tests/static/static_serial_marker_test.py`` is what keeps that true. It
+    covers a wrapper that *calls* this function, and a test reaching the
+    channel by raw SQL or ``docker logs`` text. It does not resolve a call
+    made through an alias or a dynamic attribute — add such a helper to its
+    root set by hand.
     """
     project = os.environ["COMPOSE_PROJECT_NAME"]
     container = f"{project}-{service}-1"

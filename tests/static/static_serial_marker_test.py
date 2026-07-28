@@ -189,6 +189,13 @@ def _side_channel_helpers() -> frozenset[str]:
     exercised: a shared wrapper belongs in ``integration_helpers.py``, and one
     added there would be invisible to a roots-only scan, so its callers would
     look unmarked-but-innocent.
+
+    Returns exactly the roots today, since ``poll_log_for`` — the one wrapper
+    that reaches another — is itself a root. That makes this inert until the
+    first real wrapper lands, which is precisely when a silent regression
+    would matter, so ``test_derivation_sees_a_call_wrapper`` pins the
+    behaviour on synthetic source rather than on the tree happening to
+    exercise it.
     """
     tree = ast.parse((INTEGRATION / "integration_helpers.py").read_text())
     return ROOT_SIDE_CHANNEL_HELPERS | _coupled_functions(
@@ -248,6 +255,52 @@ def test_every_side_channel_test_is_marked_serial():
         "@pytest.mark.serial, so they would run in the -n auto phase and race "
         f"a concurrent worker: {unmarked}"
     )
+
+
+def test_derivation_sees_a_call_wrapper():
+    """Pin the wrapper derivation on synthetic source.
+
+    The real helpers module yields no derived names today, so this mechanism
+    would otherwise be unexercised and could regress to returning nothing
+    without CI noticing — failing open on the day a wrapper is first added.
+    """
+    source = """
+def _wrap(service):
+    return container_log(service)
+
+def _wrap_twice(service):
+    return _wrap(service)
+
+def _unrelated(x):
+    return x + 1
+"""
+    derived = _coupled_functions(ast.parse(source), ROOT_SIDE_CHANNEL_HELPERS)
+
+    assert "_wrap" in derived, "a direct wrapper must be derived"
+    assert "_wrap_twice" in derived, "derivation must be transitive"
+    assert "_unrelated" not in derived, "an unrelated function must not be"
+
+
+def test_derivation_survives_a_shadowed_name():
+    """Same-named definitions must union, not overwrite.
+
+    ``integration_helpers.py`` defines ``execute`` / ``execute_stream`` /
+    ``close`` once per driver class, so keying on the bare name would drop a
+    scraping definition whenever a same-named sibling is declared later — the
+    fail-quiet direction.
+    """
+    source = """
+class A:
+    def execute(self):
+        return container_log("x")
+
+class B:
+    def execute(self):
+        return None
+"""
+    derived = _coupled_functions(ast.parse(source), ROOT_SIDE_CHANNEL_HELPERS)
+
+    assert "execute" in derived, "a shadowed scraping definition must survive"
 
 
 def test_side_channel_helpers_still_exist():
