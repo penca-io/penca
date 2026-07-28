@@ -17,15 +17,38 @@ pub fn snapshot_read_schema(user_schema: &SchemaRef) -> SchemaRef {
 /// Schema of a resolved row (Query A output):
 /// `row_uuid, <user_cols>, commit_micros, is_delete`.
 ///
-/// CHA-368: the resolve now returns the latest committed version per
-/// `row_uuid` across BOTH logs — visible upserts (`is_delete = false`, user
-/// cols carry values) and winning tombstones (`is_delete = true`, user cols
-/// NULL). The full `row_uuid` set of this batch IS the exclusion set (it
-/// replaces the retired Query-B probe); the `is_delete = false` subset is the
-/// live rows the merge emits.
+/// CHA-368: the resolve returns the latest committed version per `row_uuid`
+/// across BOTH logs — visible upserts (`is_delete = false`, user cols carry
+/// values) and winning tombstones (`is_delete = true`, user cols NULL). The full
+/// `row_uuid` set of this batch IS the exclusion set (it replaces the retired
+/// Query-B probe); the `is_delete = false` subset is the live rows the merge
+/// emits.
+///
+/// CHA-524: the user columns are declared NULLABLE here regardless of what the
+/// table declared, because the tombstone arm has no values to put in them — the
+/// delete log stores `(row_uuid, <pk_cols>, tx_uuid)` and the merge SQL reads no
+/// user columns off it at all, so `two_arm_resolve_select` sources them from a
+/// LEFT-JOINed `latest` purely to type-match the UNION. Once a Snapshot advances
+/// the hot fence `max(Pu, W_snap)` (ADR 0027) past a row's original upsert, that
+/// join misses and the arm emits NULLs — which `RecordBatch::try_new` rejects
+/// against a non-nullable declaration, wedging every subsequent read of the
+/// table. Only `__penca_system__.*` felt it at first because
+/// `PgDialect::system_*_arrow_schema` declares its columns non-nullable.
+///
+/// This relaxation does NOT weaken the user-data contract: that lives on
+/// [`snapshot_read_schema`], which stays strict and is applied by
+/// `output::project_to_output` *after* `resolve::filter_live_rows` has dropped
+/// every tombstone — so a genuine NULL in a live row still fails loudly.
+/// `row_uuid` / `commit_micros` / `is_delete` stay non-nullable: both arms
+/// always populate all three.
 pub(crate) fn resolved_schema(user_schema: &SchemaRef) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("row_uuid", DataType::Utf8, false))];
-    fields.extend(user_schema.fields().iter().cloned());
+    fields.extend(
+        user_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true))),
+    );
     fields.push(Arc::new(Field::new(
         "commit_micros",
         DataType::Int64,
@@ -237,6 +260,36 @@ mod tests {
             .map(|(n, t, nul)| (*n, t.clone(), *nul))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// CHA-524: the two-arm resolve emits tombstone rows whose user columns are
+    /// NULL by construction, so the carrier must declare them nullable — while
+    /// the OUTPUT schema stays strict, since `filter_live_rows` drops those rows
+    /// before `project_to_output` applies it. Locking both halves together is
+    /// the point: relaxing the output schema too would turn the wedged read this
+    /// fixes into silent corruption.
+    #[test]
+    fn resolved_schema_relaxes_user_columns_but_output_schema_stays_strict() {
+        let user: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+
+        let resolved = resolved_schema(&user);
+        assert!(resolved.field_with_name("name").unwrap().is_nullable());
+        assert!(resolved.field_with_name("note").unwrap().is_nullable());
+        for required in ["row_uuid", "commit_micros", "is_delete"] {
+            assert!(
+                !resolved.field_with_name(required).unwrap().is_nullable(),
+                "{required} is populated by both arms and must stay non-nullable"
+            );
+        }
+
+        let output = snapshot_read_schema(&user);
+        assert!(
+            !output.field_with_name("name").unwrap().is_nullable(),
+            "the output contract must keep the table's declared non-nullability"
+        );
     }
 
     #[test]
