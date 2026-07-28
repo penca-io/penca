@@ -863,8 +863,17 @@ integration-test *services:
         # would still exclude those tests, silently skipping every side-channel
         # test with the gate green. Checking the marks distinguishes the two,
         # and self-disarms when CHA-519 lands.
+        # grep does its own globbing here rather than taking a shell-expanded
+        # list: a glob that failed to expand would be passed through as a
+        # literal filename, grep would exit 2, and the `if` would read that as
+        # "no marks left" — applying the tolerance, which is the one direction
+        # this guard exists to prevent. integration_helpers.py is excluded
+        # because it names the marker in prose, so matching it would keep the
+        # guard armed after CHA-519 removed every real mark.
         if [ "$serial_rc" -eq 5 ]; then
-            if grep -rq 'pytest\.mark\.serial' tests/integration/integration_*.py; then
+            if grep -rq --include='integration_*.py' \
+                --exclude='integration_helpers.py' \
+                'pytest\.mark\.serial' tests/integration/; then
                 echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
                 exit 1
             fi

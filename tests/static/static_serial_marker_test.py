@@ -46,11 +46,16 @@ ROOT_SIDE_CHANNEL_HELPERS = frozenset(
     }
 )
 
-# Reaching the side channel without going through a helper at all — e.g.
+# Reaching the counters without going through a helper at all — e.g.
 # ``SELECT ... FROM pg_stat_statements`` inline, as
 # integration_cha368_filter_engine_test.py does. Matched against string
 # literals so those functions are roots in their own right.
-SIDE_CHANNEL_LITERALS = ("pg_stat_statements", "docker logs")
+#
+# SQL text only. There is no log-side equivalent: container_log shells
+# ``["docker", "logs", container]`` as separate list elements, so no single
+# string constant to match — reading that channel means calling the helper,
+# which the call graph already covers.
+SIDE_CHANNEL_SQL_LITERALS = ("pg_stat_statements",)
 
 
 def _called_names(node: ast.AST) -> set[str]:
@@ -101,46 +106,10 @@ def _body_sets_serial_pytestmark(body: list[ast.stmt]) -> bool:
     return False
 
 
-def _is_fixture(node: ast.AST) -> bool:
-    for decorator in getattr(node, "decorator_list", []):
-        for attr in ast.walk(decorator):
-            if isinstance(attr, ast.Attribute) and attr.attr == "fixture":
-                return True
-
-    return False
-
-
-def _coupled_fixtures(tree: ast.Module, coupled: set[str]) -> set[str]:
-    """Fixture names among ``coupled``.
-
-    Coupling otherwise propagates only along call edges, so a fixture that
-    scrapes would obligate nothing of the tests requesting it by parameter
-    name — and hoisting a ``since = len(container_log(...))`` preamble into a
-    fixture is the obvious next refactor of these files. That direction fails
-    open, so it is worth closing.
-    """
-    return {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in coupled
-        and _is_fixture(node)
-    }
-
-
-def _requests_fixture(node: ast.AST, fixtures: set[str]) -> bool:
-    args = getattr(node, "args", None)
-    if args is None:
-        return False
-
-    names = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
-    return bool(names & fixtures)
-
-
 def _touches_side_channel_literal(node: ast.AST) -> bool:
     for child in ast.walk(node):
         if isinstance(child, ast.Constant) and isinstance(child.value, str):
-            if any(lit in child.value for lit in SIDE_CHANNEL_LITERALS):
+            if any(lit in child.value for lit in SIDE_CHANNEL_SQL_LITERALS):
                 return True
 
     return False
@@ -215,27 +184,21 @@ def test_every_side_channel_test_is_marked_serial():
     helpers = _side_channel_helpers()
     unmarked: list[str] = []
 
-    # Glob what the recipe's phases actually select (`integration_*.py`), not
-    # `integration_*_test.py`, so a module named outside the `_test` convention
-    # is still collected by both phases AND scanned here.
+    # Glob what the recipe's phases actually select, so a module named outside
+    # the `_test` convention is scanned too. integration_helpers.py is included
+    # rather than skipped: the phases collect it, so a `test_*` added there
+    # would run, and its non-test helpers simply never match below.
     for path in sorted(INTEGRATION.glob("integration_*.py")):
-        if path.name in {"integration_helpers.py", "__init__.py"}:
-            continue
-
         tree = ast.parse(path.read_text())
         if _body_sets_serial_pytestmark(tree.body):
             continue
 
         coupled = _coupled_functions(tree, helpers)
-        fixtures = _coupled_fixtures(tree, coupled)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
 
-            if not node.name.startswith("test"):
-                continue
-
-            if node.name not in coupled and not _requests_fixture(node, fixtures):
+            if not node.name.startswith("test") or node.name not in coupled:
                 continue
 
             enclosing = _enclosing_class(tree, node)
@@ -301,6 +264,28 @@ class B:
     derived = _coupled_functions(ast.parse(source), ROOT_SIDE_CHANNEL_HELPERS)
 
     assert "execute" in derived, "a shadowed scraping definition must survive"
+
+
+def test_class_body_pytestmark_counts_as_marked():
+    """A class-level ``pytestmark`` must satisfy the check.
+
+    No class uses this form today — every mark is module-level or a decorator
+    — but it is ordinary pytest, so not recognizing it would fail in the
+    false-red direction the first time someone reaches for it.
+    """
+    source = """
+class TestThing:
+    pytestmark = pytest.mark.serial
+
+    def test_scrapes(self):
+        return container_log("x")
+"""
+    tree = ast.parse(source)
+    cls = tree.body[0]
+    assert isinstance(cls, ast.ClassDef)
+
+    assert _body_sets_serial_pytestmark(cls.body)
+    assert not _body_sets_serial_pytestmark(tree.body), "module body sets nothing"
 
 
 def test_side_channel_helpers_still_exist():
