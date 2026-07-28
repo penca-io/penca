@@ -291,15 +291,9 @@ impl SnapshotLoop {
 
     /// Purge every table in an already-enumerated set.
     ///
-    /// Deliberately takes the set rather than deriving it: the two sweeps differ
-    /// in more than data — different listing RPC, different window, different
-    /// guard, different watermark — so unifying the enumeration would need a
-    /// closure or a mode flag. This is the smaller kernel they genuinely share.
-    ///
-    /// Owns no watermark state. Both `wm.last_modified_tick = now` and
-    /// `wm.last_purge_tick = purge_upper` stay in the callers, after this
-    /// returns, because the half-open windows tile only when the same function
-    /// that used a bound as its upper edge writes it back.
+    /// Takes the set because the two sweeps differ in shape, not just data —
+    /// different listing RPC, window, guard and watermark. Owns no watermark
+    /// state; advancing the enumeration window is the caller's job.
     async fn purge_each(&mut self, catalog: &Catalog, branch: &Branch, table_uuids: &[String]) {
         for table_uuid in table_uuids {
             ops::purge_one(

@@ -62,7 +62,7 @@ pub use crate::snapshot_loop::SnapshotLoop;
 /// (config validation, durable-watermark serialization, signal handling)
 /// can join the type cleanly without re-wrapping as `tonic::Status`.
 #[derive(Debug, thiserror::Error)]
-pub enum SchedulerError {
+pub(crate) enum SchedulerError {
     #[error("gRPC error: {0}")]
     Transport(#[from] tonic::Status),
 }

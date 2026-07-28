@@ -22,11 +22,7 @@ use tonic::transport::Channel;
 /// stays per-table until CHA-502 moves it too.
 #[tracing::instrument(
     skip_all,
-    fields(
-        catalog = %catalog_uuid,
-        branch = %branch_uuid,
-        table = %table_uuid,
-    ),
+    fields(table = %table_uuid),
 )]
 pub(crate) async fn purge_one(
     lifecycle: &mut LifecycleServiceClient<Channel>,
