@@ -169,7 +169,8 @@ impl Scheduler {
     pub async fn run(&mut self) -> ! {
         let Some(interval) = self.tick_interval else {
             tracing::warn!(
-                "scheduler disabled: tick interval is non-positive, \
+                env_var = "SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS",
+                "scheduler disabled: configured cadence is non-positive, \
                  no lifecycle ops will fire"
             );
             std::future::pending::<()>().await;

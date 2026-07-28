@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(lifecycle_config(5, 5).purge_sweep_interval_seconds(), 5);
     }
 
-    /// A disabled loop (negative cadence) contributes no floor; the hot-grace
+    /// A disabled loop (non-positive cadence) contributes no floor; the hot-grace
     /// window then stands alone. Both disabled is the integration-test profile.
     ///
     /// The `(5, -1)` case floors on the persist cadence even though Purge rides
