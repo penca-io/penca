@@ -86,10 +86,11 @@ def _is_runnable_example(name: str) -> bool:
     """A file a reader would actually run, so a README entry is warranted.
 
     The `_` prefix is the escape hatch: a future `__init__.py` or shared private
-    module is not something a reader runs. Applied to BOTH sides of the
-    comparison — filtering only discovery would make an index entry for a
-    private module fail as "names examples that do not exist", pointing at a
-    file that is sitting right there.
+    module is not something a reader runs, so the index is not required to name
+    it. Applied to the REQUIRED set only — the stale check deliberately does not
+    filter, and instead compares against every file on disk, so that an index
+    entry naming a private module that exists is tolerated while one naming a
+    file that is gone is still reported.
     """
     return not name.startswith("_")
 

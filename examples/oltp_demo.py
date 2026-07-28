@@ -5,19 +5,21 @@ One feature: fetch a single row by its primary key. The interesting part is
 where the row lives. A columnar layout is built for scans, so the fair question
 to ask of a lakehouse is whether fetching one row is still cheap once the data
 has been persisted, snapshotted AND purged into open columnar files — all three,
-because persist alone leaves the rows still queryable from the hot tier, and the
-read plan's hot/cold fence is the purge watermark. This script drives the table
-to that steady state first, then times the lookup.
+because persist alone leaves the rows still queryable from the hot tier and the
+read plan's hot/cold fence is the purge watermark, while purge itself can only
+advance as far as the snapshot. This script drives the table to that steady
+state first, then times the lookup.
 
-The same row is fetched two ways, and they are deliberately not the same
-request. The gRPC arm sends `ids=`, a primary-key restriction the server
-resolves to a row identity and looks up directly. The SQL arm sends
-`WHERE account_id = ...` over Flight SQL, a predicate the engine has to plan and
-then evaluate against the columnar data. So the two numbers are not one
-operation over two transports — they are a keyed fetch and a filtered read, and
-that difference is most of the gap between them. The SQL arm additionally pays
-the ADBC driver's prepared-statement round trip, which is on the client side of
-the wire.
+The same row is fetched two ways, and they converge. The gRPC arm sends `ids=`,
+a primary-key restriction the server resolves to a row identity. The SQL arm
+sends `WHERE account_id = ...` over Flight SQL, and the gateway extracts that
+primary-key equality into the *same* `ids` restriction — the WHERE fragment is
+dropped entirely rather than evaluated over the data — so both arms land on the
+same keyed read. Neither one scans.
+
+What the SQL arm pays on top is the SQL itself: parsing and logical planning on
+each execution, and the driver's extra round trips to get the plan and then the
+data.
 
 Both numbers are measured live on your machine; nothing is baked into this file.
 
@@ -272,10 +274,10 @@ def main() -> None:
         )
         print(
             f"\nOne row out of {args.rows}, out of open columnar files on object "
-            f"storage. The gRPC arm named the row by primary key and the engine "
-            f"looked it up; the SQL arm sent a predicate, which the engine "
-            f"planned and then evaluated over the data. Two different requests, "
-            f"which is most of why the two numbers differ."
+            f"storage. Both arms made the same keyed read — the SQL arm's "
+            f"primary-key equality is extracted into the same restriction the "
+            f"gRPC arm sends — so the difference between the numbers is what the "
+            f"SQL round trip costs, not different work."
         )
     finally:
         # finally, not straight-line: a failed run is exactly when leaving a

@@ -106,7 +106,7 @@ single-feature scripts you can read end to end in a minute:
 | Script | Shows |
 |---|---|
 | `examples/sandbox_demo.py` | The flagship. Fork a branch per agent, transact on each in place, compare them, throw them away — prod untouched. |
-| `examples/oltp_demo.py` | Fetching one row out of a large table on cold columnar storage — by primary key over the gRPC client, and by predicate over Flight SQL. |
+| `examples/oltp_demo.py` | Fetching one row out of a large table on cold columnar storage, timed over the gRPC client and over Flight SQL — both of which resolve to the same keyed read. |
 | `examples/audit_demo.py` | Version history and time travel on one table: `read_data`, `audit_data`, and reading the table as it was at an earlier commit. |
 
 Each is standalone and copy-pasteable — they deliberately repeat their setup
@@ -227,13 +227,13 @@ hot tier. The script seeds a table, drives it all the way cold — persist,
 snapshot, **and purge**, because persist alone leaves the rows still queryable
 from hot — and only then times the lookup.
 
-It fetches the row two ways, and they are deliberately not the same request.
-The gRPC arm sends `ids=`, a primary-key restriction the engine resolves to a
-row identity and looks up directly. The SQL arm sends `WHERE account_id = …`
-over Flight SQL, a predicate the engine plans and then evaluates against the
-columnar data. A keyed fetch and a filtered read are different work, and that
-is most of why the two numbers differ — the SQL arm also pays the ADBC driver's
-prepared-statement round trip, on the client side of the wire.
+It fetches the row two ways, and they converge. The gRPC arm sends `ids=`, a
+primary-key restriction the engine resolves to a row identity. The SQL arm sends
+`WHERE account_id = …` over Flight SQL, and the gateway extracts that
+primary-key equality into the **same** `ids` restriction — the `WHERE` fragment
+is dropped rather than evaluated over the data — so both arms land on the same
+keyed read. Neither scans. What the SQL arm pays on top is parsing and logical
+planning on each execution, plus the driver's extra round trips.
 
 **No figures are printed here on purpose.** Every number the demo shows is
 measured on your machine when you run it — hardware, container limits and object
