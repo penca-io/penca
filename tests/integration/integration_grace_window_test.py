@@ -146,6 +146,10 @@ class TestQueryTimeoutCap:
     gRPC ``RESOURCE_EXHAUSTED``. The cap is what closes the grace
     correctness argument."""
 
+    # Serial for contention, not for a side channel: this parks a servicer PG
+    # connection (of PG_POOL_MAX=4) while asserting a bounded time, so concurrent
+    # workers would make it flaky in both directions. Outlives CHA-519.
+    @pytest.mark.serial
     def test_query_exceeds_cap_returns_resource_exhausted(self):
         """A ``read_data`` call that runs past ``query_timeout_seconds``
         must terminate with ``RESOURCE_EXHAUSTED``.
@@ -402,6 +406,10 @@ class TestPerOperationLockKeys:
         thread = threading.Thread(target=run, daemon=True)
         return thread, done, error
 
+    # Serial for contention, not for a side channel: this parks a servicer PG
+    # connection (of PG_POOL_MAX=4) while asserting a bounded time, so concurrent
+    # workers would make it flaky in both directions. Outlives CHA-519.
+    @pytest.mark.serial
     def test_concurrent_persist_and_purge_on_T_run_in_parallel(self):
         """``Persist(T)`` and ``Purge(T)`` on the same table must NOT
         serialize on the ADR-0018 shared key. Pre-hold
@@ -469,6 +477,10 @@ class TestPerOperationLockKeys:
             "Persist's 'persist:{table_uuid}:{branch_uuid}'."
         )
 
+    # Serial for contention, not for a side channel: this parks a servicer PG
+    # connection (of PG_POOL_MAX=4) while asserting a bounded time, so concurrent
+    # workers would make it flaky in both directions. Outlives CHA-519.
+    @pytest.mark.serial
     def test_concurrent_snapshot_and_purge_on_T_run_in_parallel(self):
         """``Snapshot(T)`` and ``Purge(T)`` on the same table must NOT
         serialize on the ADR-0018 shared key. Same shape as

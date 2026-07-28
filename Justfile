@@ -821,12 +821,16 @@ integration-test *services:
         done
     fi
 
-    # Two disjoint phases against the one stack. The `serial` tests assert on
-    # process-global state — container stdout log windows and pg_stat_statements
-    # counters — so they need the side channels quiet, which means running them
-    # alone rather than merely one-at-a-time. (`--dist loadgroup` only
-    # serializes the group internally; it would still run them concurrently with
-    # the parallel phase.) The marks and this split both go away with CHA-519.
+    # Two disjoint phases against the one stack. The `serial` tests must run
+    # alone for one of two reasons: they read process-global state (container
+    # stdout log windows, pg_stat_statements counters) that a concurrent worker
+    # pollutes, or they deliberately park a servicer PG connection while
+    # asserting a bounded time. Either way alone means alone — `--dist
+    # loadgroup` only serializes the group internally and would still run it
+    # concurrently with the parallel phase.
+    #
+    # CHA-519 retires the first reason, not the second, so it shrinks this
+    # phase rather than deleting it.
     #
     # Serial first, and the order is load-bearing. `container_log` buffers and
     # ANSI-strips the container's whole stdout on EVERY call, and `poll_log_for`

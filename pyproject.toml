@@ -125,5 +125,5 @@ testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
 strict_markers = true
 filterwarnings = ["error::pytest.PytestUnknownMarkWarning"]
 markers = [
-    "serial: tests that read a process-global side channel (container stdout via container_log/poll_log_for, or pg_stat_statements reset+count) and must run in the serial phase, isolated from the -n auto parallel phase. Temporary — removed when CHA-519 lands the structured per-request seam.",
+    "serial: tests that must run alone, outside the -n auto parallel phase. Two reasons, and only the first goes away with CHA-519: (a) the test reads a process-global side channel — container stdout via container_log/poll_log_for, or pg_stat_statements reset+count — which a concurrent worker pollutes; (b) the test deliberately parks a servicer PG connection (advisory lock, LOCK TABLE) while asserting a bounded time, so concurrent workers contending for the same PG_POOL_MAX=4 pool would make it flaky in both directions.",
 ]
