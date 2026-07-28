@@ -28,40 +28,68 @@ _EXAMPLES_DIR = _REPO_ROOT / "examples"
 _README = _REPO_ROOT / "README.md"
 
 # The index section's heading. The test and the README have to agree on this
-# anchor, so it is pinned in one place and both assertions read it.
+# anchor, so it is pinned in one place and every assertion reads it.
 _INDEX_HEADING = "## Examples"
 
-# Matches an `examples/<stem>.py` mention anywhere in the index section, however
+# Anchored to a line start, because a plain substring search for "## Examples"
+# also matches inside "### Examples" — and the README's per-script sections are
+# h3s in exactly this space, so that collision is likely rather than theoretical.
+_INDEX_START = re.compile(rf"^{re.escape(_INDEX_HEADING)}\s*$", re.MULTILINE)
+_NEXT_H2 = re.compile(r"^## ", re.MULTILINE)
+
+# A fenced code block, including the fence lines. Stripped before matching: the
+# README pairs each example with a `uv run python examples/<name>.py` block, so
+# without this a script that appears ONLY as a run command would count as
+# indexed — precisely the "claims completeness it does not have" failure this
+# file exists to prevent. The index entry has to be prose.
+_FENCED_BLOCK = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
+
+# Matches an `examples/<name>.py` mention anywhere in the index section, however
 # it is decorated — bare, in backticks, or as a markdown link target:
 #   "`examples/oltp_demo.py`" -> "oltp_demo.py"
 #   "[point lookup](examples/oltp_demo.py)" -> "oltp_demo.py"
-# Deliberately not anchored to a list-item or table-cell shape: the index's
-# formatting is the author's call, and pinning it here would make every
-# cosmetic README edit a test failure.
-_EXAMPLE_MENTION = re.compile(r"examples/([A-Za-z0-9_]+\.py)")
+# `[\w.-]` rather than `[A-Za-z0-9_]` so a hyphenated name is recognised as
+# indexed instead of reported missing. Deliberately not anchored to a list-item
+# or table-cell shape: the index's formatting is the author's call, and pinning
+# it here would make every cosmetic README edit a test failure.
+_EXAMPLE_MENTION = re.compile(r"examples/([\w.-]+\.py)")
 
 
 def _index_section() -> str:
-    """The README text from the examples-index heading to the next h2.
+    """The README's examples-index section, prose only.
 
     Scoped to the section rather than searched over the whole README: a script
     named in some unrelated paragraph (the Quick start's run command, say) would
     otherwise satisfy the index assertion without the index listing it at all.
     """
     readme = _README.read_text(encoding="utf-8")
-    assert _INDEX_HEADING in readme, (
+    start = _INDEX_START.search(readme)
+    assert start is not None, (
         f"README.md has no examples index section (expected a {_INDEX_HEADING!r} "
-        f"heading). It is the entry point for the examples family — see CHA-527."
+        f"heading on its own line). It is the entry point for the examples "
+        f"family — see CHA-527."
     )
 
-    after = readme.split(_INDEX_HEADING, 1)[1]
-    # Split on the next h2 so per-script `###` subsections stay inside the
-    # section; splitting on a bare "#" would cut at the first h3 instead.
-    return after.split("\n## ", 1)[0]
+    # End at the next h2 so per-script `###` subsections stay inside the section.
+    tail = readme[start.end() :]
+    end = _NEXT_H2.search(tail)
+    section = tail[: end.start()] if end else tail
+
+    return _FENCED_BLOCK.sub("", section)
 
 
 def _discovered_examples() -> set[str]:
-    return {path.name for path in _EXAMPLES_DIR.glob("*.py")}
+    """The runnable examples — every `*.py` under examples/ except private ones.
+
+    The `_` prefix is the escape hatch: a future `__init__.py` or shared private
+    module is not something a reader runs, so requiring a README entry for it
+    would be noise.
+    """
+    return {
+        path.name
+        for path in _EXAMPLES_DIR.glob("*.py")
+        if not path.name.startswith("_")
+    }
 
 
 def test_examples_dir_is_not_empty():
