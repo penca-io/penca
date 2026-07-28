@@ -479,10 +479,15 @@ penca-up profile="dev" db="": vm-gc
         if [ -n "$repo_root" ]; then
             case "$db_dir/" in
                 "$repo_root"/*)
-                    echo "warning: $db_dir is inside the repo, which is the Docker" >&2
-                    echo "         build context — every build would ship the whole" >&2
-                    echo "         database to the daemon. Prefer a path outside the" >&2
-                    echo "         repo, e.g. --db ~/.penca/data" >&2
+                    echo "error: $db_dir is inside the repo, which is the Docker" >&2
+                    echo "       build context (compose.yml uses \`context: ..\`)." >&2
+                    echo "       penca-up builds by default, and Postgres creates" >&2
+                    echo "       its datadir mode 0700 owned by a container uid —" >&2
+                    echo "       so the next build cannot read the context and will" >&2
+                    echo "       FAIL, not merely run slowly. It would also show up" >&2
+                    echo "       in git status." >&2
+                    echo "       Use a path outside the repo: --db ~/.penca/data" >&2
+                    exit 1
                     ;;
             esac
         fi

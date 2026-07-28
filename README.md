@@ -88,8 +88,9 @@ set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
 uv run python examples/branch_demo.py
 ```
 
-Fixed ports (Postgres 5432, Flight SQL 50060), so you can point any Flight SQL
-driver at it. To keep your data across restarts, give it a directory — both
+Fixed ports (Postgres 5432, Flight SQL 50060), bound to loopback, so you can
+point any Flight SQL driver on this machine at it — drop the `127.0.0.1:` prefix
+in `docker/dev.env` if you want it reachable from your network. To keep your data across restarts, give it a directory — both
 Postgres and the object store write there, and it survives `just penca-down`:
 
 ```bash

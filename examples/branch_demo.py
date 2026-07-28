@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import uuid4
@@ -548,7 +549,22 @@ def run_demo(
     branch_uuids: dict[str, str] = {}
     branches: dict[str, PencaClient] = {}
     try:
+        forked_at = time.perf_counter()
         branch_uuids = fork_branches(client, prod)
+        forked_ms = (time.perf_counter() - forked_at) * 1000
+        # The differentiated claim, measured on the reader's own machine rather
+        # than asserted: forking is a metadata operation, so it is fast and it
+        # copies nothing — the forks read main's storage until they write their
+        # own. No byte figure, because the client has no segment API and this
+        # example will not reach into Postgres to get one;
+        # tests/integration/integration_branch_demo_test.py proves the no-copy
+        # half directly (main holds exactly one object, each fork holds zero).
+        print(
+            f"Forked {len(branch_uuids)} branches off main in {forked_ms:.0f}ms — "
+            f"no data copied.\n"
+            f"Each one starts from main's committed rows and shares its storage "
+            f"until it writes.\n"
+        )
         # One pinned connection per branch: three branches is literally three
         # endpoints, which is the shape a reader would use. Built by assignment
         # rather than a comprehension so that a failure on the second or third
@@ -613,10 +629,7 @@ def run_demo(
             )
         )
     finally:
-        try:
-            main_conn.close()
-        except Exception as exc:
-            print(f"  (could not close the main connection: {exc})")
+        close_connections({"main": main_conn})
 
     return DemoOutcome(
         catalog_uuid=prod.catalog_uuid,

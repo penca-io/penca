@@ -2,8 +2,10 @@
 
 The dashboard is the optional interactive surface over the SQLite history:
 ``streamlit run scripts/perf/dashboard.py``. These structural guards pin that
-streamlit/pandas are *dev* dependencies (scoped to the dependency group, so they
-can't pass as runtime deps — they're heavy and dashboard-only), the
+streamlit stays a *dev* dependency (heavy and dashboard-only, so it must not
+ship) while pandas is a runtime one — CHA-517 moved it, because ``examples/``
+print through ``to_pandas().to_markdown()``, and having it declared in both
+places meant the ``fresh-clone`` CI job could not pin it at all. Also that the
 ``perf-dashboard`` recipe exists, and the script exposes a
 ``load_dataframe(db_path)`` data accessor distinct from the streamlit UI entry
 point. No Docker, no penca services. Runs under ``just static-test
