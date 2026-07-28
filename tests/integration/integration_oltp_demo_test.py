@@ -123,8 +123,13 @@ def _assert_found_the_right_row(stdout: str) -> None:
     Sliced to the row section rather than searched over the whole run: the demo
     names the target id in its progress lines too, so a whole-stdout check would
     pass even if the lookup returned nothing.
+
+    Sliced between the two section headers, NOT on a bare "---": the printed
+    table's own alignment rule (``|---:|``) contains that string, so splitting on
+    it cuts the section off above the data rows and the assertion then fails on
+    a table that is in fact correct.
     """
-    row_section = stdout.split(_ROW_SECTION)[1].split("---")[0]
+    row_section = stdout.split(_ROW_SECTION)[1].split(_LATENCY_SECTION)[0]
 
     assert _TARGET_OWNER in row_section, (
         f"the lookup must return account {_TARGET_ID} ({_TARGET_OWNER}); "

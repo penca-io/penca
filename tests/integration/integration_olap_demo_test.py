@@ -105,15 +105,17 @@ def _assert_walkthrough(result) -> None:
     for marker in (_GRPC_SECTION, _SQL_SECTION, _LATENCY_SECTION):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
-    grpc_groups = _parse_groups(stdout, _GRPC_SECTION)
-    sql_groups = _parse_groups(stdout, _SQL_SECTION)
+    grpc_groups = _parse_groups(stdout, _GRPC_SECTION, _SQL_SECTION)
+    sql_groups = _parse_groups(stdout, _SQL_SECTION, _LATENCY_SECTION)
 
     _assert_arms_agree(grpc_groups, sql_groups)
     _assert_covers_every_seeded_row(grpc_groups)
     _assert_both_arms_measured(stdout)
 
 
-def _parse_groups(stdout: str, section: str) -> dict[str, tuple[int, int]]:
+def _parse_groups(
+    stdout: str, section: str, next_section: str
+) -> dict[str, tuple[int, int]]:
     """``region -> (events, total_cents)`` from one printed aggregate table.
 
     ``total_cents`` is an integer column on purpose: the two arms sum in
@@ -121,8 +123,12 @@ def _parse_groups(stdout: str, section: str) -> dict[str, tuple[int, int]]:
     associative — comparing them exactly would be a flake waiting to happen,
     while rounding to compare would weaken the assertion. Integer cents make the
     equality exact and meaningful.
+
+    Bounded by the *next* section header, NOT by a bare "---": the printed
+    table's own alignment rule (``|---:|``) contains that string, so splitting on
+    it would cut the body off above the data rows and parse zero groups.
     """
-    body = stdout.split(section)[1].split("---")[0]
+    body = stdout.split(section)[1].split(next_section)[0]
     groups = {
         region.strip(): (int(events), int(total))
         for region, events, total in _TABLE_ROW.findall(body)
