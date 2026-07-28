@@ -175,7 +175,10 @@ mod tests {
         assert_eq!(snapshot_zero.snapshot_tick_interval(), None);
 
         let both_on = config(1, 30);
-        assert_eq!(both_on.persist_tick_interval(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            both_on.persist_tick_interval(),
+            Some(Duration::from_secs(1))
+        );
         assert_eq!(
             both_on.snapshot_tick_interval(),
             Some(Duration::from_secs(30))

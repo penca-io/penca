@@ -193,7 +193,8 @@ impl LifecycleServiceConfig {
         // `SchedulerConfig::from_env` carries the same alias — the two crates and
         // docker/{compose.yml,dev.env,test.env} MUST flip in one commit, or
         // `required_env_parsed` panics whichever binary reads the retired name at boot.
-        let scheduler_tick_interval_seconds = required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
+        let scheduler_tick_interval_seconds =
+            required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS");
         Self {
             database_url: required_env("DATABASE_URL"),
             bind_addr: required_env("BIND_ADDR"),
@@ -223,10 +224,11 @@ impl LifecycleServiceConfig {
     /// hand, silently under-waiting if anyone forgot. Over-waiting is the safe
     /// direction: under-waiting strands a timed-out tx's hot rows forever.
     ///
-    /// Retention consequence, deliberate: the ledger-GC grace now floors at the
-    /// snapshot cadence (deployment default 30s) rather than the single 5s knob,
-    /// so timed-out txs' `commit_tx_log` bookkeeping is held ~6x longer before
-    /// GC. That is the cost of decoupling the cadences.
+    /// Retention consequence, deliberate: once the split env vars land the
+    /// ledger-GC grace floors at whichever cadence is slower — in practice the
+    /// snapshot loop, which wants to be long — rather than at one shared knob,
+    /// so timed-out txs' `commit_tx_log` bookkeeping is held correspondingly
+    /// longer. That is the cost of decoupling the cadences.
     ///
     /// Clamped at 0: a disabled loop (non-positive) contributes no floor.
     pub fn purge_sweep_interval_seconds(&self) -> i64 {
