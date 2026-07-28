@@ -74,11 +74,11 @@ impl SchedulerConfig {
     }
 
     pub fn persist_tick_interval(&self) -> Option<Duration> {
-        todo!("CHA-513: delegate to tick_interval(self.persist_tick_interval_seconds)")
+        interval_from_seconds(self.persist_tick_interval_seconds)
     }
 
     pub fn snapshot_tick_interval(&self) -> Option<Duration> {
-        todo!("CHA-513: delegate to tick_interval(self.snapshot_tick_interval_seconds)")
+        interval_from_seconds(self.snapshot_tick_interval_seconds)
     }
 
     pub fn grace_window_micros(&self) -> i64 {
@@ -92,11 +92,18 @@ impl SchedulerConfig {
 
 /// A loop's configured cadence, or `None` when that loop is disabled.
 ///
-/// Negative seconds disable the loop: the binary boots, logs a warning, and
-/// idles forever without firing any lifecycle op. The integration-test profile
-/// relies on this so the suite's manual lifecycle calls cannot race a sweep.
-fn tick_interval(_seconds: i64) -> Option<Duration> {
-    todo!("CHA-513: negative -> None, otherwise Some(Duration::from_secs(seconds))")
+/// **Non-positive** seconds disable the loop: the binary boots, logs a warning,
+/// and idles forever without firing any lifecycle op. The integration-test
+/// profile relies on this so the suite's manual lifecycle calls cannot race a
+/// sweep.
+///
+/// Zero disables rather than yielding `Duration::ZERO`, which would make
+/// `loop { tick(); sleep(interval) }` a backoff-free hot loop hammering the
+/// lifecycle service. Splitting one cadence knob into two doubles the chance of
+/// a stray `0` reaching a deployment env file, and "sweep as fast as possible"
+/// is not a mode anyone wants — so `<= 0` has exactly one meaning, "off".
+fn interval_from_seconds(_seconds: i64) -> Option<Duration> {
+    todo!("CHA-513: seconds <= 0 -> None, otherwise Some(Duration::from_secs(seconds))")
 }
 
 #[cfg(test)]
@@ -115,22 +122,21 @@ mod tests {
         }
     }
 
+    /// Zero is grouped with the negatives deliberately: `Duration::ZERO` would
+    /// turn the tick loop into a backoff-free hot loop against the lifecycle
+    /// service, so `<= 0` means "off" and nothing else.
     #[test]
-    fn negative_seconds_disable_the_loop() {
-        assert_eq!(tick_interval(-1), None);
-        assert_eq!(tick_interval(-60), None);
-    }
-
-    #[test]
-    fn zero_seconds_is_a_zero_duration() {
-        assert_eq!(tick_interval(0), Some(Duration::ZERO));
+    fn non_positive_seconds_disable_the_loop() {
+        assert_eq!(interval_from_seconds(-60), None);
+        assert_eq!(interval_from_seconds(-1), None);
+        assert_eq!(interval_from_seconds(0), None);
     }
 
     #[test]
     fn positive_seconds_map_to_that_many_seconds() {
         for seconds in [1_i64, 5, 30] {
             assert_eq!(
-                tick_interval(seconds),
+                interval_from_seconds(seconds),
                 Some(Duration::from_secs(seconds as u64))
             );
         }
