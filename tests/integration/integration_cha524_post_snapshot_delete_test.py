@@ -19,6 +19,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
+from penca_client import Mutation
 
 from .integration_helpers import make_client
 
@@ -55,6 +56,21 @@ def _seed_catalog(client, table_names):
     ]
 
     return catalog_uuid, main_branch, schema_uuid, table_uuids
+
+
+def _commit(client, catalog_uuid, branch_uuid, schema_uuid, mutation):
+    """Open a tx, apply one mutation, commit."""
+    tx = client.begin_tx(
+        catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, branch_uuid=branch_uuid
+    )
+    client.write_data(
+        tx.tx_uuid,
+        mutation,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+    )
+    client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
 
 
 def _delete_t2_after_snapshot(client, catalog_uuid, main_branch, schema_uuid):
@@ -100,3 +116,54 @@ def test_delete_catalog_survives_post_snapshot_delete_table():
 
     remaining = [c.catalog_uuid for c in client.list_catalogs()]
     assert catalog_uuid not in remaining, "catalog survived DeleteCatalog"
+
+
+def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
+    """The same defect on a USER table — nothing about it is system-specific.
+
+    ``__penca_system__.*`` only bit first because Penca declares those columns
+    non-nullable; a client that does the same on its own table is affected
+    identically.
+    """
+    client = make_client()
+    catalog_uuid, main_branch, schema_uuid, (table_uuid,) = _seed_catalog(
+        client, ["t1"]
+    )
+    _commit(
+        client,
+        catalog_uuid,
+        main_branch,
+        schema_uuid,
+        Mutation(
+            table_uuid=table_uuid,
+            upserts=pa.table(
+                {"name": ["a", "b"], "value": [1, 2]}, schema=STRICT_SCHEMA
+            ),
+        ),
+    )
+
+    client.persist_and_snapshot_branch(
+        catalog_uuid=catalog_uuid, branch_uuid=main_branch
+    )
+    _commit(
+        client,
+        catalog_uuid,
+        main_branch,
+        schema_uuid,
+        Mutation(
+            table_uuid=table_uuid,
+            deletes=pa.table(
+                {"name": ["a"]},
+                schema=pa.schema([pa.field("name", pa.utf8(), nullable=False)]),
+            ),
+        ),
+    )
+
+    rows = client.read_data(
+        table_uuid=table_uuid,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=main_branch,
+    )
+
+    assert rows.column("name").to_pylist() == ["b"], "only the undeleted row survives"
