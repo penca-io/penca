@@ -58,7 +58,10 @@ def _seed_catalog(client, table_names):
     return catalog_uuid, main_branch, schema_uuid, table_uuids
 
 
-def _commit(client, catalog_uuid, branch_uuid, schema_uuid, mutation):
+# The UUID args are keyword-only: three same-typed strings in an order that
+# differs from PencaClient's own (catalog, schema, branch) would transpose
+# silently into an opaque server-side resolve error.
+def _commit(client, *, catalog_uuid, branch_uuid, schema_uuid, mutation):
     """Open a tx, apply one mutation, commit."""
     tx = client.begin_tx(
         catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, branch_uuid=branch_uuid
@@ -73,7 +76,7 @@ def _commit(client, catalog_uuid, branch_uuid, schema_uuid, mutation):
     client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
 
 
-def _delete_t2_after_snapshot(client, catalog_uuid, main_branch, schema_uuid):
+def _delete_t2_after_snapshot(client, *, catalog_uuid, main_branch, schema_uuid):
     """Snapshot main, then drop ``t2`` — the tombstone lands above the fence."""
     client.persist_and_snapshot_branch(
         catalog_uuid=catalog_uuid, branch_uuid=main_branch
@@ -92,14 +95,30 @@ def test_list_tables_survives_post_snapshot_delete_table():
     """ListTables must still resolve after a table is dropped post-snapshot."""
     client = make_client()
     catalog_uuid, main_branch, schema_uuid, _ = _seed_catalog(client, ["t1", "t2"])
-    _delete_t2_after_snapshot(client, catalog_uuid, main_branch, schema_uuid)
+    _delete_t2_after_snapshot(
+        client,
+        catalog_uuid=catalog_uuid,
+        main_branch=main_branch,
+        schema_uuid=schema_uuid,
+    )
 
-    names = [
-        t.table_name
-        for t in client.list_tables(catalog_uuid=catalog_uuid, schema_uuid=schema_uuid)
-    ]
+    def surviving():
+        return [
+            t.table_name
+            for t in client.list_tables(
+                catalog_uuid=catalog_uuid, schema_uuid=schema_uuid
+            )
+        ]
 
-    assert names == ["t1"], f"expected only the surviving table, got {names}"
+    assert surviving() == ["t1"], "tombstone above the fence (hot resolve arm)"
+
+    # Flush again so the tombstone itself lands in cold — the state a real
+    # deployment reaches within one scheduler tick, resolved by the cold arm.
+    client.persist_and_snapshot_branch(
+        catalog_uuid=catalog_uuid, branch_uuid=main_branch
+    )
+
+    assert surviving() == ["t1"], "tombstone flushed to cold (cold resolve arm)"
 
 
 def test_delete_catalog_survives_post_snapshot_delete_table():
@@ -110,7 +129,12 @@ def test_delete_catalog_survives_post_snapshot_delete_table():
     """
     client = make_client()
     catalog_uuid, main_branch, schema_uuid, _ = _seed_catalog(client, ["t1", "t2"])
-    _delete_t2_after_snapshot(client, catalog_uuid, main_branch, schema_uuid)
+    _delete_t2_after_snapshot(
+        client,
+        catalog_uuid=catalog_uuid,
+        main_branch=main_branch,
+        schema_uuid=schema_uuid,
+    )
 
     client.delete_catalog(catalog_uuid=catalog_uuid)
 
@@ -131,10 +155,10 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     )
     _commit(
         client,
-        catalog_uuid,
-        main_branch,
-        schema_uuid,
-        Mutation(
+        catalog_uuid=catalog_uuid,
+        branch_uuid=main_branch,
+        schema_uuid=schema_uuid,
+        mutation=Mutation(
             table_uuid=table_uuid,
             upserts=pa.table(
                 {"name": ["a", "b"], "value": [1, 2]}, schema=STRICT_SCHEMA
@@ -147,23 +171,43 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     )
     _commit(
         client,
-        catalog_uuid,
-        main_branch,
-        schema_uuid,
-        Mutation(
+        catalog_uuid=catalog_uuid,
+        branch_uuid=main_branch,
+        schema_uuid=schema_uuid,
+        mutation=Mutation(
             table_uuid=table_uuid,
+            # Derived, not re-declared: a drifting pk type would otherwise fail
+            # the delete on a type mismatch instead of exercising this path.
             deletes=pa.table(
-                {"name": ["a"]},
-                schema=pa.schema([pa.field("name", pa.utf8(), nullable=False)]),
+                {"name": ["a"]}, schema=pa.schema([STRICT_SCHEMA.field("name")])
             ),
         ),
     )
 
-    rows = client.read_data(
-        table_uuid=table_uuid,
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=main_branch,
+    def survivors():
+        return client.read_data(
+            table_uuid=table_uuid,
+            catalog_uuid=catalog_uuid,
+            schema_uuid=schema_uuid,
+            branch_uuid=main_branch,
+        )
+
+    # Assert the whole row, not just the pk: the defect is non-key user columns
+    # arriving NULL, so a fix that kept row `b` with a NULL `value` must fail
+    # here. The schema assertion pins the other half — the strict output
+    # contract must survive, since relaxing it would turn this bug into silent
+    # corruption rather than a loud one.
+    hot = survivors()
+    assert hot.to_pydict() == {"name": ["b"], "value": [2]}
+    assert hot.schema == STRICT_SCHEMA, (
+        "read_data must keep the declared non-nullability"
     )
 
-    assert rows.column("name").to_pylist() == ["b"], "only the undeleted row survives"
+    # And again once the tombstone itself is flushed to cold.
+    client.persist_and_snapshot_branch(
+        catalog_uuid=catalog_uuid, branch_uuid=main_branch
+    )
+
+    cold = survivors()
+    assert cold.to_pydict() == {"name": ["b"], "value": [2]}
+    assert cold.schema == STRICT_SCHEMA
