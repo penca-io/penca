@@ -166,8 +166,12 @@ impl SnapshotLoop {
 
     /// `SnapshotBranch` enumerates the PERSISTED set server-side (CHA-509), not
     /// the hot-modified set, so a table persisted-then-purged still gets
-    /// re-snapshotted. Fail-fast per table like `PersistBranch`; a failure is
-    /// logged and this pass continues so Purge still runs and the watermarks
+    /// re-snapshotted.
+    ///
+    /// Continue-on-error per table like `PersistBranch`, and for the same
+    /// starvation reason — the persisted set is enumerated
+    /// `ORDER BY MAX(commit_micros) ASC`. Both failure arms are logged, and
+    /// either way this pass continues so Purge still runs and the watermarks
     /// still advance.
     #[tracing::instrument(
         skip_all,
@@ -177,7 +181,7 @@ impl SnapshotLoop {
         ),
     )]
     async fn snapshot_branch(&mut self, catalog: &Catalog, branch: &Branch) {
-        if let Err(e) = self
+        match self
             .lifecycle
             .snapshot_branch(BranchOpRequest {
                 catalog_uuid: Some(catalog.catalog_uuid.clone()),
@@ -186,12 +190,22 @@ impl SnapshotLoop {
             })
             .await
         {
-            tracing::warn!(
+            Err(e) => tracing::warn!(
                 catalog = %catalog.catalog_uuid,
                 branch = %branch.branch_uuid,
                 error = %e,
                 "SnapshotBranch failed"
-            );
+            ),
+            Ok(resp) => {
+                if resp.get_ref().watermark.is_none() {
+                    tracing::warn!(
+                        catalog = %catalog.catalog_uuid,
+                        branch = %branch.branch_uuid,
+                        "SnapshotBranch incomplete: at least one table failed; \
+                         see the lifecycle service log for which"
+                    );
+                }
+            }
         }
     }
 

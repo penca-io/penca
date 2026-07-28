@@ -3,9 +3,13 @@
 //! [`LifecycleManager::persist_branch`], [`LifecycleManager::snapshot_branch`],
 //! and [`LifecycleManager::persist_and_snapshot_branch`] loop the per-table
 //! [`persist`](LifecycleManager::persist) / [`snapshot`](LifecycleManager::snapshot)
-//! primitives over a `(catalog, branch)`'s dirty set, all bounded at the one fork
-//! commit `T` — so the whole catalog-wide flush captures a single consistent
-//! snapshot at the fork point. Each returns `T`'s [`Watermark`].
+//! primitives over a `(catalog, branch)`'s dirty set. Each returns `T`'s
+//! [`Watermark`].
+//!
+//! Only the **Persist** side is bounded at `T` (`persist_request` sets
+//! `target_micros = T.commit_micros`), which is what makes a fork flush capture
+//! a single consistent position. Snapshot bounds itself at each table's own
+//! latest committed persist instead, so it needs no per-table micros bound.
 //!
 //! `T` is a commit-order position ([`Watermark`] — no tx_uuid). It is either
 //! supplied by the caller in `BranchOpRequest.target` (CreateBranch's write path
@@ -22,11 +26,19 @@
 //! bound. The Snapshot side enumerates PERSISTED tables instead, so a table
 //! persisted then dropped from hot is still re-snapshotted.
 //!
-//! [`LifecycleManager::persist_branch`] and [`LifecycleManager::snapshot_branch`]
-//! fail fast on the first per-table error: the flush is synchronous inside
-//! CreateBranch, so a partial flush must surface, not silently succeed.
-//! [`LifecycleManager::persist_and_snapshot_branch`] instead continues on error —
-//! see its doc.
+//! All three are **continue-on-error** per table: a failure is logged, the loop
+//! proceeds, and the returned watermark is withheld (`None`). Aborting instead
+//! would be unsafe — both dirty sets are enumerated oldest-timestamp-first, so a
+//! table whose op keeps failing sorts first on every subsequent sweep and would
+//! starve everything behind it forever.
+//!
+//! An absent watermark is therefore the partial-completion signal, and callers
+//! needing an all-or-nothing flush (CreateBranch, whose child reads the parent's
+//! COLD tier) MUST treat it as an error rather than record the fork.
+//!
+//! The one step that still fails fast is `persist_tx_log`, which is a
+//! correctness prerequisite for every table (CHA-507) rather than per-table
+//! best-effort work.
 
 use std::collections::HashMap;
 
@@ -499,12 +511,15 @@ fn branch_op_watermark(
     if failed == 0 {
         return Some(watermark);
     }
+    // `op` is a field, not interpolated into the message, so these events group
+    // and filter like the sibling per-table warns.
     tracing::warn!(
         catalog = %catalog_uuid,
         branch = %branch_uuid,
+        op,
         failed,
         total,
-        "branch {op} incomplete; withholding watermark"
+        "branch op incomplete; withholding watermark"
     );
     None
 }

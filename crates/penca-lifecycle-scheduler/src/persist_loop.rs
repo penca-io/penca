@@ -83,10 +83,15 @@ impl PersistLoop {
         Ok(())
     }
 
-    /// `PersistBranch` is fail-fast per table (it serves CreateBranch's
-    /// all-or-nothing fork flush), so a poison table costs this branch the rest
-    /// of its sweep. Accepted: the tail re-enters the next tick, and a branch's
-    /// failure must not stop the other branches.
+    /// `PersistBranch` is continue-on-error per table: a poison table is logged
+    /// and skipped, so it cannot starve the rest of the branch. That matters
+    /// because the dirty set is enumerated `ORDER BY MAX(modified_at_micros)
+    /// ASC` — a table whose Persist keeps failing never advances its timestamp
+    /// and would otherwise sort first, and abort the sweep, on every tick.
+    ///
+    /// It signals partial completion by withholding the watermark rather than
+    /// returning an error, so both arms are logged here: a transport error means
+    /// the whole call failed, an absent watermark means some table did.
     #[tracing::instrument(
         skip_all,
         fields(
@@ -95,7 +100,7 @@ impl PersistLoop {
         ),
     )]
     async fn persist_branch(&mut self, catalog: &Catalog, branch: &Branch) {
-        if let Err(e) = self
+        match self
             .lifecycle
             .persist_branch(BranchOpRequest {
                 catalog_uuid: Some(catalog.catalog_uuid.clone()),
@@ -104,12 +109,22 @@ impl PersistLoop {
             })
             .await
         {
-            tracing::warn!(
+            Err(e) => tracing::warn!(
                 catalog = %catalog.catalog_uuid,
                 branch = %branch.branch_uuid,
                 error = %e,
                 "PersistBranch failed; will retry next tick"
-            );
+            ),
+            Ok(resp) => {
+                if resp.get_ref().watermark.is_none() {
+                    tracing::warn!(
+                        catalog = %catalog.catalog_uuid,
+                        branch = %branch.branch_uuid,
+                        "PersistBranch incomplete: at least one table failed; \
+                         see the lifecycle service log for which"
+                    );
+                }
+            }
         }
     }
 }

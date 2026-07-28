@@ -94,13 +94,18 @@ change aborted-only tables (no committed writes ever) would never
 have Persist called, leaving their hot rows + tx-log family
 metadata to leak indefinitely.
 
-Snapshot is chained directly off each Persist on the same `(catalog,
-branch, T)` within the same tick — Snapshot's input is the cold data
-that Persist just wrote, so no separate enumeration is needed. For
-aborted-only tables, Persist writes a `table_persist_metadata` row
-with no segments; Snapshot then writes a placeholder via the
-existing CHA-228 empty-merge path. Bounded overhead per
-aborted-only table per tick.
+Snapshot is **not** chained off Persist. It runs on its own loop, on its
+own cadence, and enumerates the PERSISTED set — tables carrying a
+committed `table_persist_metadata` row — so its input is whatever an
+earlier persist tick already made durable. That decoupling is the point
+of the cadence split: a table persisted then dropped from hot is still
+re-snapshotted, because Snapshot keys on persisted state rather than on
+hot-modified state.
+
+For aborted-only tables, Persist writes a `table_persist_metadata` row
+with no segments; Snapshot then writes a placeholder via the existing
+CHA-228 empty-merge path. Bounded overhead per aborted-only table per
+snapshot tick.
 
 Purge is driven by `ListPersistedTables` instead. The reason is the
 universal grace window in [ADR 0019](../decisions/0019-plan-time-pinning-and-universal-grace-window.md):
@@ -138,9 +143,13 @@ The scheduler is a pure gRPC client. It does NOT:
 All data access flows through `QueryServiceClient` and
 `LifecycleServiceClient` (CHA-445 rehomed the `ListModifiedTables` /
 `ListPersistedTables` dirty-set discovery RPCs onto `LifecycleService`,
-dropping the StorageMetadataService client). The per-table chain is the
-existing per-table RPCs (`Persist`, `Snapshot`, `Purge` from
-[CHA-220](https://linear.app/chapala/issue/CHA-220)) invoked individually.
+dropping the StorageMetadataService client). Persist and Snapshot are
+branch-scoped server-side RPCs — `PersistBranch` and `SnapshotBranch`,
+whose per-table loops live in `LifecycleManager` — so the scheduler makes
+one call per branch per loop. `Purge` is still the per-table RPC from
+[CHA-220](https://linear.app/chapala/issue/CHA-220), invoked in a
+client-side loop over the enumerated set (TODO(CHA-502) moves it
+server-side too).
 
 ## Configuration
 
@@ -161,8 +170,18 @@ All values are required from environment variables; defaults live in
 
 Errors inside a single `(catalog, branch)` tick are logged at `warn` and
 the loop continues. Errors on a single table within a branch are also
-logged and skipped. Every lifecycle op is idempotent, so transient
-failures self-heal on the next sweep that re-enumerates the table.
+logged and skipped — the branch ops are continue-on-error, which is
+load-bearing rather than incidental: both dirty sets are enumerated
+oldest-timestamp-first, so a table whose op keeps failing sorts first on
+every subsequent sweep and would starve everything behind it forever if
+the loop aborted on it.
+
+A branch op that skipped at least one table signals partial completion by
+withholding its response watermark; the scheduler logs that, and callers
+needing an all-or-nothing flush (CreateBranch) treat it as an error.
+
+Every lifecycle op is idempotent, so transient failures self-heal on the
+next sweep that re-enumerates the table.
 
 The scheduler does NOT use gRPC retries or backoff. The tick cadence
 (`SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` for Persist,
