@@ -94,22 +94,25 @@ def _is_runnable_example(name: str) -> bool:
     return not name.startswith("_")
 
 
+def _files_on_disk() -> set[str]:
+    """Every `*.py` under examples/, private modules included."""
+    return {path.name for path in _EXAMPLES_DIR.glob("*.py")}
+
+
 def _discovered_examples() -> set[str]:
-    """The runnable examples on disk."""
-    return {
-        path.name
-        for path in _EXAMPLES_DIR.glob("*.py")
-        if _is_runnable_example(path.name)
-    }
+    """The runnable examples on disk — what the index is required to name."""
+    return {name for name in _files_on_disk() if _is_runnable_example(name)}
 
 
 def _indexed_examples() -> set[str]:
-    """The runnable examples named in the README's index section."""
-    return {
-        name
-        for name in _EXAMPLE_MENTION.findall(_index_section())
-        if _is_runnable_example(name)
-    }
+    """Every example the README's index section names, unfiltered.
+
+    Deliberately NOT filtered by `_is_runnable_example`: filtering here would
+    drop a private-module entry from the stale check entirely, so an index
+    pointing at an `examples/_helpers.py` that does not exist could never be
+    reported. The private-module skip belongs on the *required* side only.
+    """
+    return set(_EXAMPLE_MENTION.findall(_index_section()))
 
 
 def test_examples_dir_is_not_empty():
@@ -142,10 +145,12 @@ def test_index_names_no_missing_example():
     The reverse containment, so deleting or renaming a script fails here instead
     of leaving a dead entry pointing a reader at a file that is gone.
     """
-    discovered = _discovered_examples()
     indexed = _indexed_examples()
 
-    stale = indexed - discovered
+    # Compared against every file on disk, not just the runnable ones: an index
+    # entry naming a private module that genuinely exists is odd but not stale,
+    # while one naming a file that is gone is exactly what this catches.
+    stale = indexed - _files_on_disk()
     assert not stale, (
         f"the README's {_INDEX_HEADING!r} section names examples that do not exist: "
         f"{sorted(stale)}. Remove the entry or restore the script."
