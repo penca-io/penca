@@ -53,10 +53,26 @@ use crate::resolve::{parse_resolved_uuid, resolve_branch, resolve_catalog};
 
 impl LifecycleManager {
     /// Persist (flush hot→cold) every MODIFIED table on the `(catalog, branch)`
-    /// named by `request`, bounded at the fork commit `T`. Returns `T`'s
-    /// [`Watermark`]. Supersedes the former inline `flush_branch_to_cold`
-    /// (CHA-273 rework): enumerates MODIFIED tables rather than every table, and
-    /// returns the resolved fork `T` so the caller can seed from it.
+    /// named by `request`, bounded at the fork commit `T`.
+    ///
+    /// Returns `Some(T)` only when EVERY table flushed. A per-table failure is
+    /// logged and the loop continues, and the watermark is then **withheld**
+    /// (`None`) — the absent watermark is the partial-flush signal.
+    ///
+    /// Continue-on-error is load-bearing for the scheduler's persist loop: the
+    /// dirty-set enumeration is `ORDER BY MAX(modified_at_micros) ASC`
+    /// (`penca-storage-meta/src/lifecycle.rs:192`), and a table whose Persist
+    /// keeps failing never advances its `modified_at`, so it sorts FIRST on every
+    /// subsequent tick. Aborting on it would permanently starve the rest of the
+    /// branch, growing hot storage without bound.
+    ///
+    /// Callers needing an all-or-nothing flush (CreateBranch) MUST treat `None`
+    /// as a failure — a partial flush leaves the fork's child reading a parent
+    /// cold tier that is missing the unflushed tables' rows.
+    ///
+    /// The `persist_tx_log` call is the one step that still fails fast: it is a
+    /// correctness prerequisite for every table (CHA-507), not per-table
+    /// best-effort work.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -73,7 +89,7 @@ impl LifecycleManager {
         dl_driver: &L,
         writer: &W,
         request: &BranchOpRequest,
-    ) -> Result<Watermark, ApiError>
+    ) -> Result<Option<Watermark>, ApiError>
     where
         L: DlDriver + ?Sized,
         W: FormatWriter,
@@ -99,23 +115,49 @@ impl LifecycleManager {
         let table_uuids = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
+        let mut failed = 0usize;
         for table_uuid in &table_uuids {
-            self.persist(
-                pool,
-                hot,
-                dl_driver,
-                writer,
-                &persist_request(&catalog_uuid, &branch_uuid, table_uuid, &watermark),
-            )
-            .await?;
+            if let Err(e) = self
+                .persist(
+                    pool,
+                    hot,
+                    dl_driver,
+                    writer,
+                    &persist_request(&catalog_uuid, &branch_uuid, table_uuid, &watermark),
+                )
+                .await
+            {
+                failed += 1;
+                tracing::warn!(
+                    catalog = %catalog_uuid,
+                    branch = %branch_uuid,
+                    table = %table_uuid,
+                    error = %e,
+                    "branch Persist failed; continuing"
+                );
+            }
         }
-        Ok(watermark)
+        Ok(branch_op_watermark(
+            &catalog_uuid,
+            &branch_uuid,
+            watermark,
+            failed,
+            table_uuids.len(),
+            "Persist",
+        ))
     }
 
     /// Snapshot (all-cold merge) every PERSISTED table on the `(catalog, branch)`
-    /// named by `request`. Returns the fork [`Watermark`] `T`. Snapshot bounds
-    /// itself at each table's latest committed persist, so no per-table micros
-    /// bound is threaded here (mirrors the scheduler's `snapshot_one`).
+    /// named by `request`. Snapshot bounds itself at each table's latest
+    /// committed persist, so no per-table micros bound is threaded here.
+    ///
+    /// Returns `Some(T)` only when EVERY table snapshotted; a per-table failure
+    /// is logged, the loop continues, and the watermark is withheld. Same
+    /// starvation argument as [`Self::persist_branch`] — the persisted-set
+    /// enumeration is `ORDER BY MAX(commit_micros) ASC`
+    /// (`penca-storage-meta/src/lifecycle.rs:262`), so a poison table would sort
+    /// first forever. It compounds there: Purge's committed axis is gated on
+    /// `Pu = W_snap`, so a starved tail's hot rows are never reclaimed either.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -132,7 +174,7 @@ impl LifecycleManager {
         dl_driver: &L,
         writer: &W,
         request: &BranchOpRequest,
-    ) -> Result<Watermark, ApiError>
+    ) -> Result<Option<Watermark>, ApiError>
     where
         R: FormatReader,
         L: DlDriver + ?Sized,
@@ -142,37 +184,58 @@ impl LifecycleManager {
         let table_uuids = self
             .list_all_persisted_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
+        let mut failed = 0usize;
         for table_uuid in &table_uuids {
-            self.snapshot(
-                pool,
-                readers,
-                dl_driver,
-                writer,
-                &snapshot_request(&catalog_uuid, &branch_uuid, table_uuid),
-            )
-            .await?;
+            if let Err(e) = self
+                .snapshot(
+                    pool,
+                    readers,
+                    dl_driver,
+                    writer,
+                    &snapshot_request(&catalog_uuid, &branch_uuid, table_uuid),
+                )
+                .await
+            {
+                failed += 1;
+                tracing::warn!(
+                    catalog = %catalog_uuid,
+                    branch = %branch_uuid,
+                    table = %table_uuid,
+                    error = %e,
+                    "branch Snapshot failed; continuing"
+                );
+            }
         }
-        Ok(watermark)
+        Ok(branch_op_watermark(
+            &catalog_uuid,
+            &branch_uuid,
+            watermark,
+            failed,
+            table_uuids.len(),
+            "Snapshot",
+        ))
     }
 
     /// Persist every MODIFIED table, then Snapshot every PERSISTED table, on the
-    /// `(catalog, branch)` named by `request`, per table (non-atomic). Returns
-    /// the fork [`Watermark`] `T`.
+    /// `(catalog, branch)` named by `request`, per table (non-atomic).
     ///
     /// The two phases enumerate **distinct dirty-sets** — Persist the hot-modified
     /// set, Snapshot the post-persist persisted set. See the inline note on the
     /// Snapshot phase for why.
     ///
-    /// **Continue-on-error**, matching the old `ops::persist_and_snapshot` shape
-    /// the scheduler relied on: a per-table failure is logged and the loop
-    /// proceeds, so a persistent poison table cannot starve the healthy tail of
-    /// the modified set (which the deterministic `list_modified_tables` order
-    /// would otherwise return first every tick). Each table self-heals when it
-    /// re-enters a future sweep. Snapshot is gated on the same table's Persist
-    /// succeeding — Snapshot's watermark is bounded by the latest committed
-    /// persist, so running it after a failed Persist would no-op or replay stale
-    /// state. This differs from [`Self::persist_branch`], which fails fast because
-    /// its CreateBranch caller needs an all-or-nothing fork flush.
+    /// **No server-side caller.** The scheduler drives [`Self::persist_branch`]
+    /// and [`Self::snapshot_branch`] from its two independently-paced loops; this
+    /// stays as a client-facing convenience for callers wanting both phases in
+    /// one round-trip.
+    ///
+    /// Continue-on-error like its two halves — a per-table failure is logged, the
+    /// loop proceeds, and the watermark is withheld. Snapshot is additionally
+    /// gated on the same table's Persist succeeding: Snapshot's watermark is
+    /// bounded by the latest committed persist, so running it after a failed
+    /// Persist would no-op or replay stale state. Here that gating is structural
+    /// rather than explicit — a table whose Persist failed writes no
+    /// `table_persist_metadata` row, so it never enters the persisted set the
+    /// Snapshot phase enumerates.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -191,7 +254,7 @@ impl LifecycleManager {
         dl_driver: &L,
         writer: &W,
         request: &BranchOpRequest,
-    ) -> Result<Watermark, ApiError>
+    ) -> Result<Option<Watermark>, ApiError>
     where
         R: FormatReader,
         L: DlDriver + ?Sized,
@@ -225,6 +288,7 @@ impl LifecycleManager {
         let modified = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
+        let mut failed = 0usize;
         for table_uuid in &modified {
             if let Err(e) = self
                 .persist(
@@ -236,6 +300,7 @@ impl LifecycleManager {
                 )
                 .await
             {
+                failed += 1;
                 tracing::warn!(
                     catalog = %catalog_uuid,
                     branch = %branch_uuid,
@@ -259,6 +324,7 @@ impl LifecycleManager {
                 )
                 .await
             {
+                failed += 1;
                 tracing::warn!(
                     catalog = %catalog_uuid,
                     branch = %branch_uuid,
@@ -268,7 +334,14 @@ impl LifecycleManager {
                 );
             }
         }
-        Ok(watermark)
+        Ok(branch_op_watermark(
+            &catalog_uuid,
+            &branch_uuid,
+            watermark,
+            failed,
+            modified.len() + persisted.len(),
+            "PersistAndSnapshot",
+        ))
     }
 
     /// Shared skeleton entry: resolve the `(catalog, branch)` the branch op
@@ -409,6 +482,31 @@ impl LifecycleManager {
         }
         Ok(all)
     }
+}
+
+/// The branch op's watermark, withheld when any table failed.
+///
+/// An absent watermark is the partial-completion signal on `BranchOpResponse`
+/// — richer per-table response metadata is deferred until a caller needs it.
+fn branch_op_watermark(
+    catalog_uuid: &Uuid,
+    branch_uuid: &Uuid,
+    watermark: Watermark,
+    failed: usize,
+    total: usize,
+    op: &str,
+) -> Option<Watermark> {
+    if failed == 0 {
+        return Some(watermark);
+    }
+    tracing::warn!(
+        catalog = %catalog_uuid,
+        branch = %branch_uuid,
+        failed,
+        total,
+        "branch {op} incomplete; withholding watermark"
+    );
+    None
 }
 
 /// The persist request for one table in a branch flush: bounded at the fork

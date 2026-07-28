@@ -131,9 +131,15 @@ where
         // Resolve the fork position (the request's fork_point → Watermark) in
         // the write pod — a position that names no committed tx is a hard
         // INVALID_ARGUMENT — then synchronously flush the SOURCE branch hot→cold
-        // up to that position via
-        // PersistBranch (the persist loop runs in the lifecycle pod), then record
-        // the fork. The returned watermark is the position we passed, so ignored.
+        // up to that position via PersistBranch (the persist loop runs in the
+        // lifecycle pod), then record the fork.
+        //
+        // PersistBranch is continue-on-error per table for the scheduler's sake,
+        // and signals a partial flush by withholding the watermark. CreateBranch
+        // needs all-or-nothing: the child reads the parent's COLD tier, so a fork
+        // recorded over a partial flush would silently serve a child that is
+        // missing the unflushed tables' rows. An absent watermark must fail the
+        // fork.
         let fork = self
             .manager
             .resolve_fork_watermark(&self.pool, self.readers.as_ref(), req)
@@ -148,7 +154,16 @@ where
                 branch_name: req.source_branch_name.clone(),
                 target: Some(fork),
             })
-            .await?;
+            .await?
+            .into_inner()
+            .watermark
+            .ok_or_else(|| {
+                Status::internal(
+                    "CreateBranch aborted: the source branch could not be fully \
+                     flushed hot→cold; see the lifecycle service log for the \
+                     failing tables",
+                )
+            })?;
         let resp = self
             .manager
             .create_branch(&self.pool, self.dl_driver.as_ref(), req, &fork)

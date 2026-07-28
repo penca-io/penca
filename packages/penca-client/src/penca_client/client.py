@@ -1551,8 +1551,13 @@ class PencaClient:
 
         Catalog-wide sibling of :meth:`persist`. ``target`` is a resolved
         ``Watermark`` fork position (commit_seq_num + commit_micros); when unset,
-        the op bounds at the branch head. Returns the position it used. Drives
-        CreateBranch's persist-at-fork and branch-merge source flush.
+        the op bounds at the branch head. Drives the lifecycle scheduler's
+        persist loop, plus CreateBranch's persist-at-fork and branch-merge
+        source flush.
+
+        Continue-on-error per table: ``response.watermark`` is the position used
+        and is set ONLY when every table succeeded. It is left unset when any
+        table failed, so callers needing an all-or-nothing flush must check it.
         """
         return self._branch_op(
             self._lifecycle.PersistBranch,
@@ -1571,7 +1576,13 @@ class PencaClient:
         branch_name: str | None = None,
         target: Watermark | None = None,
     ) -> BranchOpResponse:
-        """Snapshot every modified table on a branch (CHA-273)."""
+        """Snapshot every PERSISTED table on a branch.
+
+        Drives the lifecycle scheduler's snapshot loop. Enumerates the persisted
+        set, not the hot-modified one, so a table persisted then dropped from hot
+        is still re-snapshotted. Same withheld-watermark signal as
+        :meth:`persist_branch`.
+        """
         return self._branch_op(
             self._lifecycle.SnapshotBranch,
             catalog_uuid,
@@ -1589,8 +1600,13 @@ class PencaClient:
         branch_name: str | None = None,
         target: Watermark | None = None,
     ) -> BranchOpResponse:
-        """Persist then snapshot every modified table on a branch, per table
-        (non-atomic) (CHA-273). Drives the lifecycle scheduler's per-tick loop.
+        """Persist every modified table then snapshot every persisted table on a
+        branch, per table (non-atomic).
+
+        A client-side convenience for both phases in one round-trip; the
+        scheduler drives :meth:`persist_branch` and :meth:`snapshot_branch`
+        separately on independent cadences. Same withheld-watermark signal as
+        :meth:`persist_branch`.
         """
         return self._branch_op(
             self._lifecycle.PersistAndSnapshotBranch,
