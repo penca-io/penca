@@ -785,6 +785,9 @@ fetch-jdbc-driver:
 #   just integration-test lifecycle query
 # Lower the parallel phase's worker ceiling (default 4) on a constrained box:
 #   PENCA_TEST_JOBS=2 just integration-test
+# Note a named subset now runs its non-serial tests under xdist too, so it is
+# representative of CI — but that means output is captured and breakpoint()/pdb
+# won't attach. For an interactive debug loop, call pytest directly.
 integration-test *services:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -859,22 +862,27 @@ integration-test *services:
         -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
 
     # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
-    # which is indistinguishable from collecting nothing. Never tolerated for
-    # the parallel phase — for the full suite that is everything CI runs, so
-    # swallowing it would turn "ran nothing" into a green required check.
+    # which is indistinguishable from collecting nothing. Each phase may
+    # legitimately be empty, but only under conditions the other phase proves,
+    # so neither tolerance is unconditional and they are not symmetric.
     #
-    # For the serial phase, tolerate it only when the SELECTED files carry no
-    # `serial` mark — true for most named subsets, and true everywhere once
-    # CHA-519 lands. The exit code alone cannot say WHY the phase was empty:
-    # `-m` expressions are unvalidated, so a mistyped `-m "seriall"` also
-    # collects zero while the other phase still excludes those tests — every
-    # side-channel test skipped, gate green. Scoping the scan to the selected
-    # files is what keeps this correct for a subset, not just the full run.
+    # SERIAL empty: fine only when the SELECTED files carry no `serial` mark —
+    # true for most named subsets, and true everywhere once CHA-519 lands. The
+    # exit code alone cannot say WHY: `-m` expressions are unvalidated, so a
+    # mistyped `-m "seriall"` also collects zero while the other phase still
+    # excludes those tests — every side-channel test skipped, gate green.
+    # Scoping the scan to the selected files is what makes this right for a
+    # subset and not just the full run.
     #
-    # Matches the mark SYNTAX, not the bare string, so prose naming the marker
-    # (integration_helpers.py documents it) doesn't keep the guard armed after
-    # CHA-519. grep's exit 2 (scan failed) stays distinct from 1 (no marks):
-    # only the latter may apply the tolerance.
+    # The scan matches the mark SYNTAX, not the bare string, so prose naming
+    # the marker (integration_helpers.py documents it) doesn't keep the guard
+    # armed after CHA-519. grep's exit 2 (scan failed) stays distinct from 1
+    # (no marks): only the latter may apply the tolerance.
+    serial_collected=1
+    if [ "$serial_rc" -eq 5 ]; then
+        serial_collected=0
+    fi
+
     if [ "$serial_rc" -eq 5 ]; then
         set +e
         grep -qE '^[[:space:]]*(@pytest\.mark\.serial|pytestmark[[:space:]]*=.*pytest\.mark\.serial)' "${files[@]}"
@@ -892,6 +900,23 @@ integration-test *services:
         fi
 
         serial_rc=0
+    fi
+
+    # PARALLEL empty: fine only for a named subset whose serial phase DID
+    # collect — i.e. every selected module is fully serial, which eight of them
+    # are (module-level `pytestmark`), so `just integration-test
+    # direct_point_read` runs green in phase 1 and legitimately selects nothing
+    # here. Never tolerated for the full suite, where this phase is everything
+    # CI runs and swallowing it would turn "ran nothing" into a green required
+    # check; and never when the serial phase was also empty, which means the
+    # selection matched nothing at all.
+    if [ "$parallel_rc" -eq 5 ]; then
+        if [ -n "{{services}}" ] && [ "$serial_collected" -eq 1 ]; then
+            parallel_rc=0
+        else
+            echo "parallel phase collected zero tests" >&2
+            exit 1
+        fi
     fi
 
     # Surface the first non-zero. Written as a full `if` rather than

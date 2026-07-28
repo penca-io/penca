@@ -226,12 +226,33 @@ def test_every_side_channel_test_is_marked_serial():
         f"a concurrent worker: {unmarked}"
     )
 
-    # A pass means nothing if the scan found nothing to check. Renaming a
-    # helper out of the root set, or any regression that empties the call-graph
-    # walk, would otherwise leave this silently green — the one way a guard
-    # like this fails without anyone noticing. The floor is well under the
-    # current count so ordinary edits don't trip it.
-    assert scanned >= 30, (
-        f"only {scanned} side-channel tests found; the check is not looking at "
-        "anything. Did a helper in ROOT_SIDE_CHANNEL_HELPERS get renamed?"
+    # A pass means nothing if the scan found nothing to check, and that is the
+    # one way a guard like this fails without anyone noticing. Two assertions,
+    # because neither subsumes the other.
+    #
+    # Exact: every root must still exist. A rename is the likely cause of a
+    # silently-narrowed scan, and it is cheap to detect precisely rather than
+    # to infer from a count.
+    defined = {
+        node.name
+        for node in ast.walk(
+            ast.parse((INTEGRATION / "integration_helpers.py").read_text())
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing = ROOT_SIDE_CHANNEL_HELPERS - defined
+    assert not missing, (
+        f"{sorted(missing)} no longer exist in integration_helpers.py, so the "
+        "scan below silently stopped covering them — update "
+        "ROOT_SIDE_CHANNEL_HELPERS, or delete this file if CHA-519 removed the "
+        "scrapes"
+    )
+
+    # Coarse: catches a narrowed scan that the existence check can't see — a
+    # regression inside the call-graph walk itself. 47 today; the floor is set
+    # close enough to bite (dropping `container_log` alone yields exactly 30)
+    # but with room for ordinary edits.
+    assert scanned >= 40, (
+        f"only {scanned} side-channel tests found; the check has stopped "
+        "looking at most of the suite"
     )
