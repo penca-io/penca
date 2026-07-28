@@ -54,6 +54,11 @@ _TIER_LINE = "Persisting, snapshotting and purging to cold columnar storage..."
 # its lifecycle call was a no-op, which on the scheduler-idle test profile means
 # the call did not happen.
 _WATERMARKS = ("persisted_at", "snapshotted_at", "purged_at")
+# Captures label -> value from the demo's watermark line, so the assertion can
+# require the label's PRESENCE before judging its value. A bare
+# `"persisted_at=none" not in stdout` check would pass vacuously the moment the
+# label was renamed or the line dropped.
+_WATERMARK_VALUE = re.compile(r"(persisted_at|snapshotted_at|purged_at)=(\S+)")
 
 
 def _demo_catalogs(client) -> set[str]:
@@ -156,11 +161,20 @@ def _assert_tier_transition(stdout: str) -> None:
     queryable from hot, so without a purge that advanced, every "cold" number in
     this run is a hot read wearing a cold label.
     """
-    for field in _WATERMARKS:
-        assert f"{field}=none" not in stdout, (
-            f"{field} is unset — the lifecycle call behind it was a no-op, so the "
-            f"rows are not where the output says they are:\n{stdout[-2000:]}"
-        )
+    printed = dict(_WATERMARK_VALUE.findall(stdout))
+
+    missing = [field for field in _WATERMARKS if field not in printed]
+    assert not missing, (
+        f"the demo printed no {missing} watermark, so nothing here pins the tier "
+        f"transition. Absence must fail rather than exempt itself:\n"
+        f"{stdout[-2000:]}"
+    )
+
+    no_ops = [field for field in _WATERMARKS if printed[field] == "none"]
+    assert not no_ops, (
+        f"{no_ops} unset — the lifecycle calls behind them were no-ops, so the "
+        f"rows are not where the output says they are:\n{stdout[-2000:]}"
+    )
 
 
 def _assert_found_the_right_row(stdout: str) -> None:
@@ -211,8 +225,18 @@ def _assert_both_arms_measured(stdout: str) -> None:
             f"{latency_section[:2000]}"
         )
 
+    # Exactly two rows, counted structurally. `>=` on numeric cells would let a
+    # third arm — or a `path` column that happened to render numerically — pass
+    # as "both arms measured".
+    rows = _table_body_rows(latency_section)
+    assert len(rows) == 2, (
+        f"expected exactly two arms (gRPC and SQL), saw {len(rows)} table rows "
+        f"in:\n{latency_section[:2000]}"
+    )
+
+    # And each row carries a real number rather than a placeholder.
     measured = _MS_CELL.findall(latency_section)
     assert len(measured) >= 2, (
-        f"expected a measurement for each arm (gRPC and SQL), saw "
-        f"{len(measured)} numeric cells in:\n{latency_section[:2000]}"
+        f"expected a measurement for each arm, saw {len(measured)} numeric "
+        f"cells in:\n{latency_section[:2000]}"
     )
