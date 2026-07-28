@@ -817,59 +817,48 @@ integration-test *services:
         # still run them concurrently with the parallel phase.) The marks and
         # this split both go away with CHA-519.
         #
-        # SERIAL RUNS FIRST, and the ordering is load-bearing despite the
-        # phases being disjoint. `container_log` shells `docker logs`, buffers
-        # the whole stream and ANSI-strips it on EVERY call, and `poll_log_for`
-        # calls it every 100ms for up to 5s per assertion. The test services log
-        # at debug with no size cap, so running these after the parallel phase
-        # makes each scrape pay a worst-case buffer: measured 19m for 56 tests
-        # that way, against ~11m of the same files' work when the suite was
-        # fully serial. Cheap to avoid — just go first.
+        # Serial first, and the order is load-bearing. `container_log` buffers
+        # and ANSI-strips the container's whole stdout on EVERY call, and
+        # `poll_log_for` repeats that every 100ms for up to 5s per assertion.
+        # The services log at debug with no size cap, so scraping after the
+        # parallel phase means paying a worst-case buffer each time: 19m for 56
+        # tests measured that way. Going first costs nothing.
         serial_rc=0
         uv run pytest tests/integration/integration_*.py -m "serial" -s || serial_rc=$?
 
-        # No `-s` here: N workers interleave into noise, and nothing depends on
-        # it — the scrapers read `docker logs`, not pytest's capture, and they
-        # all ran in phase 1 anyway.
+        # No `-s`: N workers interleave into noise, and nothing here needs it —
+        # the scrapers read `docker logs`, not pytest's capture, and all ran in
+        # phase 1. Runs even if phase 1 failed, so one invocation reports both.
         #
-        # The cap protects the REQUEST DEADLINE, not the connection table.
-        # Each servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus
-        # workers queue on pool acquisition *inside* the request, where the wait
-        # counts against QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — an absolute
-        # deadline that surfaces as RESOURCE_EXHAUSTED in whatever read-path
-        # test happened to be running, which reads like a product bug rather
-        # than contention. So stay at or under the servicers' own concurrency.
-        # Inert on CI (ubuntu-latest is 4-core for public repos). PENCA_TEST_JOBS
-        # only lowers the ceiling — `--maxprocesses` bounds `-n auto` from above,
-        # so it can never buy more workers than the machine has cores.
-        #
-        # Runs even when the serial phase failed, so one invocation reports
-        # every failure rather than hiding this phase behind the other's exit.
+        # The cap protects the REQUEST DEADLINE, not the connection table. Each
+        # servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus workers
+        # queue on pool acquisition *inside* the request, against the absolute
+        # QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — surfacing as
+        # RESOURCE_EXHAUSTED in whatever read-path test happened to be running,
+        # which reads like a product bug rather than contention. PENCA_TEST_JOBS
+        # only lowers the ceiling, since `--maxprocesses` bounds `-n auto` from
+        # above; inert on CI, where ubuntu-latest gives public repos 4 cores.
         parallel_rc=0
         uv run pytest tests/integration/integration_*.py \
             -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
 
-        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects
-        # everything, which is indistinguishable from collecting nothing.
+        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
+        # which is indistinguishable from collecting nothing. Never tolerated
+        # for the parallel phase — that is the whole suite in CI, so swallowing
+        # it would turn "ran nothing" into a green required check.
         #
-        # Never tolerated for the parallel phase — that is the whole suite in
-        # CI, so swallowing 5 would turn "the integration suite ran nothing"
-        # into a green required check.
+        # For the serial phase, tolerate it only once no `serial` mark is left,
+        # i.e. after CHA-519. The exit code cannot say WHY the phase was empty:
+        # `-m` expressions are unvalidated, so a mistyped `-m "seriall"` also
+        # collects zero while phase 2 still excludes those tests — every
+        # side-channel test skipped, gate green. The marks distinguish the two
+        # cases and self-disarm when CHA-519 lands.
         #
-        # Tolerated for the serial phase ONLY once no `serial` mark is left,
-        # i.e. after CHA-519. The exit code alone cannot say why the phase was
-        # empty: `-m` expressions are unvalidated, so a mistyped `-m "seriall"`
-        # also collects zero — and phase 2's separately-typed `-m "not serial"`
-        # would still exclude those tests, silently skipping every side-channel
-        # test with the gate green. Checking the marks distinguishes the two,
-        # and self-disarms when CHA-519 lands.
-        # grep does its own globbing here rather than taking a shell-expanded
-        # list: a glob that failed to expand would be passed through as a
-        # literal filename, grep would exit 2, and the `if` would read that as
-        # "no marks left" — applying the tolerance, which is the one direction
-        # this guard exists to prevent. integration_helpers.py is excluded
-        # because it names the marker in prose, so matching it would keep the
-        # guard armed after CHA-519 removed every real mark.
+        # grep globs internally rather than taking a shell-expanded list: an
+        # unexpanded glob becomes a literal filename, grep exits 2, and the `if`
+        # reads that as "no marks left" — the one direction this must not fail.
+        # integration_helpers.py is excluded because it names the marker in
+        # prose, which would keep the guard armed after CHA-519.
         if [ "$serial_rc" -eq 5 ]; then
             if grep -rq --include='integration_*.py' \
                 --exclude='integration_helpers.py' \
