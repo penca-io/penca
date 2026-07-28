@@ -808,100 +808,96 @@ integration-test *services:
     # ``os.environ`` see the same caps the containers run under.
     set -a && source docker/test.env && source docker/.client.env && source docker/.baseline.env && set +a
 
+    # Both the full suite and a named subset run the same two phases; only the
+    # file list differs. A subset run is the dev loop, so it should be fast AND
+    # representative — running it un-split would let a test that is not
+    # xdist-safe pass locally and fail only in the merge queue.
     if [ -z "{{services}}" ]; then
-        # Two disjoint phases against the one stack. The `serial` tests assert
-        # on process-global state — container stdout log windows and
-        # pg_stat_statements counters — so they need the side channels quiet,
-        # which means running them alone rather than merely one-at-a-time.
-        # (`--dist loadgroup` only serializes the group internally; it would
-        # still run them concurrently with the parallel phase.) The marks and
-        # this split both go away with CHA-519.
-        #
-        # Serial first, and the order is load-bearing. `container_log` buffers
-        # and ANSI-strips the container's whole stdout on EVERY call, and
-        # `poll_log_for` repeats that every 100ms for up to 5s per assertion.
-        # The services log at debug with no size cap, so scraping after the
-        # parallel phase means paying a worst-case buffer each time: measured
-        # 19m for 56 tests that way, against ~11m for the same files' work back
-        # when the suite was fully serial. The gap is buffer cost, not what
-        # these tests inherently take. Going first costs nothing.
-        serial_rc=0
-        uv run pytest tests/integration/integration_*.py -m "serial" -s || serial_rc=$?
-
-        # No `-s`: N workers interleave into noise, and nothing here needs it —
-        # the scrapers read `docker logs`, not pytest's capture, and all ran in
-        # phase 1. Runs even if phase 1 failed, so one invocation reports both.
-        #
-        # The cap protects the REQUEST DEADLINE, not the connection table. Each
-        # servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus workers
-        # queue on pool acquisition *inside* the request, against the absolute
-        # QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — surfacing as
-        # RESOURCE_EXHAUSTED in whatever read-path test happened to be running,
-        # which reads like a product bug rather than contention. PENCA_TEST_JOBS
-        # only lowers the ceiling, since `--maxprocesses` bounds `-n auto` from
-        # above; inert on CI, where ubuntu-latest gives public repos 4 cores.
-        parallel_rc=0
-        uv run pytest tests/integration/integration_*.py \
-            -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
-
-        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
-        # which is indistinguishable from collecting nothing. Never tolerated
-        # for the parallel phase — that is the whole suite in CI, so swallowing
-        # it would turn "ran nothing" into a green required check.
-        #
-        # For the serial phase, tolerate it only once no `serial` mark is left,
-        # i.e. after CHA-519. The exit code cannot say WHY the phase was empty:
-        # `-m` expressions are unvalidated, so a mistyped `-m "seriall"` also
-        # collects zero while phase 2 still excludes those tests — every
-        # side-channel test skipped, gate green. The marks distinguish the two
-        # cases and self-disarm when CHA-519 lands.
-        #
-        # Matches the mark SYNTAX, not the bare string, so prose naming the
-        # marker (integration_helpers.py documents it) doesn't keep the guard
-        # armed after CHA-519 — no per-file exclusion needed, which also keeps
-        # this consistent with the static check, which scans every module the
-        # phases collect. grep globs internally so an unexpanded shell glob
-        # can't become a literal filename. Its exit 2 (scan failed) is kept
-        # distinct from 1 (no marks): only the latter may apply the tolerance.
-        if [ "$serial_rc" -eq 5 ]; then
-            set +e
-            grep -rqE --include='integration_*.py' \
-                '^[[:space:]]*(@pytest\.mark\.serial|pytestmark[[:space:]]*=.*pytest\.mark\.serial)' \
-                tests/integration/
-            grep_rc=$?
-            set -e
-
-            if [ "$grep_rc" -eq 0 ]; then
-                echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
-                exit 1
-            fi
-
-            if [ "$grep_rc" -ne 1 ]; then
-                echo "could not scan tests/integration for serial marks (grep exit $grep_rc)" >&2
-                exit 1
-            fi
-
-            serial_rc=0
-        fi
-
-        # Surface the first non-zero. Written as a full `if` rather than
-        # `[ ... ] && rc=...`, whose non-zero test would trip `set -e`.
-        rc="$serial_rc"
-        if [ "$rc" -eq 0 ]; then
-            rc="$parallel_rc"
-        fi
-
-        exit "$rc"
+        files=(tests/integration/integration_*.py)
     else
-        # Deliberately un-split: a targeted run wants direct live output. Note
-        # that it therefore never exercises the parallel phase, so it cannot
-        # show that a test is xdist-safe — run the full form before pushing.
-        files=""
+        files=()
         for svc in {{services}}; do
-            files="$files tests/integration/integration_${svc}_test.py"
+            files+=("tests/integration/integration_${svc}_test.py")
         done
-        uv run pytest $files -s
     fi
+
+    # Two disjoint phases against the one stack. The `serial` tests assert on
+    # process-global state — container stdout log windows and pg_stat_statements
+    # counters — so they need the side channels quiet, which means running them
+    # alone rather than merely one-at-a-time. (`--dist loadgroup` only
+    # serializes the group internally; it would still run them concurrently with
+    # the parallel phase.) The marks and this split both go away with CHA-519.
+    #
+    # Serial first, and the order is load-bearing. `container_log` buffers and
+    # ANSI-strips the container's whole stdout on EVERY call, and `poll_log_for`
+    # repeats that every 100ms for up to 5s per assertion. The services log at
+    # debug with no size cap, so scraping after the parallel phase means paying
+    # a worst-case buffer each time: measured 19m for 56 tests that way, against
+    # ~11m for the same files' work back when the suite was fully serial. The
+    # gap is buffer cost, not what these tests inherently take.
+    serial_rc=0
+    uv run pytest "${files[@]}" -m "serial" -s || serial_rc=$?
+
+    # No `-s`: N workers interleave into noise, and nothing here needs it — the
+    # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
+    # Runs even if phase 1 failed, so one invocation reports both.
+    #
+    # The cap protects the REQUEST DEADLINE, not the connection table. Each
+    # servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus workers
+    # queue on pool acquisition *inside* the request, against the absolute
+    # QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — surfacing as
+    # RESOURCE_EXHAUSTED in whatever read-path test happened to be running,
+    # which reads like a product bug rather than contention. PENCA_TEST_JOBS
+    # only lowers the ceiling, since `--maxprocesses` bounds `-n auto` from
+    # above; inert on CI, where ubuntu-latest gives public repos 4 cores.
+    parallel_rc=0
+    uv run pytest "${files[@]}" \
+        -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
+
+    # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
+    # which is indistinguishable from collecting nothing. Never tolerated for
+    # the parallel phase — for the full suite that is everything CI runs, so
+    # swallowing it would turn "ran nothing" into a green required check.
+    #
+    # For the serial phase, tolerate it only when the SELECTED files carry no
+    # `serial` mark — true for most named subsets, and true everywhere once
+    # CHA-519 lands. The exit code alone cannot say WHY the phase was empty:
+    # `-m` expressions are unvalidated, so a mistyped `-m "seriall"` also
+    # collects zero while the other phase still excludes those tests — every
+    # side-channel test skipped, gate green. Scoping the scan to the selected
+    # files is what keeps this correct for a subset, not just the full run.
+    #
+    # Matches the mark SYNTAX, not the bare string, so prose naming the marker
+    # (integration_helpers.py documents it) doesn't keep the guard armed after
+    # CHA-519. grep's exit 2 (scan failed) stays distinct from 1 (no marks):
+    # only the latter may apply the tolerance.
+    if [ "$serial_rc" -eq 5 ]; then
+        set +e
+        grep -qE '^[[:space:]]*(@pytest\.mark\.serial|pytestmark[[:space:]]*=.*pytest\.mark\.serial)' "${files[@]}"
+        grep_rc=$?
+        set -e
+
+        if [ "$grep_rc" -eq 0 ]; then
+            echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
+            exit 1
+        fi
+
+        if [ "$grep_rc" -ne 1 ]; then
+            echo "could not scan the selected tests for serial marks (grep exit $grep_rc)" >&2
+            exit 1
+        fi
+
+        serial_rc=0
+    fi
+
+    # Surface the first non-zero. Written as a full `if` rather than
+    # `[ ... ] && rc=...`, whose non-zero test would trip `set -e`.
+    rc="$serial_rc"
+    if [ "$rc" -eq 0 ]; then
+        rc="$parallel_rc"
+    fi
+
+    exit "$rc"
 
 # Run performance tests: brings up infra + servicers, runs tests, tears
 # down. Requires Docker daemon. Uses random ports by default (safe for

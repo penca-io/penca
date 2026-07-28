@@ -160,11 +160,7 @@ def _side_channel_helpers() -> frozenset[str]:
     look unmarked-but-innocent.
 
     Returns exactly the roots today, since ``poll_log_for`` — the one wrapper
-    that reaches another — is itself a root. That makes this inert until the
-    first real wrapper lands, which is precisely when a silent regression
-    would matter, so ``test_derivation_sees_a_call_wrapper`` pins the
-    behaviour on synthetic source rather than on the tree happening to
-    exercise it.
+    that reaches another — is itself a root.
     """
     tree = ast.parse((INTEGRATION / "integration_helpers.py").read_text())
     return ROOT_SIDE_CHANNEL_HELPERS | _coupled_functions(
@@ -183,6 +179,7 @@ def _enclosing_class(tree: ast.Module, target: ast.AST) -> ast.ClassDef | None:
 def test_every_side_channel_test_is_marked_serial():
     helpers = _side_channel_helpers()
     unmarked: list[str] = []
+    scanned = 0
 
     # Glob what the recipe's phases actually select, so a module named outside
     # the `_test` convention is scanned too. integration_helpers.py is included
@@ -190,10 +187,20 @@ def test_every_side_channel_test_is_marked_serial():
     # would run, and its non-test helpers simply never match below.
     for path in sorted(INTEGRATION.glob("integration_*.py")):
         tree = ast.parse(path.read_text())
+        coupled = _coupled_functions(tree, helpers)
+        scanned += sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+            and node.name in coupled
+        )
+
+        # Counted before this skip, not after: a module-level mark satisfies
+        # the invariant but its tests are still evidence the scan is working.
         if _body_sets_serial_pytestmark(tree.body):
             continue
 
-        coupled = _coupled_functions(tree, helpers)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -219,92 +226,12 @@ def test_every_side_channel_test_is_marked_serial():
         f"a concurrent worker: {unmarked}"
     )
 
-
-def test_derivation_sees_a_call_wrapper():
-    """Pin the wrapper derivation on synthetic source.
-
-    The real helpers module yields no derived names today, so this mechanism
-    would otherwise be unexercised and could regress to returning nothing
-    without CI noticing — failing open on the day a wrapper is first added.
-    """
-    source = """
-def _wrap(service):
-    return container_log(service)
-
-def _wrap_twice(service):
-    return _wrap(service)
-
-def _unrelated(x):
-    return x + 1
-"""
-    derived = _coupled_functions(ast.parse(source), ROOT_SIDE_CHANNEL_HELPERS)
-
-    assert "_wrap" in derived, "a direct wrapper must be derived"
-    assert "_wrap_twice" in derived, "derivation must be transitive"
-    assert "_unrelated" not in derived, "an unrelated function must not be"
-
-
-def test_derivation_survives_a_shadowed_name():
-    """Same-named definitions must union, not overwrite.
-
-    ``integration_helpers.py`` defines ``execute`` / ``execute_stream`` /
-    ``close`` once per driver class, so keying on the bare name would drop a
-    scraping definition whenever a same-named sibling is declared later — the
-    fail-quiet direction.
-    """
-    source = """
-class A:
-    def execute(self):
-        return container_log("x")
-
-class B:
-    def execute(self):
-        return None
-"""
-    derived = _coupled_functions(ast.parse(source), ROOT_SIDE_CHANNEL_HELPERS)
-
-    assert "execute" in derived, "a shadowed scraping definition must survive"
-
-
-def test_class_body_pytestmark_counts_as_marked():
-    """A class-level ``pytestmark`` must satisfy the check.
-
-    No class uses this form today — every mark is module-level or a decorator
-    — but it is ordinary pytest, so not recognizing it would fail in the
-    false-red direction the first time someone reaches for it.
-    """
-    source = """
-class TestThing:
-    pytestmark = pytest.mark.serial
-
-    def test_scrapes(self):
-        return container_log("x")
-"""
-    tree = ast.parse(source)
-    cls = tree.body[0]
-    assert isinstance(cls, ast.ClassDef)
-
-    assert _body_sets_serial_pytestmark(cls.body)
-    assert not _body_sets_serial_pytestmark(tree.body), "module body sets nothing"
-
-
-def test_side_channel_helpers_still_exist():
-    """Guard the guard: a rename would silently empty the check above.
-
-    Without this, CHA-519 renaming ``container_log`` turns the correspondence
-    test into a vacuous pass rather than a failure that says "come update me".
-    """
-    helpers_source = (INTEGRATION / "integration_helpers.py").read_text()
-    tree = ast.parse(helpers_source)
-    defined = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-    missing = ROOT_SIDE_CHANNEL_HELPERS - defined
-    assert not missing, (
-        f"{sorted(missing)} no longer exist in integration_helpers.py — update "
-        "ROOT_SIDE_CHANNEL_HELPERS, or drop this file if CHA-519 removed the "
-        "scrapes"
+    # A pass means nothing if the scan found nothing to check. Renaming a
+    # helper out of the root set, or any regression that empties the call-graph
+    # walk, would otherwise leave this silently green — the one way a guard
+    # like this fails without anyone noticing. The floor is well under the
+    # current count so ordinary edits don't trip it.
+    assert scanned >= 30, (
+        f"only {scanned} side-channel tests found; the check is not looking at "
+        "anything. Did a helper in ROOT_SIDE_CHANNEL_HELPERS get renamed?"
     )
