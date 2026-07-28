@@ -815,33 +815,59 @@ integration-test *services:
         # still run them concurrently with the parallel phase.) The marks and
         # this split both go away with CHA-519.
         #
-        # No `-s` in the parallel phase: N workers interleave into noise, and
-        # nothing depends on it — the scrapers read `docker logs`, not pytest's
-        # capture, and they all run in phase 2 anyway.
-        #
-        # `--maxprocesses` is a ceiling for big DEV machines, where `-n auto`
-        # would otherwise point dozens of workers at the one shared stack and
-        # thrash it. It is inert in CI: `ubuntu-latest` is 4-core, so `-n auto`
-        # already lands under the cap. Postgres is not the limit either —
-        # max_connections is 100 and the servicer pools are bounded server-side
-        # (PG_POOL_MAX=4 each, ~20 total), so worker count buys only the few
-        # direct connections the white-box tests open.
-        parallel_rc=0
-        uv run pytest tests/integration/integration_*.py \
-            -m "not serial" -n auto --maxprocesses 8 || parallel_rc=$?
-        # Runs even when phase 1 failed, so one invocation reports every
-        # failure rather than hiding phase 2 behind phase 1's exit.
+        # SERIAL RUNS FIRST, and the ordering is load-bearing despite the
+        # phases being disjoint. `container_log` shells `docker logs`, buffers
+        # the whole stream and ANSI-strips it on EVERY call, and `poll_log_for`
+        # calls it every 100ms for up to 5s per assertion. The test services log
+        # at debug with no size cap, so running these after the parallel phase
+        # makes each scrape pay a worst-case buffer: measured 19m for 56 tests
+        # that way, against ~11m of the same files' work when the suite was
+        # fully serial. Cheap to avoid — just go first.
         serial_rc=0
         uv run pytest tests/integration/integration_*.py -m "serial" -s || serial_rc=$?
+
+        # No `-s` here: N workers interleave into noise, and nothing depends on
+        # it — the scrapers read `docker logs`, not pytest's capture, and they
+        # all ran in phase 1 anyway.
+        #
+        # The cap protects the REQUEST DEADLINE, not the connection table.
+        # Each servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus
+        # workers queue on pool acquisition *inside* the request, where the wait
+        # counts against QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — an absolute
+        # deadline that surfaces as RESOURCE_EXHAUSTED in whatever read-path
+        # test happened to be running, which reads like a product bug rather
+        # than contention. So stay at or under the servicers' own concurrency.
+        # Inert on CI (ubuntu-latest is 4-core for public repos); the override
+        # is for dev machines, in either direction.
+        parallel_rc=0
+        uv run pytest tests/integration/integration_*.py \
+            -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
+
+        # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
+        # which is indistinguishable from collecting nothing. That is a real
+        # green-suite-fails-red trap: CHA-519 removes the last `serial` mark, so
+        # phase 1 will one day legitimately select zero tests. Same for anyone
+        # who drops the last mark while iterating.
+        if [ "$serial_rc" -eq 5 ]; then
+            serial_rc=0
+        fi
+
+        if [ "$parallel_rc" -eq 5 ]; then
+            parallel_rc=0
+        fi
+
         # Surface the first non-zero. Written as a full `if` rather than
         # `[ ... ] && rc=...`, whose non-zero test would trip `set -e`.
-        rc="$parallel_rc"
+        rc="$serial_rc"
         if [ "$rc" -eq 0 ]; then
-            rc="$serial_rc"
+            rc="$parallel_rc"
         fi
 
         exit "$rc"
     else
+        # Deliberately un-split: a targeted run wants direct live output. Note
+        # that it therefore never exercises the parallel phase, so it cannot
+        # show that a test is xdist-safe — run the full form before pushing.
         files=""
         for svc in {{services}}; do
             files="$files tests/integration/integration_${svc}_test.py"
