@@ -634,6 +634,9 @@ def container_log(service: str) -> str:
     *after* the offset, inside the window. So calling this obligates the
     marker — CHA-519 removes both, replacing the scrape with a structured
     per-request seam.
+
+    ``tests/static/static_serial_marker_test.py`` is what keeps that true; it
+    walks the call graph, so a wrapper added to this module is covered too.
     """
     project = os.environ["COMPOSE_PROJECT_NAME"]
     container = f"{project}-{service}-1"

@@ -133,10 +133,8 @@ class TestQueryService:
         assert response.table_uuid == table_uuid
         assert response.table_name == "name_resolve_table"
 
-    # Serialized: asserts on process-global white-box state (container stdout log
-    # windows / pg_stat_statements counters) that a concurrent worker would
-    # pollute. Runs in the serial phase, not under -n auto.
-    # TODO(CHA-519): drop this mark once the structured per-request seam lands.
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
     @pytest.mark.serial
     def test_get_table_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_table by-name must issue the same number of
@@ -205,10 +203,8 @@ class TestQueryService:
             f"table row (CHA-365 Layer A: carry it on ReadRequestScope and reuse)"
         )
 
-    # Serialized: asserts on process-global white-box state (container stdout log
-    # windows / pg_stat_statements counters) that a concurrent worker would
-    # pollute. Runs in the serial phase, not under -n auto.
-    # TODO(CHA-519): drop this mark once the structured per-request seam lands.
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
     @pytest.mark.serial
     def test_get_schema_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_schema by-name must issue the same number of

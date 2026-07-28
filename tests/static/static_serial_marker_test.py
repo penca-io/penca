@@ -30,9 +30,11 @@ from pathlib import Path
 REPO = Path(__file__).parents[2]
 INTEGRATION = REPO / "tests" / "integration"
 
-# The process-global readers. Defined in integration_helpers.py; calling any of
-# them from a test obligates the marker.
-SIDE_CHANNEL_HELPERS = frozenset(
+# The primitives that actually touch process-global state. Everything else is
+# derived: `_side_channel_helpers` also treats any function in
+# integration_helpers.py that *reaches* one of these as a side-channel helper,
+# so adding a wrapper there cannot quietly open a hole in the check below.
+ROOT_SIDE_CHANNEL_HELPERS = frozenset(
     {
         "container_log",
         "poll_log_for",
@@ -85,8 +87,8 @@ def _module_is_serial(tree: ast.Module) -> bool:
     return False
 
 
-def _coupled_functions(tree: ast.Module) -> set[str]:
-    """Names of functions that reach a side-channel helper, transitively.
+def _coupled_functions(tree: ast.Module, roots: frozenset[str]) -> set[str]:
+    """Names of functions in ``tree`` that reach ``roots``, transitively.
 
     Fixed-point rather than one pass: a test may call a helper that calls a
     helper. Names are module-unique enough in this suite that a flat map is
@@ -102,13 +104,26 @@ def _coupled_functions(tree: ast.Module) -> set[str]:
         newly_found = {
             name
             for name, node in functions.items()
-            if name not in coupled
-            and _called_names(node) & (SIDE_CHANNEL_HELPERS | coupled)
+            if name not in coupled and _called_names(node) & (roots | coupled)
         }
         if not newly_found:
             return coupled
 
         coupled |= newly_found
+
+
+def _side_channel_helpers() -> frozenset[str]:
+    """The roots plus every ``integration_helpers`` wrapper that reaches one.
+
+    Without this the check has a blind spot in the direction most likely to be
+    exercised: a shared wrapper belongs in ``integration_helpers.py``, and one
+    added there would be invisible to a roots-only scan, so its callers would
+    look unmarked-but-innocent.
+    """
+    tree = ast.parse((INTEGRATION / "integration_helpers.py").read_text())
+    return ROOT_SIDE_CHANNEL_HELPERS | _coupled_functions(
+        tree, ROOT_SIDE_CHANNEL_HELPERS
+    )
 
 
 def _enclosing_class(tree: ast.Module, target: ast.AST) -> ast.ClassDef | None:
@@ -120,6 +135,7 @@ def _enclosing_class(tree: ast.Module, target: ast.AST) -> ast.ClassDef | None:
 
 
 def test_every_side_channel_test_is_marked_serial():
+    helpers = _side_channel_helpers()
     unmarked: list[str] = []
 
     for path in sorted(INTEGRATION.glob("integration_*_test.py")):
@@ -127,7 +143,7 @@ def test_every_side_channel_test_is_marked_serial():
         if _module_is_serial(tree):
             continue
 
-        coupled = _coupled_functions(tree)
+        coupled = _coupled_functions(tree, helpers)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -164,8 +180,9 @@ def test_side_channel_helpers_still_exist():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    missing = SIDE_CHANNEL_HELPERS - defined
+    missing = ROOT_SIDE_CHANNEL_HELPERS - defined
     assert not missing, (
         f"{sorted(missing)} no longer exist in integration_helpers.py — update "
-        "SIDE_CHANNEL_HELPERS, or drop this file if CHA-519 removed the scrapes"
+        "ROOT_SIDE_CHANNEL_HELPERS, or drop this file if CHA-519 removed the "
+        "scrapes"
     )
