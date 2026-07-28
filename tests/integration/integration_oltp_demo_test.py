@@ -57,8 +57,9 @@ _WATERMARKS = ("persisted_at", "snapshotted_at", "purged_at")
 # Captures label -> value from the demo's watermark line, so the assertion can
 # require the label's PRESENCE before judging its value. A bare
 # `"persisted_at=none" not in stdout` check would pass vacuously the moment the
-# label was renamed or the line dropped.
-_WATERMARK_VALUE = re.compile(r"(persisted_at|snapshotted_at|purged_at)=(\S+)")
+# label was renamed or the line dropped. Derived from _WATERMARKS rather than
+# respelling the names, so the two cannot drift apart.
+_WATERMARK_VALUE = re.compile(rf"({'|'.join(_WATERMARKS)})=(\S+)")
 
 
 def _demo_catalogs(client) -> set[str]:
@@ -170,10 +171,15 @@ def _assert_tier_transition(stdout: str) -> None:
         f"{stdout[-2000:]}"
     )
 
-    no_ops = [field for field in _WATERMARKS if printed[field] == "none"]
+    # Judged on shape, not on the spelling of the demo's placeholder. Comparing
+    # against the literal "none" would stop catching anything the moment that
+    # string became "unset" or "-", which is the same drift the label check
+    # above exists to prevent — a real watermark is a number.
+    no_ops = [field for field in _WATERMARKS if not printed[field].isdigit()]
     assert not no_ops, (
-        f"{no_ops} unset — the lifecycle calls behind them were no-ops, so the "
-        f"rows are not where the output says they are:\n{stdout[-2000:]}"
+        f"{no_ops} carry no numeric watermark, so the lifecycle calls behind "
+        f"them were no-ops and the rows are not where the output says they "
+        f"are:\n{stdout[-2000:]}"
     )
 
 
@@ -210,9 +216,10 @@ def _assert_found_the_right_row(stdout: str) -> None:
 def _assert_both_arms_measured(stdout: str) -> None:
     """Both surfaces, each with a real measurement.
 
-    A run that quietly skipped an arm would print a smaller table and still exit
-    0. Checking the labels AND the count of millisecond cells catches both a
-    missing arm and an arm that printed a placeholder instead of a number.
+    Three separate roles, because a run that quietly skipped an arm would print
+    a smaller table and still exit 0: the labels say which arms are named, the
+    structural row count pins that there are exactly two of them, and the
+    numeric cells pin that each printed a number rather than a placeholder.
     """
     # Bounded at the trailing prose, not open to end-of-stdout: an unbounded
     # slice lets text printed after the table satisfy both checks below.
