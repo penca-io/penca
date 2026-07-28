@@ -19,7 +19,7 @@
 - [feedback_simplest_correct_mechanism_no_hedging.md](feedback_simplest_correct_mechanism_no_hedging.md) — Lead with the simplest correct mechanism; don't over-engineer or hedge.
 - [feedback_tickets_are_spirit_not_spec.md](feedback_tickets_are_spirit_not_spec.md) — Tickets = spirit, not spec; derive the best mechanism, surface alternatives at the gate.
 - [feedback_evaluate_ticket_necessity_first_principles.md](feedback_evaluate_ticket_necessity_first_principles.md) — A well-specified ticket isn't self-justifying; evaluate necessity at the plan gate (CHA-464 was built then cancelled for this miss).
-- [feedback_ask_before_filing_tickets.md](feedback_ask_before_filing_tickets.md) — NEVER file a Linear ticket unprompted; propose and wait (exception: a ticket/skill that mandates the split). Also: no test harnesses for local dev tooling — a hang is self-announcing, only silent+costly failures earn machinery.
+- [feedback_ask_before_filing_tickets.md](feedback_ask_before_filing_tickets.md) — NEVER file a Linear ticket unprompted; propose and wait. Exceptions: gate-approved deferred scope, or a ticket/skill whose text mandates the split
 - [feedback_fold_trivial_review_fixes.md](feedback_fold_trivial_review_fixes.md) — Fold trivial in-scope review fixes into the PR; don't file follow-up tickets for one-liners.
 - [feedback_review_role_no_implementation.md](feedback_review_role_no_implementation.md) — During /review-pr, only update comments/tickets — never edit source.
 - [feedback_intermediate_breakage_ok.md](feedback_intermediate_breakage_ok.md) — Large refactors: don't fragment commits to keep CI green every step.
@@ -86,4 +86,5 @@
 - [feedback_flight_sql_driver_parity.md](feedback_flight_sql_driver_parity.md) — Read the ADBC/JDBC/ODBC driver source BEFORE planning a Flight SQL ticket; same SQL → different wire actions → different entry-points.
 - [reference_cold_datafusion_session_and_penca_api_dep_boundary.md](reference_cold_datafusion_session_and_penca_api_dep_boundary.md) — Cold reads derive their session via `penca_dl::derive_cold_session`, never `SessionContext::new()`; penca-api names datafusion types only via penca-dl re-exports.
 - [feedback_exhaustive_helper_cross_product_tests.md](feedback_exhaustive_helper_cross_product_tests.md) — Timestamp helpers: pure primitive signatures + exhaustive cross-product unit tests.
+- [feedback_no_harness_for_local_dev_tooling.md](feedback_no_harness_for_local_dev_tooling.md) — No test harnesses for local dev tooling; a hang is self-announcing, so weigh the guard against the failure it prevents (silent AND costly) not against how embarrassing the bug was
 - [feedback_dont_test_upstream_libs.md](feedback_dont_test_upstream_libs.md) — Don't write tests whose assertions are mostly upstream library behavior; pin Penca-owned logic only.

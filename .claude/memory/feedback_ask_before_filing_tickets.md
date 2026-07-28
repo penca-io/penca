@@ -1,23 +1,21 @@
 ---
-name: feedback-ask-before-filing-tickets
-description: "Don't file Linear tickets unprompted — propose and wait for approval; and don't propose test harnesses for local dev tooling."
-metadata: 
+name: feedback_ask_before_filing_tickets
+description: Don't file Linear tickets on your own initiative — propose in a sentence and wait for approval.
+metadata:
   node_type: memory
   type: feedback
-  originSessionId: f4540695-2957-4a5b-9c63-ff237adce167
-  modified: 2026-07-28T19:18:57.547Z
 ---
 
-**Never create a Linear ticket without the user's explicit approval.** Propose it in one or two sentences and wait. This holds even when a finding is real and well-characterised.
+**Never create a Linear ticket unprompted.** Propose it in one or two sentences and wait for the user to say yes. This holds even when the finding is real, well-characterised and clearly worth tracking — discovering a problem and *filing* a problem are separate acts, and only the first is mine to make unilaterally.
 
-Exception: when a ticket's own text mandates a split (e.g. CHA-517 said "stage 2 → its own ticket when stage 1 ships") or a skill instructs it, filing is expected — but say so when reporting.
+**Why:** filing is cheap for me and expensive for the user. Every ticket is backlog they have to triage, prioritise and eventually close, and volume dilutes the queue. Corrected 2026-07-28 after I filed CHA-529 and CHA-530 on my own initiative during CHA-517's cleanup.
 
-**Why:** filing is cheap for me and expensive for the user — every ticket is backlog they have to triage, prioritise and eventually close. Volume dilutes the queue. Discovering a problem and *filing* a problem are different acts, and only the first is mine to make unilaterally.
+**Where filing IS expected — no need to re-ask:**
 
-**Second, related correction (2026-07-28):** I proposed extracting `just clean-agent-tools`' drain loop into a script so it could carry a regression test, after getting its loop-termination guard wrong twice. The user pushed back — regression tests for **local dev tooling** are disproportionate. Reasoning worth keeping:
+- **Deferred scope at an approved plan gate.** [[feedback_followup_tickets_before_impl_todo_pointers]] says to mint follow-up tickets at plan approval, before implementation, so the first commit can cite a real CHA-NNN. That is not in tension with this rule: the plan the user approved *enumerated* the deferrals, so the approval already covers them.
+- **A ticket or skill whose own text mandates the split** — e.g. CHA-517 said "stage 2 → its own ticket when stage 1 ships". Say so when reporting, rather than filing silently.
+- **A rule the ticket itself sets**, e.g. CHA-517's "engine bugs found by this work go to separate tickets, never folded into this PR".
 
-- Blast radius is tiny: the recipe runs once per ticket on a disposable VM, and failure leaves some kata rows behind.
-- A **hang is self-announcing** — you Ctrl-C it and know instantly. Only *silent* failures (the original under-clean, which exited 0 having skipped items past a list cap) justify machinery.
-- Weigh the cost of the guard against the cost of the failure it prevents. Production/engine paths earn tests; a convenience recipe usually does not.
+**How to apply:** outside those cases, report the finding and end with "want me to file it?". If the answer is no, the finding still belongs in the report — the user can act on it without a ticket existing.
 
-**How to apply:** when a dev-tooling bug is found, fix it and verify by hand. Report the verification in the commit message. Do not propose extraction-plus-harness unless the failure would be silent AND costly. See [[feedback_evaluate_ticket_necessity_first_principles]] — same instinct, applied to whether the work should exist at all.
+Related: [[feedback_evaluate_ticket_necessity_first_principles]] (whether the work should exist at all), [[feedback_no_harness_for_local_dev_tooling]] (the proportionality correction from the same review).

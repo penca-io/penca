@@ -15,3 +15,5 @@ Two linked rules from the CHA-485 gate (2026-07-04):
 **Why:** grep gives code→ticket discovery, but a ticket reader has no way to know a code anchor exists without the reverse pointer; and a TODO naming a Done ticket is archaeology that actively misleads.
 
 **How to apply:** in /do-issue, when the gate summary lists "deferred to follow-up" items, create those tickets immediately after (or during) plan approval with the code-anchor path in the description, and add a task-body line retargeting any existing TODO in whichever kata task already touches that file. Related: [[feedback_fold_trivial_review_fixes]], [[tickets-are-spirit-not-spec]].
+
+Not a licence to file freely: [[feedback_ask_before_filing_tickets]] is the default (never file unprompted). This rule is one of its named exceptions, because the plan the user approved enumerated the deferrals — so the approval already covers them.
