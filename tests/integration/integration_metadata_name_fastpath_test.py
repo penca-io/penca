@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
+import pytest
 from penca_client.naming import (
     system_indexes_table_uuid,
     system_schema_uuid,
@@ -41,6 +42,12 @@ from .integration_helpers import (
     make_client,
     poll_log_for,
 )
+
+# Serialized: asserts on process-global white-box state (container stdout log
+# windows / pg_stat_statements counters) that a concurrent worker would
+# pollute. Runs in the serial phase, not under -n auto.
+# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+pytestmark = pytest.mark.serial
 
 # The DataFusion-free seek bypass marker — a `tracing` fmt-subscriber unquoted
 # bool field. CHA-380 unified metadata reads onto read_data's kernel, so this

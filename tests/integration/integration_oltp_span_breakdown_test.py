@@ -33,12 +33,20 @@ from __future__ import annotations
 import re
 import time
 
+import pytest
+
 from .integration_helpers import (
     container_log,
     make_client,
     setup_with_data,
     setup_with_data_named,
 )
+
+# Serialized: asserts on process-global white-box state (container stdout log
+# windows / pg_stat_statements counters) that a concurrent worker would
+# pollute. Runs in the serial phase, not under -n auto.
+# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+pytestmark = pytest.mark.serial
 
 # FmtSpan::CLOSE renders the closing span's timing on a `close
 # time.busy=..` event line; requiring the span name on the same line is

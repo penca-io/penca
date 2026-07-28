@@ -5487,6 +5487,11 @@ def _await_statement_cache_event(
     return window
 
 
+# Serialized: asserts on process-global white-box state (container stdout log
+# windows / pg_stat_statements counters) that a concurrent worker would
+# pollute. Runs in the serial phase, not under -n auto.
+# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+@pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanReuse:
     """CHA-355: a statement query plans once — DoGet reuses the
@@ -5533,6 +5538,11 @@ class TestFlightSqlPlanReuse:
         )
 
 
+# Serialized: asserts on process-global white-box state (container stdout log
+# windows / pg_stat_statements counters) that a concurrent worker would
+# pollute. Runs in the serial phase, not under -n auto.
+# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+@pytest.mark.serial
 class TestFlightSqlPlanReuseMiss:
     """CHA-355 cache-miss path. Not parametrized over `driver`: the
     two-connection ticket replay is below the ADBC/JDBC layer — both drivers
@@ -5741,6 +5751,11 @@ def _count_grpc_handler_closes(window: str, span_name: str, branch_uuid: str) ->
     )
 
 
+# Serialized: asserts on process-global white-box state (container stdout log
+# windows / pg_stat_statements counters) that a concurrent worker would
+# pollute. Runs in the serial phase, not under -n auto.
+# TODO(CHA-519): drop this mark once the structured per-request seam lands.
+@pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanningResolutionCount:
     """CHA-367: one Flight SQL SELECT must issue exactly 1 ``get_schema`` and

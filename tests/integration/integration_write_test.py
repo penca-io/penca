@@ -2166,6 +2166,11 @@ class TestWriteDataByUuidSchemaAgnostic:
         )
         assert result.num_rows == 0
 
+    # Serialized: asserts on process-global white-box state (container stdout log
+    # windows / pg_stat_statements counters) that a concurrent worker would
+    # pollute. Runs in the serial phase, not under -n auto.
+    # TODO(CHA-519): drop this mark once the structured per-request seam lands.
+    @pytest.mark.serial
     def test_write_data_by_uuid_resolves_table_metadata_once(self):
         """A by-``table_uuid`` WriteData must issue the SAME number of
         ``__penca_system__.tables`` merge SELECTs as a by-``table_uuid``
