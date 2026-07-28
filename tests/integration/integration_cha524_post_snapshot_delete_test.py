@@ -230,8 +230,6 @@ def test_read_data_survives_post_snapshot_row_delete_on_non_nullable_column():
     # fail here. The schema assertion pins the other half — the strict output
     # contract must survive, since relaxing it too would have turned this bug
     # into silent corruption rather than a loud one.
-    # Order-independent: the merge SQL carries no final ORDER BY, so row order
-    # is a snapshot-layout side effect (PK-sorted segments), not a read contract.
     first = survivors()
     assert _rows(first) == [("b", 2), ("c", 3)]
     assert first.schema == STRICT_SCHEMA, (

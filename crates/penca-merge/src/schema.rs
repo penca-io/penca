@@ -248,9 +248,11 @@ pub(crate) const CANONICAL_TX_METADATA_TAIL: &[(&str, DataType, bool)] = &[
 
 /// Carrier-shaped fixtures shared by this crate's test modules.
 ///
-/// Both live here, beside [`resolved_schema`], because they are positionally
-/// coupled to its column order — a new carrier column is then one edit, not a
-/// set of per-module copies that drift into opaque `try_new` arity errors.
+/// [`test_fixtures::resolved_batch_nullable`] lives beside [`resolved_schema`]
+/// because it is positionally coupled to that schema's column order — a new
+/// carrier column is then one edit, not a set of per-module copies that drift
+/// into opaque `try_new` arity errors. [`test_fixtures::test_user_schema`]
+/// follows it because it is the user schema that builder hardcodes.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use std::sync::Arc;

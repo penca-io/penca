@@ -1276,6 +1276,7 @@ where
 mod tests {
     use super::resolve::string_column;
     use super::schema::resolved_schema;
+    use super::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
     use super::*;
 
     use std::collections::HashMap;
@@ -1661,8 +1662,6 @@ mod tests {
     }
 
     // ----- Fixtures ------------------------------------------------------
-
-    use super::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
 
     /// A resolved batch of live (`is_delete = false`) upsert rows — the common
     /// case (CHA-368: the resolve is now `is_delete`-flagged).
