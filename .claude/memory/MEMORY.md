@@ -19,7 +19,7 @@
 - [feedback_simplest_correct_mechanism_no_hedging.md](feedback_simplest_correct_mechanism_no_hedging.md) — Lead with the simplest correct mechanism; don't over-engineer or hedge.
 - [feedback_tickets_are_spirit_not_spec.md](feedback_tickets_are_spirit_not_spec.md) — Tickets = spirit, not spec; derive the best mechanism, surface alternatives at the gate.
 - [feedback_evaluate_ticket_necessity_first_principles.md](feedback_evaluate_ticket_necessity_first_principles.md) — A well-specified ticket isn't self-justifying; evaluate necessity at the plan gate (CHA-464 was built then cancelled for this miss).
-- [feedback_ask_before_filing_tickets.md](feedback_ask_before_filing_tickets.md) — NEVER file a Linear ticket unprompted; propose and wait
+- [feedback_ask_before_filing_tickets.md](feedback_ask_before_filing_tickets.md) — NEVER file a Linear ticket unprompted; propose and wait (exceptions inside)
 - [feedback_fold_trivial_review_fixes.md](feedback_fold_trivial_review_fixes.md) — Fold trivial in-scope review fixes into the PR; don't file follow-up tickets for one-liners.
 - [feedback_review_role_no_implementation.md](feedback_review_role_no_implementation.md) — During /review-pr, only update comments/tickets — never edit source.
 - [feedback_intermediate_breakage_ok.md](feedback_intermediate_breakage_ok.md) — Large refactors: don't fragment commits to keep CI green every step.
