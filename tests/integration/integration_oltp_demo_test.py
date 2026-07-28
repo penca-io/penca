@@ -47,12 +47,13 @@ _LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per seek) --
 # Lookahead on the closing pipe so adjacent cells share their delimiter —
 # re.findall does not overlap, so consuming it would hide every second cell.
 _MS_CELL = re.compile(r"\|\s*\d+\.?\d*\s*(?=\|)")
-# A table body row: starts with a pipe then a digit. Excludes the header and the
-# alignment rule, so counting these counts rows rather than punctuation.
-_BODY_ROW = re.compile(r"^\|\s*[\w.-]+\s*\|.*\d", re.MULTILINE)
-# The demo's lifecycle line. Persist alone leaves rows queryable from hot, so
-# "cold" is only true once purge has run — this is the marker that says it did.
+# The demo's lifecycle line. Kept as a cheap presence check, but it is only an
+# announcement — _assert_tier_transition below is what actually pins the move.
 _TIER_LINE = "Persisting, snapshotting and purging to cold columnar storage..."
+# The watermarks the demo prints straight after it. Each renders as `none` when
+# its lifecycle call was a no-op, which on the scheduler-idle test profile means
+# the call did not happen.
+_WATERMARKS = ("persisted_at", "snapshotted_at", "purged_at")
 
 
 def _demo_catalogs(client) -> set[str]:
@@ -119,8 +120,47 @@ def _assert_walkthrough(result) -> None:
     for marker in (_TIER_LINE, _ROW_SECTION, _LATENCY_SECTION):
         assert marker in stdout, f"missing {marker!r} in:\n{stdout[-2000:]}"
 
+    _assert_tier_transition(stdout)
     _assert_found_the_right_row(stdout)
     _assert_both_arms_measured(stdout)
+
+
+def _table_body_rows(section: str) -> list[str]:
+    """The data rows of a printed markdown table.
+
+    Structural rather than heuristic: take the pipe-prefixed lines, drop the
+    first (the header), then drop the alignment rule by its content — its cells
+    hold nothing but dashes and colons. Matching body rows by "contains a digit"
+    would count a header as a body row the moment a column name gained one.
+    """
+    piped = [line for line in section.splitlines() if line.startswith("|")]
+
+    return [
+        line
+        for line in piped[1:]
+        if not set(line.replace("|", "").strip()) <= set("-: ")
+    ]
+
+
+def _assert_tier_transition(stdout: str) -> None:
+    """The rows really moved to cold, rather than the demo saying so.
+
+    The announcement line is an unconditional print — deleting the persist,
+    snapshot and purge calls while keeping it would leave every other assertion
+    here green. The watermarks are the real signal, and the demo prints them for
+    exactly this check: on the test profile the lifecycle scheduler is idle, so
+    these calls are the only thing that can move them and `none` means one did
+    not run.
+
+    Purge is the load-bearing one. Persist copies rows to cold but leaves them
+    queryable from hot, so without a purge that advanced, every "cold" number in
+    this run is a hot read wearing a cold label.
+    """
+    for field in _WATERMARKS:
+        assert f"{field}=none" not in stdout, (
+            f"{field} is unset — the lifecycle call behind it was a no-op, so the "
+            f"rows are not where the output says they are:\n{stdout[-2000:]}"
+        )
 
 
 def _assert_found_the_right_row(stdout: str) -> None:
@@ -146,7 +186,7 @@ def _assert_found_the_right_row(stdout: str) -> None:
     # silently stops catching anything at all if the demo ever seeds from 1
     # instead of 0 — the string it looks for would simply never be printed.
     # Counting rows is independent of both the id scheme and _ROWS.
-    body_rows = _BODY_ROW.findall(row_section)
+    body_rows = _table_body_rows(row_section)
     assert len(body_rows) == 1, (
         f"a point lookup returns exactly one row; saw {len(body_rows)} in:\n"
         f"{row_section}"
