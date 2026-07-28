@@ -115,9 +115,11 @@ front, so the branches see identical traffic and can only diverge on what they
 strategies rather than of luck.
 
 Each agent's loop is the shape agentic work actually takes: read the current
-state, decide, write, repeat — reading back its *own* uncommitted-a-moment-ago
-writes, on the same copy it is transacting against. That feedback loop is the
-thing you cannot get from a read replica or a nightly extract.
+state, decide, write, repeat — each round reading back the writes it *committed*
+a moment ago, on the same copy it is transacting against. (Committed, not
+uncommitted: the read is taken before the transaction opens. Nothing here relies
+on reading your own dirty writes.) That feedback loop is the thing you cannot get
+from a read replica or a nightly extract.
 
 The round loop is **ordinary SQL over Flight SQL** — each branch is one
 connection, and branch selection binds at handshake and is immutable for the

@@ -262,9 +262,10 @@ services:
       QUERY_SERVICE_ADDR: http://query:50052
       LIFECYCLE_SERVICE_ADDR: http://lifecycle:50054
       # Default tick: 5s — keeps the unattended-happy-path latency
-      # bounded without burning cycles. Test profile overrides to 1s
-      # via `docker/test.env` so the integration suite's
-      # "wait 2 ticks" assertions complete in seconds.
+      # bounded without burning cycles. Both shipped profiles override it
+      # (CHA-517): `dev` pins 1s so an interactive stack does not sit on
+      # unpersisted hot data, and `test` pins -1 (boot and idle) so the
+      # tick loop cannot race a suite's manual Persist/Snapshot/Purge.
       SCHEDULER_TICK_INTERVAL_SECONDS: "${SCHEDULER_TICK_INTERVAL_SECONDS:-5}"
       SCHEDULER_LIST_PAGE_SIZE: "${SCHEDULER_LIST_PAGE_SIZE:-100}"
       # Universal grace window (ADR 0019) — MUST equal the lifecycle

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import random
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -515,8 +516,11 @@ def test_run_demo_announces_the_fork_and_claims_no_copy(capsys):
     assert f"Forked {len(demo.POLICY_NAMES)} branches off main" in printed, printed
     assert "no data copied" in printed, printed
     assert "shares its storage" in printed, printed
-    # No milliseconds: a duration here would report the flush, not the fork.
-    assert "ms" not in printed.split("no data copied")[0].split("Forked")[-1], printed
+    # No duration anywhere in the fork announcement, not just before the claim:
+    # a fork's cost is the parent's unflushed hot backlog, so any number here
+    # reports the flush rather than the fork and swings with scheduler state.
+    announcement = printed.split("Forked", 1)[1].split("round", 1)[0]
+    assert not re.search(r"\d+\s*(ms|s\b|seconds?)", announcement), announcement
 
 
 def test_run_demo_reports_every_branch_round_to_the_callback():

@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 # The workspace packages, so `uv run` and `uv sync` at the repo root install
 # them editable. Declaring them as `members` below is not enough — uv only
 # installs a workspace member that something actually depends on, so without
-# these a fresh clone gets no `penca_client` and `examples/branch_demo.py`
+# these a fresh clone gets no `penca_client` and `examples/sandbox_demo.py`
 # fails at import with ModuleNotFoundError.
 dependencies = [
     "penca-client",
