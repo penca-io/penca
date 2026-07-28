@@ -375,8 +375,9 @@ def run_rounds(
     connection.
     """
     # Keyed off the branches actually passed in, not POLICY_NAMES: `branches` is
-    # a parameter, so a caller driving a subset (or anything else) would other-
-    # wise KeyError here instead of just running what it asked for.
+    # a parameter, so a caller driving a *subset* would otherwise KeyError here
+    # rather than running the subset. A name that is not a policy at all still
+    # fails, but in choose_creative, which says so.
     rngs = {name: random.Random(f"{config.seed}:{name}") for name in branches}
 
     for round_index, start in enumerate(
@@ -515,6 +516,20 @@ def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
 # --- the whole run -----------------------------------------------------------
 
 
+def close_connections(branches: Mapping[str, PencaClient]) -> None:
+    """Release every branch connection, reporting rather than raising.
+
+    Each connection holds a Flight SQL session; closing is best-effort because
+    this runs from unwind paths where the exception in flight is the one worth
+    propagating.
+    """
+    for branch_name, conn in branches.items():
+        try:
+            conn.close()
+        except Exception as exc:
+            print(f"  (could not close the {branch_name} connection: {exc})")
+
+
 def connect_to_branch(catalog_name: str, branch_name: str) -> PencaClient:
     """A Flight SQL connection pinned to one branch of one catalog."""
     return PencaClient.from_settings(catalog=catalog_name, branch=branch_name)
@@ -535,9 +550,14 @@ def run_demo(
     try:
         branch_uuids = fork_branches(client, prod)
         # One pinned connection per branch: three branches is literally three
-        # endpoints, which is the shape a reader would use.
-        branches = {name: connect(prod.catalog_name, name) for name in POLICY_NAMES}
+        # endpoints, which is the shape a reader would use. Built by assignment
+        # rather than a comprehension so that a failure on the second or third
+        # connect leaves the earlier ones bound in `branches`, where the unwind
+        # below can close them — a comprehension discards the whole dict.
+        for policy_name in POLICY_NAMES:
+            branches[policy_name] = connect(prod.catalog_name, policy_name)
     except BaseException:
+        close_connections(branches)
         # Setup, so leave no debris: nothing has been demonstrated yet, and a
         # connection failure is exactly what a misconfigured reader hits — one
         # stranded catalog per attempt would pile up fast. Contrast the rounds
@@ -559,12 +579,7 @@ def run_demo(
         )
         completed = True
     finally:
-        for branch_name, conn in branches.items():
-            try:
-                conn.close()
-            except Exception as exc:
-                print(f"  (could not close the {branch_name} connection: {exc})")
-
+        close_connections(branches)
         # finally, not straight-line: a failed run is exactly when leaving three
         # live branches behind would hurt most. The prod_* catalog deliberately
         # survives — prod outliving its forks is the thing being demonstrated.

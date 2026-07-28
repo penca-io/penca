@@ -31,3 +31,6 @@ target/
 /.roborev/
 .kata.local.toml
 *-tracker.html
+
+# Persistent stack storage from `just penca-up --db` (never commit a database).
+penca-data/

@@ -1679,8 +1679,6 @@ dev = [
     { name = "ipython", version = "9.10.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "ipython", version = "9.12.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "matplotlib" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1693,7 +1691,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "penca-client", editable = "packages/penca-client" },
     { name = "penca-proto", editable = "packages/penca-proto" },
-    { name = "pyarrow", specifier = ">=18.0.0" },
+    { name = "pyarrow", specifier = ">=23.0.0" },
     { name = "tabulate", specifier = ">=0.10.0" },
 ]
 
@@ -1702,7 +1700,6 @@ dev = [
     { name = "grpcio-tools", specifier = ">=1.70.0" },
     { name = "ipython", specifier = ">=8.39.0" },
     { name = "matplotlib", specifier = ">=3.10.9" },
-    { name = "pandas", specifier = ">=2.3.3" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "ruff", specifier = ">=0.15.0" },

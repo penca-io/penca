@@ -436,8 +436,9 @@ docker-ensure:
 # Requires Docker daemon.
 #
 # Profile selects port bindings:
-#   test    -> random host ports (parallel-worktree safe, default)
-#   dev     -> fixed host ports (50051..50055, 50060)
+#   dev     -> fixed host ports + lifecycle scheduler running (DEFAULT)
+#   test    -> random host ports (parallel-worktree safe) + scheduler idle,
+#              so its tick loop cannot race a suite's manual lifecycle calls
 #
 # After containers are healthy, generates two host-env files with the
 # actual Docker-assigned ports:
@@ -468,6 +469,23 @@ penca-up profile="dev" db="": vm-gc
         mkdir -p "$db_dir/pg" "$db_dir/s3"
         export PENCA_PG_VOLUME="$db_dir/pg"
         export PENCA_S3_VOLUME="$db_dir/s3"
+        # The Docker build context is the repo root (`context: ..` in
+        # compose.yml), so a data directory inside the repo gets shipped to the
+        # daemon on every build — a live Postgres datadir plus the whole object
+        # store — and it shows up in `git status` too. Warn rather than refuse:
+        # it is the caller's disk, and .gitignore/.dockerignore cover the name
+        # the README used to suggest.
+        repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$repo_root" ]; then
+            case "$db_dir/" in
+                "$repo_root"/*)
+                    echo "warning: $db_dir is inside the repo, which is the Docker" >&2
+                    echo "         build context — every build would ship the whole" >&2
+                    echo "         database to the daemon. Prefer a path outside the" >&2
+                    echo "         repo, e.g. --db ~/.penca/data" >&2
+                    ;;
+            esac
+        fi
         echo "Persistent storage: $db_dir (pg/ and s3/)"
     fi
     # Every service in both compose files is tagged with a profile (`infra`

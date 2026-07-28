@@ -10,3 +10,7 @@ dist/
 docs/
 .ruff_cache/
 .pytest_cache/
+
+# Persistent stack storage from `just penca-up --db` — a live Postgres datadir
+# and object store must never enter the build context.
+penca-data/

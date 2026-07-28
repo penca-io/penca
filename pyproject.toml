@@ -17,7 +17,7 @@ dependencies = [
     # ImportError without it — and it otherwise lives only in penca-client's
     # dev group, which a plain root `uv sync` does not install.
     "pandas>=2.3.3",
-    "pyarrow>=18.0.0",
+    "pyarrow>=23.0.0",  # matches penca-client; a looser floor here would lie
     "tabulate>=0.10.0",
 ]
 
@@ -33,7 +33,6 @@ dev = [
     "grpcio-tools>=1.70.0",
     "ipython>=8.39.0",
     "matplotlib>=3.10.9",
-    "pandas>=2.3.3",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "ruff>=0.15.0",

@@ -211,6 +211,14 @@ class _FakeSql:
             }
         )
 
+    def close(self):
+        # Real PencaClients are closed on every path, so the fake must offer it:
+        # without it each close raised AttributeError, was swallowed by the
+        # best-effort `except Exception`, and printed a "could not close" line
+        # for every branch of every test — leaving the close path untested and
+        # the suite output noisy.
+        self.calls.append((self.branch, "close", ""))
+
     def execute_update(self, sql):
         self.calls.append((self.branch, "update", sql))
         if self.fail_on and self.fail_on in sql:
@@ -550,6 +558,64 @@ def test_run_demo_drops_the_catalog_when_a_fork_fails():
     )
     assert admin.deleted == [f"uuid-{demo.POLICY_NAMES[0]}"], (
         f"the fork created before the failure must be discarded, saw {admin.deleted}"
+    )
+
+
+def test_a_failed_connect_leaves_no_forks_and_no_catalog():
+    """Setup failures must leave no debris.
+
+    `connect` sat outside every unwind envelope, so a connection failure left
+    three live forks AND a catalog behind — and a connection failure is exactly
+    what a misconfigured reader hits, so it would have accumulated one per
+    attempt. Contrast the rounds, which deliberately KEEP the catalog.
+    """
+    admin = _FakeAdmin()
+    calls: list[tuple[str, str, str]] = []
+    opened: list[str] = []
+
+    def failing_connect(_catalog, branch):
+        # Fail on the last branch, so the earlier connections exist and must be
+        # closed by the unwind rather than leaked.
+        if branch == demo.POLICY_NAMES[-1]:
+            raise RuntimeError("connect refused")
+
+        opened.append(branch)
+
+        return _FakeSql(calls, branch)
+
+    try:
+        demo.run_demo(admin, _small_config(), connect=failing_connect)
+    except RuntimeError as exc:
+        assert "connect refused" in str(exc), exc
+    else:
+        raise AssertionError("the connect failure must propagate")
+
+    assert admin.deleted_catalogs == ["cat"], (
+        f"a failed connect must not strand the catalog, saw {admin.deleted_catalogs}"
+    )
+    assert sorted(admin.deleted) == sorted(
+        f"uuid-{name}" for name in demo.POLICY_NAMES
+    ), f"every fork must be discarded, saw {admin.deleted}"
+
+    # The connections opened before the failure must be closed. Built by
+    # assignment rather than a comprehension precisely so the unwind can see
+    # them; a comprehension discards the partial dict and leaks them.
+    closed = {branch for branch, kind, _sql in calls if kind == "close"}
+    assert closed == set(opened), (
+        f"connections opened before the failure must be closed; "
+        f"opened {opened}, closed {sorted(closed)}"
+    )
+
+
+def test_a_green_run_closes_every_connection():
+    """Each connection holds a Flight SQL session, so a run that opens four must
+    not leave them dangling."""
+    calls: list[tuple[str, str, str]] = []
+    demo.run_demo(_FakeAdmin(), _small_config(), connect=_connect_factory(calls))
+
+    closed = [branch for branch, kind, _sql in calls if kind == "close"]
+    assert sorted(closed) == sorted([*demo.POLICY_NAMES, "main"]), (
+        f"every branch connection plus main's must be closed, saw {closed}"
     )
 
 

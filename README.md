@@ -93,7 +93,7 @@ driver at it. To keep your data across restarts, give it a directory — both
 Postgres and the object store write there, and it survives `just penca-down`:
 
 ```bash
-just penca-up --db ./penca-data
+just penca-up --db ~/.penca/data
 ```
 
 ### `examples/branch_demo.py` — fork, transact, read back, discard
