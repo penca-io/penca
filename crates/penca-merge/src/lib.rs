@@ -1187,13 +1187,14 @@ where
 mod tests {
     use super::resolve::string_column;
     use super::schema::resolved_schema;
+    use super::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
     use super::*;
 
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::common::DFSchema;
@@ -1549,13 +1550,6 @@ mod tests {
         }
     }
 
-    fn test_user_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-        ]))
-    }
-
     /// A resolved batch of live (`is_delete = false`) upsert rows.
     fn make_resolved_batch(
         row_uuids: &[&str],
@@ -1577,18 +1571,13 @@ mod tests {
         committed_ats: &[i64],
         is_deletes: &[bool],
     ) -> RecordBatch {
-        let schema = resolved_schema(&test_user_schema());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(row_uuids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(committed_ats.to_vec())),
-                Arc::new(arrow::array::BooleanArray::from(is_deletes.to_vec())),
-            ],
+        resolved_batch_nullable(
+            row_uuids,
+            &names.iter().copied().map(Some).collect::<Vec<_>>(),
+            &values.iter().copied().map(Some).collect::<Vec<_>>(),
+            committed_ats,
+            is_deletes,
         )
-        .unwrap()
     }
 
     fn make_snapshot_batch(row_uuids: &[&str], names: &[&str], values: &[i32]) -> RecordBatch {
@@ -2541,6 +2530,78 @@ mod tests {
             "segment with stats [0,299] should be pruned by `l.value > 999`; got reads = {:?}",
             dl.recorded_snapshot_reads()
         );
+    }
+
+    /// A tombstone whose user columns are NULL — production's actual
+    /// shape once a Snapshot has fenced the row's upsert out of `latest` — must
+    /// flow through the read, not abort it. The table declares `name`/`value`
+    /// non-nullable (`test_user_schema`), which is exactly the condition that
+    /// used to make `RecordBatch::try_new` reject the resolve and wedge every
+    /// later read.
+    ///
+    /// The schema assertion is the half that distinguishes this fix from the
+    /// silent-corruption alternative: relaxing the OUTPUT contract too would
+    /// also make the read succeed, while handing clients an all-nullable schema
+    /// for a table they declared strict.
+    #[tokio::test]
+    async fn null_carrying_tombstone_resolves_without_wedging_the_read() {
+        let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("s1")]);
+        let schema = test_user_schema();
+        let dl = MockDlDriver::default()
+            .with_resolved(resolved_batch_nullable(
+                &["u1", "d1"],
+                &[Some("a"), None],
+                &[Some(1), None],
+                &[100, 150],
+                &[false, true],
+            ))
+            .with_snapshot("s1", make_snapshot_batch(&["s-row"], &["s"], &[9]));
+
+        let batches = collect_stream(stream_all_cold(MergeReadRequest {
+            segment_order: SegmentOrder::ByCompletion,
+            plan: &plan,
+            driver: &MockDriver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &ReadSnapshot::AsOfMicros(2_000),
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 2,
+            snapshot_prune_min_segments: 0,
+        }))
+        .await
+        .expect("a NULL-carrying tombstone must not abort the read");
+
+        // Static panic messages, nothing derived from `emitted` interpolated
+        // into them: row_uuids are PK-derived, and CodeQL's cleartext-logging
+        // rule treats an assert message as a log sink and taints anything
+        // reached from them — including `.len()`, whose receiver carries the
+        // taint. `assert!` evaluates its condition without printing it.
+        let emitted = all_row_uuids(&batches);
+        assert!(
+            emitted.len() == 2,
+            "expected exactly the live row and the snapshot row"
+        );
+        assert!(
+            !emitted.contains(&"d1".to_string()),
+            "the tombstone must be dropped from the live delta"
+        );
+        assert!(
+            emitted.contains(&"u1".to_string()),
+            "the live row must survive"
+        );
+        assert!(
+            dl.recorded_scan_exclusion().contains(&"d1".to_string()),
+            "the tombstone must still shadow its snapshot version"
+        );
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                snapshot_read_schema(&test_user_schema()),
+                "the strict output contract must survive the carrier's relaxation"
+            );
+        }
     }
 
     /// For an all-cold plan, the dedicated cold path must produce the

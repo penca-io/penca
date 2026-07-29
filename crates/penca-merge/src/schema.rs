@@ -23,9 +23,29 @@ pub fn snapshot_read_schema(user_schema: &SchemaRef) -> SchemaRef {
 /// NULL). The full `row_uuid` set of this batch IS the exclusion set (it
 /// replaces the retired Query-B probe); the `is_delete = false` subset is the
 /// live rows the merge emits.
+///
+/// The user columns are declared NULLABLE regardless of what the table
+/// declared, because the tombstone arm has no values to put in them: the delete
+/// log stores no user columns, so `two_arm_resolve_select` sources them from a
+/// LEFT-JOINed `latest` purely to type-match the UNION. Once a Snapshot advances
+/// the hot fence `max(Pu, W_snap)` past a row's original upsert that join misses
+/// and the arm emits NULLs, which `RecordBatch::try_new` rejects against a
+/// non-nullable declaration — wedging every later read of the table.
+///
+/// This does NOT weaken the user-data contract: that lives on
+/// [`snapshot_read_schema`], which stays strict and is applied by
+/// `output::project_to_output` *after* `resolve::filter_live_rows` has dropped
+/// every tombstone, so a genuine NULL in a live row still fails loudly.
+/// `row_uuid` / `commit_micros` / `is_delete` stay non-nullable: both arms
+/// always populate all three.
 pub(crate) fn resolved_schema(user_schema: &SchemaRef) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("row_uuid", DataType::Utf8, false))];
-    fields.extend(user_schema.fields().iter().cloned());
+    fields.extend(
+        user_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true))),
+    );
     fields.push(Arc::new(Field::new(
         "commit_micros",
         DataType::Int64,
@@ -223,6 +243,59 @@ pub(crate) const CANONICAL_TX_METADATA_TAIL: &[(&str, DataType, bool)] = &[
     ("commit_seq_num", DataType::Int64, false),
 ];
 
+/// Carrier-shaped fixtures shared by this crate's test modules.
+///
+/// [`test_fixtures::resolved_batch_nullable`] lives beside [`resolved_schema`]
+/// because it is positionally coupled to that schema's column order — a new
+/// carrier column is then one edit, not a set of per-module copies that drift
+/// into opaque `try_new` arity errors. [`test_fixtures::test_user_schema`]
+/// follows it because it is the user schema that builder hardcodes.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    /// Both user columns are NON-nullable on purpose: that is the condition
+    /// under which the tombstone arm's NULLs used to abort the read (CHA-524),
+    /// so relaxing it here would silently retire the regression locks.
+    pub(crate) fn test_user_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]))
+    }
+
+    /// A resolved batch whose user columns may be NULL — the shape the tombstone
+    /// arm actually produces: the delete log carries no user columns, so once a
+    /// Snapshot fences the row's upsert out of the hot `latest` CTE the arm
+    /// emits NULLs.
+    ///
+    /// Constructing against [`super::resolved_schema`] is itself the regression
+    /// lock: re-tightening the carrier's user columns makes `try_new` fail here.
+    pub(crate) fn resolved_batch_nullable(
+        row_uuids: &[&str],
+        names: &[Option<&str>],
+        values: &[Option<i32>],
+        commit_micros: &[i64],
+        is_deletes: &[bool],
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            super::resolved_schema(&test_user_schema()),
+            vec![
+                Arc::new(StringArray::from(row_uuids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(commit_micros.to_vec())),
+                Arc::new(BooleanArray::from(is_deletes.to_vec())),
+            ],
+        )
+        .expect("the resolve carrier must accept NULL user columns")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +310,36 @@ mod tests {
             .map(|(n, t, nul)| (*n, t.clone(), *nul))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// CHA-524: the two-arm resolve emits tombstone rows whose user columns are
+    /// NULL by construction, so the carrier must declare them nullable — while
+    /// the OUTPUT schema stays strict, since `filter_live_rows` drops those rows
+    /// before `project_to_output` applies it. Locking both halves together is
+    /// the point: relaxing the output schema too would turn the wedged read this
+    /// fixes into silent corruption.
+    #[test]
+    fn resolved_schema_relaxes_user_columns_but_output_schema_stays_strict() {
+        let user: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+
+        let resolved = resolved_schema(&user);
+        assert!(resolved.field_with_name("name").unwrap().is_nullable());
+        assert!(resolved.field_with_name("note").unwrap().is_nullable());
+        for required in ["row_uuid", "commit_micros", "is_delete"] {
+            assert!(
+                !resolved.field_with_name(required).unwrap().is_nullable(),
+                "{required} is populated by both arms and must stay non-nullable"
+            );
+        }
+
+        let output = snapshot_read_schema(&user);
+        assert!(
+            !output.field_with_name("name").unwrap().is_nullable(),
+            "the output contract must keep the table's declared non-nullability"
+        );
     }
 
     #[test]

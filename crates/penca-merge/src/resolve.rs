@@ -446,7 +446,36 @@ fn dedup_by_row_uuid(batch: &RecordBatch) -> Result<RecordBatch, MergeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::fold_cold_seq_upper;
+    use super::{compose_resolved_and_exclusion, fold_cold_seq_upper};
+    use crate::schema::resolved_schema;
+    use crate::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
+
+    /// CHA-524, the production shape: the tombstone is in HOT (committed after
+    /// the snapshot) while its upsert is already COLD, so the hot arm's
+    /// `deletes d LEFT JOIN latest l` finds no `latest` row and emits NULL user
+    /// columns. Both batches are non-empty here, so — unlike the all-cold path,
+    /// where `union_latest` short-circuits on the empty hot side — this drives
+    /// the NULLs through `concat_batches` against the carrier schema and then
+    /// through the cross-tier `dedup_by_row_uuid`.
+    #[test]
+    fn hot_null_tombstone_beats_cold_upsert_and_feeds_the_exclusion_set() {
+        let schema = resolved_schema(&test_user_schema());
+        let hot = resolved_batch_nullable(&["r1"], &[None], &[None], &[200], &[true]);
+        let cold = resolved_batch_nullable(&["r1"], &[Some("a")], &[Some(1)], &[100], &[false]);
+
+        let (resolved, exclusion) = compose_resolved_and_exclusion(&schema, &hot, &cold)
+            .expect("a NULL-carrying hot tombstone must not abort the composition");
+
+        assert_eq!(
+            resolved.num_rows(),
+            0,
+            "the newer tombstone must shadow the cold upsert out of the live delta"
+        );
+        assert!(
+            exclusion.contains("r1"),
+            "the tombstone must still shadow its snapshot version"
+        );
+    }
 
     // The cold seq upper folds the tier fence `W_persist`
     // with the `AsOfSeq` visibility cap into one inclusive `<= min(..)` bound.
