@@ -191,7 +191,7 @@ Either way the loop moves on to the next branch.
 
 **Per-table.** Purge failures are swallowed inside `ops::purge_one`.
 `PersistBranch` and `SnapshotBranch` swallow their own per-table failures
-server-side and report it by leaving `BranchOpResponse.watermark` unset — a
+server-side and report them by leaving `BranchOpResponse.watermark` unset — a
 *different* watermark from the scheduler's enumeration watermarks, which advance
 regardless. The scheduler logs the unset response; `CreateBranch` treats it as a
 hard error.
