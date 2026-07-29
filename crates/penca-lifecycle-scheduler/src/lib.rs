@@ -21,8 +21,8 @@
 //!
 //! ## Failure semantics
 //!
-//! Nothing here retries in-process; recovery always waits for a later tick, and
-//! whether one is guaranteed to come differs per op. The **full tier-by-tier
+//! Nothing here retries in-process; recovery waits for a later tick, and whether
+//! that tick is guaranteed to retry the failed table differs per op. The **full tier-by-tier
 //! breakdown lives in
 //! `docs/services/lifecycle-scheduler.md`, section "Failure handling"** — it is
 //! the operator-facing contract and the single source of truth. Do not restate

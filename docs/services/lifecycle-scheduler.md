@@ -168,9 +168,9 @@ All values are required from environment variables; defaults live in
 
 ## Failure handling
 
-Failure handling has three tiers. Nothing retries in-process: recovery always
-waits for a later tick, and whether it is guaranteed to come differs per op — see
-"What gets retried, and when" below.
+Failure handling has three tiers. Nothing retries in-process: recovery waits for
+a later tick, and whether that tick is guaranteed to *retry the failed table*
+differs per op — see "What gets retried, and when" below.
 
 **Discovery.** A `ListCatalogs` / `ListBranches` error propagates out of the tick
 entirely. Nothing else runs that tick, in either loop.
@@ -190,28 +190,34 @@ entirely. Nothing else runs that tick, in either loop.
 Either way the loop moves on to the next branch.
 
 **Per-table.** Purge failures are swallowed inside `ops::purge_one`. The branch
-ops swallow their own per-table failures server-side and report it by leaving
-`BranchOpResponse.watermark` unset — a *different* watermark from the scheduler's
+`PersistBranch` and `SnapshotBranch` swallow their own per-table failures
+server-side and report it by leaving `BranchOpResponse.watermark` unset — a *different* watermark from the scheduler's
 enumeration watermarks, which advance regardless. The scheduler logs the unset
 response; `CreateBranch` treats it as a hard error.
 
-Swallowing per-table failures is load-bearing, not incidental: both dirty sets
-are enumerated oldest-timestamp-first, so a table whose op keeps failing sorts
-first on every subsequent sweep and would starve everything behind it if the
-loop aborted on it.
+Swallowing is load-bearing for the **branch ops** specifically, not incidental:
+their enumerations are unwindowed and ordered oldest-timestamp-first, so a table
+whose op keeps failing sorts first on every subsequent sweep and would starve
+everything behind it if the server-side loop aborted on it. (`ops::purge_one`
+runs under windowed enumerations, where a poison table ages out of the window
+rather than pinning the head.)
 
 ### What gets retried, and when
 
 The branch ops enumerate **unwindowed** — `list_all_modified_table_uuids` and
 `list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound,
-and neither set is filtered on failure. A table that failed is simply still in
-the set, so it is retried on the next tick with no dependence on new traffic:
+and neither set is filtered on failure — or, for the persisted set, on snapshot
+state at all. `ListPersistedTables` selects every table with a committed
+`table_persist_metadata` row (`branch_uuid` plus `commit_micros IS NOT NULL`);
+there is no "and not yet snapshotted" predicate, so `SnapshotBranch` re-visits
+every persisted table each tick and the per-table `Snapshot` no-ops when its own
+watermark already covers the range. `ListModifiedTables` is the union of
+committed and aborted writers via `tx_table_log`, whose rows only `PurgeTxLog`
+clears and which it cannot reach until Purge advances.
 
-- a failed Snapshot keeps its committed persist row with no snapshot past it, so
-  it remains in `ListPersistedTables`;
-- a failed Persist keeps its `tx_table_log` rows, which only `PurgeTxLog` clears
-  and which it cannot reach until Purge advances, so it remains in
-  `ListModifiedTables`.
+So a table that failed is retried not because its failure kept it in the set, but
+because the set never excluded it: membership tracks persist and write state, not
+success.
 
 The two **Purge** passes are windowed, and their windows differ in both bounds:
 the modified pass runs `[last_modified_tick, now)`, the aged-persisted pass runs
