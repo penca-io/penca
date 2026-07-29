@@ -12,7 +12,7 @@
 mod cold_read;
 mod index_select;
 mod meta_plan;
-mod meta_resolve;
+pub(crate) mod meta_resolve;
 
 use crate::scope::ResolvedScope;
 

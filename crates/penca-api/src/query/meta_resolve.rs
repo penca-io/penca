@@ -28,14 +28,94 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
+use penca_storage_hot::HotStorageClient;
 use penca_storage_meta::convert::{
     self, index_from_record_batch, schema_from_record_batch, table_from_record_batch,
 };
 use penca_storage_meta::helpers::{parse_uuid, qi, resolve_branch};
 use penca_storage_meta::{LifecycleManager, MetadataError, Result};
 
+use crate::error::ApiError;
+
 use super::QueryManager;
 use super::cold_read::stream_cold_read;
+
+/// Resolve a `tx_uuid` to its open state, returning the tx's `began_at_seq_num`.
+///
+/// Reads the single-shot `begin_tx_log ⟕ abort_tx_log ⟕ commit_tx_log` join via
+/// `HotStorageClient::get_tx_status` against the request branch's leaf
+/// partitions, and rejects:
+/// - a tx with no `begin_tx_log` row (never begun, or begun on another
+///   branch) → `NotFound`;
+/// - a tx that is aborted / expired / already committed →
+///   `FailedPrecondition`.
+///
+/// The returned `began_at_seq_num` is the read path's snapshot anchor
+/// ([`ReadSnapshot::OpenTx`]); the append path ignores it and uses this purely as
+/// a liveness gate.
+///
+/// Snapshot read (`for_update=false`): a best-effort fast-fail, not a lock.
+/// Under READ COMMITTED a concurrent `abort_tx` / expiry sweep can land an
+/// `abort_tx_log` row after this SELECT but before the append commits, so a
+/// racing append can still reference a tx that just went non-open. That's
+/// acceptable because final consistency is enforced at `CommitTx`
+/// (`commit_open_tx` takes `FOR UPDATE OF begin_tx_log` and re-checks abort),
+/// so no committed data ever references a non-open tx — the orphaned
+/// upsert/delete rows are filtered by the `commit_tx_log` JOIN on read. A
+/// `for_update=true` lock here would only serialize concurrent appends to the
+/// same tx without buying any correctness — `CommitTx` is the authoritative gate.
+pub(crate) async fn resolve_tx(
+    driver: &impl DbDriver<Row = PgRow>,
+    catalog_uuid: &Uuid,
+    branch_uuid: &Uuid,
+    tx_uuid: &str,
+) -> std::result::Result<i64, ApiError> {
+    let parsed = Uuid::parse_str(tx_uuid)
+        .map_err(|e| ApiError::InvalidRequest(format!("invalid tx_uuid '{tx_uuid}': {e}")))?;
+    let begin_partition = naming::begin_tx_log_partition(catalog_uuid, branch_uuid);
+    let abort_partition = naming::abort_tx_log_partition(catalog_uuid, branch_uuid);
+    let tx_partition = naming::commit_tx_log_partition(catalog_uuid, branch_uuid);
+    let hot = HotStorageClient;
+    let status = hot
+        .get_tx_status(
+            driver,
+            &begin_partition,
+            &abort_partition,
+            &tx_partition,
+            &parsed,
+            false,
+        )
+        .await?
+        // TODO(CHA-541): these four are stringly-typed `ApiError` variants, so a
+        // caller wanting to branch on which state the tx is in has to string-match.
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "transaction not found on branch {branch_uuid} \
+                 (never begun, or begun on a different branch): {tx_uuid}"
+            ))
+        })?;
+    match status {
+        penca_storage_hot::TxStatus::Open {
+            began_at_seq_num, ..
+        } => Ok(began_at_seq_num),
+        penca_storage_hot::TxStatus::Aborted {
+            aborted_at_micros, ..
+        } => Err(ApiError::FailedPrecondition(format!(
+            "transaction {tx_uuid} was aborted at {aborted_at_micros}"
+        ))),
+        penca_storage_hot::TxStatus::Expired { expired_at_micros } => {
+            Err(ApiError::FailedPrecondition(format!(
+                "transaction {tx_uuid} expired at {expired_at_micros} \
+                 (the lifecycle sweep will move it to abort_tx_log)"
+            )))
+        }
+        penca_storage_hot::TxStatus::Committed { commit_micros } => {
+            Err(ApiError::FailedPrecondition(format!(
+                "transaction {tx_uuid} was already committed at {commit_micros}"
+            )))
+        }
+    }
+}
 
 /// Pure mapping from the `commit_tx_log_seq_num` counter value (the NEXT `commit_seq_num`
 /// to allocate) to the per-branch commit frontier (the last committed serial):
@@ -523,10 +603,12 @@ impl QueryManager {
     /// Mutex precedence (callers must enforce the mutex at the proto
     /// boundary; this method picks deterministically if several are set):
     ///
-    /// 1. `open_tx_uuid = Some` → looks up `began_at_seq_num` in
-    ///    `begin_tx_log`; returns [`ReadSnapshot::OpenTx`] for
-    ///    snapshot-isolation + RYOW. Unknown / already-settled tx falls
-    ///    through to the default.
+    /// 1. `open_tx_uuid = Some` → resolves the tx through [`resolve_tx`] and
+    ///    returns [`ReadSnapshot::OpenTx`] for snapshot-isolation + RYOW. A tx
+    ///    that is not open is an ERROR (`NotFound` / `FailedPrecondition`), never
+    ///    a fall-through: resolving a dead tx at committed-latest would serve a
+    ///    caller that believes it is inside a transaction. Only `None` — "no tx
+    ///    supplied" — reaches the arms below.
     /// 2. `as_of_micros = Some` → [`ReadSnapshot::AsOfMicros`] (identifiers
     ///    resolve on the micros axis, matching a micros data read).
     /// 3. `as_of_seq = Some` → [`ReadSnapshot::AsOfSeq`] — a seq time-travel
@@ -551,20 +633,25 @@ impl QueryManager {
         as_of_micros: Option<i64>,
         as_of_seq: Option<i64>,
         default_frontier: Option<i64>,
-    ) -> Result<ReadSnapshot> {
+    ) -> std::result::Result<ReadSnapshot, ApiError> {
+        // The axes are mutually exclusive: RYOW only makes sense at the tx's own
+        // begin frontier, so an as_of alongside an open tx is a contradiction
+        // rather than a precedence question.
+        if open_tx_uuid.is_some() && (as_of_micros.is_some() || as_of_seq.is_some()) {
+            return Err(ApiError::InvalidRequest(
+                "exactly one of as_of / open_tx_uuid may be set".to_string(),
+            ));
+        }
         if let Some(tx_str) = open_tx_uuid {
             let tx_uuid = parse_uuid(tx_str);
             let catalog = parse_uuid(catalog_uuid);
             let branch = parse_uuid(branch_uuid);
-            if let Some(began_at_seq_num) =
-                LifecycleManager::get_open_tx_began_at_seq_num(driver, &catalog, &branch, &tx_uuid)
-                    .await?
-            {
-                return Ok(ReadSnapshot::OpenTx {
-                    began_at_seq_num,
-                    tx_uuid,
-                });
-            }
+            let began_at_seq_num = resolve_tx(driver, &catalog, &branch, tx_str).await?;
+
+            return Ok(ReadSnapshot::OpenTx {
+                began_at_seq_num,
+                tx_uuid,
+            });
         }
         if let Some(ts) = as_of_micros {
             return Ok(ReadSnapshot::AsOfMicros(ts));
