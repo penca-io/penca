@@ -56,6 +56,7 @@ import time
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client.naming import (
     abort_tx_log_partition,
@@ -909,6 +910,9 @@ class TestPurgeTxLogLiveQuerySafety:
     a consistent view even under churn. ``PurgeTxLog`` running in the
     background must not break in-flight ``read_data`` calls."""
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_live_query_safety_under_purge_tx_log_churn(self):
         """A ``read_data`` consumer running for ~3 seconds against a
         branch with concurrent Persist+Purge+PurgeTxLog churn returns

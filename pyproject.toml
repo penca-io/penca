@@ -114,16 +114,10 @@ testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
 # recomputes it — so the `MarkGenerator` check reads the unset default. The ini
 # key below is read from `_inicfg` and does fail collection.
 #
-# `filterwarnings` is belt-and-braces for the same typo. It is kept because it
-# is independent, but it is the weaker of the two: it reports a warning
-# traceback rather than "'serail' not found in `markers`", and a stray `-W` or
-# `@pytest.mark.filterwarnings` can switch it off.
-#
-# Neither guards the `-m` EXPRESSION — `-m "not serail"` silently matches
-# everything. That gap is why the recipe's phases must not both be allowed to
+# This does NOT guard the `-m` EXPRESSION — `-m "not serail"` silently matches
+# everything — which is why the recipe's phases must not both be allowed to
 # collect zero tests.
 strict_markers = true
-filterwarnings = ["error::pytest.PytestUnknownMarkWarning"]
 markers = [
-    "serial: tests that must run alone, outside the -n auto parallel phase. Two reasons, and only the first goes away with CHA-519: (a) the test reads a process-global side channel — container stdout via container_log/poll_log_for, or pg_stat_statements reset+count — which a concurrent worker pollutes; (b) the test deliberately parks a servicer PG connection (advisory lock, LOCK TABLE) while asserting a bounded time, so concurrent workers contending for the same PG_POOL_MAX=4 pool would make it flaky in both directions.",
+    "serial: tests that must run alone, outside the -n auto parallel phase. Two reasons, and only the first goes away with CHA-519: (a) the test reads a process-global side channel — container stdout via container_log/poll_log_for, or pg_stat_statements reset+count — which a concurrent worker pollutes; (b) the test deliberately parks or saturates servicer PG connections (advisory lock, LOCK TABLE, sustained concurrent churn) while asserting a bounded time or zero errors, so concurrent workers contending for the same PG_POOL_MAX=4 pool would make it flaky in both directions.",
 ]

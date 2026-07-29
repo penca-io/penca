@@ -783,8 +783,9 @@ fetch-jdbc-driver:
 # Requires Docker daemon. Uses the test profile (random ports) by default,
 # safe for parallel worktrees. Pass service names to run specific tests:
 #   just integration-test lifecycle query
-# Lower the parallel phase's worker ceiling (default 4) on a constrained box:
-#   PENCA_TEST_JOBS=2 just integration-test
+# Set the parallel phase's worker count (default `auto`, capped at 4). Raises
+# as well as lowers, so a 2-core box can reproduce CI's 4-worker contention:
+#   PENCA_TEST_JOBS=4 just integration-test
 # Note a named subset now runs its non-serial tests under xdist too, so it is
 # representative of CI — but that means output is captured and breakpoint()/pdb
 # won't attach. For an interactive debug loop, call pytest directly.
@@ -857,45 +858,49 @@ integration-test *services:
     # which reads like a product bug rather than contention. PENCA_TEST_JOBS
     # only lowers the ceiling, since `--maxprocesses` bounds `-n auto` from
     # above; inert on CI, where ubuntu-latest gives public repos 4 cores.
+    #
+    # PENCA_TEST_JOBS binds `-n`, not `--maxprocesses`, so it can raise as well
+    # as lower. That matters because `--maxprocesses` is only a ceiling on
+    # `-n auto`: on a 2-core box no value could reach CI's 4 workers, leaving
+    # the queue as the only place contention was reproducible. The cap stays as
+    # a separate backstop for `auto` on a large dev machine.
     parallel_rc=0
-    uv run pytest "${files[@]}" \
-        -m "not serial" -n auto --maxprocesses "${PENCA_TEST_JOBS:-4}" || parallel_rc=$?
+    uv run pytest "${files[@]}" -m "not serial" \
+        -n "${PENCA_TEST_JOBS:-auto}" --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
 
     # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
     # which is indistinguishable from collecting nothing. Each phase may
     # legitimately be empty, but only under conditions the other phase proves,
     # so neither tolerance is unconditional and they are not symmetric.
     #
-    # SERIAL empty: fine only when the SELECTED files carry no `serial` mark —
+    # SERIAL empty: fine only when the SELECTED files hold no serial test —
     # true for most named subsets, and true everywhere once CHA-519 lands. The
     # exit code alone cannot say WHY: `-m` expressions are unvalidated, so a
     # mistyped `-m "seriall"` also collects zero while the other phase still
     # excludes those tests — every side-channel test skipped, gate green.
-    # Scoping the scan to the selected files is what makes this right for a
-    # subset and not just the full run.
     #
-    # The scan matches the mark SYNTAX, not the bare string, so prose naming
-    # the marker (integration_helpers.py documents it) doesn't keep the guard
-    # armed after CHA-519. grep's exit 2 (scan failed) stays distinct from 1
-    # (no marks): only the latter may apply the tolerance.
+    # Ask pytest rather than pattern-matching the source. Earlier revisions
+    # grepped for the mark, which meant maintaining a second definition of
+    # "is marked" alongside the static check's AST walk — and the two drifted
+    # (prose mentions, multi-line `pytestmark` lists, recursion scope) every
+    # time either moved. A collect-only run over the same files with the same
+    # `-m` cannot disagree with the phase it is vouching for.
     serial_collected=1
     if [ "$serial_rc" -eq 5 ]; then
         serial_collected=0
-    fi
 
-    if [ "$serial_rc" -eq 5 ]; then
         set +e
-        grep -qE '^[[:space:]]*(@pytest\.mark\.serial|pytestmark[[:space:]]*=.*pytest\.mark\.serial)' "${files[@]}"
-        grep_rc=$?
+        uv run pytest "${files[@]}" -m "serial" --collect-only -q >/dev/null 2>&1
+        collect_rc=$?
         set -e
 
-        if [ "$grep_rc" -eq 0 ]; then
-            echo "serial phase collected zero tests while @pytest.mark.serial still exists" >&2
+        if [ "$collect_rc" -eq 0 ]; then
+            echo "serial phase collected zero tests while serial-marked tests exist" >&2
             exit 1
         fi
 
-        if [ "$grep_rc" -ne 1 ]; then
-            echo "could not scan the selected tests for serial marks (grep exit $grep_rc)" >&2
+        if [ "$collect_rc" -ne 5 ]; then
+            echo "could not collect the selected tests (pytest exit $collect_rc)" >&2
             exit 1
         fi
 

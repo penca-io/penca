@@ -17,6 +17,11 @@ helper (``_await_statement_cache_event`` in the Flight SQL suite,
 ``_poll_for_read_data_ids_close`` in the point-read suite) — a body grep marks
 neither.
 
+This checks reason (a) of the ``serial`` marker only — the side-channel one.
+Reason (b) marks (contention: a test parking or saturating servicer PG
+connections) are hand-placed and outlive CHA-519, so deleting this file must
+not un-mark them. See the marker description in ``pyproject.toml``.
+
 Lives in ``tests/static`` because it reads source and needs no Docker, so it
 runs in the Python-unit CI job, which — unlike the integration job — runs on
 every PR. CHA-519 deletes the side channels; this file goes with them.
@@ -115,23 +120,29 @@ def _touches_side_channel_literal(node: ast.AST) -> bool:
     return False
 
 
-def _coupled_functions(tree: ast.Module, roots: frozenset[str]) -> set[str]:
-    """Names of functions in ``tree`` that reach ``roots``, transitively.
+def _coupled_functions(trees: list[ast.Module], roots: frozenset[str]) -> set[str]:
+    """Names of functions across ``trees`` that reach ``roots``, transitively.
 
     Fixed-point rather than one pass: a test may call a helper that calls a
     helper.
 
-    Names are NOT unique within a module — the Flight SQL suite defines
-    ``_exec_query`` in three classes, and the write suite defines ``_setup``
-    twice. So a name maps to every definition sharing it and their callees are
-    unioned: an over-broad match costs a spurious mark, while keying on the
-    last definition would silently drop a scraping sibling out of the result,
-    which is the direction that fails quiet.
+    Takes every module at once rather than one at a time, because these
+    modules import helpers from each other — the cha492 suites both pull
+    ``_sql_steps_via`` from the point-read suite, which is itself a scraper
+    definer. Resolving per module would leave those callees unresolved and
+    their callers unflagged, which fails quiet.
+
+    Names are NOT unique — the Flight SQL suite defines ``_exec_query`` in
+    three classes, and the write suite defines ``_setup`` twice — so a name
+    maps to every definition sharing it and their callees are unioned. An
+    over-broad match costs a spurious mark; keying on the last definition
+    would silently drop a scraping sibling, which is the direction that hides.
     """
     definitions: dict[str, list[ast.AST]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            definitions.setdefault(node.name, []).append(node)
+    for tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions.setdefault(node.name, []).append(node)
 
     coupled = {
         name
@@ -164,7 +175,7 @@ def _side_channel_helpers() -> frozenset[str]:
     """
     tree = ast.parse((INTEGRATION / "integration_helpers.py").read_text())
     return ROOT_SIDE_CHANNEL_HELPERS | _coupled_functions(
-        tree, ROOT_SIDE_CHANNEL_HELPERS
+        [tree], ROOT_SIDE_CHANNEL_HELPERS
     )
 
 
@@ -185,9 +196,13 @@ def test_every_side_channel_test_is_marked_serial():
     # the `_test` convention is scanned too. integration_helpers.py is included
     # rather than skipped: the phases collect it, so a `test_*` added there
     # would run, and its non-test helpers simply never match below.
-    for path in sorted(INTEGRATION.glob("integration_*.py")):
-        tree = ast.parse(path.read_text())
-        coupled = _coupled_functions(tree, helpers)
+    paths = sorted(INTEGRATION.glob("integration_*.py"))
+    trees = {path: ast.parse(path.read_text()) for path in paths}
+    # One closure over every module, so a helper imported from a sibling test
+    # module resolves. Per-module closures left those callees unresolved.
+    coupled = _coupled_functions(list(trees.values()), helpers)
+
+    for path, tree in trees.items():
         scanned += sum(
             1
             for node in ast.walk(tree)
@@ -248,10 +263,11 @@ def test_every_side_channel_test_is_marked_serial():
         "scrapes"
     )
 
-    # Coarse: catches a narrowed scan that the existence check can't see — a
-    # regression inside the call-graph walk itself. 47 today; the floor is set
-    # close enough to bite (dropping `container_log` alone yields exactly 30)
-    # but with room for ordinary edits.
+    # Coarse: catches a scan that has stopped seeing most of the suite,
+    # whatever the cause. 47 today; the floor is set close enough to bite
+    # (dropping `container_log` alone yields exactly 30) but with room for
+    # ordinary edits. It does NOT catch subtler walk regressions that leave the
+    # count intact — the existence check above is the precise instrument.
     assert scanned >= 40, (
         f"only {scanned} side-channel tests found; the check has stopped "
         "looking at most of the suite"

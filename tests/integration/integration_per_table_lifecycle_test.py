@@ -659,9 +659,8 @@ class TestPerTableLifecycle:
         )[0][0]
         assert abort_count == 1, "abort_tx_log row must survive per-table persist"
 
-    # Serial for contention, not for a side channel: this parks a servicer PG
-    # connection (of PG_POOL_MAX=4) while asserting a bounded time, so concurrent
-    # workers would make it flaky in both directions. Outlives CHA-519.
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
     @pytest.mark.serial
     def test_lock_serialization_per_table(self):
         """Persist's lock key is ``persist:{table_uuid}:{branch_uuid}``
