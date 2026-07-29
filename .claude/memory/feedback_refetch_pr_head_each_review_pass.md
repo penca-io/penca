@@ -9,7 +9,7 @@ metadata:
 
 For repeat /review-pr passes on the same PR (the user types "Review once more please", "give it another pass", etc.), the first step is always `git fetch origin pull/N/head:pr<N>-head --force`. The local ref does not auto-update between passes — assuming it still points at the prior head produces stale reviews that flag findings the user has already fixed.
 
-**Why:** Caught on [[feedback-purged-at-micros-cold-coverage-invariant]] review of CHA-220 / PR #84. After pass 4 posted a BLOCKER on `cffb0019`, the user pushed `ce017f4` (a fix commit titled "fix(api): address CHA-220 review feedback") that resolved the BLOCKER plus 5 Suggestions. Pass 5 didn't refetch, reviewed against stale `cffb0019`, and posted an "ADR also needs updating" finding for changes that were already in the pushed commit. User had to correct: "Wait the ADR was updated in ce017f4. That should already be pushed."
+**Why:** Caught on the pass-5 review of CHA-220 / PR #84. After pass 4 posted a BLOCKER on `cffb0019`, the user pushed `ce017f4` (a fix commit titled "fix(api): address CHA-220 review feedback") that resolved the BLOCKER plus 5 Suggestions. Pass 5 didn't refetch, reviewed against stale `cffb0019`, and posted an "ADR also needs updating" finding for changes that were already in the pushed commit. User had to correct: "Wait the ADR was updated in ce017f4. That should already be pushed."
 
 **How to apply:** First step of any /review-pr re-run after the initial pass:
 

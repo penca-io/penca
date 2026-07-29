@@ -56,7 +56,7 @@ There is no fourth option of silently substituting an alternative and writing a 
 ### Conventional commits
 Format: `<type>(<scope>): <description>`. Types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `build`, `chore`. Scopes are defined in `linear/labels.toml` (`agent`, `lifecycle`, `query`, `proto`, …) — omit when a change spans multiple areas. Description: lowercase, imperative mood, no period, under 72 chars. Footer: `CHA-XX` reference required.
 
-**Commit scope: one commit = one logical change. A single kata task may close with many commits (`kata close --commit` is repeatable) when one logical change naturally splits — e.g. substantive change + a follow-up `chore: cargo fmt` fixup.** (`style` is not an allowed commit type — the commit-msg hook rejects it; use `chore` for fmt fixups.)
+**Commit scope: one commit = one logical change. A single kata task may close with many commits (`kata close --commit` is repeatable) when one logical change naturally splits — e.g. substantive change + a follow-up `chore: cargo fmt` fixup.** (`style` is not an allowed commit type — the commit-msg hook rejects it; use `chore` for fmt fixups. `scripts/check_commit_msg.py` validates the scope against the section names in `linear/labels.toml`, which are **bounded contexts, not crate names** — code in `crates/penca-datafusion` commits under `query`/`schema`/`sql`, never `datafusion`. Omit the scope entirely when a change spans areas. A rejected commit message aborts the commit, so a `kata close --commit $(git rev-parse HEAD)` chained after it records the *previous* SHA.)
 
 ### Read the conventions up front
 Read `docs/style-guide.md`, `docs/development-methodology-guide.md`, and `.claude/skills/code-comments/SKILL.md` in full at the start of this skill — they are required inputs for every planning, implementation, and commit step, loaded **preemptively** (not on demand). `docs/algorithms.md` and `README.md` stay on demand within the relevant step.
@@ -68,13 +68,32 @@ Read `docs/style-guide.md`, `docs/development-methodology-guide.md`, and `.claud
 Cheat sheet for the kata calls this skill makes:
 
 - `kata create --label cha-NNN --label plan-draft --label <kind> [--label <source>] --priority N [--blocked-by <ref>] -- "<title>"` — create a task. `<kind>` is one of `red-test`, `impl`, `orch:run-cleanup`, `orch:open-pr`, `orch:spawn-review`. `<source>` (optional) marks late-arriving findings: `roborev`, `review-pr`, `cleanup-pass`, `agent-discovered`. Priority is 0..4 with 0 = highest (direct numeric pass-through from Linear: Urgent=1 → kata 1, None=0 → kata 0).
-- `kata list --label cha-NNN --label approved --json` — read the approved set. Output is wrapped: `{kata_api_version, issues: [...]}`. Use `.issues[]` in jq. **Repeated `--label` flags have not reliably AND-intersected** (the second `--label` has been observed silently dropped), so always confirm the second label client-side: `jq '.issues[] | select(.labels | index("approved"))'`.
-- `kata ready --unowned --label cha-NNN --label approved --json` — surfaces tasks that are not blocked, not claimed, and (nominally) approved. The native filter covers the blocker and ownership checks, but because of the `--label` AND-intersect bug above, **defensively post-filter on the label array** — `jq '.issues[] | select(.labels | index("approved"))'` — or the drain can surface unapproved `plan-draft` tasks and break the Step-3 gate.
+- **`--json` shapes differ per subcommand — this is the single biggest footgun in this skill.** Every row below was verified by running the installed CLI on throwaway tasks (2026-07-29). **Verify this way, not by reading kata's source:** `kata version` reports `dev` with an unknown commit, so the installed binary is not necessarily the tagged release in the module cache — a source-read of `ListIssues`/`ReadyIssues` suggests repeated `--label` AND-intersects, and the running binary demonstrably does not.
+
+  | subcommand | wrapper | `qualified_id` | `labels` |
+  |---|---|---|---|
+  | `kata list --json` | `{kata_api_version, issues: [...]}` | ✅ `penca#9y1b` | ✅ `["approved", …]` (plain strings) |
+  | `kata ready --json` | `{kata_api_version, issues: [...]}` | ❌ **null** | ❌ **null** |
+  | `kata create --json` | `{kata_api_version, issue: {...}, event, changed}` | ❌ **absent** (use `.issue.short_id`) | — |
+  | `kata show --json` | `{kata_api_version, issue, labels, links, comments}` | under `.issue` | ✅ but as objects — `.labels[].label` |
+
+  Consequences you must code around: a `jq 'select(.labels | index("approved"))'` post-filter on **`kata ready` output evaluates `null | index(...)` → null and silently drops every row**, so the drain looks empty when work is ready. And `.issues[0].qualified_id` off `ready` (or `.qualified_id` off `create`) yields empty, silently breaking any downstream `kata claim` / `--blocked-by` wiring. Build refs as `penca#<short_id>` from `.issue.short_id` (create) or `.issues[].short_id` (ready).
+
+- `kata list --label cha-NNN --label approved --json` — read the approved set. Use `.issues[]` in jq. **Repeated `--label` flags do NOT AND-intersect** (the second `--label` is silently dropped, despite `--help` claiming "repeatable, AND logic"), so always confirm the second label client-side: `jq '.issues[] | select(.labels | index("approved"))'`. This works here because `list` is the one query that returns `labels`.
+- `kata ready --unowned --label cha-NNN --json` — surfaces tasks that are not blocked and not claimed. It cannot filter on `approved` (no `labels` in its output, and the second `--label` is dropped anyway), so **intersect the two queries** rather than post-filtering `ready`:
+  ```bash
+  # approved set (labels only exist on `list`) ∩ ready set (blockers/ownership only known to `ready`)
+  comm -12 \
+    <(kata list  --label cha-NNN --json | jq -r '.issues[] | select(.labels | index("approved")) | .short_id' | sort) \
+    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[]?.short_id' | sort)
+  ```
+  Skipping the intersection breaks the Step-3 gate in one of two ways: post-filtering `ready` on `.labels` surfaces *nothing*, and not filtering at all surfaces unapproved `plan-draft` tasks. The human-readable `kata ready --label cha-NNN` (no `--json`) is reliable when you just need to eyeball what's ready — the `--json` shape is the unreliable part, not the readiness computation.
 - `kata claim <ref>` — atomic claim. If a previous loop tick abandoned a claim (session restart, crash), `kata claim --force <ref>` is the recovery path (kata has no TTL-based auto-release).
 - `kata close <ref> --done --commit <sha> --message "<text>"` — close the task. `--done` requires **both** a `--message` (≥40 chars after normalization, describing scope + how it was verified) **and** typed evidence. `--commit <sha>` is the evidence for code tasks (repeatable). Orchestration tasks produce no commit but **still need evidence** — use `--reviewed <path>` (cleanup walk, repeatable), `--pr <url>` and/or `--test "just check"` (PR open). `--done` with neither message nor evidence is rejected mid-drain. (`--wontfix` is the opposite — it *rejects* evidence; close challenged/duplicate findings with `--wontfix --message "<justification>"`.)
 - `kata edit <ref> --blocked-by <other-ref>` — additive, repeatable. The dynamic-blocker mechanism — roborev / `/review-pr` / cleanup-pass enqueuers all extend in-flight `orch:*` tasks via this call.
 - `kata create --idempotency-key <key> -- ...` — idempotent create. Re-running with the same key + identical content is a no-op (`changed:false`). Re-running with the same key + different content errors with `idempotency_mismatch`; the caller must use stable content per key (the roborev hook does — `<short-sha>:<finding-index>` is content-stable per review).
-- Issue refs are `<project>#<short_id>` (e.g. `penca#p6yp`) — the canonical form. `kata` also accepts ULIDs and numeric ids but qualified-id is what `--json` outputs and what TUI shows.
+- Issue refs are `<project>#<short_id>` (e.g. `penca#p6yp`) — the canonical form, and what TUI shows. `kata` also accepts ULIDs and numeric ids, but a **bare numeric id is rejected** by `--blocked-by` and friends (`"…looks like a legacy issue number; use a short_id"`). Only `kata list --json` emits `qualified_id` directly; everywhere else assemble it from `short_id` per the shape table above.
+- `kata edit <ref> --body "$(cat /tmp/body.md)"` — `kata edit` has **no** `--body-file` / `--body-stdin`; those are `kata create`-only flags.
 - `kata delete --force --confirm "DELETE <qualified_id>"` — the help text says `"DELETE <short_id>"` but the daemon checks against `<qualified_id>` (`DELETE penca#p6yp`). Same shape for `kata purge --confirm "PURGE <qualified_id>"`.
 
 ## Step 1: Mark In Progress and digest the ticket
@@ -291,8 +310,14 @@ A single tick processes as many ready tasks as it can in one model invocation, t
 ```bash
 # Inner loop within one tick — process while there's ready work.
 while true; do
-  ref=$(kata ready --unowned --label cha-NNN --label approved --json | jq -r '.issues[0].qualified_id // empty')
-  [ -z "$ref" ] && break
+  # `ready` knows blockers/ownership but carries no labels; `list` carries labels
+  # but not readiness. Intersect them — see the --json shape table in the cheat sheet.
+  short=$(comm -12 \
+    <(kata list  --label cha-NNN --json | jq -r '.issues[] | select(.labels | index("approved")) | .short_id' | sort) \
+    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[]?.short_id' | sort) \
+    | head -1)
+  [ -z "$short" ] && break
+  ref="penca#$short"
   kata claim "$ref"
   # ... dispatch on task kind (see below) ...
 done
@@ -309,11 +334,28 @@ done
 pr_state=$(gh pr view --json state -q .state 2>/dev/null || echo "NOT_OPEN")
 [ "$pr_state" = "MERGED" ] && exit  # Workflow complete.
 
-roborev_busy=$(roborev status 2>&1 | grep -qE 'queued|running' && echo 1 || echo 0)
-open_orch=$(kata list --label cha-NNN --status open --json 2>/dev/null \
-  | jq '[.issues[] | .labels[] | select(startswith("orch:"))] | length')
+# Parse the COUNTS off the Jobs line. A bare `grep -qE 'queued|running'` is always
+# true: the header reads "Daemon: running" and the Jobs line spells out both words
+# even at "0 queued, 0 running" — a wait-loop built on it never terminates.
+# No `Jobs:` line at all means the daemon is down or unreachable ("Daemon not
+# running…"), which is NOT idle — report `unknown` so the sweep blocks instead of
+# declaring itself clean without ever having queried a queue. `unknown` groups
+# with busy below: it keeps the loop alive on the tight cadence (a daemon restart
+# resolves itself) and never lets the drain reach "ready for merge" on an
+# uncertified sweep. Do NOT turn it into a bare `exit` — a tick that ends with no
+# ScheduleWakeup and no stop just dies, stalling the ticket while looking idle.
+# If it stays `unknown` across several ticks the daemon is genuinely down: say so
+# via SendUserMessage (plain text between tool calls does not render mid-loop —
+# see .claude/memory/feedback_send_user_message_mid_loop.md) and stop the loop
+# deliberately with ScheduleWakeup(stop: true).
+roborev_busy=$(roborev status 2>&1 \
+  | awk '/^Jobs:/ { print ($2 + $4 > 0) ? 1 : 0; found=1 } END { if (!found) print "unknown" }')
 
-if [ "$roborev_busy" = "1" ] || [ "$open_orch" -gt 0 ] || [ "$pr_state" = "NOT_OPEN" ]; then
+open_orch=$(kata list --label cha-NNN --status open --json 2>/dev/null \
+  | jq '[.issues[]? | .labels[] | select(startswith("orch:"))] | length')
+
+if [ "$roborev_busy" = "unknown" ] || [ "$roborev_busy" = "1" ] \
+   || [ "$open_orch" -gt 0 ] || [ "$pr_state" = "NOT_OPEN" ]; then
   exit  # ScheduleWakeup ~10s — work could appear soon.
 else
   exit  # ScheduleWakeup ~45s — waiting on human merge.
@@ -414,9 +456,9 @@ Include `Closes CHA-XX` so merge auto-transitions the Linear issue.
    if [ "$n" -gt 0 ]; then
      round=$(kata list --label cha-NNN --label orch:spawn-review --json \
        | jq '.issues | length')   # how many spawn-review tasks ever existed under this slug
-     next=$(kata create --label cha-NNN --label approved --label orch:spawn-review \
+     next="penca#$(kata create --label cha-NNN --label approved --label orch:spawn-review \
        --priority 4 --json -- "orch:spawn-review (round $((round + 1))) — re-review after findings close" \
-       | jq -r '.qualified_id')
+       | jq -r '.issue.short_id')"   # `create --json` has NO .qualified_id — see the shape table
      echo "$new_findings" | while read f; do
        [ -n "$f" ] && kata edit "$next" --blocked-by "$f" >/dev/null
      done
@@ -425,7 +467,7 @@ Include `Closes CHA-XX` so merge auto-transitions the Linear issue.
    - Round-numbered title (`round 2`, `round 3`, …) keeps the iteration visible in `kata tui`.
    - The new task is blocked-by every finding from this round; the drain claims+processes findings first (as impl-like tasks), then unblocks+claims the new `orch:spawn-review`, spawning another subagent for a fresh-eyes pass on the fixes.
    - **Termination**: when a subagent run returns 0 new findings, no new `orch:spawn-review` is armed. The drain proceeds to "wait for human merge" (long-cadence wakeup).
-   - **Final roborev sweep before reporting ready-for-merge.** The loop's exit is gated on `MERGED`, which the agent never reaches (the human merges — never `gh pr merge`), so in practice the loop is stopped by hand at "ready for merge." Roborev reviews lag each commit by seconds-to-minutes, so the *last* commits (review fixes, the PR-open commit) may still be under review when the queue looks empty. Before declaring ready-for-merge, poll `roborev status` until it shows **0 queued / 0 running**, then drain `kata ready --unowned --label cha-NNN --json | jq '.issues[] | select(.labels | index("approved"))'` one more time — and check `kata list --label cha-NNN --status open` for findings that landed after a cleanup pass. (Drop the second `--label approved` and jq-filter the array instead: the dual-`--label` AND-intersect is broken — see [[feedback_kata_list_label_intersect_broken]] — so a bare `--label cha-NNN --label approved` silently surfaces every ready `cha-NNN` task.) Do **not** assume quiet from an empty `kata ready`; verify roborev directly. This same discipline applies to any **post-PR** commits the human later asks for (merge-conflict resolution, follow-up edits): every commit fires roborev, so re-sweep after them too. See `.claude/memory/feedback_poll_roborev_after_any_commits.md`.
+   - **Final roborev sweep before reporting ready-for-merge.** The loop's exit is gated on `MERGED`, which the agent never reaches (the human merges — never `gh pr merge`), so in practice the loop is stopped by hand at "ready for merge." Roborev reviews lag each commit by seconds-to-minutes, so the *last* commits (review fixes, the PR-open commit) may still be under review when the queue looks empty. Before declaring ready-for-merge, poll `roborev status` until the **Jobs line reports 0 queued and 0 running** (parse the counts — see the `roborev_busy` awk above; a `grep` for the words matches even when idle), then drain the ready∩approved intersection one more time — and check `kata list --label cha-NNN --status open` for findings that landed after a cleanup pass. Use the intersection form from the tick loop above, never a `.labels` post-filter on `kata ready` output: `ready --json` carries no `labels`, so the filter silently matches nothing and the sweep looks clean when it isn't. Do **not** assume quiet from an empty `kata ready`; verify roborev directly. This same discipline applies to any **post-PR** commits the human later asks for (merge-conflict resolution, follow-up edits): every commit fires roborev, so re-sweep after them too. See `.claude/memory/feedback_poll_roborev_after_any_commits.md`.
 
 The pre/post diff (not the absolute count) is what determines whether to re-arm — a subagent run that surfaces no NEW findings (even if old ones are still open and being drained) doesn't trigger another round. This is the right shape because the open findings are already going to drive a re-review via the existing `orch:spawn-review` chain: when they close, the LAST-armed `orch:spawn-review` unblocks and fires.
 
