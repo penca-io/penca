@@ -48,11 +48,6 @@ _QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 _GRACE_WAIT_SECONDS = _QUERY_TIMEOUT_SECONDS + 1.0
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _setup_branch_with_committed_data(
     client, catalog_uuid, schema_uuid, table_uuid, branch_name
 ):
@@ -92,11 +87,6 @@ def _setup_branch_with_committed_data(
         branch_uuid=branch.branch_uuid,
     )
     return branch, committed_tx
-
-
-# ---------------------------------------------------------------------------
-# Persist — existing tests
-# ---------------------------------------------------------------------------
 
 
 class TestPersistBasic:
@@ -144,11 +134,6 @@ class TestPersistBasic:
         names = result.column("name").to_pylist()
         assert "alice" in names
         assert "bob" in names
-
-
-# ---------------------------------------------------------------------------
-# Persist — identifier resolution paths
-# ---------------------------------------------------------------------------
 
 
 class TestPersistIdentifierResolution:
@@ -232,11 +217,6 @@ class TestPersistIdentifierResolution:
             table_name="persist_name_table",
         )
         assert response.persisted_at_micros > 0
-
-
-# ---------------------------------------------------------------------------
-# Persist — correctness
-# ---------------------------------------------------------------------------
 
 
 class TestPersistCorrectness:
@@ -620,11 +600,6 @@ class TestPersistCorrectness:
         assert result_b.column("name").to_pylist() == ["charlie"]
 
 
-# ---------------------------------------------------------------------------
-# Two-phase persist — commit_micros tracking
-# ---------------------------------------------------------------------------
-
-
 class TestPersistTwoPhase:
     def test_persist_segment_has_committed_at(self):
         """After persist, table_persist_segment_metadata rows have non-NULL commit_micros."""
@@ -727,11 +702,6 @@ class TestPersistTwoPhase:
         assert result.num_rows == 2
 
 
-# ---------------------------------------------------------------------------
-# Branch deletion — cold storage metadata cleanup
-# ---------------------------------------------------------------------------
-
-
 class TestBranchDeletionColdStorageCleanup:
     def test_branch_delete_cleans_segment_metadata(self):
         """After deleting a branch, table_persist_segment_metadata rows for
@@ -777,11 +747,6 @@ class TestBranchDeletionColdStorageCleanup:
             (branch.branch_uuid, table_uuid),
         )
         assert rows_after[0][0] == 0
-
-
-# ---------------------------------------------------------------------------
-# Compact
-# ---------------------------------------------------------------------------
 
 
 def _insert_and_commit(
@@ -1541,9 +1506,7 @@ class TestCompactPersistSegments:
         assert {"alice", "bob", "carol"} <= set(names)
 
 
-# ---------------------------------------------------------------------------
 # CHA-202: compact_segment_metadata in-flight tracking
-# ---------------------------------------------------------------------------
 #
 # The `compact_segment_metadata` table tracks merged compact files: a
 # row INSERTs (commit_micros NULL) before the merged file is
@@ -1760,11 +1723,6 @@ class TestCompactSegmentMetadata:
         )
         assert len(post_compact) == len(post_persist)
         assert all(v is not None for v in post_compact)
-
-
-# ---------------------------------------------------------------------------
-# Snapshot
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshot:
@@ -2035,9 +1993,7 @@ class TestSnapshot:
             assert row_count > 0
 
 
-# ---------------------------------------------------------------------------
 # CHA-406 — delta-partition carry-forward onto immutable segments
-# ---------------------------------------------------------------------------
 
 
 def _select_snapshot_segment_storage_tuples(catalog_uuid, branch_uuid, snapshot_uuid):
@@ -2499,9 +2455,7 @@ class TestCarryForwardSnapshot:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-215 — persist + snapshot chunk writes to cap segment size
-# ---------------------------------------------------------------------------
 #
 # Pre-CHA-215, persist and snapshot each emitted exactly one cold
 # segment per ``(table_uuid, log_kind)`` (persist) / per cycle (snapshot),
@@ -2863,9 +2817,7 @@ class TestChunkedPersistAndSnapshot:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-347 — recorded ``size_bytes`` is the in-memory Arrow footprint
-# ---------------------------------------------------------------------------
 #
 # ``size_bytes`` on persist/snapshot segment rows must be the standalone
 # uncompressed in-memory Arrow footprint — the unit every consumer
@@ -3143,9 +3095,7 @@ class TestCompactedSegmentSizeBytesIsInMemoryFootprint:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-198 — catalog-scoped persist + snapshot metadata tables
-# ---------------------------------------------------------------------------
 #
 # Tests below pin the per-catalog physical isolation of the five
 # persist/purge/snapshot metadata tables, their per-branch LIST
@@ -3774,9 +3724,7 @@ class TestBootstrapOnlyCatalogStoreGlobal:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-203: log_kind CHECK constraint
-# ---------------------------------------------------------------------------
 
 
 class TestLogKindCheckConstraintRejectsInvalid:
@@ -3822,9 +3770,7 @@ class TestLogKindCheckConstraintRejectsInvalid:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-203: cold object_uri path layout
-# ---------------------------------------------------------------------------
 
 
 class TestColdSegmentPathsUnderCatalogBranchPrefix:
@@ -3975,9 +3921,7 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-218: snapshot watermark sourced from cold persist segments, not commit_tx_log
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshotWatermarkFromColdPersistSegments:
@@ -4102,9 +4046,7 @@ class TestSnapshotWatermarkFromColdPersistSegments:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-407: snapshot-compaction machinery removed (ADR 0024)
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshotCompactionRemoved:

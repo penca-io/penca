@@ -1247,7 +1247,7 @@ mod tests {
         assert_eq!(res.schema(), out_schema, "result normalized to out_schema");
     }
 
-    // ----- CHA-482 (RT1): composite-key seek_snapshot_point -----------------
+    // CHA-482 (RT1): composite-key seek_snapshot_point
     // CHA-480 shipped the composite build+seek kernel; these pin the dl seek
     // path (sidecar decode at the right arity, tuple probes passed straight
     // through, multi-segment concat) for a 2-column `(key0, key1)` index. The
@@ -2152,7 +2152,7 @@ mod tests {
         assert_eq!(second.num_columns(), 3);
     }
 
-    // ----- CHA-411 R-D: scan_snapshot end-to-end ------------------------
+    // CHA-411 R-D: scan_snapshot end-to-end
     //
     // penca-dl cannot depend on penca-merge, so these build the snapshot-scan
     // SQL inline (the shape `penca_merge::sql::build_cold_snapshot_scan` emits)

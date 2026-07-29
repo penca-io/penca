@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(offsets(&batch), vec![1, 2, 0]);
     }
 
-    // ----- CHA-454 R1: seek_row_offsets (the read/seek side) --------------
+    // CHA-454 R1: seek_row_offsets (the read/seek side)
 
     fn sorted(mut v: Vec<i64>) -> Vec<i64> {
         v.sort_unstable();
@@ -482,7 +482,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-480: composite multi-column keys (build + seek) ------------
+    // CHA-480: composite multi-column keys (build + seek)
     // The sorted `(key_0 … key_{n-1}, row_offset)` layout is the interface
     // contract the build chunks (CHA-481/483) and the seek chunk (CHA-482)
     // meet at. These cases lock it for N = 1, 2, 3 columns.
@@ -677,7 +677,7 @@ mod tests {
         assert!(seek_row_offsets(&empty, prefix).unwrap().is_empty());
     }
 
-    // ----- CHA-499: leading-prefix seek (short probe = prefix) -------------
+    // CHA-499: leading-prefix seek (short probe = prefix)
     // A probe SHORTER than the sidecar's key arity is a leading-prefix seek:
     // it matches every row whose leading key columns equal the probe and
     // returns the full contiguous run. Correctness rests entirely on
@@ -776,7 +776,7 @@ mod tests {
         }
     }
 
-    // ----- CHA-485: typed (non-Utf8) key seek ------------------------------
+    // CHA-485: typed (non-Utf8) key seek
     // The build already sorts any key type; these pin that the SEEK compares
     // in the column's native type via the cast-probe + typed-comparator path.
 

@@ -590,7 +590,7 @@ impl LifecycleManager {
 
         let merge_snapshot = penca_merge::ReadSnapshot::AsOfMicros(snapshotted_at_micros);
         if let Some(prior_keys) = prior_keys {
-            // ---- Carry-forward path ----
+            // Carry-forward path
             // Resolve the windowed delta once (the prior snapshot is NOT
             // a merge baseline here — its untouched partitions carry by
             // reference, its touched ones stream and rewrite), derive the
@@ -721,7 +721,7 @@ impl LifecycleManager {
             )
             .await
         } else {
-            // ---- CHA-404 full-rewrite path ----
+            // CHA-404 full-rewrite path
             // The whole prior snapshot is the merge baseline; its
             // survivors stream in plan order (= label-sorted runs) with
             // the exclusion applied per batch inside the all-cold entry

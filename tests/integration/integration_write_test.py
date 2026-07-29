@@ -1598,9 +1598,7 @@ def _all_tx_uuids(
     return {str(row[0]) for row in rows}
 
 
-# ===========================================================================
 # CHA-163: Multi-schema atomicity within a catalog
-# ===========================================================================
 
 
 class TestMultiSchemaTransactions:
@@ -1803,11 +1801,9 @@ class TestMultiSchemaTransactions:
             )
 
 
-# ===========================================================================
 # CHA-164: schema/table CRUD takes an optional tx_uuid. Mode-switch
 # mirrors WriteData — absent = auto-commit, present = join the open
 # tx and become visible at CommitTx. AbortTx leaves no orphan rows.
-# ===========================================================================
 
 
 class TestSchemaTxUuidMode:

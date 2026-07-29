@@ -306,10 +306,6 @@ pub(crate) fn build_cold_snapshot_scan_plain<D: Dialect>(
     format!("SELECT l.row_uuid{user_cols_leading}{user_cols_l} FROM {snapshot_q} l{user_filter}")
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// CHA-227 + CHA-429 + CHA-443: cold-tier visibility predicate. ANDs the
 /// half-open `commit_micros` window with the optional `commit_seq_num <=
 /// seq` upper bound. Returns a full `WHERE ...` prefix (with a leading

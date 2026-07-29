@@ -3567,9 +3567,7 @@ class TestFlightSqlPerConnSessionScoping:
         finally:
             cursor.close()
 
-    # ----------------------------------------------------------------
     # Test 1: closing the conn rolls back any in-flight transaction.
-    # ----------------------------------------------------------------
 
     def test_close_conn_drops_session_and_aborts_open_tx(self):
         """Open a conn, ``BEGIN`` + ``INSERT``, close the conn without
@@ -3654,9 +3652,7 @@ class TestFlightSqlPerConnSessionScoping:
 
         assert rows.num_rows == 0
 
-    # ----------------------------------------------------------------
     # Test 2: two conns hold independent ``default_schema`` state.
-    # ----------------------------------------------------------------
 
     def test_two_conns_do_not_share_default_schema(self):
         """Open two conns against the same catalog. ``SET search_path``
@@ -3693,9 +3689,7 @@ class TestFlightSqlPerConnSessionScoping:
             conn_a.close()
             conn_b.close()
 
-    # ----------------------------------------------------------------
     # Test 3: no Set-Cookie / penca-session-id cookie on the wire.
-    # ----------------------------------------------------------------
 
     def test_no_set_cookie_response_or_penca_session_id_cookie_on_wire(self):
         """A raw pyarrow.flight ``FlightClient`` issuing a benign
@@ -3774,9 +3768,7 @@ class TestFlightSqlPerConnSessionScoping:
         # has to drive client-side cookie state.
         _ = captured_outgoing  # currently unused; kept for clarity.
 
-    # ----------------------------------------------------------------
     # Test 4: catalog list is frozen at conn-mint.
-    # ----------------------------------------------------------------
 
     def test_catalog_list_frozen_at_mint(self):
         """Open conn A pinned to a sentinel catalog. Create a
@@ -3844,9 +3836,7 @@ class TestFlightSqlPerConnSessionScoping:
             conn_a.close()
             client.close()
 
-    # ----------------------------------------------------------------
     # Test 5: schema/table metadata stays live within a session.
-    # ----------------------------------------------------------------
 
     def test_schema_changes_within_session_visible_after_create(self):
         """Open a conn. Create a new schema out-of-band via
@@ -3910,10 +3900,8 @@ class TestFlightSqlPerConnSessionScoping:
             conn.close()
             client.close()
 
-    # ----------------------------------------------------------------
     # Test 6 & 7: deleted env-var names must no longer appear in the
     # crates / tests source tree.
-    # ----------------------------------------------------------------
 
     @staticmethod
     def _repo_root():
@@ -3996,9 +3984,7 @@ class TestFlightSqlPerConnSessionScoping:
             " post-CHA-255:\n  " + "\n  ".join(matches)
         )
 
-    # ----------------------------------------------------------------
     # Test 11: branch rename mid-session does not break routing.
-    # ----------------------------------------------------------------
 
     def test_branch_rename_mid_session_does_not_break_routing(self):
         """Open conn A pinned to branch ``feat``; ``BEGIN``; rename
@@ -5485,7 +5471,6 @@ class TestFlightSqlCreateTableRejections:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-355: DoGet reuses the GetFlightInfo plan instead of re-planning.
 #
 # A Flight SQL statement query is planned twice today — once in
@@ -5508,7 +5493,6 @@ class TestFlightSqlCreateTableRejections:
 # event on any target surfaces in `docker logs`. These tests scrape the
 # penca-sql-server container log for that event. The match strings below
 # are the coordination contract with impl task D — keep them in sync.
-# ---------------------------------------------------------------------------
 
 # The tracing subscriber colourises output (ANSI SGR escapes) even into a
 # non-TTY docker log, so a raw `statement_cache...outcome="hit"` regex fails — the
@@ -5752,7 +5736,6 @@ class TestFlightSqlPlanReuseMiss:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-367: per-query planning metadata-resolution count (Layer B).
 #
 # After CHA-365 Layer A (per-RPC dedup, merged) each get_schema/get_table gRPC
@@ -5771,7 +5754,6 @@ class TestFlightSqlPlanReuseMiss:
 # names), so counting get_schema/get_table CLOSE lines isolates planning gRPCs
 # from execution-time scope resolution — the pg_stat-over-__penca_system__
 # needle (CHA-365) would conflate the two and is deliberately NOT used here.
-# ---------------------------------------------------------------------------
 
 
 # Each `get_schema`/`get_table` gRPC the SQL server issues is handled by the

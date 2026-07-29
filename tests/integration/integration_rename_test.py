@@ -112,9 +112,7 @@ def _write_rows(
     )
 
 
-# ---------------------------------------------------------------------------
 # 1-5. Random UUIDs + name uniqueness
-# ---------------------------------------------------------------------------
 
 
 class TestRandomUuidsAndNameUniqueness:
@@ -273,9 +271,7 @@ class TestRandomUuidsAndNameUniqueness:
         )
 
 
-# ---------------------------------------------------------------------------
 # 6-14. Rename via new_*_name on Update messages
-# ---------------------------------------------------------------------------
 
 
 class TestRename:
@@ -669,9 +665,7 @@ class TestRename:
         assert sorted(result.column("name").to_pylist()) == ["post", "pre"]
 
 
-# ---------------------------------------------------------------------------
 # 15-18. System tables locked to CRUD path
-# ---------------------------------------------------------------------------
 #
 # Reads against ``__penca_system__.{schemas,tables}`` remain allowed —
 # users discover their catalog through them. Mutating handlers reject

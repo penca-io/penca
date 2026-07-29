@@ -1847,7 +1847,7 @@ mod tests {
         assert!(err.is_err(), "empty name-key tuple set must fail fast");
     }
 
-    // ----- CHA-499: leading-prefix (table_uuid) seek resolution -------------
+    // CHA-499: leading-prefix (table_uuid) seek resolution
 
     #[test]
     fn resolve_prefix_seek_indexes_full_key_arity_one_tuples() {

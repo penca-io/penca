@@ -2843,7 +2843,7 @@ mod tests {
         assert_eq!(snapshot, ReadSnapshot::AsOfSeq(42));
     }
 
-    // ----- CHA-427: read_data dispatch predicates ---------------------
+    // CHA-427: read_data dispatch predicates
 
     /// Pins the three-way dispatch contract over the four plan shapes,
     /// including the precedence property the dispatch comment leans on:

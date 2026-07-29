@@ -202,7 +202,7 @@ pub async fn scan_uuids(
     out
 }
 
-// ----- CHA-454 seek variant -------------------------------------------------
+// CHA-454 seek variant
 
 /// In-memory reader serving the sorted index sidecar for the sidecar uri and the
 /// base batch for everything else — the index seek reads both.

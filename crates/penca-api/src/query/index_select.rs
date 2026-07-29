@@ -522,7 +522,7 @@ mod tests {
         assert!(select_from_bindings(&HashMap::new(), &snapshot, CAP).is_empty());
     }
 
-    // ---- CHA-492 residual formatting --------------
+    // CHA-492 residual formatting
 
     #[test]
     fn sql_literal_quotes_and_escapes_strings() {
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(residual, r#"("city" = 'paris') OR ("city" = 'oslo')"#);
     }
 
-    // ---- CHA-492 decode + validation -------------
+    // CHA-492 decode + validation
 
     #[test]
     fn decode_index_seek_accepts_defined_columns() {

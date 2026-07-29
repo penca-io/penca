@@ -819,8 +819,6 @@ mod tests {
         );
     }
 
-    // ----- CREATE TABLE -----
-
     fn parse_create_table(sql: &str) -> CreateTable {
         let mut stmts = DFParser::parse_sql(sql).expect("parse");
         match stmts.pop_front().expect("non-empty") {

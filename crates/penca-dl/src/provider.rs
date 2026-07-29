@@ -330,10 +330,6 @@ fn register_persist<R: FormatReader + 'static>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// SnapshotTableProvider (CHA-411)
-// ---------------------------------------------------------------------------
-
 /// `TableProvider` exposing pruned cold-storage snapshot segments as a
 /// queryable table (CHA-411). Mirrors [`PersistTableProvider`] but reads
 /// through the process-lifetime [`SegmentCache`] with bounded
@@ -810,7 +806,7 @@ mod tests {
         assert_eq!(output_schema.field(0).name(), "name");
     }
 
-    // ----- CHA-82 R6: persist provider statistics aggregate ------------
+    // CHA-82 R6: persist provider statistics aggregate
 
     fn r6_fixture_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -931,7 +927,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-410: persist-tier output_ordering advertisement -----------
+    // CHA-410: persist-tier output_ordering advertisement
 
     /// Schema carrying the Int64 `commit_seq_num` + `write_seq_num` columns — the
     /// persist total-version-order axes CHA-410 / CHA-431 advertise.
@@ -1073,7 +1069,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-411 R-A: SnapshotTableProvider session behavior -----------
+    // CHA-411 R-A: SnapshotTableProvider session behavior
 
     /// In-test `FormatReader` returning a preset decoded batch (a stand-in for a
     /// snapshot segment / file). Ignores the requested projection — the test
@@ -1337,7 +1333,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-454 R3: provider index-driven selective read --------------
+    // CHA-454 R3: provider index-driven selective read
 
     /// A `FormatReader` serving a different preset batch per uri — lets the seek
     /// test register both the base segment and its index sidecar.

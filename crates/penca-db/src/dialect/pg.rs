@@ -61,10 +61,6 @@ impl Dialect for PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DbDialect trait implementation
-// ---------------------------------------------------------------------------
-
 impl DbDialect for PgDialect {
     fn arrow_type_to_sql(arrow_type: &DataType) -> Result<String, ArrowTypeError> {
         // The supported set is owned by `penca_core::types` (CHA-386);
@@ -124,10 +120,6 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: global tables (bootstrap)
-// ---------------------------------------------------------------------------
-
 impl PgDialect {
     /// Create global resource tables if they don't already exist.
     ///
@@ -155,11 +147,6 @@ impl PgDialect {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// DDL: per-catalog tables (branch_store, tx-log family) + system-table
-// physicals on main (CHA-177)
-// ---------------------------------------------------------------------------
 
 impl PgDialect {
     /// Create per-catalog metadata tables and bootstrap the main branch.
@@ -1290,10 +1277,6 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: branch partitions (CHA-177: tx-log family only)
-// ---------------------------------------------------------------------------
-
 impl PgDialect {
     /// Create all per-catalog log partitions for a branch.
     ///
@@ -1569,10 +1552,6 @@ impl PgDialect {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// DDL: per-table data tables
-// ---------------------------------------------------------------------------
 
 /// Errors from DDL operations on data tables.
 #[derive(Debug, thiserror::Error)]

@@ -272,10 +272,6 @@ where
     Ok(new_name.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// DDL helpers
-// ---------------------------------------------------------------------------
-
 fn retention_duration_seconds(rc: &Option<RetentionConfig>) -> Option<i64> {
     rc.as_ref().and_then(|r| r.retention_duration_seconds)
 }

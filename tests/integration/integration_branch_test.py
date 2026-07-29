@@ -37,10 +37,6 @@ from .integration_helpers import (
     make_client,
 )
 
-# ---------------------------------------------------------------------------
-# Setup helpers
-# ---------------------------------------------------------------------------
-
 
 def _qi(name: str) -> str:
     return Identifier(name).as_string(None)
@@ -142,11 +138,6 @@ def _persist_seg_count(catalog_uuid, branch_uuid, table_uuid) -> int:
         (branch_uuid, table_uuid),
     )
     return rows[0][0]
-
-
-# ---------------------------------------------------------------------------
-# CreateBranch — multi-schema materialization
-# ---------------------------------------------------------------------------
 
 
 class TestCreateBranchAllSchemas:
@@ -354,11 +345,6 @@ class TestCreateBranchEnablesWritesPerSchema:
         assert main_t2.num_rows == 0
 
 
-# ---------------------------------------------------------------------------
-# MergeBranch — multi-schema fan-out
-# ---------------------------------------------------------------------------
-
-
 class TestMergeBranchAllSchemas:
     def test_multi_schema_merge_lands_writes_from_every_schema_on_target(self):
         """MergeBranch from a multi-schema source copies writes for
@@ -456,11 +442,6 @@ class TestMergeBranchAllSchemas:
         )
 
 
-# ---------------------------------------------------------------------------
-# DeleteBranch — multi-schema cold cleanup
-# ---------------------------------------------------------------------------
-
-
 class TestDeleteBranchAllSchemas:
     def test_multi_schema_delete_branch_cleans_cold_storage_in_every_schema(self):
         """After DeleteBranch on a multi-schema catalog, persist_segment
@@ -553,9 +534,6 @@ class TestDeleteBranchAllSchemas:
             )
 
 
-# ---------------------------------------------------------------------------
-# (Original test 6 — "commit_tx_log purge watermark spans all schemas" — dropped.)
-# ---------------------------------------------------------------------------
 #
 # The original CHA-184 plan included a test asserting that persisting
 # `s1.t1` alone does not purge `commit_tx_log` rows still referenced by an
@@ -630,9 +608,7 @@ class TestHotLogIndexPerBranch:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-515: main-only branching guard (interim, removed by CHA-509)
-# ---------------------------------------------------------------------------
 
 
 class TestCreateBranchMainOnlyGuard:

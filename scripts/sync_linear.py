@@ -51,9 +51,7 @@ OLD_SCOPE_PROJECT_NAMES = {
 }
 
 
-# ---------------------------------------------------------------------------
 # TOML parsing (lightweight, no toml dependency)
-# ---------------------------------------------------------------------------
 
 
 def parse_toml(path: Path) -> list[dict]:
@@ -185,11 +183,6 @@ def write_projects(projects: list[dict]) -> None:
         projects,
         ["name", "description", "linear_project_id", "keywords"],
     )
-
-
-# ---------------------------------------------------------------------------
-# Linear API helpers
-# ---------------------------------------------------------------------------
 
 
 def graphql(api_key: str, query: str, variables: dict | None = None) -> dict:
@@ -363,11 +356,6 @@ def update_issue_project(api_key: str, issue_id: str, project_id: str | None) ->
     )
 
 
-# ---------------------------------------------------------------------------
-# LLM-based classification
-# ---------------------------------------------------------------------------
-
-
 def classify_issues(
     issues: list[dict],
     scopes: list[dict],
@@ -501,11 +489,6 @@ Use the exact scope/project names from the lists above."""
         classifications = json.loads(classifications)
 
     return classifications
-
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 
 
 def sync(

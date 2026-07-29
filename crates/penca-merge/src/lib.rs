@@ -1473,8 +1473,6 @@ mod tests {
         );
     }
 
-    // ----- Mock DB driver (returns nothing — hot resolve stays empty) -----
-
     struct MockDriver;
 
     impl DbDriver for MockDriver {
@@ -1527,7 +1525,6 @@ mod tests {
         }
     }
 
-    // ----- Mock DL driver (returns pre-set batches) ----------------------
     //
     // CHA-368: one cold resolve per read — `execute_sql` returns the two-arm
     // resolved batch (`is_delete`-flagged upserts + tombstones). The exclusion
@@ -1659,8 +1656,6 @@ mod tests {
             ))
         }
     }
-
-    // ----- Fixtures ------------------------------------------------------
 
     fn test_user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1832,7 +1827,7 @@ mod tests {
         uuids.iter().map(|s| s.to_string()).collect()
     }
 
-    // ----- fold_in_base_cold_source (CHA-368 x CHA-178) -------------------
+    // fold_in_base_cold_source (CHA-368 x CHA-178)
     //
     // Unit-level guards for the two-arm adaptation of the parent-cold fold. The
     // parent resolve is driven by the mock's `resolved` batch; the child batch
@@ -1994,8 +1989,6 @@ mod tests {
             "mixed path folds the base unfiltered; the residual is deferred to assemble_parts",
         );
     }
-
-    // ----- Tests ---------------------------------------------------------
 
     #[tokio::test]
     async fn empty_plan_yields_empty() {
@@ -2485,7 +2478,7 @@ mod tests {
         assert_eq!(open.tighten_for_hot(None), open);
     }
 
-    // ----- CHA-82 R1: snapshot segment pruning red test -----------------
+    // CHA-82 R1: snapshot segment pruning red test
 
     /// Build a SnapshotSegment whose `statistics` field is produced by
     /// `penca_dl::stats::compute_segment_statistics` over a 2-row batch
@@ -2592,7 +2585,7 @@ mod tests {
         //   subcase 1 (correctness sanity): filter `value > 200` DOES
         //     intersect [0,299] → segment IS read → recorded reads == 1.
 
-        // ---- subcase 2: filter pruning excludes the segment ----
+        // subcase 2: filter pruning excludes the segment
         let plan = plan_with_snapshot(vec![snapshot_segment_with_value_stats(
             "seg-merged",
             0,
@@ -2625,7 +2618,7 @@ mod tests {
             dl.recorded_snapshot_reads()
         );
 
-        // ---- subcase 1: filter intersects the segment, so it IS read ----
+        // subcase 1: filter intersects the segment, so it IS read
         let plan2 = plan_with_snapshot(vec![snapshot_segment_with_value_stats(
             "seg-merged",
             0,
@@ -2657,7 +2650,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-351: snapshot pruning works with `l.`-qualified filter ----
+    // CHA-351: snapshot pruning works with `l.`-qualified filter
 
     /// System-internal stream_merged callers (`penca-storage-meta`,
     /// `penca-sql-server` DML) always qualify their filter columns with
@@ -2702,7 +2695,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-427: stream_all_cold ≡ stream_merged on all-cold plans ----
+    // CHA-427: stream_all_cold ≡ stream_merged on all-cold plans
 
     /// For an all-cold plan, the dedicated cold path must produce the
     /// exact batches the merged path produces (whose hot arms self-skip
@@ -2920,7 +2913,7 @@ mod tests {
         );
     }
 
-    // ----- CHA-482 (RT2): MergeReadRequest.seeks subsumes row_uuids ---------
+    // CHA-482 (RT2): MergeReadRequest.seeks subsumes row_uuids
 
     /// A single identity `IndexSeek` entry must thread to every tier exactly as
     /// the pre-CHA-482 `row_uuids` restriction did: the provider receives the

@@ -19,10 +19,6 @@ use tokio::sync::Mutex;
 
 use super::{DbDriver, SqlType, SqlValue};
 
-// ---------------------------------------------------------------------------
-// Bind-parameter helper
-// ---------------------------------------------------------------------------
-
 /// Build a `PgArguments` from a slice of [`SqlValue`].
 ///
 /// This is the bridge between penca's database-agnostic [`SqlValue`] enum
@@ -69,10 +65,6 @@ fn build_pg_args(params: &[SqlValue]) -> Result<PgArguments, sqlx::Error> {
     Ok(args)
 }
 
-// ---------------------------------------------------------------------------
-// AdvisoryLockGuard
-// ---------------------------------------------------------------------------
-
 /// Owns a pooled connection holding a session-scoped advisory lock. On
 /// drop (panic or early return), spawns a task to detach and close the
 /// connection so the lock dies with the backend session instead of
@@ -114,10 +106,6 @@ impl Drop for AdvisoryLockGuard {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// PgDriver
-// ---------------------------------------------------------------------------
 
 /// PostgreSQL driver backed by a sqlx connection pool.
 #[derive(Clone)]
@@ -371,10 +359,6 @@ impl DbDriver for PgDriver {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// PgTransactionDriver
-// ---------------------------------------------------------------------------
 
 /// Transaction-scoped driver bound to a single connection.
 ///

@@ -1458,9 +1458,7 @@ class TestBranchMaterialization:
         assert main_result.num_rows == 0
 
 
-# ---------------------------------------------------------------------------
 # CHA-142 — filter pushdown on the read path
-# ---------------------------------------------------------------------------
 
 
 _FILTER_STATES = [
@@ -1948,9 +1946,7 @@ class TestReadDataFilterPushdown:
         assert unfiltered.column("value").to_pylist() == [100]
 
 
-# ---------------------------------------------------------------------------
 # CHA-361: GetPlan without committed_at pins to pg_now (no unbounded plan)
-# ---------------------------------------------------------------------------
 
 
 class TestTimeTravelCatalogReadRespectsAsOfOnColdTier:
@@ -2074,13 +2070,11 @@ class TestTimeTravelCatalogReadRespectsAsOfOnColdTier:
             )
 
 
-# ---------------------------------------------------------------------------
 # The CHA-215 time-travel segment-selection tests (TestTimeTravelSegmentFilters)
 # were removed with the StorageMetadataService Plan RPC they dialed (CHA-445).
 # Their DB-bound coverage — persist-segment interval-overlap straddle behavior
 # and snapshot-picker watermark (not commit-time) ordering — is tracked for
 # restoration in CHA-456.
-# ---------------------------------------------------------------------------
 
 
 def _commit_one_row(
@@ -2114,9 +2108,7 @@ def _micros_to_dt(micros: int):
     return micros_to_datetime(micros)
 
 
-# ---------------------------------------------------------------------------
 # CHA-218: cold reads/audit after pre-joining commit_tx_log into persist segments
-# ---------------------------------------------------------------------------
 #
 # These tests pin the read-path consequences of CHA-218: cold merge-read
 # collapses to a pure scan (no JOIN against cold ``commit_tx_log``); ``audit_data``
@@ -3078,9 +3070,7 @@ class TestAuditAppliesPurgeCutoff:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-227: strict hot/cold partition + plan-time threading in plan()
-# ---------------------------------------------------------------------------
 #
 # Pins the planner reshape: pre-Purge ``plan()`` returns
 # ``cold_storage = None`` (hot serves everything); post-Purge the cold

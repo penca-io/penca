@@ -43,7 +43,6 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-// ===========================================================================
 // Entity resolvers (CHA-381) — return the whole resolved object.
 //
 // Each `resolve_<entity>_by_{uuid,name}` resolves a single identifier and
@@ -56,7 +55,6 @@ use crate::error::ApiError;
 // table by `table_uuid` regardless of which schema it lives in (via
 // `get_table_by_uuid`). `resolve_table_by_name` stays schema-scoped — the
 // name lookup needs the schema parent.
-// ===========================================================================
 
 /// Resolve a [`Catalog`] by `catalog_uuid`. NOT_FOUND if absent (a
 /// `catalog_store` read, so the uuid path resolves existence, not just

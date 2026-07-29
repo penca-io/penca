@@ -178,10 +178,6 @@ impl<S: SegmentScope> DurableSegmentWriter<S> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Persist scope
-// ---------------------------------------------------------------------------
-
 /// Per-segment data for one persist-side write step. Owned because
 /// `phase1_durable_writes` borrows each chunk from `chunk_row_ranges`
 /// inside a loop; an owned struct sidesteps the borrow contortions
@@ -294,10 +290,6 @@ impl<'a> SegmentScope for PersistSegmentScope<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot scope
-// ---------------------------------------------------------------------------
-
 /// Per-segment data for one snapshot-side write step.
 pub(super) struct SnapshotSegmentStep {
     pub seg_uuid_str: String,
@@ -403,10 +395,6 @@ impl<'a> SegmentScope for SnapshotSegmentScope<'a> {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Packed snapshot files (CHA-404)
-// ---------------------------------------------------------------------------
 
 /// One packed snapshot segment FILE: several whole partitions
 /// concatenated into `file_batch`, written to one `uri`, with one

@@ -1533,10 +1533,6 @@ fn flight_info_with_self_ticket(
     Ok(flight_info)
 }
 
-// ---------------------------------------------------------------------------
-// Session helpers
-// ---------------------------------------------------------------------------
-
 /// Pull the per-request [`Arc<ConnSession>`] populated by
 /// [`super::server::PerConnService`]. Returns `INTERNAL` if missing — the
 /// per-conn service is wired in `serve()` / `serve_with_listener()`, so

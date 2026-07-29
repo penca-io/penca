@@ -105,7 +105,7 @@ class TestCha492ExactCoverTrace:
         ctx, kw = _snapshot_only_named(client)
         target = f"{ctx['schema_name']}.{ctx['table_name']}"
 
-        # ---- The user shape: SQL `WHERE pk = lit` over Flight SQL ------------
+        # The user shape: SQL `WHERE pk = lit` over Flight SQL
         since = len(container_log("query"))
         results = _sql_steps_via(
             driver,

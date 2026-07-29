@@ -69,7 +69,6 @@ pub struct ParsedSegmentStats {
     pub per_column: Vec<ParsedColumnStats>,
 }
 
-// ----- v0 wire format --------------------------------------------------
 //
 // Per-column entries are keyed by **column name**, not by position. The
 // writer's batch schema does not always match the reader's user schema:
@@ -252,8 +251,6 @@ fn stats_has_builder(ct: &CanonicalType) -> bool {
             | CanonicalType::Decimal256 { .. }
     )
 }
-
-// ----- compute (writer side) -------------------------------------------
 
 pub fn compute_segment_statistics(batch: &RecordBatch) -> Vec<u8> {
     let schema = batch.schema();
@@ -506,8 +503,6 @@ fn column_min_max(array: &ArrayRef, dt: &DataType) -> (Option<ScalarValue>, Opti
     }
 }
 
-// ----- parse (reader side) ---------------------------------------------
-
 pub fn parse_segment_statistics(bytes: &[u8], schema: &SchemaRef) -> ParsedSegmentStats {
     let empty = ParsedSegmentStats {
         row_count: 0,
@@ -556,8 +551,6 @@ pub fn parse_segment_statistics(bytes: &[u8], schema: &SchemaRef) -> ParsedSegme
         per_column,
     }
 }
-
-// ----- PruningStatistics impl ------------------------------------------
 
 pub struct SegmentPruningStats {
     pub schema: SchemaRef,
@@ -952,8 +945,6 @@ impl PruningStatistics for SegmentPruningStats {
     }
 }
 
-// ----- prune_segments_by_stats -----------------------------------------
-
 /// Prune snapshot segments by per-column statistics using a pre-built
 /// physical predicate.
 ///
@@ -996,8 +987,6 @@ pub fn prune_segments_by_stats<S>(
         Err(_) => (0..segments.len()).collect(),
     }
 }
-
-// ----- aggregate_table_statistics --------------------------------------
 
 pub fn aggregate_table_statistics(parsed: &[ParsedSegmentStats], schema: &SchemaRef) -> Statistics {
     if parsed.is_empty() {

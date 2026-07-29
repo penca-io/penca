@@ -86,11 +86,6 @@ _QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 _GRACE_WAIT_SECONDS = _QUERY_TIMEOUT_SECONDS + 1.0
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_branch(client, catalog_uuid, name):
     """Create a branch on the catalog, return its UUID."""
     branch = client.create_branch(
@@ -256,11 +251,6 @@ def _commit_tx_deleting_rows(
         catalog_uuid=catalog_uuid,
         branch_uuid=branch_uuid,
     )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 class TestPerTableLifecycle:
@@ -1159,10 +1149,8 @@ class TestPerTableLifecycle:
         assert result.num_rows == 0
 
 
-# ---------------------------------------------------------------------------
 # CHA-227: stamping rule (max(committed_at) over persisted rows) and
 # Snapshot's direct-watermark reads
-# ---------------------------------------------------------------------------
 
 
 def _max_committed_persist_segment_max_tx(catalog_uuid, branch_uuid, table_uuid):
@@ -1472,11 +1460,6 @@ class TestPerTableLifecycleCHA227:
             f"persisted_at ({persisted_at}); got "
             f"{snapshot_response.snapshotted_at_micros}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Proto-shape regressions
-# ---------------------------------------------------------------------------
 
 
 class TestPerTableLifecycleProtoShape:
