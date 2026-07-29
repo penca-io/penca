@@ -6,7 +6,7 @@
 ## Purpose
 
 Drives `Persist → Snapshot → Purge` across every branch on two periodic timers
-timer so the hot → cold → snapshotted → purged pipeline runs
+so the hot → cold → snapshotted → purged pipeline runs
 autonomously. Without the scheduler, Penca only advances lifecycle
 state when an operator (or embedded-mode caller) invokes the RPCs
 directly. With it, the happy-path unattended deployment moves data
@@ -168,8 +168,11 @@ All values are required from environment variables; defaults live in
 
 ## Failure handling
 
-Errors inside a single `(catalog, branch)` tick are logged at `warn` and
-the loop continues. Errors on a single table within a branch are also
+A **branch-level** failure — a listing RPC erroring — propagates out of the
+sweep, so `tick_branch` returns early and that branch's watermarks do NOT
+advance; the next tick re-runs the same window. A **per-table** Purge failure is
+logged and swallowed inside `purge_each`, and the watermark advances past it.
+Either way the loop moves on to the next branch. Errors on a single table within a branch are also
 logged and skipped — the branch ops are continue-on-error, which is
 load-bearing rather than incidental: both dirty sets are enumerated
 oldest-timestamp-first, so a table whose op keeps failing sorts first on
