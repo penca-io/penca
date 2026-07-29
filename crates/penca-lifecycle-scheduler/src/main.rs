@@ -36,6 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
+    // Purge and tx-log GC ride the snapshot loop, so disabling it while persist
+    // keeps running leaves hot rows with no reclaimer — and the lifecycle
+    // service's ledger-GC floor still credits the persist cadence, so it may drop
+    // bookkeeping for rows nothing will clear.
+    if config.snapshot_tick_interval().is_none() && config.persist_tick_interval().is_some() {
+        tracing::warn!(
+            persist_tick_interval_seconds = config.persist_tick_interval_seconds,
+            snapshot_tick_interval_seconds = config.snapshot_tick_interval_seconds,
+            "snapshot loop disabled while persist runs: no Purge, no tx-log GC, \
+             and hot will grow unbounded"
+        );
+    }
+
     tracing::info!(
         persist_tick_interval_seconds = config.persist_tick_interval_seconds,
         snapshot_tick_interval_seconds = config.snapshot_tick_interval_seconds,

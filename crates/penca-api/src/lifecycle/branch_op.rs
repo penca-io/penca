@@ -279,7 +279,7 @@ impl LifecycleManager {
         let modified = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
-        let mut failed = self
+        let persist_failed = self
             .persist_each(
                 pool,
                 hot,
@@ -294,7 +294,7 @@ impl LifecycleManager {
         let persisted = self
             .list_all_persisted_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
-        failed += self
+        let snapshot_failed = self
             .snapshot_each(
                 pool,
                 readers,
@@ -305,14 +305,19 @@ impl LifecycleManager {
                 &persisted,
             )
             .await;
-        Ok(branch_op_watermark(
-            &catalog_uuid,
-            &branch_uuid,
-            watermark,
-            failed,
-            modified.len() + persisted.len(),
-            "PersistAndSnapshot",
-        ))
+        if persist_failed + snapshot_failed > 0 {
+            tracing::warn!(
+                catalog = %catalog_uuid,
+                branch = %branch_uuid,
+                persist_failed,
+                persist_total = modified.len(),
+                snapshot_failed,
+                snapshot_total = persisted.len(),
+                "branch PersistAndSnapshot incomplete; withholding watermark"
+            );
+            return Ok(None);
+        }
+        Ok(Some(watermark))
     }
 
     /// Persist each table in an already-enumerated set, returning how many

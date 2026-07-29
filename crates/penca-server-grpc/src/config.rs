@@ -221,6 +221,14 @@ impl LifecycleServiceConfig {
     /// longer. That is the cost of decoupling the cadences.
     ///
     /// Clamped at 0: a disabled loop (non-positive) contributes no floor.
+    ///
+    /// **Limitation.** This bounds the gap between sweeps; it does not know
+    /// whether Purge runs at all. A deployment with a positive persist cadence
+    /// and a disabled snapshot cadence gets a finite floor from persist even
+    /// though Purge — which rides the snapshot loop — never fires, so the
+    /// expired-begin ledger GC could drop bookkeeping for hot rows nothing will
+    /// clear. No shipped profile does this; the scheduler warns at startup if it
+    /// sees that combination.
     pub fn purge_sweep_interval_seconds(&self) -> i64 {
         self.persist_tick_interval_seconds
             .max(self.snapshot_tick_interval_seconds)
@@ -439,9 +447,11 @@ mod tests {
     /// A disabled loop (non-positive cadence) contributes no floor; the hot-grace
     /// window then stands alone. Both disabled is the integration-test profile.
     ///
-    /// The `(5, -1)` case floors on the persist cadence even though Purge rides
-    /// the snapshot loop today — that is the conservative bound doing its job,
-    /// not a claim that the persist loop issues Purge.
+    /// The `(5, -1)` case floors on the persist cadence even though Purge, which
+    /// rides the snapshot loop, would never run in that configuration — the
+    /// floor bounds sweep cadence, not whether Purge fires at all. The scheduler
+    /// warns at startup on that combination; see
+    /// [`Self::purge_sweep_interval_seconds`].
     #[test]
     fn disabled_loops_contribute_no_floor() {
         assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_seconds(), 0);

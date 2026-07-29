@@ -158,11 +158,13 @@ where
             .into_inner()
             .watermark
             .ok_or_else(|| {
-                Status::internal(
-                    "CreateBranch aborted: the source branch could not be fully \
-                     flushed hot→cold; see the lifecycle service log for the \
-                     failing tables",
-                )
+                Status::internal(format!(
+                    "CreateBranch aborted: source branch {} in catalog {} could \
+                     not be fully flushed hot→cold. The lifecycle service logged \
+                     one warn per failing table with these two fields.",
+                    req.source_branch_uuid.as_deref().unwrap_or("<by name>"),
+                    req.catalog_uuid.as_deref().unwrap_or("<by name>"),
+                ))
             })?;
         let resp = self
             .manager

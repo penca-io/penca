@@ -110,16 +110,12 @@ impl PersistLoop {
             .await
         {
             Err(e) => tracing::warn!(
-                catalog = %catalog.catalog_uuid,
-                branch = %branch.branch_uuid,
                 error = %e,
                 "PersistBranch failed; will retry next tick"
             ),
             Ok(resp) => {
                 if resp.get_ref().watermark.is_none() {
                     tracing::warn!(
-                        catalog = %catalog.catalog_uuid,
-                        branch = %branch.branch_uuid,
                         "PersistBranch incomplete: at least one table failed; \
                          see the lifecycle service log for which"
                     );

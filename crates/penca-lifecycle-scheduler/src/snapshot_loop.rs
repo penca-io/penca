@@ -23,16 +23,29 @@
 //!
 //! ## Why Purge rides this loop, not the persist loop
 //!
-//! Purge's committed axis targets `Pu = W_snap`, read from the latest committed
-//! *snapshot* watermark behind a strict-advance gate. It therefore cannot
-//! advance unless a Snapshot has run: on a fast persist tick it would compute no
-//! advance and early-return, costing an RPC and buying nothing.
+//! Purge has three axes and only ONE is gated on Snapshot:
 //!
-//! The trade-off, accepted: Purge's other two axes — expired-begin cleanup and
-//! abort cleanup — have no dependence on `W_snap` and now reclaim at the
-//! snapshot cadence rather than the persist one. Both reclaim invisible garbage
-//! (aborted rows and timed-out open txs serve no reads), and ADR 0027 §5 already
-//! gives expired-begin ledger GC a wall-clock grace.
+//! - **committed** — targets `Pu = W_snap` behind a strict-advance gate, so it
+//!   cannot advance unless a Snapshot has run.
+//! - **abort** — targets `Pa = F` from the branch abort frontier. No `W_snap`
+//!   dependence.
+//! - **expired-begin** — unconditional, and runs before the no-advance
+//!   early-return.
+//!
+//! So a Purge on a persist tick is not a guaranteed no-op: with aborts or
+//! timed-out txs outstanding it would do real work. The reason it still belongs
+//! here is a cost judgement, not a no-op one.
+//!
+//! Aborted and expired-begin rows are rare in normal operation, and Purge is a
+//! per-table client loop over a paginated enumeration — putting it on the
+//! persist loop would make that loop stateful (it would need the enumeration
+//! watermark back) and add per-branch RPC fan-out to the CDC path whose whole
+//! job is to not fall behind. Paying that on every fast tick to reclaim garbage
+//! that usually is not there is the wrong trade; the committed axis, which is
+//! the one that actually moves bytes, is gated on Snapshot anyway.
+//!
+//! The accepted cost: reclamation latency for aborted and expired-begin rows is
+//! the snapshot cadence rather than the persist cadence.
 
 use std::collections::HashMap;
 use std::time::Duration;

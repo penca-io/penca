@@ -386,11 +386,8 @@ service LifecycleService {
   // Catalog-wide persist/snapshot over a branch's dirty set, returning the fork
   // Watermark T (the caller-supplied `target` position, else the branch head).
   //
-  // The scheduler's persist loop drives PersistBranch and its snapshot loop
-  // drives SnapshotBranch, on independent cadences. CreateBranch (and merge,
-  // CHA-493) also drive PersistBranch, for an all-or-nothing fork flush.
-  // PersistAndSnapshotBranch loops both per table (non-atomic) and is retained
-  // as a client-facing convenience — it has no server-side caller.
+  // PersistBranch and SnapshotBranch each run one phase;
+  // PersistAndSnapshotBranch loops both per table (non-atomic).
   //
   // Persist enumerates MODIFIED tables (already-persisted ones are already
   // durable); Snapshot enumerates PERSISTED ones, so a table persisted then
