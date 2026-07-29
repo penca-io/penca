@@ -266,10 +266,11 @@ def test_every_side_channel_test_is_marked_serial():
     )
 
     # Coarse: catches a scan that has stopped seeing most of the suite,
-    # whatever the cause. 47 today, re-derived under the global closure; the
-    # floor is set close enough to bite (dropping `container_log` alone yields
-    # exactly 30) but with room for ordinary edits. It does NOT catch subtler walk regressions that leave the
-    # count intact — the existence check above is the precise instrument.
+    # whatever the cause. Both figures re-derived under the global closure —
+    # 47 today, and dropping `container_log` alone yields exactly 30 — so the
+    # floor sits close enough to bite while leaving room for ordinary edits.
+    # It does NOT catch subtler walk regressions that leave the count intact;
+    # the existence check above is the precise instrument.
     assert scanned >= 40, (
         f"only {scanned} side-channel tests found; the check has stopped "
         "looking at most of the suite"

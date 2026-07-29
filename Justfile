@@ -783,8 +783,9 @@ fetch-jdbc-driver:
 # Requires Docker daemon. Uses the test profile (random ports) by default,
 # safe for parallel worktrees. Pass service names to run specific tests:
 #   just integration-test lifecycle query
-# Set the parallel phase's worker count (default `auto`, capped at 4). Raises
-# as well as lowers, so a 2-core box can reproduce CI's 4-worker contention:
+# Set the parallel phase's worker count. Unset means `auto`, capped by
+# PENCA_TEST_JOBS_MAX (default 4); an explicit value is used as-is, uncapped,
+# so a 2-core box can reproduce CI's 4-worker contention:
 #   PENCA_TEST_JOBS=4 just integration-test
 # Note a named subset now runs its non-serial tests under xdist too, so it is
 # representative of CI — but that means output is captured and breakpoint()/pdb
@@ -836,21 +837,47 @@ integration-test *services:
     # CHA-519 retires the first reason, not the second, so it shrinks this
     # phase rather than deleting it.
     #
-    # Count both phases up front and require them to partition the selection.
-    # This is the split's actual correctness property — every test runs in
-    # exactly one phase — and asserting it here catches a mistyped `-m` before
-    # a 30-minute run rather than after. A one-sided typo (`-m "seriall"`)
-    # drops the serial tests from BOTH phases, so the sum falls short and this
-    # fails; nothing downstream has to infer intent from an exit code.
+    # Count each selection up front, so the phases don't have to infer intent
+    # from an exit code later and a bad selector fails in seconds rather than
+    # after a 30-minute run.
     #
-    # Counting collected node ids rather than parsing pytest's summary line,
+    # The sum check is narrower than it looks: `-m X` and `-m "not X"` are
+    # exact complements for ANY well-formed X, so it is a tautology except in
+    # the one case where the two literals here stop being negations of each
+    # other — i.e. a one-sided typo like `-m "seriall"`, which drops the serial
+    # tests from both phases. That is the realistic mistake, so it earns its
+    # place, but it does NOT check that the marks themselves are right; the
+    # static check does that.
+    #
+    # Counts collected node ids rather than parsing pytest's summary line,
     # whose wording differs between the deselected and non-deselected cases.
+    # Exit 5 (nothing collected) is a legitimate answer of zero; anything else
+    # non-zero is a real collection failure — a bad service name gives exit 4 —
+    # and must not be silently counted as zero.
+    collect_out=$(mktemp)
+    trap 'rm -f "$collect_out"' EXIT
     count_tests() {
-        uv run pytest "$@" --collect-only -q 2>/dev/null | grep -c '::' || true
+        uv run pytest "$@" --collect-only -q >"$collect_out" 2>&1
+        collect_rc=$?
+        if [ "$collect_rc" -ne 0 ] && [ "$collect_rc" -ne 5 ]; then
+            cat "$collect_out" >&2
+            echo "collection failed (pytest exit $collect_rc)" >&2
+            return 1
+        fi
+
+        grep -c '::' "$collect_out" || true
     }
-    total_n=$(count_tests "${files[@]}")
-    serial_n=$(count_tests "${files[@]}" -m "serial")
-    parallel_n=$(count_tests "${files[@]}" -m "not serial")
+    total_n=$(count_tests "${files[@]}") || exit 1
+    serial_n=$(count_tests "${files[@]}" -m "serial") || exit 1
+    parallel_n=$(count_tests "${files[@]}" -m "not serial") || exit 1
+
+    # Selecting nothing at all is never right — a mistyped service name lands
+    # here — and without this both phases would exit 5, both tolerances would
+    # fire, and the recipe would report success having run no tests.
+    if [ "$total_n" -eq 0 ]; then
+        echo "selection matched no tests" >&2
+        exit 1
+    fi
 
     if [ "$((serial_n + parallel_n))" -ne "$total_n" ]; then
         echo "phase selectors do not partition the suite:" >&2
