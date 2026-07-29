@@ -12,11 +12,18 @@ This module pins:
 
 - ``test_open_tx_read_issues_one_begin_tx_log_lookup`` — an open-tx read issues
   exactly ONE statement referencing the branch's ``begin_tx_log`` partition.
-  Fail-first: today it issues 2.
-- the ``TestDeadTxCharacterization`` cases — a dead ``open_tx_uuid`` keeps
-  returning the status code it returns today. These are GREEN before and after;
-  acceptance criterion 2 is "same status codes it does today", so they are
-  regression guards, not red tests.
+  Fail-first: today it issues 2. This is the only red test here.
+- the ``TestDeleteSchemaWithDeadTx`` and ``TestDeadTxCharacterization`` cases — a
+  dead ``open_tx_uuid`` keeps returning the status code it returns today. These are
+  GREEN before and after; acceptance criterion 2 is "same status codes it does
+  today", so they are regression guards, not red tests.
+
+The fallthrough in ``resolve_read_snapshot``'s open-tx arm has no user-visible
+consequence today, which is why nothing here goes red for it: reads are covered by
+``resolve_query_snapshot`` and every append path is covered by ``resolve_tx``.
+Removing it matters because CHA-540 deletes ``resolve_query_snapshot``, after which
+``resolve_read_snapshot`` is the read path's only dead-tx validation — so these
+guards are what would go red if the fallthrough survived that deletion.
 
 Counting is via ``pg_stat_statements``, the same seam the CHA-367 / CHA-441
 resolution-count tests use: ``count_stmts_referencing`` sums ``calls`` over
@@ -108,6 +115,72 @@ class TestOpenTxResolutionCount:
             f"be resolved once, by the validating get_tx_status, and threaded "
             f"through to the data read (expected 1)"
         )
+
+
+class TestDeleteSchemaWithDeadTx:
+    """Characterization guard — GREEN before and after CHA-540.
+
+    `delete_schema_cascade` passes `request_tx_uuid` straight into
+    `resolve_read_snapshot`, which is the one caller that does not subsequently
+    reach the validating `resolve_query_snapshot`. That looks like it should expose
+    the fallthrough, and it does not: every append path first calls `resolve_tx`
+    (`crates/penca-api/src/write/mod.rs`), which runs the same
+    `begin_tx_log ⟕ abort_tx_log ⟕ commit_tx_log` join and rejects a dead tx with
+    exactly these codes before the fallthrough can matter.
+
+    So this pins existing behavior, not a defect. It earns its place because CHA-540
+    changes the error type of the resolver these write paths call and consolidates
+    the tx-liveness mapping onto one helper — this is what catches a regression in
+    the write path's dead-tx rejection while that happens.
+    """
+
+    def test_delete_schema_with_never_begun_tx_raises_not_found(self):
+        client = make_client()
+        ctx = setup_with_data(client)
+        cat = ctx["catalog_uuid"]
+        sch = ctx["schema_uuid"]
+        br = ctx["main_branch_uuid"]
+
+        with pytest.raises(NotFoundError):
+            client.delete_schema(
+                catalog_uuid=cat,
+                schema_uuid=sch,
+                branch_uuid=br,
+                tx_uuid=NEVER_BEGUN_TX,
+            )
+
+        # The delete must not have partially applied.
+        assert (
+            client.get_schema(
+                catalog_uuid=cat, schema_uuid=sch, branch_uuid=br
+            ).schema_uuid
+            == sch
+        ), "schema must survive a rejected delete_schema"
+
+    def test_delete_schema_with_aborted_tx_raises_failed_precondition(self):
+        client = make_client()
+        ctx = setup_with_data(client)
+        cat = ctx["catalog_uuid"]
+        sch = ctx["schema_uuid"]
+        br = ctx["main_branch_uuid"]
+
+        tx = client.begin_tx(catalog_uuid=cat, schema_uuid=sch, branch_uuid=br)
+        client.abort_tx(tx.tx_uuid, catalog_uuid=cat, branch_uuid=br)
+
+        with pytest.raises(FailedPreconditionError):
+            client.delete_schema(
+                catalog_uuid=cat,
+                schema_uuid=sch,
+                branch_uuid=br,
+                tx_uuid=tx.tx_uuid,
+            )
+
+        assert (
+            client.get_schema(
+                catalog_uuid=cat, schema_uuid=sch, branch_uuid=br
+            ).schema_uuid
+            == sch
+        ), "schema must survive a rejected delete_schema"
 
 
 class TestDeadTxCharacterization:
