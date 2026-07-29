@@ -449,16 +449,71 @@ impl LifecycleManager {
                 });
             }
         };
+        // This branch's OWN prior snapshot watermark. Everything windowed
+        // against the branch's persist log keys off this: the delta resolve, the
+        // seq-watermark fold, and the CHA-178 base-fold gate in
+        // `assemble_cold_only_plan`. It stays `None` on a fork's first snapshot
+        // even once the parent's baseline is adopted below — letting the
+        // parent's watermark leak in here would drop the parent's entire cold
+        // tier on the full-rewrite path and would window the delta resolve
+        // against a watermark from another branch's log.
+        let prev_snap_watermark = snapshot_result.snapshotted_at_micros;
+
+        // CHA-531: a fork's first snapshot has no baseline of its own, so the
+        // carry-forward gate below would see an empty segment set and fall
+        // through to the CHA-404 full rewrite — O(table) bytes per fork. Adopt
+        // the parent's baseline at the fork edge and carry from that instead.
+        //
+        // The pick bound is the same `(snapshotted_at_micros,
+        // fork_commit_seq_num)` pair `enumerate_base_cold_source` uses, so the
+        // carry path and the full-rewrite fallback inherit the same parent state
+        // by construction rather than by coincidence.
+        //
+        // Single-level only: `read_branch_lineage` returns one immediate parent
+        // (CHA-509 tracks recursion, CHA-515 guards main-only forks).
+        let fork_base = if prev_snap_watermark.is_some() {
+            None
+        } else {
+            match self
+                .query_manager
+                .read_branch_lineage(pool, &catalog_str, &branch_str)
+                .await?
+            {
+                Some((parent_branch_uuid, fork_commit_seq_num)) => {
+                    let base = self
+                        .query_manager
+                        .read_snapshot_segments_for_table(
+                            pool,
+                            &catalog_str,
+                            &parent_branch_uuid,
+                            &table_str,
+                            Some(snapshotted_at_micros),
+                            Some(fork_commit_seq_num),
+                            None,
+                        )
+                        .await?;
+                    base.snapshotted_at_micros
+                        .map(|_| (parent_branch_uuid, base))
+                }
+                None => None,
+            }
+        };
+        // `source_branch` is the branch the carried rows are READ from; the new
+        // rows are always written under `branch_str`. The two differ only here.
+        let (source_branch, baseline) = match fork_base {
+            Some((parent_branch_uuid, base)) => (parent_branch_uuid, base),
+            None => (branch_str.clone(), snapshot_result),
+        };
         let SnapshotResult {
             // CHA-485: planner-only field; the snapshot writer re-derives defs
             // from live index_metadata itself.
             indexes: _,
-            snapshotted_at_micros: prev_snap_watermark,
-            commit_seq_num: prev_snapshot_commit_seq_num,
+            snapshotted_at_micros: baseline_watermark,
+            commit_seq_num: baseline_commit_seq_num,
             snapshot_segments,
             partition_keys: recorded_partition_keys,
             clustering_keys: recorded_clustering_keys,
-        } = snapshot_result;
+        } = baseline;
 
         // CHA-483: prior committed segments keyed by uuid, so the write tail can
         // read a CARRIED segment's base file to materialize a newly-active user
@@ -492,8 +547,12 @@ impl LifecycleManager {
                 Some(snapshotted_at_micros.saturating_add(1)),
             )
             .await?;
+        // CHA-531: on a fork's first snapshot the baseline is the parent's, so
+        // the new watermark bases at the PARENT's W_snap. Basing at the child's
+        // own (`None` → genesis) would stamp a watermark below the seq of rows
+        // the snapshot actually materializes.
         let snapshot_commit_seq_num = compute_snapshot_seq_watermark(
-            prev_snapshot_commit_seq_num,
+            baseline_commit_seq_num,
             &segment_seq_max.into_iter().collect::<Vec<i64>>(),
         );
 
@@ -553,9 +612,7 @@ impl LifecycleManager {
             table_uuid: &table_uuid,
             catalog_str: &catalog_str,
             branch_str: &branch_str,
-            // IMPL-B (CHA-531) is what routes a fork's parent in here; until
-            // then every snapshot's baseline is its own branch.
-            source_branch_str: &branch_str,
+            source_branch_str: &source_branch,
             table_str: &table_str,
             snap_uuid: &snap_uuid,
             snap_str: &snap_str,
@@ -683,8 +740,10 @@ impl LifecycleManager {
 
             let touched_plan = SnapshotPlan {
                 segments: touched_segments,
-                snapshotted_at_micros: prev_snap_watermark
-                    .expect("eligibility guarantees a prior snapshot watermark"),
+                // The BASELINE's watermark, not this branch's: on a fork's first
+                // snapshot the touched segments are the parent's (CHA-531).
+                snapshotted_at_micros: baseline_watermark
+                    .expect("eligibility guarantees a baseline snapshot watermark"),
                 ..Default::default()
             };
             // Prior stream over the touched subset only, with the same
