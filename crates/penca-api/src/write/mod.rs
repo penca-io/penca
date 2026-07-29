@@ -1068,18 +1068,6 @@ impl WriteManager {
         with_pg_tx(pool, async |tx| {
             let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
             if deleted {
-                // BEFORE the partition drops, per the lock-ordering invariant on
-                // `insert_segment_delete_set_rows`: every writer of the delete
-                // set takes its row locks before touching the segment-metadata
-                // parents. Dropping a partition takes ACCESS EXCLUSIVE on the
-                // catalog-wide parent, so enqueueing afterwards would invert that
-                // against both other writers — retirement and the compact merge —
-                // and a URI shared across a fork edge makes the cycle reachable
-                // with no misuse. Still one transaction, so atomicity is
-                // unchanged.
-                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
-                    .await?;
-
                 for table_uuid_str in &table_uuid_strs {
                     LifecycleManager::drop_data_tables(
                         tx,
@@ -1098,6 +1086,17 @@ impl WriteManager {
                 // deletes (Phase 2 above) and the data-table drops above
                 // are tier-specific and stay here.
                 LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
+
+                // Delete-set LAST, after the partition drops, per the ordering
+                // invariant on `insert_segment_delete_set_rows`. Dropping a
+                // partition takes ACCESS EXCLUSIVE on the catalog-wide parent; a
+                // concurrent compact holds ROW SHARE on that same parent from its
+                // opening `SELECT ... FOR UPDATE` and cannot release it, so
+                // teardown must not be holding a delete-set row while it waits
+                // for the parent. Still one transaction, so removing the
+                // references and queueing the files remain one atomic fact.
+                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
+                    .await?;
             }
             Ok(())
         })

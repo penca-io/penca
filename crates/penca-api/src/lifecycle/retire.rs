@@ -126,13 +126,6 @@ impl LifecycleManager {
             .begin()
             .await
             .map_err(|e| ApiError::Metadata(e.into()))?;
-        penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
-            &tx,
-            &catalog_str,
-            &distinct_uris,
-        )
-        .await?;
-
         // Cold-index sidecars are cold files too: enqueue their URIs in the
         // same sweep so they don't outlive the base segments they reference. A
         // carried sidecar copies the prior file's URI by reference, so the
@@ -146,20 +139,12 @@ impl LifecycleManager {
             &segment_uuid_strs,
         )
         .await?;
-        if !sidecars.is_empty() {
-            let sidecar_uris: Vec<String> = sidecars
-                .iter()
-                .map(|s| s.object_uri.clone())
-                .collect::<BTreeSet<String>>()
-                .into_iter()
-                .collect();
-            penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
-                &tx,
-                &catalog_str,
-                &sidecar_uris,
-            )
-            .await?;
-        }
+        let sidecar_uris: Vec<String> = sidecars
+            .iter()
+            .map(|s| s.object_uri.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
         // Unconditional (no-op on empty): deletes committed AND any stray
         // uncommitted sidecar rows so none outlive their base segments —
         // the committed-only `sidecars` list above would otherwise leave
@@ -192,6 +177,29 @@ impl LifecycleManager {
             &branch_str,
         )
         .await?;
+
+        // Delete-set LAST, after every segment-metadata parent this tx touches,
+        // per the ordering invariant on `insert_segment_delete_set_rows`. The
+        // sidecar URIs are read above (before their rows are deleted) but
+        // enqueued here, so the parent locks are all taken before any delete-set
+        // row lock. Position within the tx is free for ADR 0019 item 3 — it
+        // requires the rows to commit atomically with the retirement, not to
+        // precede it.
+        penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
+            &tx,
+            &catalog_str,
+            &distinct_uris,
+        )
+        .await?;
+        if !sidecar_uris.is_empty() {
+            penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
+                &tx,
+                &catalog_str,
+                &sidecar_uris,
+            )
+            .await?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| ApiError::Metadata(e.into()))?;

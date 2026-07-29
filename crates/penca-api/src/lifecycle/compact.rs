@@ -288,21 +288,6 @@ where
     // `is_sealed`.
     let total_rows: i64 = input_meta.iter().map(|m| m.row_count).sum();
     let mut cumulative: i64 = 0;
-
-    // Enqueue BEFORE the repoint loop. Every writer that touches both
-    // `segment_delete_set` and the segment-metadata parents must take the
-    // delete-set row locks FIRST — see the ordering invariant on
-    // `insert_segment_delete_set_rows`. Repointing takes ROW EXCLUSIVE on the
-    // catalog-wide parent, so enqueueing afterwards inverted this against
-    // `retire.rs` (and, once branch teardown started enqueueing, against that
-    // too), giving PG a cycle to break by aborting one side.
-    //
-    // Still inside `tx`, which is what ADR 0019 §"Four-part mechanism" item 3
-    // actually requires — the row must commit atomically with the URI swap, not
-    // after it. `sweep_segments` removes the file only once past the grace
-    // window, by which time any concurrent plan holding the old URI has finished
-    // within `query_timeout` and still found the file.
-    //
     // Reachable only for rows in `input_meta`, so a seal-mode wave's prior
     // active — whose rows stay sealed and keep pointing at their file — is never
     // enqueued.
@@ -311,10 +296,6 @@ where
         .filter(|meta| meta.old_uri != merged_uri)
         .map(|meta| meta.old_uri.clone())
         .collect();
-    if !uris_to_defer_delete.is_empty() {
-        let defer_uris: Vec<String> = uris_to_defer_delete.into_iter().collect();
-        LifecycleManager::insert_segment_delete_set_rows(&tx, &catalog_str, &defer_uris).await?;
-    }
 
     for meta in &input_meta {
         let proportional_size = if total_rows > 0 {
@@ -357,6 +338,24 @@ where
         .await?;
     }
     LifecycleManager::commit_compact_segment(&tx, &catalog_str, &branch_str, &merged_uri).await?;
+
+    // Delete-set LAST, per the ordering invariant on
+    // `insert_segment_delete_set_rows`. This tx already holds a lock on the
+    // segment-metadata parent — its very first statement is
+    // `enumerate_unsealed_segments`, a `SELECT ... FOR UPDATE OF seg` against the
+    // catalog-wide parent — and the defer set is derived from that read, so
+    // compact cannot take a delete-set row lock before a parent lock even in
+    // principle. That is what fixes the global order for every other writer.
+    //
+    // Still inside `tx`, which is what ADR 0019 §"Four-part mechanism" item 3
+    // requires: the row must commit atomically with the URI swap.
+    // `sweep_segments` removes the file only once past the grace window, by
+    // which time any concurrent plan holding the old URI has finished within
+    // `query_timeout` and still found the file.
+    if !uris_to_defer_delete.is_empty() {
+        let defer_uris: Vec<String> = uris_to_defer_delete.into_iter().collect();
+        LifecycleManager::insert_segment_delete_set_rows(&tx, &catalog_str, &defer_uris).await?;
+    }
 
     tx.commit()
         .await
