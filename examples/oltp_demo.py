@@ -105,8 +105,8 @@ def _watermark(response, field: str) -> str:
     return str(getattr(response, field)) if response.HasField(field) else "none"
 
 
-def print_table(columns: dict[str, list]) -> None:
-    print(pa.table(columns).to_pandas().to_markdown(index=False))
+def print_table(table: pa.Table) -> None:
+    print(table.to_pandas().to_markdown(index=False))
 
 
 def discard_catalog(client: PencaClient, catalog_uuid: str) -> None:
@@ -235,8 +235,8 @@ def main() -> None:
         # `filter="account_id = N"` would instead read the columnar data and
         # evaluate a predicate over it — a scan, however small, which is the
         # opposite of what this script claims to show. On a snapshot-only plan
-        # with no value filter this is the shape that skips query planning
-        # altogether.
+        # with no value filter this is the shape that takes the
+        # DataFusion-free snapshot seek.
         ids = pa.table(
             {"account_id": [target_id]},
             schema=pa.schema([ACCOUNTS_SCHEMA.field("account_id")]),
@@ -265,14 +265,16 @@ def main() -> None:
         check_found(sql_found, target_id, "SQL")
 
         print("\n--- The row we looked up ---")
-        print(found.to_pandas().to_markdown(index=False))
+        print_table(found)
 
         print("\n--- Point lookup latency on cold columnar (mean per lookup) ---")
         print_table(
-            {
-                "path": ["gRPC", "SQL"],
-                "ms": [round(grpc_ms, 3), round(sql_ms, 3)],
-            }
+            pa.table(
+                {
+                    "path": ["gRPC", "SQL"],
+                    "ms": [round(grpc_ms, 3), round(sql_ms, 3)],
+                }
+            )
         )
         print(
             f"\nOne row out of {args.rows}, out of open columnar files on object "
