@@ -566,7 +566,7 @@ impl LifecycleManager {
                 .await?
         };
         let fork_base = match &fork_edge {
-            Some((parent_branch_uuid, fork_commit_seq_num)) => {
+            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
                 let base = self
                     .query_manager
                     .read_snapshot_segments_for_table(
@@ -677,7 +677,7 @@ impl LifecycleManager {
         // `fold_seqs.push(fork_commit_seq_num.min(as_of_seq))` — the
         // translation belongs at the API boundary, not here.
         let mut fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
-        if let Some((parent_branch_uuid, fork_commit_seq_num)) = &fork_edge {
+        if let Some((parent_branch_uuid, fork_commit_seq_num, _)) = &fork_edge {
             let parent_uuid = Uuid::parse_str(parent_branch_uuid)
                 .map_err(|e| ApiError::Internal(format!("invalid parent branch uuid: {e}")))?;
             if let Some(pinned) = self
@@ -809,7 +809,7 @@ impl LifecycleManager {
                     &table_str,
                     fork_edge
                         .as_ref()
-                        .map(|(parent, seq)| (parent.as_str(), *seq)),
+                        .map(|(parent, seq, _micros)| (parent.as_str(), *seq)),
                     baseline_watermark,
                     snapshotted_at_micros,
                 )
@@ -970,7 +970,7 @@ impl LifecycleManager {
                     snapshot_segments,
                     fork_edge
                         .as_ref()
-                        .map(|(parent, seq)| (parent.as_str(), *seq)),
+                        .map(|(parent, seq, _micros)| (parent.as_str(), *seq)),
                 )
                 .await?;
             let parts = penca_merge::stream_all_cold_parts(penca_merge::MergeReadRequest {

@@ -1762,7 +1762,7 @@ impl QueryManager {
             .read_branch_lineage(pool, &catalog_uuid_str, &branch_uuid_str)
             .await?
         {
-            Some((parent_branch_uuid, fork_commit_seq_num)) => {
+            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
                 let (base_upserts, base_deletes) = self
                     .read_persist_segments_for_window(
                         pool,

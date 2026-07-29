@@ -186,10 +186,21 @@ impl PgDialect {
                 // planner can enumerate the parent's cold tier as a second
                 // source, capped at `fork_commit_seq_num`. NULL for `main` and
                 // any non-forked branch.
+                //
+                // The fork position is recorded on BOTH axes because reads arrive
+                // on both: a seq-axis read carries `commit_seq_upper`, while a
+                // current-time or `AsOfMicros` read carries only `as_of_micros`.
+                // The planner has to answer "is this read at or above the fork?"
+                // for either, and CreateBranch resolves the position to a full
+                // `Watermark` anyway, so both halves are free at write time.
+                // Seq stays the authority for any *ceiling* — `commit_micros` is
+                // only non-strictly monotonic (CHA-178), so a same-micros
+                // higher-seq commit would leak past a micros bound.
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
                     branch_uuid          UUID PRIMARY KEY,
                     branch_name          TEXT NOT NULL UNIQUE,
                     fork_commit_seq_num  BIGINT NOT NULL,
+                    fork_commit_micros   BIGINT NOT NULL,
                     parent_branch_uuid   UUID
                 )"#,
                 qi = Self::quote_identifier(&branch_store),
@@ -1013,8 +1024,9 @@ impl PgDialect {
         // position.
         driver
             .execute_no_result(&format!(
-                r#"INSERT INTO {qi} (branch_uuid, branch_name, fork_commit_seq_num)
-                VALUES ('{main_branch_uuid}', '{main_branch_name}', 0)"#,
+                r#"INSERT INTO {qi}
+                    (branch_uuid, branch_name, fork_commit_seq_num, fork_commit_micros)
+                VALUES ('{main_branch_uuid}', '{main_branch_name}', 0, 0)"#,
                 qi = Self::quote_identifier(&branch_store),
                 main_branch_name = naming::MAIN_BRANCH_NAME,
             ))

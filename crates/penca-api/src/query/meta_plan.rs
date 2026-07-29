@@ -29,8 +29,10 @@ use penca_storage_meta::{MetadataError, Result, RetentionFloor, SnapshotResult};
 use super::QueryManager;
 use super::meta_resolve::parse_meta_uuid;
 
-/// A branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num)`.
-type BranchLineage = (String, i64);
+/// A branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num,
+/// fork_commit_micros)`. The position is carried on both axes because reads
+/// arrive on both; seq stays the authority for any ceiling.
+type BranchLineage = (String, i64, i64);
 
 /// Result of [`Self::read_and_classify_persist_segments`].
 struct ClassifiedPersistSegments {
@@ -264,7 +266,7 @@ impl QueryManager {
         // them — so enumerating the base source again would double-count.
         // Steady-state forked reads return to the non-forked plan shape.
         let base_cold_storage = match lineage {
-            Some((parent_branch_uuid, fork_commit_seq_num))
+            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros))
                 if child_snapshot_seq < fork_commit_seq_num =>
             {
                 // Parent ceiling = min(fork_seed, as_of_seq): the fork is a hard
@@ -471,7 +473,8 @@ impl QueryManager {
                  WHERE branch_uuid = $2 AND table_uuid = $1 AND commit_micros IS NOT NULL \
              ) \
              SELECT h.persist_wm, p.commit_seq_num AS w_snap, p.table_snapshot_uuid, \
-                    bs.parent_branch_uuid, bs.fork_commit_seq_num{floor_cols} \
+                    bs.parent_branch_uuid, bs.fork_commit_seq_num, \
+                    bs.fork_commit_micros{floor_cols} \
              FROM hot h \
              LEFT JOIN LATERAL ( \
                  SELECT s.commit_seq_num, s.table_snapshot_uuid \
@@ -530,7 +533,12 @@ impl QueryManager {
                 let fork_commit_seq_num: i64 = r
                     .try_get("fork_commit_seq_num")
                     .map_err(MetadataError::Db)?;
-                parent.map(|parent| (parent.to_string(), fork_commit_seq_num))
+                let fork_commit_micros: i64 = r
+                    .try_get("fork_commit_micros")
+                    .map_err(MetadataError::Db)?;
+                parent.map(|parent| {
+                    (parent.to_string(), fork_commit_seq_num, fork_commit_micros)
+                })
             }
             None => None,
         };
@@ -973,21 +981,28 @@ impl QueryManager {
         Ok((upsert_segments, delete_segments))
     }
 
-    /// Read a branch's fork lineage from `branch_store` — the parent
-    /// branch and the fork commit's seq. `None` for `main` and any branch with
-    /// NULL lineage (non-forked). The read planner consults this to decide
-    /// whether to enumerate a parent cold source for a forked-branch read.
+    /// Read a branch's fork lineage from `branch_store` — the parent branch and
+    /// the fork commit's position on both axes, `(parent, seq, micros)`. `None`
+    /// for `main` and any branch with NULL lineage (non-forked). The read planner
+    /// consults this to decide whether to enumerate a parent cold source for a
+    /// forked-branch read.
+    ///
+    /// Both axes come back because reads arrive on both: a seq-axis read carries
+    /// `commit_seq_upper`, a current-time or `AsOfMicros` read carries only
+    /// `as_of_micros`. Seq remains the authority for any ceiling — see the
+    /// non-strict-monotonic `commit_micros` note on the `branch_store` DDL.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn read_branch_lineage(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
         branch_uuid: &str,
-    ) -> Result<Option<(String, i64)>> {
+    ) -> Result<Option<(String, i64, i64)>> {
         let catalog = parse_uuid(catalog_uuid);
         let branch_store = naming::branch_store_table(&catalog);
         let sql = format!(
-            "SELECT parent_branch_uuid, fork_commit_seq_num FROM {store} WHERE branch_uuid = $1",
+            "SELECT parent_branch_uuid, fork_commit_seq_num, fork_commit_micros \
+             FROM {store} WHERE branch_uuid = $1",
             store = qi(&branch_store),
         );
         let rows = driver
@@ -1007,7 +1022,16 @@ impl QueryManager {
         let fork_commit_seq_num: i64 = row
             .try_get("fork_commit_seq_num")
             .map_err(MetadataError::Db)?;
-        Ok(parent.map(|parent_branch_uuid| (parent_branch_uuid.to_string(), fork_commit_seq_num)))
+        let fork_commit_micros: i64 = row
+            .try_get("fork_commit_micros")
+            .map_err(MetadataError::Db)?;
+        Ok(parent.map(|parent_branch_uuid| {
+            (
+                parent_branch_uuid.to_string(),
+                fork_commit_seq_num,
+                fork_commit_micros,
+            )
+        }))
     }
 
     /// Enumerate the parent branch's cold tier as a second cold

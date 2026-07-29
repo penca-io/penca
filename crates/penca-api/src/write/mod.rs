@@ -869,6 +869,7 @@ impl WriteManager {
                     &branch_str,
                     &request.branch_name,
                     fork.commit_seq_num,
+                    fork.commit_micros,
                     // The parent lineage the read planner's parent-cold source
                     // keys on.
                     Some(source_branch_str.as_str()),
