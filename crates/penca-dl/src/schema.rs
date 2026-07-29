@@ -23,6 +23,12 @@ pub const SNAPSHOT_TABLE: &str = "l";
 /// exclusion `MemTable` under (the anti-join target).
 pub const EXCLUSION_TABLE: &str = "exclusion";
 
+/// The per-row commit-order column. Named here because a persist segment's
+/// `max_commit_seq_num` ceiling is applied to it, so the read that fetches the
+/// batch and the filter that enforces the bound must agree on the column — see
+/// `read_projected_uncached_persist` and `apply_segment_seq_ceiling`.
+pub const COMMIT_SEQ_NUM_COLUMN: &str = "commit_seq_num";
+
 /// Arrow schemas for the two log tables (`upsert_log`, `delete_log`).
 ///
 /// commit_tx_log is hot-only — cold has no commit_tx_log table to register.

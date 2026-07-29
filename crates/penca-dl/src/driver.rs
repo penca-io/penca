@@ -13,20 +13,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::{SessionContext, SessionState};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
-use penca_format::reader::FormatReader;
+use penca_format::reader::{FormatError, FormatReader};
 use penca_storage_cold::ColdStorageError;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::cache::SegmentCache;
 use crate::provider::{build_persist_session, build_snapshot_session};
-use crate::schema::LogSchemas;
+use crate::schema::{COMMIT_SEQ_NUM_COLUMN, LogSchemas};
 use crate::session_template::derive_cold_session;
 
 /// Errors raised by [`DlDriver`] implementations.
@@ -355,12 +355,37 @@ async fn read_and_cache_full_persist<R: FormatReader>(
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
 /// An oversized persist segment is read narrow rather than widened only to be
 /// discarded.
+///
+/// Exception: a segment carrying a `max_commit_seq_num` ceiling is widened by
+/// `commit_seq_num` when the projection drops it, because the caller has to
+/// filter on that column and cannot recover it afterwards. Narrowing here is an
+/// optimization; the ceiling is a correctness bound, so the bound wins. Without
+/// this the ceiling would hold on the cached path and silently vanish on the
+/// uncached one — wrong rows, no signal, and cache-state dependent.
 async fn read_projected_uncached_persist<R: FormatReader>(
     reader: &R,
     segment: &PersistSegment,
     out_schema: &SchemaRef,
+    full_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
-    let out_cols: Vec<&str> = out_schema
+    let read_schema = match segment.max_commit_seq_num {
+        Some(_) if out_schema.index_of(COMMIT_SEQ_NUM_COLUMN).is_err() => {
+            let mut fields: Vec<_> = out_schema.fields().iter().cloned().collect();
+            fields.push(
+                full_schema
+                    .field(
+                        full_schema
+                            .index_of(COMMIT_SEQ_NUM_COLUMN)
+                            .map_err(|e| ColdStorageError::from(FormatError::Arrow(e)))?,
+                    )
+                    .clone()
+                    .into(),
+            );
+            Arc::new(Schema::new(fields))
+        }
+        _ => out_schema.clone(),
+    };
+    let out_cols: Vec<&str> = read_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())
@@ -370,7 +395,7 @@ async fn read_projected_uncached_persist<R: FormatReader>(
             &segment.uri,
             segment.offset,
             segment.length,
-            out_schema,
+            &read_schema,
             Some(&out_cols),
         )
         .await
@@ -431,7 +456,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
         read_and_cache_full_persist(reader, cache, segment, full_schema, weight).await
     } else {
         span.record("cache", "miss-uncached");
-        read_projected_uncached_persist(reader, segment, out_schema).await
+        read_projected_uncached_persist(reader, segment, out_schema, full_schema).await
     }
 }
 

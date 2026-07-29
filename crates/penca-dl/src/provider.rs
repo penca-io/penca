@@ -44,6 +44,7 @@ use crate::driver::{
     SeekSpec, read_cached_persist_segment, read_cached_snapshot_segment,
     read_intersect_seeked_snapshot_segment,
 };
+use crate::schema::COMMIT_SEQ_NUM_COLUMN;
 use crate::schema::{
     DELETE_LOG_TABLE, EXCLUSION_TABLE, LogSchemas, SNAPSHOT_TABLE, UPSERT_LOG_TABLE,
 };
@@ -205,11 +206,21 @@ fn apply_segment_seq_ceiling(
     segment: &PersistSegment,
 ) -> Result<RecordBatch, ArrowError> {
     let Some(ceiling) = segment.max_commit_seq_num else {
+        // No ceiling: the tx_log carriers. The only legitimate pass-through.
         return Ok(batch.clone());
     };
-    let Ok(idx) = batch.schema().index_of("commit_seq_num") else {
-        return Ok(batch.clone());
-    };
+    // A ceiling that cannot be applied is an error, never a pass-through. The
+    // read path widens the projection to keep this column precisely so the bound
+    // is always enforceable (see `read_projected_uncached_persist`); reaching
+    // here without it means that contract broke, and silently returning the
+    // unfiltered batch would leak the rows the ceiling exists to hide.
+    let idx = batch.schema().index_of(COMMIT_SEQ_NUM_COLUMN).map_err(|_| {
+        ArrowError::SchemaError(format!(
+            "persist segment {} carries a commit_seq_num ceiling of {ceiling} but the \
+             batch has no commit_seq_num column to apply it to",
+            segment.segment_uuid
+        ))
+    })?;
     let seqs = batch
         .column(idx)
         .as_any()
@@ -753,15 +764,22 @@ mod tests {
             0,
         );
 
-        // A batch without the column cannot be filtered on it; pass it through
-        // rather than erroring, since the ceiling is unenforceable there.
+        // A ceiling that cannot be applied is an ERROR, not a pass-through: the
+        // read path widens the projection to keep `commit_seq_num` precisely so
+        // the bound is always enforceable, and passing the batch through here
+        // would leak exactly the rows the ceiling exists to hide.
         let no_seq = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("row_uuid", DataType::Utf8, false)])),
             vec![Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"]))],
         )
         .unwrap();
+        assert!(
+            apply_segment_seq_ceiling(&no_seq, &seg(Some(0))).is_err(),
+            "an unenforceable ceiling must fail loudly, not silently pass rows through",
+        );
+        // ...but a carrier with no ceiling still passes through unfiltered.
         assert_eq!(
-            apply_segment_seq_ceiling(&no_seq, &seg(Some(0)))
+            apply_segment_seq_ceiling(&no_seq, &seg(None))
                 .unwrap()
                 .num_rows(),
             3,
