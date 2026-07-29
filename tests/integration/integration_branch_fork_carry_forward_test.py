@@ -8,6 +8,17 @@ snapshot branch-scoped, so a fork sees no prior baseline,
 full-rewrite path re-writes every partition under the child's own
 prefix — O(table) bytes per fork.
 
+**Row materialization is the contract, not an incidental query detail.**
+The child's first snapshot must insert its OWN ``branch_uuid``-scoped
+segment rows that point at the parent's ``object_uri``; it must not rely
+on staying reachable through the single-base cold pointer alone. The
+assertions below are written against that mechanism deliberately. A
+snapshot is a self-contained materialization of the table as of its
+watermark — that is what lets the parent retire or rewrite its own
+snapshot independently, and what gives the refcounted GC (CHA-405) a row
+to count. Leaving the child dependent on the parent's live snapshot
+would be byte-equivalent on day one and would break both properties.
+
 Run via ``just integration-test branch_fork_carry_forward``.
 """
 
@@ -86,7 +97,7 @@ def _make_env():
 def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
     """One write cycle on a branch: mutate → commit → persist → snapshot.
 
-    Returns ``(snap_uuid, snapshotted_at_micros)``.
+    Returns the resulting snapshot uuid.
     """
     tx = client.begin_tx(
         catalog_uuid=catalog_uuid,
@@ -114,14 +125,19 @@ def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upsert
         branch_uuid=branch_uuid,
     )
     assert response.HasField("snapshotted_at_micros")
-    snap_uuid = table_snapshot_uuid(
+    return table_snapshot_uuid(
         catalog_uuid, branch_uuid, table_uuid, response.snapshotted_at_micros
     )
-    return snap_uuid, response.snapshotted_at_micros
 
 
 def _read_pairs(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid):
-    """``{name: value}`` visible on a branch."""
+    """Sorted ``[(name, value), ...]`` visible on a branch.
+
+    A list, not a dict: duplicated rows are the most likely failure mode
+    of a first-cut carry-forward (a partition both carried by reference
+    AND rewritten), and ``dict`` would silently collapse them into a
+    passing result.
+    """
     table = client.read_data(
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -130,7 +146,7 @@ def _read_pairs(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid):
     )
     names = table.column("name").to_pylist()
     values = table.column("value").to_pylist()
-    return dict(zip(names, values, strict=True))
+    return sorted(zip(names, values, strict=True))
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
@@ -142,13 +158,14 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
     child's first snapshot (carried by reference), while ``alice`` lands
     in a fresh file under the child's own prefix.
 
-    Asserts on ``object_uri`` values rather than row counts — a
-    full-rewrite child would produce the right COUNT of rows while
-    sharing none of the parent's files.
+    Asserts on ``object_uri`` values AND on cardinality: a full-rewrite
+    child produces the right COUNT of rows while sharing none of the
+    parent's files, and a carry-and-also-rewrite child shares the files
+    while still paying O(table) bytes. Only both together exclude both.
     """
     client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
 
-    snap_main, _ = _cycle(
+    snap_main = _cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -180,7 +197,7 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         comment="cha-531",
     ).branch_uuid
 
-    snap_child, _ = _cycle(
+    snap_child = _cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -200,25 +217,30 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         f" parent {sorted(parent_tuples)} vs child {sorted(child_tuples)}"
     )
 
-    # (ii) A carried row lives under the CHILD's branch_uuid column but
-    # its object_uri still names the branch that WROTE the file — the
-    # parent. Ownership is the column, not the path.
-    for uri, _offset, _length, _rows in carried:
-        assert main_branch in uri, (
-            f"carried uri must name the writing (parent) branch: {uri}"
-        )
-        assert child_branch not in uri, (
-            f"carried uri must not be rewritten under the child prefix: {uri}"
-        )
-
-    # (iii) The touched partition is rewritten into a fresh file under
+    # (ii) The touched partition is rewritten into a fresh file under
     # the child's own prefix.
     rewritten = child_tuples - parent_tuples
-    assert rewritten, "the touched partition (alice) must be rewritten, not carried"
     for uri, _offset, _length, _rows in rewritten:
         assert child_branch in uri, (
             f"rewritten uri must sit under the child's prefix: {uri}"
         )
+
+    # (iii) Cardinality. Without this the arms above are satisfied by an
+    # implementation that carries bob/carol by reference AND ALSO
+    # rewrites them under the child's prefix: the intersection in (i) is
+    # unchanged, the extra tuples in (ii) all sit under the child prefix,
+    # and (iv)'s read is order-insensitive. That is exactly the "shares
+    # files but still pays O(table) bytes" outcome this test exists to
+    # catch, so pin the counts, not just the sets.
+    assert len(child_tuples) == 3, (
+        "the child's snapshot must hold exactly three segment rows (bob and"
+        " carol carried, alice rewritten); extra rows mean untouched"
+        f" partitions were re-materialized as well: {sorted(child_tuples)}"
+    )
+    assert len(rewritten) == 1, (
+        "exactly one partition (alice) was touched, so exactly one segment"
+        f" row may be freshly written: {sorted(rewritten)}"
+    )
 
     # (iv) Content: the child sees its own alice plus the inherited
     # bob/carol. This arm passes today (the read path already folds the
@@ -230,7 +252,7 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=child_branch,
-    ) == {"alice": 99, "bob": 2, "carol": 3}
+    ) == [("alice", 99), ("bob", 2), ("carol", 3)]
 
     # (v) The parent is untouched by the child's snapshot.
     assert _read_pairs(
@@ -239,4 +261,4 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=main_branch,
-    ) == {"alice": 1, "bob": 2, "carol": 3}
+    ) == [("alice", 1), ("bob", 2), ("carol", 3)]

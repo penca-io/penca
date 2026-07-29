@@ -84,18 +84,25 @@ def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upsert
 
 def _distinct_uri_bytes(catalog_uuid):
     """``(distinct_file_count, total_bytes)`` over every committed
-    snapshot segment in the catalog, deduped by ``object_uri``.
+    snapshot segment in the catalog, deduped by storage slice.
 
-    One physical file has one size, so ``MAX(size_bytes)`` per uri is
-    that file's size however many branches reference it.
+    ``size_bytes`` is the *partition slice's* in-memory footprint
+    (CHA-347), not a file size: the packer emits one segment row per
+    partition and packs several small partitions into one file, so a
+    single ``object_uri`` carries many rows with distinct ``offset``s.
+    Deduping by uri alone would therefore measure one partition, not the
+    table. ``(object_uri, "offset")`` is the slice identity, and
+    carry-forward copies both verbatim, so a carried row collapses onto
+    the row it references and contributes nothing — which is exactly the
+    "referenced, not copied" distinction being measured.
     """
     seg = f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
     rows = get_pg_driver().execute(
         SQL(
-            "SELECT count(*), coalesce(sum(bytes), 0) FROM ("
-            "  SELECT object_uri, max(size_bytes) AS bytes FROM {tbl}"
+            "SELECT count(DISTINCT object_uri), coalesce(sum(bytes), 0) FROM ("
+            '  SELECT object_uri, "offset", max(size_bytes) AS bytes FROM {tbl}'
             "  WHERE commit_micros IS NOT NULL"
-            "  GROUP BY object_uri"
+            '  GROUP BY object_uri, "offset"'
             ") f"
         ).format(tbl=Identifier(seg)),
         (),
@@ -161,8 +168,10 @@ def test_fork_storage_growth_is_o_delta():
     budget = baseline_bytes * _FORKS // 2
     assert growth <= budget, (
         f"{_FORKS} forks each touching 1 of {len(_PARTITIONS)} partitions grew"
-        f" cold storage by {growth} bytes over a {baseline_bytes}-byte baseline"
-        f" (budget {budget}); distinct files {baseline_files} -> {final_files}."
-        " Each fork's first snapshot is re-materializing the whole table"
-        " instead of carrying untouched partitions by reference."
+        f" cold storage by {growth} bytes of segment footprint (CHA-347"
+        f" size_bytes, a format-independent proxy for stored bytes) over a"
+        f" {baseline_bytes}-byte baseline (budget {budget}); distinct files"
+        f" {baseline_files} -> {final_files}. Each fork's first snapshot is"
+        " re-materializing the whole table instead of carrying untouched"
+        " partitions by reference."
     )

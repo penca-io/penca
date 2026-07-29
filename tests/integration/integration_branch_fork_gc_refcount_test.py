@@ -285,3 +285,21 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
         " eligible_segment_delete_set_rows probes its NOT EXISTS arms with"
         " branch_uuid = $1 and cannot see it."
     )
+
+    # Positive control. Surviving phase 1 is also what a sweep that never
+    # considered the URI eligible at all looks like — a grace-window or
+    # clock mismatch, an enqueue on a branch the sweep does not scan, a
+    # swallowed cold-delete error. Dropping the child's reference and
+    # sweeping again isolates the child reference as the one thing
+    # pinning the file: if the row drains now, the sweep was live and
+    # willing to delete this URI all along.
+    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
+    drained = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    assert drained == [], (
+        "the delete-set row survived a sweep with zero remaining references,"
+        " so phase 1's survival proves nothing about the refcount gate — the"
+        f" sweep never treated {shared_uri} as eligible in the first place."
+    )
