@@ -189,11 +189,12 @@ entirely. Nothing else runs that tick, in either loop.
 
 Either way the loop moves on to the next branch.
 
-**Per-table.** Purge failures are swallowed inside `ops::purge_one`. The branch
+**Per-table.** Purge failures are swallowed inside `ops::purge_one`.
 `PersistBranch` and `SnapshotBranch` swallow their own per-table failures
-server-side and report it by leaving `BranchOpResponse.watermark` unset — a *different* watermark from the scheduler's
-enumeration watermarks, which advance regardless. The scheduler logs the unset
-response; `CreateBranch` treats it as a hard error.
+server-side and report it by leaving `BranchOpResponse.watermark` unset — a
+*different* watermark from the scheduler's enumeration watermarks, which advance
+regardless. The scheduler logs the unset response; `CreateBranch` treats it as a
+hard error.
 
 Swallowing is load-bearing for the **branch ops** specifically, not incidental:
 their enumerations are unwindowed and ordered oldest-timestamp-first, so a table
