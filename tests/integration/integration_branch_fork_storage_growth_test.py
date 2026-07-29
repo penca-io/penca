@@ -21,68 +21,20 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client import Mutation
 from penca_client.naming import TABLE_SNAPSHOT_SEGMENT_METADATA
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
     USER_SCHEMA,
     get_pg_driver,
-    make_client,
+    setup_partitioned_table,
+    write_cycle,
 )
 
 _PARTITIONS = ["p0", "p1", "p2", "p3", "p4", "p5"]
 _FORKS = 3
 
 # ── Helpers ───────────────────────────────────────────────────────────
-
-
-def _make_env():
-    client = make_client()
-    catalog_uuid, main_branch_uuid = client.create_catalog(
-        f"fsg_cat_{uuid4().hex[:8]}", "owner"
-    )
-    schema_uuid = client.create_schema(
-        "fsg_schema", catalog_uuid=catalog_uuid, author="test", comment="cha-531"
-    )
-    table_uuid = client.create_table(
-        "fsg_table",
-        USER_SCHEMA,
-        primary_keys=["name"],
-        partition_keys=["name"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        author="test",
-        comment="cha-531",
-    )
-    return client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid
-
-
-def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
-    tx = client.begin_tx(
-        catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, branch_uuid=branch_uuid
-    )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(table_uuid=table_uuid, upserts=upserts),
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
-    client.persist(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-        table_uuid=table_uuid,
-    )
-    response = client.snapshot(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        table_uuid=table_uuid,
-        branch_uuid=branch_uuid,
-    )
-    assert response.HasField("snapshotted_at_micros")
 
 
 def _distinct_slice_bytes(catalog_uuid):
@@ -119,9 +71,11 @@ def _distinct_slice_bytes(catalog_uuid):
 def test_fork_storage_growth_is_o_delta():
     """Three forks each touching ONE of six partitions must add roughly
     one partition's bytes apiece, not one table's."""
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fsg")
+    )
 
-    _cycle(
+    write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -150,7 +104,7 @@ def test_fork_storage_growth_is_o_delta():
             author="test",
             comment="cha-531",
         ).branch_uuid
-        _cycle(
+        write_cycle(
             client,
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,

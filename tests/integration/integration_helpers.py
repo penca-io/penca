@@ -34,6 +34,7 @@ from penca_client.client import PencaClient
 from penca_client.config import ClientSettings, DbSettings
 from penca_client.naming import (
     row_uuid_for_pk,
+    table_snapshot_uuid,
 )
 from psycopg import Connection
 from psycopg.abc import Buffer
@@ -582,6 +583,108 @@ def setup_with_data_named(client: PencaClient) -> dict:
         "table_uuid": table_uuid,
         "main_branch_uuid": main_branch_uuid,
     }
+
+
+def setup_partitioned_table(prefix: str) -> tuple[PencaClient, str, str, str, str]:
+    """Catalog + schema + partitioned table on ``main``.
+
+    Returns ``(client, catalog_uuid, schema_uuid, table_uuid,
+    main_branch_uuid)``. ``prefix`` names the catalog/schema/table so a
+    failure points back at the test that created them.
+    """
+    client = make_client()
+    catalog_uuid, main_branch_uuid = client.create_catalog(
+        f"{prefix}_cat_{uuid4().hex[:8]}", "owner"
+    )
+    schema_uuid = client.create_schema(
+        f"{prefix}_schema", catalog_uuid=catalog_uuid, author="test", comment=prefix
+    )
+    table_uuid = client.create_table(
+        f"{prefix}_table",
+        USER_SCHEMA,
+        primary_keys=["name"],
+        partition_keys=["name"],
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        author="test",
+        comment=prefix,
+    )
+    return client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid
+
+
+def write_and_persist(
+    client,
+    *,
+    catalog_uuid,
+    schema_uuid,
+    table_uuid,
+    branch_uuid,
+    upserts=None,
+    deletes=None,
+) -> None:
+    """mutate -> commit -> persist, stopping short of a snapshot.
+
+    Split out of :func:`write_cycle` so a test can leave a branch with a
+    persist tail its last snapshot does not cover.
+    """
+    mutation_kwargs: dict[str, Any] = {}
+    if upserts is not None:
+        mutation_kwargs["upserts"] = upserts
+
+    if deletes is not None:
+        mutation_kwargs["deletes"] = deletes
+
+    tx = client.begin_tx(
+        catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, branch_uuid=branch_uuid
+    )
+    client.write_data(
+        tx.tx_uuid,
+        Mutation(table_uuid=table_uuid, **mutation_kwargs),
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+    )
+    client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+    client.persist(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+        table_uuid=table_uuid,
+    )
+
+
+def write_cycle(
+    client,
+    *,
+    catalog_uuid,
+    schema_uuid,
+    table_uuid,
+    branch_uuid,
+    upserts=None,
+    deletes=None,
+) -> str:
+    """One full write cycle on a branch: mutate -> commit -> persist ->
+    snapshot. Returns the resulting ``table_snapshot_uuid``.
+    """
+    write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=branch_uuid,
+        upserts=upserts,
+        deletes=deletes,
+    )
+    response = client.snapshot(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=branch_uuid,
+    )
+    assert response.HasField("snapshotted_at_micros")
+    return table_snapshot_uuid(
+        catalog_uuid, branch_uuid, table_uuid, response.snapshotted_at_micros
+    )
 
 
 # The fmt subscriber colourises even into docker's non-TTY log; the SGR
