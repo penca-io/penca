@@ -802,7 +802,15 @@ integration-test *services:
     # `penca-down` dumps per-service logs to /tmp before teardown; trap
     # guarantees teardown whether pytest passes, fails, or the shell is
     # interrupted, while preserving pytest's exit code for CI.
-    trap 'just penca-down --profile=test' EXIT
+    #
+    # ONE trap for the whole recipe. bash does not stack EXIT handlers — a
+    # second `trap ... EXIT` silently replaces this one, which would leave the
+    # stack up, skip the volume wipe that makes the next run a fresh one, and
+    # drop the /tmp/penca-logs-* that CI uploads on failure. So the collection
+    # scratch file is created here and cleaned up here rather than by a trap of
+    # its own.
+    collect_out=$(mktemp)
+    trap 'just penca-down --profile=test; rm -f "$collect_out"' EXIT
 
     # `.client.env` — the 6 PENCA_*_URL values for PencaClient.
     # `.baseline.env` — PENCA_DB_* for white-box tests that open a direct
@@ -854,8 +862,6 @@ integration-test *services:
     # Exit 5 (nothing collected) is a legitimate answer of zero; anything else
     # non-zero is a real collection failure — a bad service name gives exit 4 —
     # and must not be silently counted as zero.
-    collect_out=$(mktemp)
-    trap 'rm -f "$collect_out"' EXIT
     count_tests() {
         uv run pytest "$@" --collect-only -q >"$collect_out" 2>&1
         collect_rc=$?
