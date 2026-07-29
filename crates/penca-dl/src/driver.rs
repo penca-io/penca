@@ -918,16 +918,41 @@ mod tests {
     }
 
     impl FormatReader for CountingFormatReader {
+        /// Honors `projection` when it can satisfy it, and returns the full
+        /// batch when it cannot.
+        ///
+        /// Honoring it at all is necessary: returning the batch verbatim
+        /// regardless makes any test about *which* columns were requested
+        /// vacuous — it would pass whether or not the caller widened its
+        /// projection, which is exactly what
+        /// `uncached_oversized_segment_honors_its_seq_ceiling` must distinguish
+        /// (verified by defeating the widening and watching that test fail).
+        ///
+        /// Falling back is equally necessary: `scan_snapshot_schema_tolerance`
+        /// deliberately projects a column this batch does NOT have, so the
+        /// CALLER's null-filling tolerance is what's under test there. Erroring
+        /// would move the failure into the double and hide the behavior.
         async fn read_segment(
             &self,
             _uri: &str,
             _offset: Option<i64>,
             _length: Option<i64>,
             _schema: &SchemaRef,
-            _projection: Option<&[&str]>,
+            projection: Option<&[&str]>,
         ) -> Result<RecordBatch, FormatError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(self.batch.clone())
+            let Some(cols) = projection else {
+                return Ok(self.batch.clone());
+            };
+            let Ok(indices) = cols
+                .iter()
+                .map(|name| self.batch.schema().index_of(name))
+                .collect::<Result<Vec<usize>, _>>()
+            else {
+                return Ok(self.batch.clone());
+            };
+
+            Ok(self.batch.project(&indices)?)
         }
     }
 
@@ -1862,6 +1887,69 @@ mod tests {
         assert_eq!(
             first, second,
             "cached persist read returns identical content, not just the same row count"
+        );
+    }
+
+    /// The ceiling must survive the UNCACHED read path. `read_cached_persist_segment`
+    /// returns a batch already projected to the output schema when
+    /// `cache.admits` is false, so a scan projecting `commit_seq_num` away would
+    /// leave the bound unenforceable unless the read widens for it.
+    ///
+    /// Distinguishing: with the widening, the read asks for
+    /// `(row_uuid, commit_seq_num)` and the ceiling drops the over-bound row;
+    /// without it, the read asks for `row_uuid` alone and
+    /// `apply_segment_seq_ceiling` errors rather than silently passing rows
+    /// through. Either way the assertion below fails if the widening is removed.
+    #[tokio::test]
+    async fn uncached_oversized_segment_honors_its_seq_ceiling() {
+        use penca_core::{PersistPlan, PersistSegment};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("commit_seq_num", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r0", "r1", "r2"])),
+                Arc::new(arrow::array::Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .unwrap();
+        // Budget below size_bytes so `admits` is false and the read takes the
+        // uncached, already-projected path.
+        let cache = Arc::new(SegmentCache::new(64));
+        let (dl, _reads) = driver_with(cache, batch);
+
+        let seg = PersistSegment {
+            segment_uuid: "big-with-ceiling".into(),
+            format: Format::Parquet,
+            size_bytes: 4096,
+            max_commit_seq_num: Some(20),
+            ..Default::default()
+        };
+        let plan = ColdStoragePlan {
+            snapshot: None,
+            persist: Some(PersistPlan {
+                upsert_segments: vec![seg],
+                ..Default::default()
+            }),
+        };
+        let log_schemas = LogSchemas {
+            upsert: schema.clone(),
+            delete: schema.clone(),
+        };
+
+        // Projection deliberately drops `commit_seq_num`.
+        let out = dl
+            .execute_sql(&plan, "SELECT row_uuid FROM upsert_log", &log_schemas)
+            .await
+            .expect("the ceiling must be enforceable on the uncached path");
+        let rows = out.num_rows();
+        assert_eq!(
+            rows, 2,
+            "ceiling 20 must drop the seq-30 row even though the projection omits \
+             commit_seq_num; saw {rows} rows"
         );
     }
 
