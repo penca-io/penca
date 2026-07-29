@@ -71,8 +71,6 @@ from .integration_helpers import (
     setup_schema,
 )
 
-# ── Constants ─────────────────────────────────────────────────────────
-
 QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 # Grace pad: extra wall-clock past the cap before re-issuing a
 # grace-gated operation. Keeps the tests deterministic against clock
@@ -86,9 +84,6 @@ GRACE_WAIT_SECONDS = QUERY_TIMEOUT_SECONDS + GRACE_EPSILON_SECONDS
 TABLE_PERSIST_METADATA = "table_persist_metadata"
 TABLE_PURGE_METADATA = "table_purge_metadata"
 SEGMENT_DELETE_SET = "segment_delete_set"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _make_branch(client, catalog_uuid, name):
@@ -143,9 +138,6 @@ def _count_segment_delete_set_rows(catalog_uuid, branch_uuid):
         (branch_uuid,),
     )
     return rows[0][0]
-
-
-# ── Tests ─────────────────────────────────────────────────────────────
 
 
 class TestQueryTimeoutCap:

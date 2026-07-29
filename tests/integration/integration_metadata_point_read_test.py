@@ -116,9 +116,7 @@ def _new_catalog_schema_table(client) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # RT-1 — table metadata point-read-by-uuid restricts the resolve.
-# ---------------------------------------------------------------------------
 class TestTableMetadataPointRead:
     """CHA-473: a by-uuid table resolve threads the row_uuids restriction."""
 
@@ -140,9 +138,7 @@ class TestTableMetadataPointRead:
             client.close()
 
 
-# ---------------------------------------------------------------------------
 # RT-2 — schema + index metadata point-read-by-uuid restrict the resolve.
-# ---------------------------------------------------------------------------
 class TestSchemaIndexMetadataPointRead:
     """CHA-473: by-uuid schema/index resolves thread the row_uuids restriction."""
 

@@ -7,9 +7,6 @@
 //! "latest row per partition" (`DISTINCT ON` in Postgres, `ROW_NUMBER()`
 //! window in DataFusion), which is delegated to
 //! [`Dialect::latest_per_partition`].
-//!
-//! See also CHA-130. This is the Rust port of
-//! `packages/penca/src/penca/lib/merge/sql.py`.
 
 use penca_sql::{
     CompositeMergeResolution, Dialect, build_composite_merge_resolution, leading_comma_if_nonempty,
@@ -26,7 +23,7 @@ use crate::ReadSnapshot;
 ///
 /// The query:
 /// 1. Picks committed transactions, optionally clipped by
-///    `tier_seq_lower` (CHA-443: the hot↔cold tier fence — hot serves
+///    `tier_seq_lower` (the hot↔cold tier fence — hot serves
 ///    `commit_seq_num > W_persist`, skipping cold-already-persisted rows) and
 ///    `snapshot` (which governs the upper visibility bound and whether the
 ///    open tx's own uncommitted writes are included — see [`ReadSnapshot`]).
@@ -38,19 +35,17 @@ use crate::ReadSnapshot;
 /// CTE names — the builder applies [`Dialect::quote_identifier`] to each.
 /// User column names are also unquoted on input.
 ///
-/// CHA-368: the resolve returns the latest committed version per `row_uuid`
+/// The resolve returns the latest committed version per `row_uuid`
 /// across BOTH logs — a `UNION ALL` of visible upserts (`is_delete = false`,
 /// user cols valued) and winning tombstones (`is_delete = true`, user cols
-/// NULL). The full `row_uuid` set of the output IS the exclusion set (it
-/// replaces the retired Query-B probe: `build_composite_merge_resolution`
-/// already computes both the upsert-visible and delete-visible predicates).
+/// NULL). The full `row_uuid` set of the output IS the exclusion set.
 /// No user filter is spliced here — DataFusion applies the residual once,
 /// after cross-tier dedup (`apply_resolved_residual`).
 ///
-/// `row_uuids` (CHA-398) is the point-lookup restriction: when present,
-/// the per-log source subqueries are restricted to those `row_uuid`s
-/// **below** the latest-wins dedup, so only the named rows' versions
-/// are deduped — O(table) → O(versions-of-named-rows).
+/// `row_uuids` is the point-lookup restriction: when present, the per-log
+/// source subqueries are restricted to those `row_uuid`s **below** the
+/// latest-wins dedup, so only the named rows' versions are deduped —
+/// O(table) → O(versions-of-named-rows).
 ///
 /// [`Dialect::quote_identifier`]: penca_sql::Dialect::quote_identifier
 pub fn build_merge_resolved<D: Dialect>(
@@ -76,9 +71,9 @@ pub fn build_merge_resolved<D: Dialect>(
     // Step 1 (hot-tier-specific): build canonical-shape source SQLs.
     // Hot joins upsert/delete logs to `committed_tx` to recover the
     // commit timestamp; `write_seq_num` is per-row on the log.
-    // The CHA-398 row_uuid restriction sits inside each source — below
-    // the DISTINCT ON — so the dedup only touches the named rows'
-    // versions (and the (row_uuid, tx_uuid) index can serve the probe).
+    // The row_uuid restriction sits inside each source — below the
+    // DISTINCT ON — so the dedup only touches the named rows' versions
+    // (and the (row_uuid, tx_uuid) index can serve the probe).
     let ids_u = row_uuid_in_clause::<D>(row_uuids, " WHERE ", "u.");
     let ids_d = row_uuid_in_clause::<D>(row_uuids, " WHERE ", "d.");
     let upsert_source = format!(
@@ -91,9 +86,9 @@ pub fn build_merge_resolved<D: Dialect>(
          FROM {delete_log_q} d JOIN committed_tx c USING (tx_uuid){ids_d}) _d"
     );
 
-    // Step 2 (shared, CHA-243 + CHA-429): build the latest + deletes CTEs
-    // and the composite-tiebreaker tombstone-shadow predicate, ordered on
-    // the commit-order serial (`commit_seq_num`) — the authoritative total
+    // Step 2 (shared): build the latest + deletes CTEs and the
+    // composite-tiebreaker tombstone-shadow predicate, ordered on the
+    // commit-order serial (`commit_seq_num`) — the authoritative total
     // order — with `write_seq_num` as the within-tx secondary.
     let composite = build_composite_merge_resolution::<D>(
         &upsert_source,
@@ -116,28 +111,27 @@ pub fn build_merge_resolved<D: Dialect>(
     two_arm_resolve_select(&cte_list, &composite, user_cols_leading, &user_cols_l)
 }
 
-/// Cold-tier variant of [`build_merge_resolved`] (CHA-218).
+/// Cold-tier variant of [`build_merge_resolved`].
 ///
 /// Each cold upsert/delete row already carries `commit_micros`
 /// inline (denormalized at persist time), so the cold side never JOINs
 /// against a commit_tx_log table — cold has no commit_tx_log table at all.
 ///
-/// CHA-443 (IMPL-5): the hot↔cold tier upper fence rides `commit_seq_num`, not
-/// `committed_at`. Cold serves `commit_seq_num <= W_persist`; the caller folds
-/// `W_persist` (from `PersistPlan.commit_seq.max_seq`) into `commit_seq_upper`
-/// as `min(W_persist, as_of_seq)` before calling here, so this builder keeps a
-/// single seq upper bound. `committed_at` now carries only the `AsOfMicros`
+/// The hot↔cold tier upper fence rides `commit_seq_num`, not `committed_at`.
+/// Cold serves `commit_seq_num <= W_persist`; the caller folds `W_persist`
+/// (from `PersistPlan.commit_seq.max_seq`) into `commit_seq_upper` as
+/// `min(W_persist, as_of_seq)` before calling here, so this builder keeps a
+/// single seq upper bound. `committed_at` carries only the `AsOfMicros`
 /// visibility cap (`committed_to = as_of + 1`, inert `i64::MAX` on seq/OpenTx
 /// reads) plus — on the snapshot-WRITE path, where `commit_seq` is absent —
 /// the full `[from, to)` construction window. There is no per-row cold lower
 /// bound: the segment fetch and the snapshot exclusion anti-join own the
 /// baseline overlap. OpenTx `< began_at` rides the `commit_seq` upper bound
-/// (`began_at_seq_num - 1`, threaded in by the caller) — CHA-444 moved this to
-/// the read side when Persist's `oldest_open_began_at` write-time clamp dropped.
+/// (`began_at_seq_num - 1`, threaded in by the caller).
 ///
 /// Output columns: `row_uuid, <user_cols>, commit_micros, is_delete` — the
 /// same two-arm (upsert / tombstone) shape as [`build_merge_resolved`]; see
-/// that builder for the CHA-368 rationale. No user filter is spliced.
+/// that builder for the rationale. No user filter is spliced.
 pub(crate) fn build_cold_merge_resolved<D: Dialect>(
     upsert_log: &str,
     delete_log: &str,
@@ -158,8 +152,8 @@ pub(crate) fn build_cold_merge_resolved<D: Dialect>(
     let committed_at_filter_d =
         cold_visibility_clause(committed_from, committed_to, commit_seq_upper, Some("d"));
 
-    // CHA-398: the row_uuid restriction AND-composes with the
-    // committed_at window when one is present, else opens the WHERE.
+    // The row_uuid restriction AND-composes with the committed_at window when
+    // one is present, else opens the WHERE.
     let ids_u = row_uuid_in_clause_after::<D>(row_uuids, &committed_at_filter_u, "u.");
     let ids_d = row_uuid_in_clause_after::<D>(row_uuids, &committed_at_filter_d, "d.");
 
@@ -167,8 +161,8 @@ pub(crate) fn build_cold_merge_resolved<D: Dialect>(
     // and `write_seq_num` inline (persist projects them through), so
     // the canonical source SQL reads them directly without a commit_tx_log JOIN.
     // The committed_at window filter applies before the per-row_uuid
-    // pick in step 2; the CHA-398 row_uuid restriction sits in the same
-    // sources, below the dedup.
+    // pick in step 2; the row_uuid restriction sits in the same sources,
+    // below the dedup.
     let upsert_source = format!(
         "(SELECT u.row_uuid{user_cols_leading}{user_cols_u}, \
                 u.commit_micros, u.write_seq_num, u.commit_seq_num \
@@ -179,8 +173,8 @@ pub(crate) fn build_cold_merge_resolved<D: Dialect>(
          FROM {delete_log_q} d{committed_at_filter_d}{ids_d}) _d"
     );
 
-    // Step 2 (shared, CHA-243 + CHA-429): latest + deletes CTEs +
-    // tombstone-shadow, ordered on the commit-order serial.
+    // Step 2 (shared): latest + deletes CTEs + tombstone-shadow, ordered on
+    // the commit-order serial.
     let composite = build_composite_merge_resolution::<D>(
         &upsert_source,
         &delete_source,
@@ -189,8 +183,8 @@ pub(crate) fn build_cold_merge_resolved<D: Dialect>(
     );
 
     // Step 3 (cold-tier-specific): cold has no commit_tx_log, so the CTE list is
-    // just latest/deletes — splice it into the shared two-arm final SELECT
-    // (CHA-368) — see `build_merge_resolved` for the upsert/tombstone shape.
+    // just latest/deletes — splice it into the shared two-arm final SELECT;
+    // see `build_merge_resolved` for the upsert/tombstone shape.
     let cte_list = format!(
         "{latest_cte}, {deletes_cte}",
         latest_cte = composite.latest_cte,
@@ -199,8 +193,8 @@ pub(crate) fn build_cold_merge_resolved<D: Dialect>(
     two_arm_resolve_select(&cte_list, &composite, user_cols_leading, &user_cols_l)
 }
 
-/// Splice a tier's assembled CTE list into the shared two-arm final SELECT
-/// (CHA-368). Arm 1 = the visible upsert per `row_uuid` (`is_delete = false`).
+/// Splice a tier's assembled CTE list into the shared two-arm final SELECT.
+/// Arm 1 = the visible upsert per `row_uuid` (`is_delete = false`).
 /// Arm 2 = the winning tombstone per `row_uuid` (`is_delete = true`); its user
 /// cols come from the LEFT-JOINed `latest` (NULL for a delete-only `row_uuid`) so
 /// the UNION type-matches arm 1 exactly — the values are never emitted
@@ -233,17 +227,16 @@ fn two_arm_resolve_select(
     )
 }
 
-/// Cold-tier snapshot scan (CHA-411): read snapshot segments through a
-/// registered `SnapshotTableProvider` (aliased `l`) and express the
-/// exclusion-set anti-join + residual filter in the plan, instead of the
-/// post-read Arrow passes (`filter_snapshot_batch` / `apply_physical_filter`).
+/// Cold-tier snapshot scan: read snapshot segments through a registered
+/// `SnapshotTableProvider` (aliased `l`) and express the exclusion-set
+/// anti-join + residual filter in the plan.
 ///
 /// `snapshot_table` / `exclusion_table` are the names the snapshot
 /// `SessionContext` registers — the `SnapshotTableProvider` and a
 /// single-column `row_uuid` exclusion `MemTable`. Output columns:
 /// `row_uuid, <user_cols>`.
 ///
-/// Invariant (CHA-142): the user `filter` is appended ONLY at the outer
+/// Invariant: the user `filter` is appended ONLY at the outer
 /// `WHERE`; the `NOT IN (SELECT row_uuid FROM exclusion)` subquery stays
 /// unfiltered — the exclusion set was built from the unfiltered composed
 /// resolve upstream (the full row_uuid set of [`build_merge_resolved`] /
@@ -260,14 +253,14 @@ pub(crate) fn build_cold_snapshot_scan<D: Dialect>(
     let user_cols_l = qualify_user_cols::<D>("l", user_cols);
     let user_cols_leading = leading_comma_if_nonempty(user_cols);
 
-    // CHA-142: the user predicate is appended ONLY here, at the outer WHERE;
+    // The user predicate is appended ONLY here, at the outer WHERE;
     // the exclusion anti-join subquery stays unfiltered.
     let user_filter = match filter {
         Some(f) if !f.is_empty() => format!(" AND ({f})"),
         _ => String::new(),
     };
-    // CHA-398: restrict the snapshot scan to the named rows (exact —
-    // row identity IS row_uuid-from-PK, so no post-scan re-check).
+    // Restricting the snapshot scan to the named rows is exact — row identity
+    // IS row_uuid-from-PK, so no post-scan re-check.
     // PAIRING INVARIANT: must carry the SAME restriction as the
     // exclusion-set builders for this read — restricting exclusion but
     // not the scan would leak shadowed snapshot versions of
@@ -283,14 +276,14 @@ pub(crate) fn build_cold_snapshot_scan<D: Dialect>(
 }
 
 /// Cold-tier snapshot scan WITHOUT the exclusion anti-join — the
-/// `ByPlan` (CHA-404 snapshot writer) variant of
+/// `ByPlan` (snapshot writer) variant of
 /// [`build_cold_snapshot_scan`]. The in-plan `NOT IN` decorrelates to a
 /// `CollectLeft` `LeftAnti` hash join that BUILDS on the snapshot side:
 /// the entire prior snapshot materializes into the hash table and rows
 /// come back in hash order — defeating both the streaming memory bound
 /// and plan-order delivery. The ByPlan consumer applies the exclusion
 /// set per batch instead (`stream_merged_parts`); the exclusion was built
-/// from the unfiltered logs upstream either way (CHA-142).
+/// from the unfiltered logs upstream either way.
 pub(crate) fn build_cold_snapshot_scan_plain<D: Dialect>(
     snapshot_table: &str,
     user_cols: &[&str],
@@ -306,30 +299,25 @@ pub(crate) fn build_cold_snapshot_scan_plain<D: Dialect>(
     format!("SELECT l.row_uuid{user_cols_leading}{user_cols_l} FROM {snapshot_q} l{user_filter}")
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// CHA-227 + CHA-429 + CHA-443: cold-tier visibility predicate. ANDs the
-/// half-open `commit_micros` window with the optional `commit_seq_num <=
-/// seq` upper bound. Returns a full `WHERE ...` prefix (with a leading
-/// space) when any bound is set, or empty otherwise. Half-open on
-/// committed_at: `[min, max)`.
+/// Cold-tier visibility predicate. ANDs the half-open `commit_micros`
+/// window with the optional `commit_seq_num <= seq` upper bound. Returns a
+/// full `WHERE ...` prefix (with a leading space) when any bound is set, or
+/// empty otherwise. Half-open on committed_at: `[min, max)`.
 ///
 /// `alias = Some("d")` emits `d.commit_micros` / `d.commit_seq_num`;
 /// `alias = None` emits bare columns. The aliased form is needed when
 /// the predicate sits in a sub-clause where the bare column would be
 /// ambiguous.
 ///
-/// CHA-443 (IMPL-5): `commit_seq_upper` now carries the **folded** seq upper
-/// `min(W_persist, as_of_seq)` — both the hot↔cold tier fence (cold serves
-/// `commit_seq_num <= W_persist`) and the `AsOfSeq` visibility cap. On the
-/// snapshot-WRITE path (`commit_seq` absent on the plan) the tier fence isn't
-/// folded in and `committed_at`'s `[from, to)` window stands alone, as before.
-/// `committed_from` is `None` on every read-path call (the cold read has no
-/// per-row lower bound); it is `Some` only on the write-path construction
-/// window. OpenTx passes `commit_seq_upper = began_at_seq_num - 1` (CHA-444
-/// read-side bound), so cold serves only `commit_seq_num < began_at_seq_num`.
+/// `commit_seq_upper` carries the **folded** seq upper `min(W_persist,
+/// as_of_seq)` — both the hot↔cold tier fence (cold serves `commit_seq_num
+/// <= W_persist`) and the `AsOfSeq` visibility cap. On the snapshot-WRITE
+/// path (`commit_seq` absent on the plan) the tier fence isn't folded in and
+/// `committed_at`'s `[from, to)` window stands alone. `committed_from` is
+/// `None` on every read-path call (the cold read has no per-row lower bound);
+/// it is `Some` only on the write-path construction window. OpenTx passes
+/// `commit_seq_upper = began_at_seq_num - 1`, so cold serves only
+/// `commit_seq_num < began_at_seq_num`.
 fn cold_visibility_clause(
     committed_from: Option<i64>,
     committed_to: Option<i64>,
@@ -366,12 +354,11 @@ fn cold_visibility_clause(
 /// "is-committed" sentinel predicate is needed against
 /// `commit_micros`.
 ///
-/// CHA-443 (IMPL-5): `tier_seq_lower` is the hot↔cold tier fence on the
-/// gapless commit-order serial — hot serves `commit_seq_num > W_persist`. It
-/// replaces the old `commit_micros > hot_min` tier predicate (the seq
-/// partition is exact at `W_persist`, with no same-microsecond ambiguity).
-/// `None` pre-Persist (hot owns every row). Composed with the axis-aware
-/// as-of bound below.
+/// `tier_seq_lower` is the hot↔cold tier fence on the gapless commit-order
+/// serial — hot serves `commit_seq_num > W_persist`. The seq partition is
+/// exact at `W_persist`, with no same-microsecond ambiguity. `None`
+/// pre-Persist (hot owns every row). Composed with the axis-aware as-of
+/// bound below.
 fn read_snapshot_clause(tier_seq_lower: Option<i64>, snapshot: &ReadSnapshot) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(w_persist) = tier_seq_lower {
@@ -382,9 +369,9 @@ fn read_snapshot_clause(tier_seq_lower: Option<i64>, snapshot: &ReadSnapshot) ->
             parts.push(format!("commit_micros <= {ts}"));
         }
         ReadSnapshot::AsOfSeq(seq) | ReadSnapshot::LatestSeq(seq) => {
-            // CHA-429: visibility on the commit-order axis — exact, no
-            // committed_at tie ambiguity. CHA-472: a default-latest read
-            // (`LatestSeq`) pins the same seq predicate as an explicit `AsOfSeq`.
+            // Visibility on the commit-order axis — exact, no committed_at tie
+            // ambiguity. A default-latest read (`LatestSeq`) pins the same seq
+            // predicate as an explicit `AsOfSeq`.
             parts.push(format!("commit_seq_num <= {seq}"));
         }
         ReadSnapshot::OpenTx {
@@ -408,7 +395,7 @@ fn read_snapshot_clause(tier_seq_lower: Option<i64>, snapshot: &ReadSnapshot) ->
 /// synthetic `committed_tx` entry — `tx_uuid` matches the open tx, with
 /// `commit_micros` and `commit_seq_num` both `i64::MAX` (when
 /// `include_committed_at = true`; the exclusion-set CTE elides those
-/// columns and passes `false`). CHA-429: the merge now orders by
+/// columns and passes `false`). The merge orders by
 /// `commit_seq_num`, so the synthetic row carries `i64::MAX` on the seq axis
 /// — higher than any real committed seq — which makes the tx's own
 /// uncommitted writes win the latest-version-per-row_uuid race in
@@ -426,9 +413,9 @@ fn read_snapshot_clause(tier_seq_lower: Option<i64>, snapshot: &ReadSnapshot) ->
 /// emission. The synthetic row's columns are constants, so the literal
 /// expansion is free — no extra round-trip, same SQL on both tiers.
 ///
-/// Cold tier never matches because, by CHA-103, only committed txs are
-/// persisted to cold; the synthetic tx_uuid joins to no upsert/delete
-/// rows there. Harmless extra row in the CTE.
+/// Cold tier never matches: only committed txs are persisted to cold, so
+/// the synthetic tx_uuid joins to no upsert/delete rows there. Harmless
+/// extra row in the CTE.
 ///
 /// `AsOfMicros` / `AsOfSeq` emit nothing (no own-writes to inject).
 fn open_tx_union_clause<D: Dialect>(snapshot: &ReadSnapshot, include_committed_at: bool) -> String {
@@ -461,13 +448,11 @@ mod tests {
     const DEL: &str = "delete_log";
     const TX: &str = "commit_tx_log";
 
-    // An effectively-unbounded upper fence for the SQL-shape tests below
-    // (CHA-86 removed the unbounded `Latest` variant). `commit_micros
-    // <= i64::MAX` matches every committed row, so these tests still
-    // exercise the no-meaningful-bound shape.
+    // An effectively-unbounded upper fence for the SQL-shape tests below —
+    // there is no unbounded `ReadSnapshot` variant. `commit_micros <= i64::MAX`
+    // matches every committed row, so these tests still exercise the
+    // no-meaningful-bound shape.
     const LATEST: ReadSnapshot = ReadSnapshot::AsOfMicros(i64::MAX);
-
-    // -- build_merge_resolved -------------------------------------------------
 
     #[test]
     fn merge_resolved_pg_uses_distinct_on() {
@@ -484,9 +469,8 @@ mod tests {
     fn merge_resolved_df_uses_row_number() {
         let sql =
             build_merge_resolved::<DfDialect>(UPS, DEL, TX, &["name", "age"], None, &LATEST, None);
-        // CHA-431: ORDER BY is the composite `(commit_seq_num, write_seq_num)`;
-        // see [`merge_latest_orders_by_composite_desc`] for the dedicated
-        // lock-in.
+        // ORDER BY is the composite `(commit_seq_num, write_seq_num)`; see
+        // [`merge_latest_orders_by_composite_desc`] for the dedicated lock-in.
         assert!(
             sql.contains(
                 "ROW_NUMBER() OVER (PARTITION BY \"row_uuid\" ORDER BY \"commit_seq_num\" DESC, \"write_seq_num\" DESC)"
@@ -496,11 +480,8 @@ mod tests {
         assert!(!sql.contains("DISTINCT ON"), "df must not use DISTINCT ON");
     }
 
-    // CHA-368: the resolve emits a two-arm UNION — visible upserts
-    // (`is_delete = false`) and winning tombstones (`is_delete = true`) — so the
-    // caller's exclusion set falls out of the full row_uuid set and the live
-    // delta is the `is_delete = false` subset. Pin the emitted shape; both
-    // dialects share it (the tier-specific sources differ above the CTEs).
+    // Both dialects share the two-arm UNION shape (the tier-specific sources
+    // differ above the CTEs), so pin it once for each.
     #[test]
     fn merge_resolved_emits_two_arm_is_delete_union() {
         for sql in [
@@ -543,9 +524,9 @@ mod tests {
     #[test]
     fn merge_resolved_omits_user_cols_cleanly_when_empty() {
         let sql = build_merge_resolved::<PgDialect>(UPS, DEL, TX, &[], None, &LATEST, None);
-        // CHA-243: joined CTE now carries write_seq_num alongside
-        // commit_micros; final SELECT still emits just row_uuid +
-        // commit_micros (caller doesn't consume write_seq_num).
+        // The joined CTE carries write_seq_num alongside commit_micros; the
+        // final SELECT emits just row_uuid + commit_micros (the caller doesn't
+        // consume write_seq_num).
         assert!(sql.contains("u.row_uuid, c.commit_micros, u.write_seq_num"));
         assert!(sql.contains("l.row_uuid, l.commit_micros"));
         assert!(!sql.contains(", ,"), "dangling comma: {sql}");
@@ -576,12 +557,10 @@ mod tests {
 
     #[test]
     fn merge_resolved_applies_seq_tier_lower() {
-        // CHA-443 (IMPL-5): the hot tier fence is now `commit_seq_num > W_persist`,
-        // not `commit_micros > hot_min`.
         let sql =
             build_merge_resolved::<PgDialect>(UPS, DEL, TX, &["name"], Some(42), &LATEST, None);
-        // The seq tier fence and the snapshot's upper bound coexist
-        // (CHA-86: every read carries a bounded `<=` snapshot predicate).
+        // The seq tier fence and the snapshot's upper bound coexist — every
+        // read carries a bounded `<=` snapshot predicate.
         assert!(sql.contains("commit_seq_num > 42"), "seq tier fence: {sql}");
         assert!(sql.contains("commit_micros <= 9223372036854775807"));
     }
@@ -589,10 +568,9 @@ mod tests {
     #[test]
     fn merge_resolved_no_tier_lower_emits_only_upper_bound() {
         let sql = build_merge_resolved::<PgDialect>(UPS, DEL, TX, &["name"], None, &LATEST, None);
-        // CHA-86: there is no unbounded read, so the committed_tx CTE
-        // always carries the snapshot's `<= ts` predicate; with no
-        // seq tier fence (pre-Persist) the CTE WHERE closes right after it
-        // (no `commit_seq_num > W_persist` fence AND'd in).
+        // There is no unbounded read, so the committed_tx CTE always carries
+        // the snapshot's `<= ts` predicate; with no seq tier fence
+        // (pre-Persist) the CTE WHERE closes right after it.
         assert!(
             sql.contains("FROM \"commit_tx_log\" WHERE commit_micros <= 9223372036854775807)"),
             "committed_tx CTE should carry only the snapshot upper bound: {sql}",
@@ -608,8 +586,8 @@ mod tests {
 
     #[test]
     fn merge_resolved_combines_seq_tier_and_as_of() {
-        // CHA-443 (IMPL-5): seq tier fence `commit_seq_num > W_persist` composed
-        // with the AsOfMicros visibility cap on committed_at.
+        // Seq tier fence `commit_seq_num > W_persist` composed with the
+        // AsOfMicros visibility cap on committed_at.
         let sql = build_merge_resolved::<PgDialect>(
             UPS,
             DEL,
@@ -627,10 +605,7 @@ mod tests {
 
     #[test]
     fn merge_resolved_filters_tombstoned_upserts() {
-        // CHA-431: tombstone-shadow predicate is the composite
-        // lexicographic `commit_seq_num > d.commit_seq_num OR (commit_seq_num
-        // = d.commit_seq_num AND write_seq_num >= d.write_seq_num)`. The
-        // lexicographic spelling avoids DataFusion's incomplete support
+        // The lexicographic spelling avoids DataFusion's incomplete support
         // for SQL row-value comparison; PG supports both forms — see
         // [`merge_predicate_uses_composite_geq`].
         let sql = build_merge_resolved::<PgDialect>(UPS, DEL, TX, &["name"], None, &LATEST, None);
@@ -649,7 +624,7 @@ mod tests {
             tx_uuid: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
         };
         let sql = build_merge_resolved::<PgDialect>(UPS, DEL, TX, &["name"], None, &snapshot, None);
-        // CHA-429: strict-< on the SEQ axis (began_at_seq_num), no `<=`.
+        // Strict-< on the SEQ axis (began_at_seq_num), no `<=`.
         assert!(
             sql.contains("WHERE commit_seq_num < 1500"),
             "expected strict-< seq bound, got: {sql}",
@@ -687,23 +662,20 @@ mod tests {
 
     #[test]
     fn merge_resolved_within_rpc_tie_upsert_wins() {
-        // CHA-431: lock-in for the seq tiebreaker that resolved
-        // ADR 0009 §76. When an open tx does INSERT R + DELETE R inside
-        // one WriteData RPC, both writes share one `commit_seq_num`; the
-        // co-batch delete gets a strictly lower `write_seq_num`
-        // (deletes-first), so the upsert wins via `>=`. The
-        // tombstone-shadow predicate is the lexicographic
-        // `commit_seq_num > d.commit_seq_num OR (commit_seq_num =
-        // d.commit_seq_num AND write_seq_num >= d.write_seq_num)`
-        // — semantically `(commit_seq_num, write_seq_num) >= (d.commit_seq_num,
-        // d.write_seq_num)`, written out because DataFusion's row-value
-        // comparison support is incomplete (PG supports both forms). On
-        // tie the `=` branch takes the `>=` side → upsert wins → row
-        // visible.
+        // Lock-in for the seq tiebreaker specified in ADR 0009 §76. When an
+        // open tx does INSERT R + DELETE R inside one WriteData RPC, both
+        // writes share one `commit_seq_num`; the co-batch delete gets a
+        // strictly lower `write_seq_num` (deletes-first), so the upsert wins
+        // via `>=`. The tombstone-shadow predicate is semantically
+        // `(commit_seq_num, write_seq_num) >= (d.commit_seq_num,
+        // d.write_seq_num)`, written out lexicographically because
+        // DataFusion's row-value comparison support is incomplete (PG supports
+        // both forms). On tie the `=` branch takes the `>=` side → upsert wins
+        // → row visible.
         //
-        // Pins both the new composite shape AND the absence of the
-        // pre-CHA-243 single-column predicate so anyone reverting the
-        // change without updating ADR 0009 fails loudly.
+        // Pins the composite shape AND the absence of the single-column
+        // predicate, so anyone reverting the change without updating ADR 0009
+        // fails loudly.
         let snapshot = ReadSnapshot::OpenTx {
             began_at_seq_num: 1_500,
             tx_uuid: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
@@ -718,8 +690,8 @@ mod tests {
             "expected lexicographic composite tombstone-shadow predicate \
              (UPSERT wins on tie), got: {sql}",
         );
-        // Pre-CHA-243 single-column shape (no `write_seq_num`
-        // tiebreaker) is gone.
+        // The single-column shape (no `write_seq_num` tiebreaker) must be
+        // absent.
         assert!(
             !sql.contains("l.commit_micros > d.deleted_at"),
             "comparison must use the composite key; reverting to single-column \
@@ -727,8 +699,6 @@ mod tests {
              regression): {sql}",
         );
     }
-
-    // CHA-243: emitted-SQL lock-ins for the composite tiebreaker.
 
     #[test]
     fn merge_predicate_uses_composite_geq() {
@@ -751,8 +721,7 @@ mod tests {
             cold.contains(expected),
             "cold builder missing composite tombstone-shadow predicate: {cold}",
         );
-        // Pre-CHA-243 single-column form (using the now-removed
-        // `deleted_at` alias) must be gone.
+        // The single-column form (using the `deleted_at` alias) must be gone.
         assert!(
             !hot.contains("d.deleted_at"),
             "hot must not retain the deleted_at alias: {hot}",
@@ -808,8 +777,7 @@ mod tests {
                 sql.contains("\"write_seq_num\""),
                 "deletes CTE must carry write_seq_num: {sql}",
             );
-            // No GROUP BY/MAX shape from the pre-CHA-243 aggregation
-            // strategy.
+            // No GROUP BY/MAX aggregation shape.
             assert!(
                 !sql.contains("MAX(c.commit_micros) AS deleted_at"),
                 "deletes CTE must not retain old MAX-aggregation: {sql}",
@@ -842,9 +810,7 @@ mod tests {
         );
     }
 
-    // -- cold_committed_at_clause + cold builders -----------------------------
-    //
-    // CHA-227: cold tier carries the committed-at window on the wire as
+    // The cold tier carries the committed-at window on the wire as
     // `PersistPlan.committed_at: IntegerRange`. The merge SQL builders
     // splice it inline; these tests pin the exact emitted shape so
     // anyone editing the clause notices the wire-shape change.
@@ -887,8 +853,8 @@ mod tests {
 
     #[test]
     fn cold_visibility_clause_ands_seq_upper() {
-        // CHA-429: the AsOfSeq read passes a `commit_seq_num <= N` upper bound,
-        // ANDed after the committed_at window (or alone when no window).
+        // An AsOfSeq read passes a `commit_seq_num <= N` upper bound, ANDed
+        // after the committed_at window (or alone when no window).
         assert_eq!(
             cold_visibility_clause(Some(100), Some(200), Some(7), Some("d")),
             " WHERE d.commit_micros >= 100 AND d.commit_micros < 200 \
@@ -900,7 +866,7 @@ mod tests {
         );
     }
 
-    // CHA-368: cold resolve shares the hot two-arm (upsert / tombstone) shape.
+    // Cold resolve shares the hot two-arm (upsert / tombstone) shape.
     #[test]
     fn cold_merge_resolved_emits_two_arm_is_delete_union() {
         let sql =
@@ -958,11 +924,10 @@ mod tests {
 
     #[test]
     fn cold_merge_resolved_threads_seq_upper_through_upsert_and_delete_logs() {
-        // CHA-429: an AsOfSeq read passes `commit_seq_upper = Some(N)`; the
-        // `commit_seq_num <= N` bound must land on BOTH cold sources of the full
-        // merge SQL (not just in the clause-builder unit test) — the upsert
-        // log inline and the delete log via the `d.` alias — ANDed after the
-        // committed_at window.
+        // The `commit_seq_num <= N` bound must land on BOTH cold sources of the
+        // full merge SQL (not just in the clause-builder unit test) — the
+        // upsert log inline and the delete log via the `d.` alias — ANDed after
+        // the committed_at window.
         let sql = build_cold_merge_resolved::<DfDialect>(
             UPS,
             DEL,
@@ -1001,8 +966,6 @@ mod tests {
             "no max bound expected with no window: {sql}",
         );
     }
-
-    // -- build_cold_snapshot_scan (CHA-411) -----------------------------------
 
     const SNAP: &str = "snapshot";
     const EXCL: &str = "exclusion";
@@ -1048,7 +1011,7 @@ mod tests {
             sql.ends_with(" AND (l.value > 5)"),
             "user filter appended at the outer WHERE: {sql}",
         );
-        // CHA-142: the exclusion subquery stays unfiltered.
+        // The exclusion subquery stays unfiltered.
         assert!(
             sql.contains("l.row_uuid NOT IN (SELECT row_uuid FROM \"exclusion\")"),
             "exclusion subquery must remain filter-free: {sql}",
@@ -1067,8 +1030,6 @@ mod tests {
         assert_eq!(none_sql, empty_sql, "empty filter is treated as None");
         assert!(none_sql.contains("l.row_uuid NOT IN (SELECT row_uuid FROM \"exclusion\")"));
     }
-
-    // -- CHA-398: row_uuid point-lookup restriction ------------------------
 
     const U1: &str = "11111111-1111-1111-1111-111111111111";
     const U2: &str = "22222222-2222-2222-2222-222222222222";

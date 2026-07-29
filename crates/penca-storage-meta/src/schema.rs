@@ -15,7 +15,7 @@ impl LifecycleManager {
     /// 1 SQL query.
     /// Insert a schema row into `__penca_system__.schemas` on a branch.
     ///
-    /// CHA-177: writes through the standard data-table upsert log
+    /// Writes through the standard data-table upsert log
     /// `{prefix}_data_upsert_log` where
     /// `prefix = data_log_prefix(sys_schemas_table_uuid, branch_uuid)`.
     /// Same SQL pattern as user data writes — `ON CONFLICT
@@ -40,8 +40,6 @@ impl LifecycleManager {
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(&catalog);
         let table = naming::upsert_log_table(&sys_schemas_table_uuid, &branch);
 
-        // CHA-380: schema_uuid is a first-class PK column; derive row_uuid
-        // canonically (`row_uuid_for_pk`) like every other Penca table.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_schemas_table_uuid,
             &[parse_uuid(schema_uuid).to_string().as_str()],
@@ -95,8 +93,8 @@ impl LifecycleManager {
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(&catalog);
         let table = naming::delete_log_table(&sys_schemas_table_uuid, &branch);
 
-        // CHA-380: derive row_uuid canonically; schema_uuid is the widened
-        // delete-log PK column (CHA-185), populated to match the upsert row.
+        // `schema_uuid` is the widened delete-log PK column, populated to
+        // match the upsert row.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_schemas_table_uuid,
             &[parse_uuid(schema_uuid).to_string().as_str()],

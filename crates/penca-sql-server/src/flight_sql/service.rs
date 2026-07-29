@@ -197,9 +197,9 @@ impl FlightSqlService {
 
         let (conn, snapshot) = self.request_session_context(&inspect_request).await?;
         // Per ADR 0010, every conn caches one `Arc<SessionContext>` for
-        // its lifetime. We just borrow it here — no per-request
-        // SessionState clone, no per-request catalog tree rebuild.
-        // CHA-345: BEGIN/COMMIT/ROLLBACK flip the `Arc`-shared
+        // its lifetime — borrowed here, so no per-request SessionState
+        // clone and no per-request catalog tree rebuild.
+        // BEGIN/COMMIT/ROLLBACK flip the `Arc`-shared
         // `ConnScope.open_tx_cell` (kept in sync with the conn's
         // authoritative `open_tx_uuid` mutex); the provider tree —
         // `PencaTableProvider::scan` plus the schema/catalog metadata
@@ -222,8 +222,8 @@ impl FlightSqlService {
 }
 
 impl FlightSqlService {
-    /// CHA-374 / CHA-460: mint and install the auto-commit read-snapshot pin for
-    /// a `GetFlightInfo` leg. Returns the pinned `as_of_seq` (a `commit_seq_num`
+    /// Mint and install the auto-commit read-snapshot pin for a
+    /// `GetFlightInfo` leg. Returns the pinned `as_of_seq` (a `commit_seq_num`
     /// frontier) to stamp on the outgoing ticket and the RAII guard to hold
     /// across the plan build (cleared on drop). Skips the `GetMaxCommitSeqNum`
     /// hop entirely when a tx is open — the open tx carries the snapshot via
@@ -267,8 +267,8 @@ impl FlightSqlService {
     ///    a long DML on stream A doesn't observe a sibling stream B's
     ///    mid-flight `SET search_path` / `BEGIN`.
     /// 3. Reject mid-session `x-penca-branch` / `x-penca-catalog`
-    ///    header drift against the conn's pinned values (CHA-119
-    ///    / CHA-253). Catalog *existence* is verified fail-fast at
+    ///    header drift against the conn's pinned values.
+    ///    Catalog *existence* is verified fail-fast at
     ///    conn-mint by [`ConnSessionFactory::mint`]; this step catches
     ///    the case where a client sends a *changed* header value on
     ///    a later HTTP/2 stream on the same TCP conn — the mint code
@@ -345,13 +345,12 @@ static SQL_INFO_DATA: Lazy<SqlInfoData> = Lazy::new(|| {
         datafusion::sql::sqlparser::keywords::ALL_KEYWORDS,
     );
     b.append(SqlInfo::SqlTransactionsSupported, true);
-    // `0` per the FlightSql.proto convention = "no limit". The ticket
-    // listed this as the single key `SQL_MAX_IDENTIFIER_LENGTH`, but
-    // arrow-flight 57's binding breaks it out per identifier kind —
-    // each `getMax*NameLength()` method on `DatabaseMetaData` reads a
-    // different key. Penca imposes no length cap on any identifier
-    // (storage routes by uuid; the gRPC `create_*` APIs accept
-    // arbitrary-length byte strings), so all four populate as 0.
+    // `0` per the FlightSql.proto convention = "no limit". arrow-flight 57
+    // breaks the spec's single `SQL_MAX_IDENTIFIER_LENGTH` out per identifier
+    // kind — each `getMax*NameLength()` method on `DatabaseMetaData` reads a
+    // different key. Penca imposes no length cap on any identifier (storage
+    // routes by uuid; the gRPC `create_*` APIs accept arbitrary-length byte
+    // strings), so all four populate as 0.
     b.append(SqlInfo::SqlMaxColumnNameLength, 0i64);
     b.append(SqlInfo::SqlDbSchemaNameLength, 0i64);
     b.append(SqlInfo::SqlMaxCatalogNameLength, 0i64);
@@ -376,7 +375,7 @@ struct FlightSqlSessionContext {
     /// directly without a second `Extensions::get::<Arc<ConnSession>>()`
     /// lookup against the request.
     conn: Arc<ConnSession>,
-    /// The conn's logical-plan cache (CHA-355). `get_flight_info_statement`
+    /// The conn's logical-plan cache. `get_flight_info_statement`
     /// registers the planned statement here and stamps the returned
     /// `statement_uuid` on the ticket; `do_get_fallback` looks it up to reuse
     /// the plan.
@@ -385,11 +384,10 @@ struct FlightSqlSessionContext {
 
 impl FlightSqlSessionContext {
     async fn sql_to_logical_plan(&self, sql: &str) -> DataFusionResult<LogicalPlan> {
-        // CHA-367: collapse the repeated CatalogProvider::schema /
-        // SchemaProvider::table gRPCs DataFusion makes within this one
-        // `create_logical_plan` to one each. The guard clears the memo when it
-        // drops at the end of this call, so the next statement re-resolves
-        // live (RYOW / mid-tx DDL). Covers the DoGet cache-miss re-plan path.
+        // Collapses the repeated CatalogProvider::schema / SchemaProvider::table
+        // gRPCs DataFusion makes within one `create_logical_plan` to one each.
+        // The guard clears the memo when it drops at the end of this call, so
+        // the next statement re-resolves live (RYOW / mid-tx DDL).
         let _memo_guard = self.conn.install_plan_resolution_memo();
         let plan = self.inner.state().create_logical_plan(sql).await?;
         let verifier = self.sql_options.unwrap_or_default();
@@ -410,13 +408,12 @@ impl FlightSqlSessionContext {
 }
 
 /// Encode an executed `SendableRecordBatchStream` as the Arrow Flight
-/// `DoGetStream` response. Shared by every `do_get_fallback` arm
-/// (CHA-355 plan-cache hit, plan-cache miss / re-plan, and the
-/// prepared-statement path) so the IPC-encode tail lives in one place.
+/// `DoGetStream` response. Shared by every `do_get_fallback` arm so the
+/// IPC-encode tail lives in one place.
 ///
 /// `advertised_schema` is the schema `get_flight_info` returned to the client
-/// (the logical plan's, via `codec::get_schema_for_plan`). CHA-402: when the
-/// executed stream's physical schema is more nullable than what was advertised
+/// (the logical plan's, via `codec::get_schema_for_plan`). When the executed
+/// stream's physical schema is more nullable than what was advertised
 /// (DataFusion's scalar-subquery decorrelation over-marks a non-null `COUNT`
 /// nullable), each batch is relabeled back to the advertised nullability so
 /// `DoGet` matches `get_flight_info` — ADBC rejects any divergence. When the two
@@ -439,8 +436,6 @@ fn record_batch_response(
             Some(target_schema) => {
                 // Nullability diverged — relabel each batch to the advertised schema
                 // (zero-copy; `try_new` validates a now-non-null column has no nulls).
-                // CHA-402: observe when the advertise/stream divergence actually fires
-                // (the matching-schema `None` hot path above stays silent).
                 tracing::debug!(
                     target: "penca_sql::schema_reconcile",
                     result_fields = target_schema.fields().len(),
@@ -472,10 +467,10 @@ where
         .boxed()
 }
 
-/// CHA-417: run a `DoGet` response stream inside one `flight_encode` debug
-/// span — the encode tail of every `do_get_fallback` arm (statement,
-/// prepared, cache-miss re-plan), since [`record_batch_response`] is the
-/// single helper they all return through. Cumulative `items`/`data_bytes`
+/// Run a `DoGet` response stream inside one `flight_encode` debug span —
+/// the encode tail of every `do_get_fallback` arm, since
+/// [`record_batch_response`] is the single helper they all return through.
+/// Cumulative `items`/`data_bytes`
 /// are recorded at end-of-stream (no per-item spans); `data_bytes` is the
 /// Arrow payload size (header + body + app_metadata), not the full
 /// protobuf `FlightData` wire size. With `PENCA_SPAN_TIMING` set, the
@@ -492,9 +487,7 @@ fn instrument_flight_encode(stream: DoGetStreamBody) -> DoGetStreamBody {
         items = tracing::field::Empty,
         data_bytes = tracing::field::Empty,
     );
-    // Zero cost when off (CHA-417): unlike the ipc_encode/
-    // stream_query_as_batches sites, this counting layer is NEW stream
-    // plumbing rather than a pre-existing block — so when the debug span
+    // The counting layer is pure added stream plumbing, so when the debug span
     // is disabled by the level filter, skip the wrapper entirely.
     if span.is_disabled() {
         return stream;
@@ -596,13 +589,12 @@ impl ArrowFlightSqlService for FlightSqlService {
         let (request, ctx) = self.new_context(request).await?;
         let ticket = CommandTicket::try_decode(request.into_inner().ticket)
             .map_err(super::error::flight_error_to_status)?;
-        // CHA-374: re-pin the auto-commit snapshot the GetFlightInfo leg minted
-        // and stamped on this ticket, for the whole execution. Held across both
-        // the cache-hit `execute_logical_plan` and the cache-miss re-plan
-        // (`sql_to_logical_plan` re-plan), so physical-planning scans
-        // and any re-plan metadata reads resolve at the one pinned snapshot via
-        // the `ConnScope` cell. `None` when the ticket carries no pin (in-tx) —
-        // the open tx then carries consistency and no guard is installed.
+        // Re-pin the auto-commit snapshot the GetFlightInfo leg minted and
+        // stamped on this ticket, for the whole execution. Held across both the
+        // cache-hit `execute_logical_plan` and the cache-miss re-plan, so
+        // physical-planning scans and any re-plan metadata reads resolve at the
+        // one pinned snapshot via the `ConnScope` cell. `None` when the ticket
+        // carries no pin (in-tx) — the open tx then carries consistency.
         let _as_of_guard = ticket
             .as_of_seq
             .map(|as_of| ctx.conn.install_pinned_as_of_seq(as_of));
@@ -617,15 +609,12 @@ impl ArrowFlightSqlService for FlightSqlService {
 
         match ticket.command {
             sql::Command::CommandStatementQuery(CommandStatementQuery { query, .. }) => {
-                // CHA-355: reuse the plan `get_flight_info_statement` cached
-                // under `ticket.statement_uuid` instead of re-planning. A miss
-                // (absent statement_uuid / evicted / disabled cache / server restart)
-                // falls back to re-planning via `sql_to_logical_plan` — always safe, so
-                // there is no correctness dependence on a hit.
-                // CHA-402: reconcile the DoGet stream to the schema
-                // get_flight_info advertised (the logical plan's, via
-                // get_schema_for_plan). Derive it from the same plan we execute,
-                // before `execute_logical_plan` consumes it.
+                // Reuse the plan `get_flight_info_statement` cached under
+                // `ticket.statement_uuid` instead of re-planning. A miss falls
+                // back to re-planning — always safe, so there is no correctness
+                // dependence on a hit. The advertised schema must come from the
+                // same plan we execute, derived before `execute_logical_plan`
+                // consumes it.
                 let (advertised_schema, stream) = match resolve_statement_cache(
                     &ctx.statement_cache,
                     ticket.statement_uuid.as_deref(),
@@ -656,13 +645,11 @@ impl ArrowFlightSqlService for FlightSqlService {
             sql::Command::CommandPreparedStatementQuery(CommandPreparedStatementQuery {
                 prepared_statement_handle,
             }) => {
-                // CHA-355: ADBC (and any prepared-statement client) reaches
-                // DoGet here, not the `CommandStatementQuery` arm. Reuse the
-                // unparameterized plan `get_flight_info_prepared_statement`
-                // cached under `ticket.statement_uuid`; a miss re-plans from the
-                // handle's SQL. Parameters bind per-execute on both paths, so
-                // the cached plan stays unparameterized and is reusable across
-                // executions with different bindings.
+                // ADBC (and any prepared-statement client) reaches DoGet here,
+                // not the `CommandStatementQuery` arm. Parameters bind
+                // per-execute on both paths, so the cached plan stays
+                // unparameterized and is reusable across executions with
+                // different bindings.
                 let handle = QueryHandle::try_decode(prepared_statement_handle)?;
                 let mut plan = match resolve_statement_cache(
                     &ctx.statement_cache,
@@ -674,10 +661,10 @@ impl ArrowFlightSqlService for FlightSqlService {
                         .await
                         .map_err(super::error::df_error_to_status)?,
                 };
-                // CHA-402: advertise == the unparameterized plan's logical schema
-                // (what get_flight_info_prepared_statement returned). Binding
-                // parameters into a filter does not change the projection schema,
-                // so capture it before `with_param_values`.
+                // Advertise the unparameterized plan's logical schema (what
+                // get_flight_info_prepared_statement returned). Binding
+                // parameters into a filter does not change the projection
+                // schema, so capture it before `with_param_values`.
                 let advertised_schema = super::codec::get_schema_for_plan(&plan);
                 if let Some(param_values) = super::codec::decode_param_values(handle.parameters())
                     .map_err(super::error::arrow_error_to_status)?
@@ -712,9 +699,8 @@ impl ArrowFlightSqlService for FlightSqlService {
         let (request, ctx) = self.new_context(request).await?;
         let sql = &query.query;
 
-        // CHA-374 / CHA-460: mint + install the auto-commit seq pin before
-        // planning so planning's metadata reads and the DoGet scans share one
-        // seq snapshot. No-op (and no GetMaxCommitSeqNum hop) when a tx is open.
+        // Install the auto-commit seq pin before planning so planning's
+        // metadata reads and the DoGet scans share one seq snapshot.
         let (as_of, _as_of_guard) = self
             .install_autocommit_pin(&ctx.conn, ctx.snapshot.open_tx_uuid.as_deref())
             .await?;
@@ -722,7 +708,7 @@ impl ArrowFlightSqlService for FlightSqlService {
             tracing::Span::current().record("as_of", as_of);
         }
 
-        // CHA-367: memoize per-build schema/table resolution for this plan.
+        // Memoize per-build schema/table resolution for this plan.
         let _memo_guard = ctx.conn.install_plan_resolution_memo();
         let (rewritten_sql, plan) = crate::gateway::plan_for_get_flight_info(
             &ctx.inner,
@@ -745,12 +731,12 @@ impl ArrowFlightSqlService for FlightSqlService {
 
         let flight_descriptor = request.into_inner();
         let dataset_schema = super::codec::get_schema_for_plan(&plan);
-        // CHA-355: register the plan we just built and stamp its statement_uuid
-        // on the ticket so `do_get_fallback` reuses it instead of re-planning. The
-        // schema above is still derived from `plan` directly. For the SET arm
-        // `plan` is the placeholder plan and `query` is `SET_PLACEHOLDER_SQL`,
-        // so a DoGet hit runs the placeholder (empty result) and a miss
-        // re-runs `SET_PLACEHOLDER_SQL` — both empty, SET semantics preserved.
+        // Register the plan we just built and stamp its statement_uuid on the
+        // ticket so `do_get_fallback` reuses it instead of re-planning. For the
+        // SET arm `plan` is the placeholder plan and `query` is
+        // `SET_PLACEHOLDER_SQL`, so a DoGet hit runs the placeholder (empty
+        // result) and a miss re-runs `SET_PLACEHOLDER_SQL` — both empty, SET
+        // semantics preserved.
         let statement_uuid = ctx.statement_cache.insert(plan);
         let mut ticket = CommandTicket::new(sql::Command::CommandStatementQuery(query))
             .with_statement_uuid(statement_uuid);
@@ -803,17 +789,13 @@ impl ArrowFlightSqlService for FlightSqlService {
             tracing::Span::current().record("as_of", as_of);
         }
 
-        // CHA-367: reuse the plan `do_action_create_prepared_statement` already
-        // built and cached for this statement instead of re-planning — that is
-        // the redundant second pass (PREPARE then GetFlightInfo) which re-issued
-        // get_schema/get_table for the same statement at the same snapshot. A
-        // miss (no stamped uuid, eviction, or a pre-CHA-367 handle) falls back
-        // to planning from the handle's SQL under a per-build resolution memo.
-        // Reuse the PREPARE-cached plan AND its uuid when present, so the DoGet
-        // ticket points at the *same* cache entry — one StatementCache slot per
-        // prepared query, preserving CHA-355's one-insert-per-query sizing. A
-        // miss (no stamped uuid, eviction, or a pre-CHA-367 handle) re-plans
-        // under the per-build resolution memo and inserts a fresh entry.
+        // Reuse the plan `do_action_create_prepared_statement` already built and
+        // cached, instead of re-planning — the redundant second pass (PREPARE
+        // then GetFlightInfo) would re-issue get_schema/get_table for the same
+        // statement at the same snapshot. Reuse its uuid too, so the DoGet
+        // ticket points at the *same* cache entry: one StatementCache slot per
+        // prepared query. A miss (no stamped uuid, eviction, or an old handle)
+        // re-plans under a per-build resolution memo and inserts a fresh entry.
         let (plan, statement_uuid) = match handle.statement_uuid().and_then(|uuid| {
             ctx.statement_cache
                 .get(uuid)
@@ -840,8 +822,8 @@ impl ArrowFlightSqlService for FlightSqlService {
                     handle.query(),
                 )
                 .await?;
-                // CHA-355: register the re-planned plan so the DoGet leg reuses
-                // it instead of re-planning a third time.
+                // Register the re-planned plan so the DoGet leg reuses it
+                // instead of re-planning a third time.
                 let uuid = ctx.statement_cache.insert(plan.clone());
                 (plan, uuid)
             }
@@ -1150,14 +1132,8 @@ impl ArrowFlightSqlService for FlightSqlService {
     ) -> Result<i64, Status> {
         let (_request, ctx) = self.new_context(request).await?;
         let transaction_id = normalize_wire_transaction_id(ticket.transaction_id.as_ref())?;
-        // CHA-259: parse + classify + dispatch through one gateway.
-        // SET → `set::handle_set`; BEGIN/COMMIT/ROLLBACK → `tx::*`;
-        // DML → `dml::execute`; SELECT → invalid_argument;
-        // CREATE SCHEMA/CREATE TABLE (auto-commit CHA-172 or
-        // transactional CHA-345) → `ddl::execute`; other DDL
-        // → "use gRPC WriteService" wording. The same gateway runs in
-        // the JDBC-side prepared-statement entry-points below so
-        // routing is identical across drivers.
+        // The same gateway runs in the JDBC-side prepared-statement
+        // entry-points below, so routing is identical across drivers.
         let gctx = crate::gateway::UpdateCtx {
             session_ctx: &ctx.inner,
             write_channel: &self.write_channel,
@@ -1228,12 +1204,10 @@ impl ArrowFlightSqlService for FlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let (request, ctx) = self.new_context(request).await?;
-        // CHA-259: route through the same gateway as
-        // `do_put_statement_update`. JDBC's `Statement.execute` walks
-        // `ActionCreatePreparedStatement` → `DoPutPreparedStatementUpdate`
-        // for every non-query SQL (DDL, DML, BEGIN/COMMIT/ROLLBACK,
-        // SET); the prepared-statement handle round-trip carries the
-        // SQL string the user typed back to us, and from there the
+        // JDBC's `Statement.execute` walks `ActionCreatePreparedStatement` →
+        // `DoPutPreparedStatementUpdate` for every non-query SQL (DDL, DML,
+        // BEGIN/COMMIT/ROLLBACK, SET); the prepared-statement handle round-trip
+        // carries the SQL string the user typed back to us, and from there the
         // dispatch is identical to the ADBC path.
         //
         // `CommandPreparedStatementUpdate` carries only
@@ -1242,20 +1216,15 @@ impl ArrowFlightSqlService for FlightSqlService {
         // session snapshot via `tx::resolve_tx_uuid_for_dml`.
         let qh = QueryHandle::try_decode(handle.prepared_statement_handle)?;
         tracing::Span::current().record("sql_len", qh.query().len());
-        // CHA-333: decode bound parameters from the request's
-        // FlightData stream. Per the Apache flight-sql-jdbc-driver,
+        // Per the Apache flight-sql-jdbc-driver,
         // `PreparedStatement.executeUpdate()` packs the parameter
         // VectorSchemaRoot into the DoPut body (see
-        // `FlightSqlClient$PreparedStatement.executeUpdate` bytecode);
-        // params do NOT travel via the handle for the update path
-        // (that's the query path's stash, via
-        // `do_put_prepared_statement_query`). A bare
-        // `Statement.execute(...)` walks the same wire surface but
-        // sends an empty VectorSchemaRoot — `decode_params_from_stream`
-        // returns `None` for that shape so existing non-parameterized
-        // callers (TestFlightSqlUnsupportedInTxDdlRejectionDriverParity,
-        // TestFlightSqlCreateTableAutoCommitEndToEnd, etc.) see
-        // unchanged behavior.
+        // `FlightSqlClient$PreparedStatement.executeUpdate` bytecode); params do
+        // NOT travel via the handle for the update path (that's the query
+        // path's stash, via `do_put_prepared_statement_query`). A bare
+        // `Statement.execute(...)` walks the same wire surface but sends an
+        // empty VectorSchemaRoot — `decode_params_from_stream` returns `None`
+        // for that shape, so non-parameterized callers are unaffected.
         let params = super::codec::decode_params_from_stream(request.into_inner()).await?;
         tracing::Span::current().record("has_params", params.is_some());
         let gctx = crate::gateway::UpdateCtx {
@@ -1290,27 +1259,20 @@ impl ArrowFlightSqlService for FlightSqlService {
         // `rewritten_sql` is `Some(SET_PLACEHOLDER_SQL)` — stashing the
         // placeholder on the handle means the subsequent
         // `get_flight_info_prepared_statement` + DoGet legs return an
-        // empty result instead of re-applying (DataGrip path; see the
-        // 2026-05-06 ticket comment). Non-SET paths return `None`; we
-        // stash the original SQL on the handle in that case.
+        // empty result instead of re-applying (the DataGrip path). Non-SET
+        // paths return `None`; we stash the original SQL on the handle then.
         //
-        // CHA-259: routing through `gateway::plan_for_create_prepared_statement`
-        // short-circuits unsupported DDL (transactional DDL → ADR
-        // 0010; non-CREATE-SCHEMA/non-CREATE-TABLE auto-commit DDL →
-        // "use gRPC WriteService") before DataFusion's
-        // `statement_to_plan` ever runs — that's what closes the JDBC
-        // residual gap from CHA-257 where `CREATE TABLE` previously
-        // bailed inside `register_table`. Auto-commit `CREATE SCHEMA`
-        // / `CREATE TABLE` prepare with an empty dataset_schema so
-        // the driver routes to `DoPutPreparedStatementUpdate` and
-        // the execute leg dispatches via `gateway::execute_update` →
-        // `crate::ddl::execute_*` (CHA-172). The prep helper (vs the
-        // read-only `plan_for_get_flight_info`) is permissive about
-        // DML / DDL / BEGIN / COMMIT / ROLLBACK because the JDBC
-        // driver walks `ActionCreatePreparedStatement` for *every*
-        // kind of SQL and decides later whether to call
-        // `DoPutPreparedStatementUpdate` or `GetFlightInfo` + `DoGet`.
-        // CHA-367: memoize per-build schema/table resolution for the prepare
+        // Routing through `gateway::plan_for_create_prepared_statement`
+        // short-circuits unsupported DDL before DataFusion's
+        // `statement_to_plan` ever runs, which is what keeps `CREATE TABLE`
+        // from bailing inside `register_table` with an opaque error. The prep
+        // helper (vs the read-only `plan_for_get_flight_info`) is permissive
+        // about DML / DDL / BEGIN / COMMIT / ROLLBACK because the JDBC driver
+        // walks `ActionCreatePreparedStatement` for *every* kind of SQL and
+        // decides later whether to call `DoPutPreparedStatementUpdate` or
+        // `GetFlightInfo` + `DoGet`.
+        //
+        // The memo collapses per-build schema/table resolution for the prepare
         // pass (the ADBC path plans here, then again in GetFlightInfo).
         let _memo_guard = ctx.conn.install_plan_resolution_memo();
         let prepared = crate::gateway::plan_for_create_prepared_statement(
@@ -1328,7 +1290,7 @@ impl ArrowFlightSqlService for FlightSqlService {
         // empty `dataset_schema` heuristic) while parameter_plan
         // carries the planned VALUES / SELECT source so the prepare-
         // time `parameter_schema` reflects the user's `?` placeholders.
-        // See `gateway::plan_for_create_prepared_statement` (CHA-333).
+        // See `gateway::plan_for_create_prepared_statement`.
         let dataset_schema = super::codec::get_schema_for_plan(&prepared.dataset_plan);
         let parameter_schema = super::codec::parameter_schema_for_plan(&prepared.parameter_plan)
             .map_err(|e| e.as_ref().clone())?;
@@ -1337,7 +1299,7 @@ impl ArrowFlightSqlService for FlightSqlService {
         let parameter_schema = super::codec::encode_schema(parameter_schema.as_ref())
             .map_err(super::error::arrow_error_to_status)?;
 
-        // CHA-367: for the Select / Set arms — the only ones that reach
+        // For the Select / Set arms — the only ones that reach
         // GetFlightInfo + DoGet — `dataset_plan` is exactly the plan
         // GetFlightInfo would rebuild. Cache it now and stamp its uuid on the
         // handle so `get_flight_info_prepared_statement` reuses it instead of
@@ -1532,10 +1494,6 @@ fn flight_info_with_self_ticket(
         .with_descriptor(descriptor);
     Ok(flight_info)
 }
-
-// ---------------------------------------------------------------------------
-// Session helpers
-// ---------------------------------------------------------------------------
 
 /// Pull the per-request [`Arc<ConnSession>`] populated by
 /// [`super::server::PerConnService`]. Returns `INTERNAL` if missing — the

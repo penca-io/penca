@@ -42,7 +42,6 @@ from .integration_helpers import (
 
 
 class TestTxFramingFlattened:
-    # 1
     def test_begin_tx_response_carries_flat_tx_uuid_began_expires(self):
         client = make_client()
         schema_uuid, _table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -59,7 +58,6 @@ class TestTxFramingFlattened:
         assert response.began_at_micros > 0
         assert response.expires_at_micros > response.began_at_micros
 
-    # 2
     def test_begin_tx_echoes_client_supplied_tx_uuid(self):
         client = make_client()
         schema_uuid, _table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -75,7 +73,6 @@ class TestTxFramingFlattened:
         assert response.DESCRIPTOR.name == "BeginTxResponse"
         assert response.tx_uuid == client_uuid
 
-    # 3
     def test_commit_tx_response_carries_flat_commit_micros(self):
         client = make_client()
         schema_uuid, _table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -94,7 +91,6 @@ class TestTxFramingFlattened:
         assert response.DESCRIPTOR.name == "CommitTxResponse"
         assert response.commit_micros >= begin.began_at_micros
 
-    # 4
     def test_abort_tx_response_carries_flat_aborted_at_micros(self):
         client = make_client()
         schema_uuid, _table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -115,7 +111,6 @@ class TestTxFramingFlattened:
         assert response.DESCRIPTOR.name == "AbortTxResponse"
         assert response.aborted_at_micros > begin.began_at_micros
 
-    # 5
     def test_write_data_auto_commit_returns_commit_micros_directly(self):
         client = make_client()
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -145,7 +140,6 @@ class TestTxFramingFlattened:
         )
         assert result.column("name").to_pylist() == ["alice"]
 
-    # 6
     def test_write_data_append_returns_no_commit_micros(self):
         client = make_client()
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -171,7 +165,6 @@ class TestTxFramingFlattened:
         # leaves commit_micros unset.
         assert not response.HasField("commit_micros")
 
-    # 7
     @pytest.mark.skip(
         reason="CHA-509: branch-off-branch (fork off a non-main branch) is disabled "
         "by the CHA-515 main-only guard; re-enable when multi-level inheritance lands."
@@ -233,7 +226,6 @@ class TestTxFramingFlattened:
         )
         assert result.column("name").to_pylist() == ["alice"]
 
-    # 8
     def test_get_tx_rpc_removed(self):
         # Generated grpc stubs bind methods in __init__, not on the class, so
         # checking the proto-level ServiceDescriptor is the load-bearing
@@ -244,7 +236,6 @@ class TestTxFramingFlattened:
         method_names = {m.name for m in service.methods}
         assert "GetTx" not in method_names
 
-    # 9
     def test_list_txs_rpc_removed(self):
         service = descriptor_pool.Default().FindServiceByName(
             "penca_proto.external.v1.QueryService"
@@ -252,18 +243,15 @@ class TestTxFramingFlattened:
         method_names = {m.name for m in service.methods}
         assert "ListTxs" not in method_names
 
-    # 10
     def test_tx_message_removed_from_descriptor_pool(self):
         pool = descriptor_pool.Default()
         with pytest.raises(KeyError):
             pool.FindMessageTypeByName("penca_proto.external.v1.Tx")
 
-    # 11
     def test_python_client_has_no_get_tx_or_list_txs(self):
         assert not hasattr(PencaClient, "get_tx")
         assert not hasattr(PencaClient, "list_txs")
 
-    # 12
     @pytest.mark.skip(
         reason="CHA-509: branch-off-branch (fork off a non-main branch) is disabled "
         "by the CHA-515 main-only guard; re-enable when multi-level inheritance lands."

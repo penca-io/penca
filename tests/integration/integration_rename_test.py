@@ -112,11 +112,6 @@ def _write_rows(
     )
 
 
-# ---------------------------------------------------------------------------
-# 1-5. Random UUIDs + name uniqueness
-# ---------------------------------------------------------------------------
-
-
 class TestRandomUuidsAndNameUniqueness:
     def test_create_catalog_returns_random_uuid_and_main_branch_uuid(self):
         """CHA-236 #1: CreateCatalog mints a random ``catalog_uuid`` and
@@ -273,11 +268,6 @@ class TestRandomUuidsAndNameUniqueness:
         )
 
 
-# ---------------------------------------------------------------------------
-# 6-14. Rename via new_*_name on Update messages
-# ---------------------------------------------------------------------------
-
-
 class TestRename:
     def test_rename_table_via_update_table_new_table_name(self):
         """CHA-236 #6: UpdateTable(new_table_name=...) renames the table.
@@ -350,7 +340,6 @@ class TestRename:
             comment="rename foo to bar",
         )
 
-        # Rows visible under the new name.
         after = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -463,8 +452,6 @@ class TestRename:
             comment="create_branch",
         )
 
-        # ``update_branch`` is a new Python client method added by
-        # CHA-236 (see plan §"Files / modules / RPCs to touch").
         client.update_branch(
             catalog_uuid=catalog_uuid,
             branch_uuid=branch.branch_uuid,
@@ -659,7 +646,6 @@ class TestRename:
             table_uuid=table_uuid,
         )
 
-        # Reads after the full cycle return all rows under the new name.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -669,10 +655,6 @@ class TestRename:
         assert sorted(result.column("name").to_pylist()) == ["post", "pre"]
 
 
-# ---------------------------------------------------------------------------
-# 15-18. System tables locked to CRUD path
-# ---------------------------------------------------------------------------
-#
 # Reads against ``__penca_system__.{schemas,tables}`` remain allowed —
 # users discover their catalog through them. Mutating handlers reject
 # targets that resolve to the three structural anchors with

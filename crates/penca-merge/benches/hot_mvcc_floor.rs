@@ -1,4 +1,4 @@
-//! CHA-415 primitive #1 — Postgres-bound hot-MVCC dedup floor (read + write).
+//! Postgres-bound hot-MVCC dedup floor (read + write).
 //!
 //! Measures the *irreducible* cost of the hot tier's merge-on-read resolution:
 //! Postgres executing the real `build_merge_resolved::<PgDialect>` dedup over an
@@ -20,8 +20,7 @@
 //! such env the bench registers nothing and exits cleanly.
 //!
 //! NOTE: setup helpers are intentionally duplicated from the workload guard
-//! test (benches and integration tests cannot share a module); the
-//! `orch:run-cleanup` pass extracts the shared kernel.
+//! test, because benches and integration tests cannot share a module.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -140,7 +139,7 @@ async fn populate(driver: &PgDriver, n: &Names, depth: u64, density: u64, clock:
             // (branch_uuid, commit_micros) unique index never collides —
             // including across write-bench iterations that share one table.
             let committed = clock.fetch_add(1, Ordering::Relaxed);
-            // CHA-428: commit_seq_num (NOT NULL) reuses the monotonic-unique
+            // commit_seq_num (NOT NULL) reuses the monotonic-unique
             // `committed` so the (branch_uuid, commit_seq_num) unique index holds.
             tx_rows.push(format!(
                 "('{tx}','{br}',{began},{committed},'floor','perf',{committed})",

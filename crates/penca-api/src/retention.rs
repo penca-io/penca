@@ -1,12 +1,13 @@
 //! Retention coalescing helpers shared by [`crate::QueryManager`] and
 //! [`crate::WriteManager`].
 //!
-//! Effective retention follows ADR 0011 §4: each field on a `Table` is
-//! resolved as `table → schema → catalog`, with the first set value
-//! winning. The policy is stamped onto `Table.retention_config` for
-//! every read response (`GetTableResponse`, `ListTablesResponse`) and
-//! for `UpdateTableResponse` so the same proto type carries the same
-//! semantics regardless of which RPC produced it.
+//! Effective retention follows ADR 0011 §4: each field on a `Table` resolves
+//! `table → schema`, first set value winning. Schema is the broadest scope —
+//! catalogs carry no retention policy, so there is no catalog arm.
+//!
+//! Every response carrying a `Table` stamps the *effective* policy onto
+//! `Table.retention_config`, so the proto type means the same thing no matter
+//! which RPC produced it.
 
 use penca_db::driver::DbDriver;
 use penca_dl::driver::DlDriver;
@@ -21,9 +22,6 @@ use crate::error::ApiError;
 /// Coalesce retention `table → schema`, per field. Pure; no I/O. Use this when
 /// the schema parent is already in hand (e.g. inside a `list_tables` loop after
 /// [`fetch_parent_retention`]).
-///
-/// CHA-433: schema is the broadest retention scope — the catalog no longer
-/// carries a policy, so there is no catalog arm.
 pub(crate) fn coalesce_retention(
     table_rc: &Option<RetentionConfig>,
     schema_rc: &Option<RetentionConfig>,
@@ -51,9 +49,6 @@ pub(crate) fn coalesce_retention(
 /// Fetch the schema parent's retention config for a table. One metadata read.
 /// Hoist this above any loop that coalesces N tables sharing the same schema —
 /// the parent is invariant within a `(catalog, schema)` pair.
-///
-/// CHA-433: schema is the broadest retention scope, so this is a single schema
-/// read (the catalog no longer carries a policy).
 pub(crate) async fn fetch_parent_retention<L>(
     query_manager: &QueryManager,
     driver: &impl DbDriver<Row = PgRow>,
@@ -66,8 +61,8 @@ where
 {
     // Schema retention coalesces from main per ADR 0011 §4 — pass no
     // branch / open_tx so the lookup hits the canonical row regardless
-    // of the request's branch context. CHA-86: pin to pg_now rather than
-    // an unbounded read.
+    // of the request's branch context, pinned to pg_now rather than
+    // read unbounded.
     let snapshot = LifecycleManager::now_snapshot(driver).await?;
     let schema = query_manager
         .meta_get_schema(
@@ -106,11 +101,11 @@ where
     Ok(())
 }
 
-/// CHA-433: the effective retention duration for a read/audit plan's floor
-/// (`None` = retention disabled). Uses the in-scope schema when present (a
-/// by-name resolve — the SQL server's hot path — so zero extra roundtrips),
-/// else reads the schema's retention (a by-uuid resolve, off the hot path).
-/// Coalesces `table -> schema`.
+/// The effective retention duration for a read/audit plan's floor (`None` =
+/// retention disabled), coalesced `table -> schema`.
+///
+/// Pass `schema_row` when the caller already resolved it (the by-name resolve
+/// on the SQL server's hot path) to keep this at zero extra roundtrips.
 pub(crate) async fn effective_retention_duration<L>(
     query_manager: &QueryManager,
     driver: &impl DbDriver<Row = PgRow>,
@@ -123,9 +118,8 @@ pub(crate) async fn effective_retention_duration<L>(
 where
     L: DlDriver + ?Sized,
 {
-    // The table pins a duration → the coalesce result is fully determined by
-    // it; skip the schema read entirely (avoids a metadata roundtrip on the
-    // by-uuid path when the table already resolves a duration).
+    // A table-pinned duration fully determines the coalesce, so the schema
+    // read is pure cost — skip it.
     if let Some(table_duration) = table_retention
         .as_ref()
         .and_then(|r| r.retention_duration_seconds)

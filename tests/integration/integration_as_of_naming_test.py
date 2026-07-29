@@ -76,11 +76,6 @@ def _write_rows_returning_commit(
     return committed.commit_micros
 
 
-# ---------------------------------------------------------------------------
-# 19-23. as_of_micros-aware name resolution
-# ---------------------------------------------------------------------------
-
-
 class TestAsOfNameResolution:
     def test_as_of_name_resolution_finds_table_at_historical_name(self):
         """CHA-236 #19: rename ``foo → bar`` at T_rename;
@@ -622,11 +617,9 @@ class TestAsOfNameResolution:
         assert upserts.column("name").to_pylist() == ["alice"]
 
 
-# ---------------------------------------------------------------------------
 # Reference: MAIN_BRANCH_NAME is the well-known parent branch this file
 # operates on. Imported to keep parity with the rename-test fixtures and
 # document that catalog + branch name resolution stays snapshot-blind
 # (catalog_store / branch_store are non-MVCC — see plan §"as_of-aware
 # name resolution"). CHA-240 tracks the design ticket to migrate them.
-# ---------------------------------------------------------------------------
 _ = MAIN_BRANCH_NAME

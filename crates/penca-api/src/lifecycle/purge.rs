@@ -1,4 +1,4 @@
-//! Purge: clear-from-hot after Persist (CHA-220; CHA-444 / ADR 0027).
+//! Purge: clear-from-hot after Persist (ADR 0027).
 //!
 //! `purge_locked` does three things, each on its own axis:
 //! - **committed cleanup** — advance the read fence `Pu` to `W_snap` and
@@ -27,16 +27,11 @@ use crate::error::ApiError;
 use crate::lifecycle::LifecycleManager;
 
 impl LifecycleManager {
-    /// Clear T's hot rows and advance its purge watermarks (CHA-220;
-    /// CHA-444 / ADR 0027).
+    /// Clear T's hot rows and advance its purge watermarks.
     ///
-    /// Committed cleanup advances `Pu` (the hot↔cold read fence `plan()`
-    /// reads) to `W_snap` and deletes committed hot rows `<= Pu`; abort
-    /// cleanup deletes aborted hot rows and advances `Pa`; expired-begin
-    /// cleanup reclaims timed-out open-tx garbage. The response carries the
-    /// committed watermark `Pu`; it is unset when `Pu` did not advance.
-    /// Branch-min consumers ([CHA-221](https://linear.app/chapala/issue/CHA-221))
-    /// treat absent rows as "this table has not contributed a watermark yet".
+    /// The response carries the committed watermark `Pu`, unset when `Pu` did
+    /// not advance — branch-min consumers read an absent row as "this table
+    /// has not contributed a watermark yet".
     ///
     /// Locked per-table via `purge:{table_uuid}:{branch_uuid}` — serializes
     /// `Purge(T)` against `Purge(T)` only (race-losers no-op via the
@@ -106,9 +101,6 @@ impl LifecycleManager {
         let branch_str = branch_uuid.to_string();
         let table_str = table_uuid.to_string();
 
-        // (A) Expired-begin hot cleanup — always. Invisible garbage (no
-        // committed commit_tx_log row), so no watermark certifies it; its ledger GC
-        // is the wall-clock expiry grace in PurgeTxLog.
         Self::delete_expired_begin_hot_rows(
             pool,
             &catalog_uuid,
@@ -118,8 +110,8 @@ impl LifecycleManager {
         )
         .await?;
 
-        // (B) Committed cleanup target — Pu = W_snap (happy path). Strict-
-        // advance gate against the last committed Pu.
+        // Committed cleanup target: Pu = W_snap, strict-advance-gated against
+        // the last committed Pu.
         let wsnap =
             penca_storage_meta::LifecycleManager::latest_committed_table_snapshot_seq_watermark(
                 pool,
@@ -138,8 +130,8 @@ impl LifecycleManager {
             .await?;
         let pu_advance = compute_purge_watermark(wsnap, last_pu);
 
-        // (C) Abort cleanup target — Pa = F (abort-counter frontier). Strict-
-        // advance gate against the last committed Pa.
+        // Abort cleanup target: Pa = F, the abort-counter frontier, likewise
+        // strict-advance-gated.
         let frontier = penca_storage_meta::LifecycleManager::read_abort_seq_frontier(
             pool,
             &catalog_uuid,
@@ -159,8 +151,7 @@ impl LifecycleManager {
         // bumps the frontier to 1, so a genuine advance is still F > 0.
         let pa_advance = compute_purge_watermark(frontier, last_pa.or(Some(0)));
 
-        // No watermark advanced ⇒ no committed/abort hot rows to clear and no
-        // metadata row to write. (Expired-begin cleanup already ran in (A).)
+        // Safe to bail: the expired-begin cleanup above already ran.
         if pu_advance.is_none() && pa_advance.is_none() {
             return Ok(PurgeResponse {
                 purged_at_micros: last_pu,
@@ -177,7 +168,7 @@ impl LifecycleManager {
         );
         let purge_uuid_str = purge_uuid.to_string();
 
-        // Phase 1: INSERT (NULL committed_at).
+        // Phase 1: insert uncommitted (NULL committed_at).
         penca_storage_meta::LifecycleManager::insert_table_purge(
             pool,
             &catalog_str,
@@ -203,7 +194,6 @@ impl LifecycleManager {
             let abort_table = abort_tx_log_partition(&catalog_uuid, &branch_uuid);
 
             if let Some(pu) = pu_advance {
-                // Committed hot rows join commit_tx_log for their commit_seq_num.
                 let subquery = format!(
                     "SELECT tx_uuid FROM {commit_tx_log} WHERE commit_seq_num <= $1",
                     commit_tx_log = PgDialect::quote_identifier(&commit_tx_log_table),
@@ -218,7 +208,6 @@ impl LifecycleManager {
                 .await?;
             }
             if let Some(pa) = pa_advance {
-                // Aborted hot rows join abort_tx_log for their aborted_at_seq_num.
                 let subquery = format!(
                     "SELECT tx_uuid FROM {abort} WHERE aborted_at_seq_num < $1",
                     abort = PgDialect::quote_identifier(&abort_table),
@@ -257,7 +246,7 @@ impl LifecycleManager {
             return Err(err);
         }
 
-        // Response watermark = the committed fence Pu (what plan() reads).
+        // The reported watermark is the committed fence Pu — what `plan()` reads.
         Ok(PurgeResponse {
             purged_at_micros: pu_advance.or(last_pu),
         })
@@ -310,9 +299,6 @@ impl LifecycleManager {
     /// wiping both hot log tables. `executor` is the phase-2 `tx` for the
     /// committed/abort clears and the `pool` for the lock-free expired-begin
     /// sweep — both impl [`DbDriver`].
-    ///
-    /// 2 SQL queries (one per log table); the per-table issue count is
-    /// unchanged from the inlined loops this replaced.
     async fn delete_hot_log_rows_for_tx_subquery(
         executor: &impl DbDriver,
         upsert_table: &str,

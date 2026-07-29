@@ -6,8 +6,6 @@
 //! [`RecordBatch`] per segment.
 //! Writes and deletes go through the single supplied [`FormatWriter`] — a given
 //! `LifecycleManager` is configured for one format at a time.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/storage/cold.py`.
 
 use std::collections::HashMap;
 use std::pin::Pin;

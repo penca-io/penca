@@ -104,9 +104,6 @@ def _count_committed_persist_segments(catalog_uuid, branch_uuid, table_uuid):
     )[0][0]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
-
-
 def _make_branch(client, catalog_uuid, name):
     branch = client.create_branch(
         f"{name}_{uuid4().hex[:6]}",
@@ -407,9 +404,6 @@ def _insert_synthetic_begin_tx_log_row(
             "test",
         ),
     )
-
-
-# ── Tests ─────────────────────────────────────────────────────────────
 
 
 class TestPurgeTxLogStableState:
@@ -998,9 +992,6 @@ class TestPurgeTxLogLiveQuerySafety:
             )
 
 
-# ── CHA-444 / ADR 0027: Purge owns aborted hot cleanup (abort Pa axis) ──
-
-
 class TestPurgeTxLogAbortedCleanup:
     """CHA-444 (ADR 0027) reverses ADR 0021: aborted hot-row cleanup moves
     from Persist back to ``Purge(T)`` (Persist is committed-only CDC). Purge
@@ -1095,7 +1086,6 @@ class TestPurgeTxLogAbortedCleanup:
                 branch_uuid=branch_uuid,
             )
 
-        # Hot tier completely clean for T.
         from penca_client.naming import delete_log_table, upsert_log_table
 
         upsert_tbl = upsert_log_table(tables["t"], branch_uuid)
@@ -1267,5 +1257,4 @@ class TestPurgeTxLogAbortedCleanup:
         assert (
             _count_begin_tx_log_rows(catalog_uuid, branch_uuid, x_open.tx_uuid) == 0
         ), "X's begin_tx_log row must be GC'd."
-        # And no orphan hot rows in T_a.
         assert _hot_upsert_count() == 0

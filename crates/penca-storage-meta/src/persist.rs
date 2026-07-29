@@ -21,7 +21,7 @@ impl LifecycleManager {
     /// Insert a `table_persist_metadata` row with NULL `commit_micros`
     /// (phase 1 of two-phase commit).
     ///
-    /// CHA-203: `persisted_at_micros` and `log_kind` are part of the
+    /// `persisted_at_micros` and `log_kind` are part of the
     /// deterministic `table_persist_uuid` derivation (one row per
     /// `(catalog, branch, table, persisted_at, log_kind)`); `log_kind`
     /// is CHECK-restricted to [`LogKind::as_str`] values. Phase-1
@@ -38,10 +38,9 @@ impl LifecycleManager {
         table_uuid: &str,
         persisted_at_micros: i64,
         log_kind: LogKind,
-        // CHA-443 (IMPL-1): the persist seq watermark = MAX(commit_seq_num) over the
-        // committed rows this persist moved cold — the seq analog of
-        // persisted_at_micros. `None` on the aborts-only branch (no committed
-        // rows persisted) → SQL NULL, so IMPL-4's MAX(commit_seq_num) ignores it.
+        // The persist seq watermark = MAX(commit_seq_num) over the committed
+        // rows this persist moved cold. `None` on the aborts-only branch (no
+        // committed rows persisted) → SQL NULL, which downstream MAX ignores.
         commit_seq_num: Option<i64>,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
@@ -132,7 +131,7 @@ impl LifecycleManager {
     }
 
     /// Largest `persisted_at_micros` across committed `table_persist_metadata`
-    /// rows for `(branch, table)`. CHA-233 (ADR 0019): feeds two consumers:
+    /// rows for `(branch, table)`. Per ADR 0019 this feeds two consumers:
     /// `purge_locked`'s hot-row delete watermark, and — via
     /// `hot_min_commit_micros` — `plan()`'s hot↔cold visibility cutoff.
     ///
@@ -173,22 +172,19 @@ impl LifecycleManager {
     /// committed `table_persist_metadata` rows for `(branch, table)` — the
     /// seq-axis sibling of [`Self::latest_committed_table_persist_watermark`].
     ///
-    /// CHA-444 (ADR 0027) moved the hot↔cold read fence off `W_persist` onto
-    /// the purge watermark `Pu`, so this has **no callers today**. Retained for
-    /// CHA-466: its memory-shedding trigger slides `Pu` up toward
-    /// `P − hot_grace`, and this reader is `P`. (Pre-CHA-444 it was the fence:
-    /// cold served `commit_seq_num <= W_persist`, hot `> W_persist`; the seq
-    /// partition is exact, so it needs no `+ 1` clamp.)
+    /// The hot↔cold read fence is the purge watermark `Pu`, NOT `W_persist`,
+    /// so this has **no callers today**. Retained for TODO(CHA-466), whose
+    /// memory-shedding trigger slides `Pu` up toward `P − hot_grace` and needs
+    /// this reader for `P`.
     ///
-    /// `commit_seq_num` is a nullable column (CHA-428 backfilled it; aborts-only
-    /// persist rows leave it NULL), so `MAX` skips the NULLs and `Ok(None)`
-    /// still means "no committed persist with a seq yet" for this table.
+    /// `commit_seq_num` is nullable (aborts-only persist rows leave it NULL),
+    /// so `MAX` skips the NULLs and `Ok(None)` still means "no committed
+    /// persist with a seq yet" for this table.
     ///
     /// 1 SQL query (partition-pruned by `branch_uuid`; same index leg as the
     /// micros watermark).
-    // CHA-353: trace span isolates this PG round-trip for the read-plan
-    // busy/idle decomposition once CHA-466 wires it back in (no caller today).
-    // Dormant under the default `penca=debug`; enable with
+    // Trace span isolates this PG round-trip for the read-plan busy/idle
+    // decomposition. Dormant under the default `penca=debug`; enable with
     // `…,penca_storage_meta=trace` + `PENCA_SPAN_TIMING=1` to time it.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn latest_committed_table_persist_seq_watermark(
@@ -236,15 +232,14 @@ impl LifecycleManager {
     /// physically present in hot when a concurrent
     /// pre-cutoff-pinned plan executes.
     /// The audit hot/cold cutoff (`MAX(persisted_at_micros) + 1`, or 0
-    /// pre-Persist). CHA-433: when `retention_duration_seconds` is `Some`, the
-    /// retention floor is folded onto the SAME round trip and returned as a
+    /// pre-Persist). When `retention_duration_seconds` is `Some`, the retention
+    /// floor is folded onto the SAME round trip and returned as a
     /// [`RetentionFloor`] — `plan_audit` enforces the `from < floor` check +
     /// unset-from clamp on it. `None` keeps the single delegated watermark read
     /// (floor `None`).
-    // CHA-353: trace span isolates this PG round-trip in a read-plan
-    // decomposition (busy vs idle). Dormant under the default
-    // `penca=debug`; enable with `…,penca_storage_meta=trace` +
-    // `PENCA_SPAN_TIMING=1` to time it.
+    // Trace span isolates this PG round-trip in a read-plan busy/idle
+    // decomposition. Dormant under the default `penca=debug`; enable with
+    // `…,penca_storage_meta=trace` + `PENCA_SPAN_TIMING=1` to time it.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn hot_min_commit_micros(
         driver: &impl DbDriver<Row = PgRow>,
@@ -265,11 +260,10 @@ impl LifecycleManager {
             .unwrap_or(0);
             return Ok((hot_min, None));
         };
-        // Retention enabled: fold the floor onto the watermark read as its OWN
-        // combined query (window start from the DB clock). Deliberately NOT
+        // Fold the floor onto the watermark read as its OWN combined query
+        // (window start from the DB clock). Deliberately NOT
         // `latest_committed_table_persist_watermark` — lifecycle ops call that
-        // without a floor, so overloading it would ripple. Reuses the shared
-        // `retention_floor_select` predicate.
+        // without a floor, so overloading it would ripple.
         let catalog = parse_uuid(catalog_uuid);
         let persist_name = naming::table_persist_metadata_table(&catalog);
         let snap_name = naming::table_snapshot_metadata_table(&catalog);
@@ -315,8 +309,8 @@ impl LifecycleManager {
     /// Insert a table-persist segment with `commit_micros` as NULL
     /// (phase 1 of two-phase commit).
     ///
-    /// CHA-203: `log_kind` lives only on the parent
-    /// (`table_persist_metadata`) — segments JOIN up to classify. Phase-1
+    /// `log_kind` lives only on the parent (`table_persist_metadata`) —
+    /// segments JOIN up to classify. Phase-1
     /// retries with identical inputs replay to the same deterministic
     /// `table_persist_segment_uuid` and slot in via `DO UPDATE` (refreshes
     /// the storage-side columns; `object_uri` may move under compact).
@@ -341,10 +335,9 @@ impl LifecycleManager {
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let table = naming::table_persist_segment_metadata_table(&catalog);
-        // CHA-430: min/max_commit_seq_num are stamped alongside the
-        // committed_at bounds and, like them, are NOT refreshed by the
-        // DO UPDATE — compact re-points storage location only and
-        // preserves the original commit-order bounds.
+        // min/max_commit_seq_num are stamped alongside the committed_at bounds
+        // and, like them, are NOT refreshed by the DO UPDATE: compact re-points
+        // storage location only and preserves the original commit-order bounds.
         let sql = format!(
             "INSERT INTO {table} \
              (table_persist_segment_uuid, table_persist_uuid, branch_uuid, table_uuid, \
@@ -390,11 +383,6 @@ impl LifecycleManager {
     /// `(min, max)_tx_commit_micros`, **and**
     /// `commit_micros` (the row stays committed and visible to
     /// reads throughout — only the storage location changes).
-    ///
-    /// Mirrors snapshot compact's planned shape and reuses the
-    /// already-existing `offset` / `length` columns on
-    /// `table_persist_segment_metadata`. Reads honor the slice via
-    /// `FormatReader::read_segment`.
     ///
     /// **Visibility:** the UPDATE deliberately does *not* touch
     /// `commit_micros`. The compact caller writes the merged
@@ -559,7 +547,7 @@ impl LifecycleManager {
     /// only if it has at least one row in the filter window.
     ///
     /// 1 SQL query (partition-pruned by `branch_uuid` and served by
-    /// the partial `is_sealed = false` index per CHA-202).
+    /// the partial `is_sealed = false` index).
     pub async fn list_unsealed_persist_scopes_on_branch(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -615,12 +603,11 @@ impl LifecycleManager {
     /// in the filter window. Result is at most 2 (`upsert_log` +
     /// `delete_log`).
     ///
-    /// CHA-220: under CHA-154's per-table scheduler, the branch-wide
-    /// helper would scan every scope on the branch for every table
-    /// compact — O(N²) on `branch.table_count`. This variant pushes
-    /// the `table_uuid` filter into the SQL so partition pruning
-    /// plus the `(table_uuid, log_kind)` filter index resolve the
-    /// query without enumerating other tables' scopes.
+    /// Under the per-table compact scheduler the branch-wide helper would scan
+    /// every scope on the branch for every table compact — O(N²) on
+    /// `branch.table_count`. This variant pushes the `table_uuid` filter into
+    /// the SQL so partition pruning plus the `(table_uuid, log_kind)` filter
+    /// index resolve the query without enumerating other tables' scopes.
     ///
     /// 1 SQL query.
     pub async fn list_unsealed_persist_scopes_on_table(
@@ -734,16 +721,13 @@ impl LifecycleManager {
             params.push(SqlValue::Int64(max));
             sql.push_str(&format!(" AND seg.commit_micros < ${}", params.len()));
         }
-        // ORDER BY min_tx_commit_micros for determinism + slice
-        // -layout locality: rows pointing at the current active merged
-        // file inherited the lowest tx watermarks (they were the
-        // inputs to the prior compact wave) and so sort to the head;
-        // subsequent uncompacted segments arrived from later persists
-        // and follow. `plan_wave` identifies the active by URI count,
-        // not by run-detection on this order, so the consecutive-active
-        // -rows property is incidental — keep it for slice-layout
-        // locality and deterministic planning, not as a correctness
-        // invariant.
+        // ORDER BY min_tx_commit_micros for determinism + slice-layout
+        // locality: rows pointing at the current active merged file inherited
+        // the lowest tx watermarks (they were the inputs to the prior compact
+        // wave) and so sort to the head. `plan_wave` identifies the active by
+        // URI count, not by run-detection on this order, so the
+        // consecutive-active-rows property is incidental — it is a locality
+        // nicety, NOT a correctness invariant.
         sql.push_str(" ORDER BY seg.min_tx_commit_micros, seg.chunk_idx");
         if for_update {
             sql.push_str(" FOR UPDATE OF seg");
@@ -755,11 +739,9 @@ impl LifecycleManager {
     /// Return `(table_persist_segment_uuid, object_uri)` for every segment
     /// belonging to any of the given tables on a branch.
     ///
-    /// CHA-203: keyed on `(branch_uuid, table_uuid IN (...))` on the
-    /// segment table directly. Replaces the pre-CHA-203
-    /// `get_table_persist_segments_by_hot_names` which keyed on the
-    /// dropped `hot_storage_table_name` column. Used by DeleteBranch
-    /// to enumerate every cold file the branch owns.
+    /// Keyed on `(branch_uuid, table_uuid IN (...))` on the segment table
+    /// directly. Used by DeleteBranch to enumerate every cold file the branch
+    /// owns.
     ///
     /// 1 SQL query.
     pub async fn get_table_persist_segments_for_tables(
@@ -796,8 +778,8 @@ impl LifecycleManager {
 
     /// Delete table-persist segments by UUID list.
     ///
-    /// Used by retention-driven prune (CHA-49). Branch-deletion uses
-    /// DROP PARTITION CASCADE instead.
+    /// Used by retention-driven prune. Branch-deletion uses DROP PARTITION
+    /// CASCADE instead.
     ///
     /// 1 SQL query.
     pub async fn delete_table_persist_segments_by_uuids(

@@ -84,9 +84,6 @@ STATE_CLASS = {
 CSS_ORDER = ["done", "wip", "prog", "todo", "cancel"]
 
 
-# --- Linear access ----------------------------------------------------------
-
-
 def fetch_issues(api_key: str, label: str) -> list[dict]:
     """All issues carrying `label`, following pagination."""
     nodes: list[dict] = []
@@ -115,9 +112,6 @@ def fetch_issues(api_key: str, label: str) -> list[dict]:
             return nodes
 
         after = conn["pageInfo"]["endCursor"]
-
-
-# --- model ------------------------------------------------------------------
 
 
 class Issue:
@@ -196,9 +190,6 @@ def build_graph(raw_issues: list[dict]) -> list[Issue]:
     return sorted(issues.values(), key=lambda i: i.num())
 
 
-# --- text helpers -----------------------------------------------------------
-
-
 def e(s: str) -> str:
     return html.escape(s, quote=True)
 
@@ -227,8 +218,6 @@ def mermaid_text(s: str, limit: int = 52) -> str:
 def node_id(identifier: str) -> str:
     return identifier.replace("-", "")
 
-
-# --- rendering --------------------------------------------------------------
 
 # css class -> (mermaid fill, stroke, text)
 MERMAID_STYLE = {

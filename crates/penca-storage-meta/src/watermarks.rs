@@ -13,13 +13,13 @@ use uuid::Uuid;
 ///
 /// Returns `min(as_of, cutoff - 1)`. Caller is responsible for
 /// `cutoff > 0` — at `cutoff == 0` (pre-Persist) the snapshot picker is
-/// skipped entirely (cold_storage = None). Since CHA-361 every plan
-/// pins a bounded `as_of`, so there is no unset case to fall back from.
+/// skipped entirely (cold_storage = None). Every plan pins a bounded `as_of`,
+/// so there is no unset case to fall back from.
 pub fn compute_snapshot_picker_as_of(as_of_micros: i64, cutoff_micros: i64) -> i64 {
     as_of_micros.min(cutoff_micros - 1)
 }
 
-/// CHA-443 (folds CHA-457): the snapshot seq watermark `W_snap` =
+/// The snapshot seq watermark `W_snap` =
 /// `max(prev_snapshot.commit_seq_num, MAX(included persist seg.max_commit_seq_num))`.
 ///
 /// The genesis / first-empty snapshot (no prior, no segments) bases at
@@ -29,7 +29,7 @@ pub fn compute_snapshot_picker_as_of(as_of_micros: i64, cutoff_micros: i64) -> i
 /// segments) keeps the prior watermark; otherwise the segment max wins when it
 /// advances past the prior baseline.
 ///
-/// The persist segments carry `max_commit_seq_num` inline (CHA-430); the snapshot
+/// The persist segments carry `max_commit_seq_num` inline; the snapshot
 /// writer feeds `included_segment_max_seqs` from the
 /// `max_persisted_segment_seq_for_window` aggregate over this snapshot's persist
 /// window.
@@ -49,7 +49,7 @@ pub fn compute_snapshot_seq_watermark(
 pub const SNAPSHOT_SEQ_GENESIS: i64 = -1;
 
 /// `purge_locked`'s strict-advance gate, axis-agnostic on the seq axis
-/// (CHA-444 / ADR 0027): given a `candidate` purge target and the
+/// (ADR 0027): given a `candidate` purge target and the
 /// `last_purged` watermark already committed, return `Some(candidate)`
 /// only when it strictly advances past `last_purged`, else `None` (no
 /// new `table_purge_metadata` row to write). Used on both purge axes —
@@ -68,23 +68,19 @@ pub fn compute_purge_watermark(candidate: Option<i64>, last_purged: Option<i64>)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// CHA-221: branch-scoped tx-log family GC
-// ─────────────────────────────────────────────────────────────────────
-
-/// The two seq cutoffs CHA-221 / CHA-444's branch-scoped tx-log family GC
-/// needs — one per axis (committed `Pu`, aborted `Pa`). See the field docs.
+/// The two seq cutoffs the branch-scoped tx-log family GC needs — one per axis
+/// (committed `Pu`, aborted `Pa`).
 /// Expired-begin / pure-begin+abort eligibility is wall-clock and computed in
 /// the DELETE itself, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PurgeTxLogCutoffs {
-    /// Committed GC bound (CHA-444 / ADR 0027): `MIN(Pu over S)` on the
+    /// Committed GC bound (ADR 0027): `MIN(Pu over S)` on the
     /// `commit_seq_num` axis — a committed tx with `commit_seq_num <= pu_cutoff` is
     /// purged from hot in every active table, so its commit_tx_log row is GC-safe.
     /// `None` when `S` is empty or any active table has no committed purge
     /// (an unpurged table blocks committed GC).
     pub pu_cutoff: Option<i64>,
-    /// Aborted GC bound (CHA-444 / ADR 0027): `MIN(Pa over S)` on the
+    /// Aborted GC bound (ADR 0027): `MIN(Pa over S)` on the
     /// `aborted_at_seq_num` axis — an aborted tx with `aborted_at_seq_num <
     /// pa_cutoff` has its aborted hot rows cleared in every active table.
     /// `None` when `S` is empty or any active table has no abort purge.
@@ -122,8 +118,6 @@ fn branch_min_watermark(vals: impl Iterator<Item = Option<i64>>) -> Option<i64> 
 mod tests {
     use super::*;
 
-    // ── compute_snapshot_picker_as_of ────────────────────────────────
-
     #[test]
     fn snapshot_picker_request_below_cutoff_returns_request() {
         assert_eq!(compute_snapshot_picker_as_of(50, 100), 50);
@@ -149,11 +143,8 @@ mod tests {
         assert_eq!(compute_snapshot_picker_as_of(5, 1), 0);
     }
 
-    // ── compute_snapshot_seq_watermark (CHA-443 / CHA-457 W_snap) ─────
-    //
-    // W_snap = max(prev.unwrap_or(GENESIS), MAX(segs).unwrap_or(GENESIS)),
-    // GENESIS = -1. Cross product: prev {None, Some} × segs {empty,
-    // below / equal / above prior}.
+    // Cross product below: prev {None, Some} × segs {empty, below / equal /
+    // above prior}.
 
     #[test]
     fn snap_seq_watermark_genesis_empty_is_base() {
@@ -201,15 +192,8 @@ mod tests {
         assert_eq!(compute_snapshot_seq_watermark(None, &[0]), 0);
     }
 
-    // ── compute_purge_watermark ──────────────────────────────────────
-    //
-    // Axis-agnostic strict-advance gate (CHA-444 / ADR 0027): return the
-    // candidate only when it strictly advances past the last committed
-    // watermark, else `None` (no row to stamp). Exercised across the four
-    // (candidate ∈ {None, Some}) × (last_purged ∈ {None, Some})
-    // permutations. The same gate runs on both purge axes — committed
-    // `Pu` (candidate = `W_snap`) and aborted `Pa` (candidate = the abort
-    // frontier `F`).
+    // Exercised across the four (candidate ∈ {None, Some}) ×
+    // (last_purged ∈ {None, Some}) permutations.
 
     #[test]
     fn purge_watermark_eligible_max_none_returns_none() {
@@ -244,9 +228,7 @@ mod tests {
         assert_eq!(compute_purge_watermark(Some(50), Some(100)), None);
     }
 
-    // ── compute_purge_tx_log_cutoffs ─────────────────────────────────
-    //
-    // The cross product (CHA-221 v2.1, post-clamp-collapse — 5 cases):
+    // The cross product below:
     //
     //   | dimension                       | values                  |
     //   |---------------------------------|-------------------------|
@@ -257,11 +239,9 @@ mod tests {
     //   |                                 |   permutation           |
     //   | mixed None + Some                | None dominates min     |
     //
-    // The `cleanup_started_at_micros` clamp from v1's cross product
-    // is gone — that bound is now baked into the upstream as-of
-    // filter on `table_purge_metadata.commit_micros`
-    // (`tx_table_log_purge_watermarks_for_branch`), not into this
-    // pure helper.
+    // There is deliberately no `cleanup_started_at_micros` dimension: that
+    // bound is baked into the upstream as-of filter on
+    // `table_purge_metadata.commit_micros`, not into this pure helper.
 
     fn uuid_n(n: u8) -> Uuid {
         let mut bytes = [0u8; 16];

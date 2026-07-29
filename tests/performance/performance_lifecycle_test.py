@@ -20,10 +20,6 @@ from .performance_helpers import (
     setup_performance_schema,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _persist(client, context: dict[str, str]):
     client.persist(
@@ -47,11 +43,6 @@ def _compact_persist_segments(client, context: dict[str, str]):
         branch_uuid=context["main_branch_uuid"],
         table_uuid=context["table_uuid"],
     )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 class TestLifecyclePerformance:

@@ -22,11 +22,9 @@ use crate::{HotStorageClient, HotStorageError};
 /// never both — guarded at INSERT time by `commit_open_tx` /
 /// `auto_commit_tx` / `abort_tx`).
 ///
-/// Naming note: the action that creates the row is called BEGIN
-/// (matching SQL convention; see `begin_tx_log`), but the *state* a
-/// tx is in after BeginTx and before any terminal action is `Open`.
-/// English uses different roots for the action ("begin") and the
-/// state ("open") here; we don't try to force them together.
+/// Naming: the action that creates the row is BEGIN (SQL convention, see
+/// `begin_tx_log`), but the *state* between BeginTx and any terminal action is
+/// `Open` — the action and the state deliberately use different words.
 ///
 /// Each variant carries the timestamp that defines it so error
 /// messages can include "expired at X" / "aborted at Y" /
@@ -39,7 +37,7 @@ pub enum TxStatus {
     /// Tx exists, not expired, not aborted, not committed — safe to
     /// commit / abort / read with RYOW visibility. `began_at_micros`
     /// is the Pg-clock timestamp recorded by `BeginTx` (tx-timeout axis);
-    /// `began_at_seq_num` (CHA-429) is the `commit_tx_log_seq_num` counter
+    /// `began_at_seq_num` is the `commit_tx_log_seq_num` counter
     /// frontier captured in the same BEGIN statement — the open tx's
     /// snapshot floor on the commit-order axis (visible iff
     /// `commit_seq_num < began_at_seq_num`).
@@ -55,9 +53,9 @@ pub enum TxStatus {
     Expired { expired_at_micros: i64 },
     /// Tx has an `abort_tx_log` row. `aborted_at_micros` is the
     /// timestamp from that row (Pg-set at abort_tx insert time);
-    /// `aborted_at_seq_num` (CHA-429) is the `commit_tx_log_seq_num` counter
-    /// frontier captured at abort — a ledger column with no read-path
-    /// consumer yet (symmetric with the begin/commit seq columns).
+    /// `aborted_at_seq_num` is the abort-counter frontier captured at abort —
+    /// a ledger column with no read-path consumer yet (symmetric with the
+    /// begin/commit seq columns).
     Aborted {
         aborted_at_micros: i64,
         aborted_at_seq_num: i64,
@@ -85,13 +83,13 @@ pub struct CommittedTx {
     pub commit_micros: i64,
     pub comment: String,
     pub author: String,
-    /// CHA-428: the monotonic, gapless commit-order serial allocated for
+    /// The monotonic, gapless commit-order serial allocated for
     /// this tx from the branch's `commit_tx_log_seq_num` counter row at commit.
     pub commit_seq_num: i64,
 }
 
 /// Builds the shared commit-INSERT into `<commit_tx_log_partition>`, allocating
-/// the CHA-428 `commit_seq_num` in the same statement.
+/// the `commit_seq_num` in the same statement.
 ///
 /// `<commit_tx_log_partition>` is the per-branch `commit_tx_log` partition;
 /// `<commit_tx_log_seq_num_partition>` is the per-branch counter partition. The `c`
@@ -120,8 +118,8 @@ fn commit_tx_log_insert_sql(
     // *non-decreasing* in seq order. It is not strictly increasing: at
     // microsecond resolution two commits <1µs apart can tie on
     // `commit_micros` while their `commit_seq_num` still differs — so
-    // `commit_seq_num` is the authoritative total order; the timestamp only has to
-    // never invert against it (the bug RT2 catches).
+    // `commit_seq_num` is the authoritative total order; the timestamp only has
+    // to never invert against it.
     let commit_micros_expr = "(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint";
     format!(
         "WITH c AS ( \
@@ -158,8 +156,7 @@ impl HotStorageClient {
     /// `get_abort_tx_log_partition` / `get_commit_tx_log_partition`). All callers
     /// know the branch up-front: read RPCs (ReadData) carry it on
     /// the request, write RPCs (CommitTx / AbortTx) require it on
-    /// the request — see `feedback_target_partitions_directly.md`.
-    /// A tx that exists only on a different branch is therefore
+    /// the request. A tx that exists only on a different branch is therefore
     /// correctly surfaced as `None` (not in this branch's
     /// partition).
     ///
@@ -289,7 +286,7 @@ impl HotStorageClient {
         author: &str,
     ) -> Result<(i64, i64), HotStorageError> {
         let epoch = PgDialect::microsecond_epoch();
-        // CHA-429: capture began_at_seq_num = the per-branch commit_tx_log_seq_num
+        // Capture began_at_seq_num = the per-branch commit_tx_log_seq_num
         // counter frontier (next-to-allocate) in the SAME statement as
         // began_at_micros, so the snapshot anchor (seq) and timeout anchor
         // (micros) can't drift. The counter leaf holds exactly one row; an
@@ -347,14 +344,12 @@ impl HotStorageClient {
     /// - `NOT EXISTS abort_tx_log` / `NOT EXISTS commit_tx_log`: redundant
     ///   against the status check (the lock makes the status final
     ///   for the duration of our Pg-tx).
-    /// - `expires_at_micros >= pg_now()`: was previously kept as a
-    ///   "live clock at INSERT time" check, but TTL is a soft
-    ///   contract — committing a tx whose status check passed at T
-    ///   but whose INSERT runs at T+ε past `expires_at_micros` is
-    ///   benign (no race with sweep, no invariant violated). The
-    ///   `commit_micros` may end up a few microseconds past
-    ///   the original expiry in the worst case; nothing depends on
-    ///   that boundary.
+    /// - `expires_at_micros >= pg_now()`: TTL is a soft contract, so
+    ///   committing a tx whose status check passed at T but whose INSERT
+    ///   runs at T+ε past `expires_at_micros` is benign (no race with
+    ///   sweep, no invariant violated). `commit_micros` may land a few
+    ///   microseconds past the original expiry; nothing depends on that
+    ///   boundary.
     ///
     /// The INSERT is therefore unconditional — driven entirely by
     /// the begin_tx_log row (locked by the caller). The
@@ -440,14 +435,14 @@ impl HotStorageClient {
         abort_seq_num_partition: &str,
         tx_uuid: &uuid::Uuid,
     ) -> Result<i64, HotStorageError> {
-        // CHA-444 (ADR 0027): allocate aborted_at_seq_num from the dedicated
-        // abort-order counter — the abort-axis sibling of the commit counter
-        // (CHA-428). The `c` CTE increments the branch's abort counter row
-        // under a row lock held to transaction end (allocation order = abort
-        // visibility order) and returns the pre-increment value (first abort
-        // on a branch is 0). This replaces CHA-429's *sample* of the commit
-        // counter frontier, which stalled between commits and let two aborts
-        // share a value — a hazard for the monotone purge abort watermark `Pa`.
+        // Allocate aborted_at_seq_num from a DEDICATED abort-order counter —
+        // the abort-axis sibling of the commit counter. The `c` CTE increments
+        // the branch's abort counter row under a row lock held to transaction
+        // end (allocation order = abort visibility order) and returns the
+        // pre-increment value (first abort on a branch is 0). Sampling the
+        // COMMIT counter frontier instead would stall between commits and let
+        // two aborts share a value, breaking the monotone purge abort
+        // watermark `Pa`.
         let sql = format!(
             "WITH c AS ( \
                  UPDATE {asn} SET seq_num = seq_num + 1 \
@@ -473,7 +468,7 @@ impl HotStorageClient {
 
     /// Insert an atomically-committed transaction directly into
     /// `commit_tx_log`. Skips `begin_tx_log` entirely — the operation is its
-    /// own commit. Used for CHA-164 auto-commit DDL, WriteData's
+    /// own commit. Used for auto-commit DDL, WriteData's
     /// auto-commit branch, and branch-merge transactions, which all
     /// have the same "no in-flight phase, just write the row" shape.
     /// Both timestamps are set by the database.

@@ -112,7 +112,7 @@ class TestWritePathFormatValidation:
         with pytest.raises(InvalidRequestError):
             client.create_catalog("", "owner")
 
-    # -- regression guard (already enforced in lib) ------------------------
+    # regression guard (already enforced in lib)
 
     def test_write_data_tx_uuid_with_author_comment_rejected(self):
         """Append (``tx_uuid`` set) with ``author``/``comment`` also set →
@@ -222,7 +222,7 @@ class TestExistenceResolution:
         with pytest.raises(NotFoundError):
             client.delete_catalog(catalog_uuid=str(uuid4()))
 
-    # -- regression guard: read path already surfaces NOT_FOUND ------------
+    # regression guard: read path already surfaces NOT_FOUND
 
     def test_read_data_nonexistent_table_uuid_not_found(self):
         """Read path with an absent ``table_uuid`` → NOT_FOUND.

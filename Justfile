@@ -248,6 +248,24 @@ init-agent-tools: init-build-tools
     kata init --project penca
     roborev init --agent claude-code
 
+    # Review calibration (CHA-531 retro). `roborev init` regenerates
+    # `.roborev.toml` from defaults, so these must be (re)applied after it —
+    # they are `config set` calls rather than a hand-edited file so the tool
+    # owns the serialization. Both are idempotent.
+    #
+    # `review_min_severity`: the kata bridge below turns every emitted finding
+    # into a task that blocks PR open, so a Low costs the same to clear as a
+    # High. Lows dominated volume (25 of 39 findings on 2026-07-28) and were
+    # closed by judgement rather than fixed.
+    #
+    # `review_guidelines`: injected into every review prompt. Roborev reviews
+    # ONE commit's diff with no view of the branch plan and no memory of prior
+    # reviews, so without this it re-raises concerns a later commit already
+    # addresses. Refresh the text from `roborev insights`, which mines the
+    # review history for findings consistently dismissed without a code change.
+    roborev config set review_min_severity medium
+    roborev config set review_guidelines "$(cat scripts/roborev-review-guidelines.md)"
+
     # Optional shared issue-graph client (CHA-447). When a shared kata instance
     # is provisioned via PENCA_KATA_GRAPH_URL, probe it so the operator knows
     # the scoped read-only client (scripts/kata-issue-graph.sh) can reach it.

@@ -3,8 +3,6 @@
 //! [`FormatReader`] defines the interface for reading columnar segment files
 //! from object storage. Implementations handle format-specific logic
 //! (row group navigation for Parquet, Lance file reader, etc.).
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/reader/__init__.py`.
 
 pub mod lance;
 pub mod parquet;
@@ -25,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 /// across multiple segments and the concat policy. Both `PersistSegment`
 /// and `SnapshotSegment` carry `uri` plus `(offset, length)` slice
 /// bounds (optional on the persist side; always set for snapshot
-/// segments since CHA-407), so the trait takes those three primitives
+/// segments), so the trait takes those three primitives
 /// rather than either proto type.
 ///
 /// `projection`, when `Some`, narrows the read to the named columns — the
@@ -153,7 +151,7 @@ pub(crate) fn project_schema(
 /// `ALTER TABLE ADD COLUMN` does not rewrite existing segment files, so an old
 /// segment legitimately lacks a newer column, whose value for those rows is
 /// NULL). The absent field must be nullable; a non-nullable absent column is a
-/// real error (`NonNullableMissingColumn`) rather than a silent pencaation.
+/// real error (`NonNullableMissingColumn`) rather than a silent null-fill.
 pub(crate) fn null_fill_to_schema(
     batch: &RecordBatch,
     output_schema: &SchemaRef,

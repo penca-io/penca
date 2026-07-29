@@ -257,7 +257,6 @@ def format_roadmap(issues: list[dict]) -> str:
 
     lines.extend(format_summary(issues))
 
-    # Group top-level issues by priority.
     by_priority: dict[int, list[dict]] = {}
     for issue in issues:
         if issue["identifier"] in sub_issue_ids:

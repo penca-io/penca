@@ -565,7 +565,6 @@ class TestFlightSqlDml:
             payload
         )
 
-        # Original row survives.
         rows = _execute_query_via(
             driver,
             f"SELECT name, value FROM {fqn} WHERE name = 'alice'",
@@ -1114,7 +1113,7 @@ class TestFlightSqlUpdateOnPk:
             {"name": "final", "value": 10},
         ]
 
-    # -- CHA-242: UPDATE PK collision check + intra-batch surfacing -------
+    # CHA-242: UPDATE PK collision check + intra-batch surfacing
     #
     # External collision: ``UPDATE t SET pk = X WHERE pk = Y`` where
     # ``X`` already lives in the table silently overwrites the
@@ -1154,7 +1153,6 @@ class TestFlightSqlUpdateOnPk:
             payload
         )
 
-        # Pre-existing bob.value (20) survives.
         rows = sorted(
             _execute_query_via(
                 driver, f"SELECT name, value FROM {fqn}", port=port, catalog=cat
@@ -1533,7 +1531,6 @@ class TestFlightSqlCompositeTiebreaker:
             "COMMIT",
         ]
         results = _execute_update_steps_via(driver, steps, port=port, catalog=cat)
-        # Steps 0, 1, 3, 5 are OK; 2 and 4 are OK_ROWS.
         assert results[0][0] == "OK", results[0]
         assert results[1][0] == "OK", results[1]
         assert results[2][0] == "OK_ROWS", results[2]
@@ -2474,7 +2471,6 @@ class TestFlightSqlSessionMintValidation:
 
         late_catalog = f"late_cat_{uuid4().hex[:8]}"
 
-        # First connection: catalog doesn't exist, validation rejects.
         results = _execute_update_steps_via(
             driver, ["SELECT 1"], port=port, catalog=late_catalog
         )
@@ -2487,15 +2483,12 @@ class TestFlightSqlSessionMintValidation:
             f"[{driver}] expected mint-validation actionable wording; got: {payload!r}"
         )
 
-        # Create the catalog out-of-band via the gRPC WriteService.
         # CHA-163 auto-creates a `public` schema, so no explicit
         # `create_schema` is needed for the literal `SELECT 1` below.
         admin_client = make_client()
         admin_client.create_catalog(late_catalog, "owner")
         admin_client.close()
 
-        # Second connection re-mints the session and validates against
-        # the now-existing row → SQL works.
         rows = _execute_query_via(
             driver, "SELECT 1 AS one", port=port, catalog=late_catalog
         )
@@ -2698,8 +2691,6 @@ class TestFlightSqlConnectionScopedRouting:
             branch_uuid=branch_uuid,
         )
 
-    # -- Branch routing ----------------------------------------------------
-
     def test_connection_branch_pinned_at_handshake_threads_to_select(self):
         """An ``x-penca-branch`` header at handshake reaches the catalog
         list machinery and resolves an unqualified SELECT against the
@@ -2828,8 +2819,6 @@ class TestFlightSqlConnectionScopedRouting:
             {"name": "bob", "value": 20},
         ]
 
-    # -- SET-statement rejection for connection-scoped knobs ---------------
-
     def test_set_branch_mid_session_rejected_with_invalid_argument(self):
         """``SET branch = 'feat'`` mid-session must be rejected with an
         actionable ``INVALID_ARGUMENT`` rather than DataFusion's opaque
@@ -2890,8 +2879,6 @@ class TestFlightSqlConnectionScopedRouting:
             conn.close()
             client.close()
 
-    # -- Three-part name resolution ---------------------------------------
-
     def test_three_part_name_overrides_default_catalog(self):
         """An explicit three-part ``catalog.schema.table`` reference
         resolves against the named catalog — DataFusion's parser binds
@@ -2920,8 +2907,6 @@ class TestFlightSqlConnectionScopedRouting:
             {"name": "alice", "value": 10},
             {"name": "bob", "value": 20},
         ]
-
-    # -- Default-schema routing -------------------------------------------
 
     def test_handshake_schema_seeds_default_schema_for_unqualified_select(self):
         """Setting ``adbc_current_db_schema`` on a fresh connection
@@ -3134,8 +3119,6 @@ class TestFlightSqlSetSessionOptions:
         finally:
             cursor.close()
 
-    # -- Schema setter (active phase, freely mutable) ---------------------
-
     def test_set_db_schema_via_adbc_setter_mutates_unqualified_select(self):
         """``conn.adbc_current_db_schema = 'sales'`` mutates the
         session's ``default_schema`` so a subsequent unqualified
@@ -3219,8 +3202,6 @@ class TestFlightSqlSetSessionOptions:
         assert _sorted_rows(public_rows) == [{"name": "alice", "value": 10}]
         assert _sorted_rows(sales_rows) == [{"name": "bob", "value": 20}]
 
-    # -- Catalog handshake-pinned model (CHA-253) -------------------------
-    #
     # The four tests below pin the post-CHA-253 architecture: catalog
     # binding is established exactly once, at session-mint time, from the
     # ``x-penca-catalog`` gRPC metadata header (mirroring the existing
@@ -3424,8 +3405,6 @@ class TestFlightSqlSetSessionOptions:
 
         assert affected == 1
 
-    # -- Branch session option (no wire-level knob) -----------------------
-
     def test_set_branch_session_option_returns_invalid_name(self):
         """Sending ``SetSessionOptions{branch: ...}`` returns
         ``INVALID_NAME`` for the ``branch`` key — branch has no
@@ -3444,8 +3423,6 @@ class TestFlightSqlSetSessionOptions:
         finally:
             conn.close()
             client.close()
-
-    # -- GetSessionOptions readback ---------------------------------------
 
     def test_get_session_options_returns_pinned_catalog_and_current_schema(self):
         """Reading ``conn.adbc_current_catalog`` /
@@ -3473,8 +3450,6 @@ class TestFlightSqlSetSessionOptions:
         finally:
             conn.close()
             client.close()
-
-    # -- Unknown key ------------------------------------------------------
 
     def test_set_session_option_unknown_key_returns_invalid_name(self):
         """Sending ``SetSessionOptions{<unknown>: ...}`` returns
@@ -3567,10 +3542,6 @@ class TestFlightSqlPerConnSessionScoping:
         finally:
             cursor.close()
 
-    # ----------------------------------------------------------------
-    # Test 1: closing the conn rolls back any in-flight transaction.
-    # ----------------------------------------------------------------
-
     def test_close_conn_drops_session_and_aborts_open_tx(self):
         """Open a conn, ``BEGIN`` + ``INSERT``, close the conn without
         ``COMMIT``. The per-conn ``ConnSession::Drop`` must spawn an
@@ -3598,7 +3569,6 @@ class TestFlightSqlPerConnSessionScoping:
         )
 
         partition = abort_tx_log_partition(ctx["catalog_uuid"], ctx["main_branch_uuid"])
-        # Sanity: fresh catalog → empty abort partition.
         before = get_pg_driver().execute(
             SQL("SELECT count(*) FROM {}").format(Identifier(partition)),
         )[0][0]
@@ -3638,7 +3608,6 @@ class TestFlightSqlPerConnSessionScoping:
             f"expected exactly 1 abort_tx_log row after conn close, got {after}"
         )
 
-        # Fresh conn — uncommitted row must not be visible.
         fresh = TestFlightSqlConnectionScopedRouting._open_conn(
             catalog=ctx["catalog_name"], branch=MAIN_BRANCH_NAME
         )
@@ -3653,10 +3622,6 @@ class TestFlightSqlPerConnSessionScoping:
             client.close()
 
         assert rows.num_rows == 0
-
-    # ----------------------------------------------------------------
-    # Test 2: two conns hold independent ``default_schema`` state.
-    # ----------------------------------------------------------------
 
     def test_two_conns_do_not_share_default_schema(self):
         """Open two conns against the same catalog. ``SET search_path``
@@ -3692,10 +3657,6 @@ class TestFlightSqlPerConnSessionScoping:
         finally:
             conn_a.close()
             conn_b.close()
-
-    # ----------------------------------------------------------------
-    # Test 3: no Set-Cookie / penca-session-id cookie on the wire.
-    # ----------------------------------------------------------------
 
     def test_no_set_cookie_response_or_penca_session_id_cookie_on_wire(self):
         """A raw pyarrow.flight ``FlightClient`` issuing a benign
@@ -3774,10 +3735,6 @@ class TestFlightSqlPerConnSessionScoping:
         # has to drive client-side cookie state.
         _ = captured_outgoing  # currently unused; kept for clarity.
 
-    # ----------------------------------------------------------------
-    # Test 4: catalog list is frozen at conn-mint.
-    # ----------------------------------------------------------------
-
     def test_catalog_list_frozen_at_mint(self):
         """Open conn A pinned to a sentinel catalog. Create a
         brand-new catalog out-of-band via
@@ -3812,7 +3769,6 @@ class TestFlightSqlPerConnSessionScoping:
 
         conn_a = TestFlightSqlConnectionScopedRouting._open_conn(catalog=pin_catalog)
         try:
-            # Mint conn A.
             self._exec_query(conn_a, "SELECT 1")
 
             # Out-of-band: create a brand-new catalog (with CHA-163
@@ -3820,7 +3776,6 @@ class TestFlightSqlPerConnSessionScoping:
             mid_session_cat = f"mid_session_cat_{uuid4().hex[:8]}"
             client.create_catalog(mid_session_cat, "owner")
 
-            # Conn A's snapshot must NOT include the new catalog.
             a_catalogs = catalog_names(conn_a)
             assert mid_session_cat not in a_catalogs, (
                 f"frozen-at-mint violated: conn A sees mid-session-created"
@@ -3843,10 +3798,6 @@ class TestFlightSqlPerConnSessionScoping:
         finally:
             conn_a.close()
             client.close()
-
-    # ----------------------------------------------------------------
-    # Test 5: schema/table metadata stays live within a session.
-    # ----------------------------------------------------------------
 
     def test_schema_changes_within_session_visible_after_create(self):
         """Open a conn. Create a new schema out-of-band via
@@ -3879,7 +3830,6 @@ class TestFlightSqlPerConnSessionScoping:
 
         conn = TestFlightSqlConnectionScopedRouting._open_conn(catalog=catalog_name)
         try:
-            # Mint the conn against the catalog.
             self._exec_query(conn, "SELECT 1")
 
             new_schema = f"sch_{uuid4().hex[:8]}"
@@ -3909,11 +3859,6 @@ class TestFlightSqlPerConnSessionScoping:
         finally:
             conn.close()
             client.close()
-
-    # ----------------------------------------------------------------
-    # Test 6 & 7: deleted env-var names must no longer appear in the
-    # crates / tests source tree.
-    # ----------------------------------------------------------------
 
     @staticmethod
     def _repo_root():
@@ -3996,10 +3941,6 @@ class TestFlightSqlPerConnSessionScoping:
             " post-CHA-255:\n  " + "\n  ".join(matches)
         )
 
-    # ----------------------------------------------------------------
-    # Test 11: branch rename mid-session does not break routing.
-    # ----------------------------------------------------------------
-
     def test_branch_rename_mid_session_does_not_break_routing(self):
         """Open conn A pinned to branch ``feat``; ``BEGIN``; rename
         the branch out-of-band to ``feat_v2`` via
@@ -4033,7 +3974,6 @@ class TestFlightSqlPerConnSessionScoping:
             rows={"name": ["alice"], "value": [10]},
         )
 
-        # Fork a `feat` branch off main.
         feat_branch = client.create_branch(
             "feat",
             "test",
@@ -4418,17 +4358,6 @@ class TestFlightSqlJdbcProbe:
         # is the signal.
         assert "alice | 10" in result.stdout, report
         assert "bob | 20" in result.stdout, report
-
-
-# CHA-257's JDBC anti-regression probe (TestFlightSqlJdbcCreateTableProbe)
-# was removed as part of CHA-172. Its premise — JDBC `CREATE TABLE`
-# surfaces the CHA-172 rejection without raw `code: NotFound` leak —
-# is structurally superseded:
-#   * Auto-commit CREATE TABLE no longer rejects on the JDBC path:
-#     end-to-end success is pinned by TestFlightSqlCreateTableAutoCommitEndToEnd[jdbc].
-#   * The CHA-257 anti-regression (PencaSchemaProvider::table maps
-#     NotFound to Ok(None), no raw `External(Status)` leak) is pinned
-#     by TestFlightSqlNotFoundClassification independently.
 
 
 # CHA-259 / CHA-333: parsed line shape of the JDBC
@@ -5485,7 +5414,6 @@ class TestFlightSqlCreateTableRejections:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-355: DoGet reuses the GetFlightInfo plan instead of re-planning.
 #
 # A Flight SQL statement query is planned twice today — once in
@@ -5508,7 +5436,6 @@ class TestFlightSqlCreateTableRejections:
 # event on any target surfaces in `docker logs`. These tests scrape the
 # penca-sql-server container log for that event. The match strings below
 # are the coordination contract with impl task D — keep them in sync.
-# ---------------------------------------------------------------------------
 
 # The tracing subscriber colourises output (ANSI SGR escapes) even into a
 # non-TTY docker log, so a raw `statement_cache...outcome="hit"` regex fails — the
@@ -5752,7 +5679,6 @@ class TestFlightSqlPlanReuseMiss:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-367: per-query planning metadata-resolution count (Layer B).
 #
 # After CHA-365 Layer A (per-RPC dedup, merged) each get_schema/get_table gRPC
@@ -5771,7 +5697,6 @@ class TestFlightSqlPlanReuseMiss:
 # names), so counting get_schema/get_table CLOSE lines isolates planning gRPCs
 # from execution-time scope resolution — the pg_stat-over-__penca_system__
 # needle (CHA-365) would conflate the two and is deliberately NOT used here.
-# ---------------------------------------------------------------------------
 
 
 # Each `get_schema`/`get_table` gRPC the SQL server issues is handled by the

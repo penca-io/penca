@@ -14,7 +14,7 @@ use crate::{LifecycleManager, Result};
 
 impl LifecycleManager {
     /// Insert a `table_purge_metadata` row with NULL `commit_micros`
-    /// (phase 1 of two-phase commit). CHA-220.
+    /// (phase 1 of two-phase commit).
     ///
     /// `table_purge_uuid` is derived deterministically from
     /// `(catalog, branch, table, purged_at)` (see
@@ -23,7 +23,7 @@ impl LifecycleManager {
     /// `DO UPDATE` (no-op write).
     ///
     /// 1 SQL query.
-    /// CHA-444 (ADR 0027): a purge wave records the seq watermark(s) it
+    /// A purge wave records the seq watermark(s) it
     /// advanced — `Pu` (`last_purged_commit_seq_num`, committed read fence) and/or
     /// `Pa` (`last_purged_aborted_seq_num`, abort cleanup frontier). NULL for
     /// an axis this wave did not advance.
@@ -65,7 +65,7 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// Mark a `table_purge_metadata` row committed (phase 2). CHA-220.
+    /// Mark a `table_purge_metadata` row committed (phase 2).
     ///
     /// 1 SQL query.
     pub async fn commit_table_purge(
@@ -95,7 +95,6 @@ impl LifecycleManager {
     }
 
     /// Delete a `table_purge_metadata` row only if uncommitted (crash cleanup).
-    /// CHA-220.
     ///
     /// 1 SQL query.
     pub async fn delete_uncommitted_table_purge(
@@ -124,7 +123,7 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// `Pu` — the committed hot↔cold read fence (CHA-444 / ADR 0027):
+    /// `Pu` — the committed hot↔cold read fence (ADR 0027):
     /// `MAX(last_purged_commit_seq_num)` over committed `table_purge_metadata`
     /// rows for `(branch, table)`. `plan()`'s fence reads this; `purge_locked`
     /// reads it for the strict-advance no-op check. `Ok(None)` when no
@@ -149,7 +148,7 @@ impl LifecycleManager {
         .await
     }
 
-    /// `Pa` — the abort cleanup frontier (CHA-444 / ADR 0027):
+    /// `Pa` — the abort cleanup frontier (ADR 0027):
     /// `MAX(last_purged_aborted_seq_num)` over committed `table_purge_metadata`
     /// rows for `(branch, table)`. Feeds `purge_locked`'s strict-advance check
     /// and commit_tx_log GC's abort branch-min. `Ok(None)` when no committed purge
@@ -204,7 +203,7 @@ impl LifecycleManager {
     }
 
     /// Read the branch's abort-order counter frontier — the next
-    /// `aborted_at_seq_num` to allocate (CHA-444 / ADR 0027). Purge samples
+    /// `aborted_at_seq_num` to allocate. Purge samples
     /// this at the start of a pass as the abort cleanup bound `F`: all aborts
     /// with `aborted_at_seq_num < F` are already allocated/visible, so cleaning
     /// `< F` and stamping `Pa = F` is exact. `Ok(None)` only if the counter
@@ -222,7 +221,7 @@ impl LifecycleManager {
 
     /// `W_snap` — the snapshot seq watermark for `(branch, table)`:
     /// `MAX(commit_seq_num)` over committed `table_snapshot_metadata` rows. The
-    /// happy-path purge target `Pu = W_snap` (CHA-444 / ADR 0027): those rows
+    /// happy-path purge target `Pu = W_snap` (ADR 0027): those rows
     /// are already in the durable, read-served snapshot baseline, so dropping
     /// them from hot is free. `Ok(None)` when no snapshot has committed yet.
     pub async fn latest_committed_table_snapshot_seq_watermark(

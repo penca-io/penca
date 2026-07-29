@@ -1,6 +1,4 @@
 //! Parquet format writer using arrow-rs `parquet` crate + `object_store`.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/writer/parquet_writer.py`.
 
 use std::sync::Arc;
 

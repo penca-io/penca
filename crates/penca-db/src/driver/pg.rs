@@ -1,7 +1,5 @@
 //! PostgreSQL driver using sqlx with connection pooling.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/db/driver/psycopg_driver.py`.
-//!
 //! [`PgDriver`] wraps a `sqlx::PgPool` and implements [`DbDriver`]. Each
 //! operation checks out a connection from the pool, executes the query, and
 //! returns the connection. Transactions are scoped via [`PgTransactionDriver`],
@@ -19,10 +17,6 @@ use tokio::sync::Mutex;
 
 use super::{DbDriver, SqlType, SqlValue};
 
-// ---------------------------------------------------------------------------
-// Bind-parameter helper
-// ---------------------------------------------------------------------------
-
 /// Build a `PgArguments` from a slice of [`SqlValue`].
 ///
 /// This is the bridge between penca's database-agnostic [`SqlValue`] enum
@@ -33,15 +27,14 @@ fn build_pg_args(params: &[SqlValue]) -> Result<PgArguments, sqlx::Error> {
     for param in params {
         match param {
             SqlValue::Text(s) => args.add(s.clone()).map_err(sqlx::Error::Encode)?,
-            // uuid::Uuid is Copy and encodes natively to PG `uuid`.
             SqlValue::Uuid(u) => args.add(*u).map_err(sqlx::Error::Encode)?,
             SqlValue::Int32(i) => args.add(*i).map_err(sqlx::Error::Encode)?,
             SqlValue::Int64(i) => args.add(*i).map_err(sqlx::Error::Encode)?,
             SqlValue::Bool(b) => args.add(*b).map_err(sqlx::Error::Encode)?,
             SqlValue::Bytes(b) => args.add(b.clone()).map_err(sqlx::Error::Encode)?,
-            // sqlx encodes `Vec<String>` natively to PG `text[]` — the
-            // bind keeps the SQL string identical across calls so PG's
-            // plan cache stays warm on hot DDL paths.
+            // Binding natively (rather than interpolating a literal) keeps
+            // the SQL string identical across calls so PG's plan cache stays
+            // warm on hot DDL paths.
             SqlValue::TextArray(arr) => args.add(arr.clone()).map_err(sqlx::Error::Encode)?,
             // A typed NULL: bind `Option::<T>::None` so the wire type matches
             // the column and PG accepts the NULL without a `$N::type` cast.
@@ -69,14 +62,10 @@ fn build_pg_args(params: &[SqlValue]) -> Result<PgArguments, sqlx::Error> {
     Ok(args)
 }
 
-// ---------------------------------------------------------------------------
-// AdvisoryLockGuard
-// ---------------------------------------------------------------------------
-
 /// Owns a pooled connection holding a session-scoped advisory lock. On
 /// drop (panic or early return), spawns a task to detach and close the
 /// connection so the lock dies with the backend session instead of
-/// riding back to the next pool consumer. See CHA-141.
+/// riding back to the next pool consumer.
 struct AdvisoryLockGuard {
     conn: Option<PoolConnection<Postgres>>,
     handle: Handle,
@@ -114,10 +103,6 @@ impl Drop for AdvisoryLockGuard {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// PgDriver
-// ---------------------------------------------------------------------------
 
 /// PostgreSQL driver backed by a sqlx connection pool.
 #[derive(Clone)]
@@ -173,11 +158,10 @@ impl PgDriver {
     /// The connection is wrapped in an [`AdvisoryLockGuard`] so that a
     /// panic or early return from `body` still expels the connection
     /// (detach + close) rather than handing a live session-scoped lock
-    /// back to the next pool consumer — see CHA-141.
+    /// back to the next pool consumer.
     ///
     /// The closure is spelled with [`AsyncFnOnce`] so the body can own
-    /// captured state (mirrors Python's `with driver.advisory_lock(key):`
-    /// context manager).
+    /// captured state.
     #[tracing::instrument(level = "debug", skip_all, fields(key = %key))]
     pub async fn advisory_lock<F, R, E>(&self, key: &str, body: F) -> Result<R, E>
     where
@@ -185,7 +169,7 @@ impl PgDriver {
         E: From<sqlx::Error>,
     {
         let conn = self.pool.acquire().await.map_err(E::from)?;
-        // CHA-141: guard fires on drop — panic in body() kills the session.
+        // The guard fires on drop, so a panic in body() kills the session.
         let mut guard = AdvisoryLockGuard::new(conn);
 
         sqlx::query("SELECT pg_advisory_lock(1, hashtext($1))")
@@ -342,11 +326,8 @@ impl DbDriver for PgDriver {
         self.pool.close().await;
     }
 
-    /// Override with true server-side cursor streaming.
-    ///
-    /// Uses PostgreSQL's portal/cursor protocol via sqlx to fetch rows
-    /// incrementally. This is the Rust equivalent of Python's server-side
-    /// cursor via `execute_stream`.
+    /// True server-side cursor streaming via PostgreSQL's portal/cursor
+    /// protocol, fetching rows incrementally.
     fn fetch_stream<'a>(
         &'a self,
         query: &'a str,
@@ -371,10 +352,6 @@ impl DbDriver for PgDriver {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// PgTransactionDriver
-// ---------------------------------------------------------------------------
 
 /// Transaction-scoped driver bound to a single connection.
 ///

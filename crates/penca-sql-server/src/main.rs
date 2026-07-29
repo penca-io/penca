@@ -11,10 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     penca_observability::init_tracing();
     let config = ServerConfig::from_env();
 
-    // Connect gRPC channels to microservices.
-    // Arrow IPC is the wire format — same as in-memory layout, no serialization overhead.
-    // Alternative: import penca-api managers directly for in-process composition.
-    // See penca-datafusion crate-level docs for the design rationale.
+    // Arrow IPC is the wire format — same as in-memory layout, no serialization
+    // overhead. See penca-datafusion crate-level docs for why this is gRPC
+    // rather than in-process composition over penca-api's managers.
     let query_channel = Channel::from_shared(config.query_addr)?.connect().await?;
     let write_channel = Channel::from_shared(config.write_addr)?.connect().await?;
 
@@ -28,15 +27,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rules registered once. `ConnSessionFactory::mint` clones this
     // template once per accepted TCP connection and composes a fresh
     // per-conn `PencaCatalogProviderList` (frozen `(name, uuid)` snapshot)
-    // over it (CHA-255).
+    // over it.
     let template = SessionStateBuilder::new().with_default_features().build();
 
     // Fail-fast bootstrap check: the default catalog + default branch
     // must exist post-bootstrap. Both resolved `uuid`s are **discarded**
     // — they're verified-to-exist booleans, nothing more.
     //
-    // `catalog_uuid` is server-minted per CHA-236 and can change across
-    // re-bootstrap. `branch_uuid` is catalog-scoped (CHA-163) — the
+    // `catalog_uuid` is server-minted and can change across
+    // re-bootstrap. `branch_uuid` is catalog-scoped — the
     // `main` branch in the default catalog has a different uuid than
     // the `main` branch in a header-supplied non-default catalog.
     // Both reasons make a startup-cached uuid actively wrong as a
@@ -64,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    // Per-TCP-connection session factory (CHA-255). Each accepted TCP
+    // Per-TCP-connection session factory. Each accepted TCP
     // conn gets a fresh `ConnSession` minted via
     // `ConnSessionFactory::mint`, scoped to that conn for its lifetime
     // (closes when the TCP conn closes). The `x-penca-catalog` /

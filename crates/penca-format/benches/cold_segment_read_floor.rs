@@ -1,6 +1,6 @@
-//! CHA-415 primitive #2a — Lance/object-store cold-segment read floor.
+//! Lance/object-store cold-segment read floor.
 //!
-//! Times the two CHA-348 read arms against a cold segment — (a) whole-segment
+//! Times the two read arms against a cold segment — (a) whole-segment
 //! read + client-side filter for one row, (b) `(offset, length)` range read (the
 //! pushdown) — plus the segment-write throughput. Pins `FormatReader` /
 //! `FormatWriter` directly (L1 object-store GET + L2 decode); no DataFusion, no
@@ -8,8 +8,7 @@
 //!
 //! Uses an in-memory object store, so it measures the decode-dominated scan
 //! cost (the Lance row-group/scan cost the point-lookup tickets target). The
-//! real-S3 first-touch GET, plus a cached-vs-uncached arm, are deferred to
-//! CHA-422.
+//! real-S3 first-touch GET, plus a cached-vs-uncached arm, are out of scope.
 //!
 //! Throughput is normalized to the segment size `n` for BOTH arms (the whole
 //! arm scans `n` rows; the range arm reads 1), so the two arms are compared by
@@ -17,9 +16,8 @@
 //! — it is "rows-scanned-equivalent per second", not rows returned.
 //!
 //! Env: PERF_FLOOR_MAX=1m adds the 1M-row segment (default just 100k);
-//! PERF_FLOOR_PARQUET=1 adds the Parquet arm (CHA-61). Setup helpers are
-//! duplicated from the guard test (benches and tests can't share a module);
-//! the orch:run-cleanup pass extracts the shared kernel.
+//! PERF_FLOOR_PARQUET=1 adds the Parquet arm. Setup helpers are duplicated
+//! from the guard test because benches and tests can't share a module.
 
 use std::hint::black_box;
 use std::sync::Arc;

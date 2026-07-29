@@ -15,9 +15,7 @@
 //! If a future query-engine concern emerges (e.g. time-travel `AS OF`
 //! syntax, statistics-driven hints, engine-specific UDF binding),
 //! introduce `DlDialect: Dialect` here, declare the new method on it,
-//! and have `DfDialect` impl it. Mirrors the Python side
-//! (``packages/penca/src/penca/lib/dl/dialect.py``), which makes the
-//! same call.
+//! and have `DfDialect` impl it.
 //!
 //! [`Dialect`]: penca_sql::Dialect
 //! [`DbDialect`]: penca_db::dialect::DbDialect
@@ -89,9 +87,6 @@ mod tests {
 
     #[test]
     fn latest_per_partition_composite_order_emits_multiple_desc_keys() {
-        // CHA-243: composite tiebreaker — order spans both committed
-        // and written timestamps, with `committed` winning if distinct
-        // and `written` resolving ties.
         let sql = DfDialect::latest_per_partition(
             &["row_uuid", "commit_micros", "write_seq_num"],
             "joined",
