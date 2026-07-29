@@ -918,6 +918,25 @@ impl PgDialect {
         // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
         // at CreateCatalog, so older catalogs lack the index — the gate stays
         // correct there, the probe just seq-scans the branch leaf.
+        // CHA-539 added a third refcount arm over the PERSIST segment table, so
+        // that probe needs the same `object_uri` access path its snapshot
+        // siblings have. Without it the arm seq-scans every branch leaf per
+        // candidate row. The pre-existing `idx_..._tfsm_seal` is a partial index
+        // on `branch_uuid` and cannot serve a catalog-wide `object_uri` probe.
+        //
+        // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
+        // at CreateCatalog, so older catalogs lack the index — the gate stays
+        // correct there, the probe just seq-scans.
+        let idx_tfsm_uri = format!("idx_{cat_u}_tfsm_uri");
+        driver
+            .execute_no_result(&format!(
+                r#"CREATE INDEX IF NOT EXISTS {qi_idx}
+                ON {qi_tbl} (object_uri)"#,
+                qi_idx = Self::quote_identifier(&idx_tfsm_uri),
+                qi_tbl = Self::quote_identifier(&table_persist_segment_metadata),
+            ))
+            .await?;
+
         let idx_tssm_uri = format!("idx_{cat_u}_tssm_uri");
         driver
             .execute_no_result(&format!(

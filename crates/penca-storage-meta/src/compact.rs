@@ -250,21 +250,20 @@ impl LifecycleManager {
     /// it references and nothing else. A still-referenced row stays
     /// queued; the retirement that drops the last reference
     /// re-enqueues the URI and refreshes its grace clock (see
-    /// [`Self::insert_segment_delete_set_rows`]). Persist-compaction
-    /// URIs never appear in the snapshot segment table, so the gate is
-    /// a structural no-op for them.
+    /// [`Self::insert_segment_delete_set_rows`]).
     ///
-    /// Both the candidate scan and the two refcount probes are
+    /// Both the candidate scan and the three refcount probes are
     /// **catalog-wide**: carry-forward crosses fork edges, so a child
     /// branch's snapshot can reference a file the parent wrote, and a
     /// branch-scoped probe would not see it. `idx_..._sds_age` serves
     /// the eligibility scan; the per-leaf `object_uri` indexes serve
     /// the refcount probes (base segments via `idx_..._tssm_uri`,
-    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455).
+    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455, persist
+    /// segments via `idx_..._tfsm_uri`).
     ///
     /// Cost note: a catalog-wide correlated `NOT EXISTS` plans as one
     /// index probe per branch leaf, so each candidate row costs
-    /// O(branches) probes rather than one. Combined with the note
+    /// O(3 x branches) probes rather than one. Combined with the note
     /// above — refcount-pinned rows sit in the expired range and are
     /// re-scanned by every sweep — a standing blocked set costs
     /// O(blocked_rows x branches) per sweep. The triage signal is
@@ -290,6 +289,16 @@ impl LifecycleManager {
         // make a file eligible while a younger carried sidecar still
         // points at it. One NOT EXISTS arm per referencing table.
         let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        // CHA-539: the persist tier joins the refcount domain. A fork
+        // materializes its inherited cold references as persist rows
+        // naming the parent's files, and enqueue-only branch teardown
+        // queues those same URIs — so without this arm the sweep would
+        // collect a file a sibling branch still reads. This is the FIRST
+        // cross-branch protection persist segments have, not a second
+        // one: CHA-72's `earliest_fork_point_into` retention clamp, which
+        // the tier's protection was previously attributed to, is
+        // unimplemented.
+        let persist_seg_table = naming::table_persist_segment_metadata_table(&catalog);
         // CHA-531: neither arm filters on `branch_uuid`. Carry-forward
         // crosses fork edges, so a child's snapshot rows reference a
         // file the parent wrote while living in the CHILD's partition;
@@ -316,10 +325,15 @@ impl LifecycleManager {
                AND NOT EXISTS (\
                  SELECT 1 FROM {seg_index_table} six \
                  WHERE six.object_uri = sds.object_uri\
+               ) \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {persist_seg_table} pseg \
+                 WHERE pseg.object_uri = sds.object_uri\
                )",
             table = qi(&table),
             seg_table = qi(&seg_table),
             seg_index_table = qi(&seg_index_table),
+            persist_seg_table = qi(&persist_seg_table),
         );
         let rows = driver
             .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
