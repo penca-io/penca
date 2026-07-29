@@ -276,14 +276,25 @@ impl LifecycleManager {
     /// a structural no-op for them.
     ///
     /// The candidate scan is partition-pruned by `branch_uuid`, but the
-    /// three reference probes are **catalog-wide**: carry-forward
-    /// crosses fork edges, so a child branch's snapshot can reference a
-    /// file the parent wrote, and a branch-scoped probe would not see
-    /// it. The `(branch_uuid, written_at_micros)` index serves the
-    /// eligibility scan; the per-leaf `object_uri` indexes serve the
-    /// refcount probes (base segments via `idx_..._tssm_uri`,
+    /// three probes — two refcount, one grace — are **catalog-wide**:
+    /// carry-forward crosses fork edges, so a child branch's snapshot
+    /// can reference a file the parent wrote, and a branch-scoped probe
+    /// would not see it. The `(branch_uuid, written_at_micros)` index
+    /// serves the eligibility scan; the per-leaf `object_uri` indexes
+    /// serve the refcount probes (base segments via `idx_..._tssm_uri`,
     /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455) and the
     /// delete-set's own `idx_..._sds_uri` serves the grace probe.
+    ///
+    /// Cost note (CHA-531): a catalog-wide correlated `NOT EXISTS`
+    /// plans as one index probe per branch leaf, so each candidate row
+    /// costs O(branches) probes rather than one. Combined with the
+    /// note above — refcount-pinned rows sit in the expired range and
+    /// are re-scanned by every sweep — a standing blocked set now
+    /// costs O(blocked_rows x branches) per sweep per branch. ADR
+    /// 0019's "`segment_delete_set` itself is small" premise no longer
+    /// bounds the work on its own; the triage signal at
+    /// `sweep.rs`'s standing-blocked warning should be read against
+    /// that baseline.
     ///
     /// 1 SQL query.
     pub async fn eligible_segment_delete_set_rows(
@@ -302,7 +313,8 @@ impl LifecycleManager {
         // queued URI while ANY base segment OR sidecar row still
         // references it — otherwise an older segment's retirement would
         // make a file eligible while a younger carried sidecar still
-        // points at it. One NOT EXISTS arm per referencing table.
+        // points at it. One NOT EXISTS arm per referencing table, plus
+        // the cross-branch grace arm below.
         let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
         // CHA-531: neither referencing arm filters on `branch_uuid`.
         // Carry-forward crosses fork edges, so a child's snapshot rows
@@ -317,6 +329,14 @@ impl LifecycleManager {
         // already-expired row would go eligible the instant a child
         // dropped that last reference, deleting the file inside the
         // grace window a concurrent reader relies on.
+        //
+        // Branch teardown is outside that contract, deliberately.
+        // `drop_branch_partitions` drops the child's segment AND
+        // delete-set partitions in one CASCADE, so dropping a branch
+        // clears arms 1/2 and removes the very row arm 3 would key on
+        // — the parent's already-expired row goes eligible on the next
+        // sweep with no residual grace. Readers of a dropped branch are
+        // fenced by DeleteBranch itself, not by this window.
         //
         // `written_at_micros < $2` keeps the column on the LHS so the
         // `(branch_uuid, written_at_micros)` index leg is reliably

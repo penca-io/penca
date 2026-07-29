@@ -1023,6 +1023,11 @@ impl PgDialect {
         // grace window honest across a fork edge. `idx_..._sds_age` is
         // `(branch_uuid, written_at_micros)`-leading and cannot serve a
         // branch-agnostic `object_uri` lookup.
+        //
+        // Stale-catalog note (pre-release, in-place DDL): this CREATE only
+        // runs at CreateCatalog, so catalogs predating CHA-531 get the new
+        // grace arm with no index behind it — the gate stays correct, the
+        // probe just seq-scans every `segment_delete_set` leaf.
         let idx_sds_uri = format!("idx_{cat_u}_sds_uri");
         driver
             .execute_no_result(&format!(

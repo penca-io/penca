@@ -142,6 +142,16 @@ Removing any one pillar reopens at least one of the TOCTOU windows.
    compaction — no `kind` discriminator, since `sweep_segments`
    treats every row as an `object_uri` to delete.
 
+   *Amended by CHA-531.* `segment_delete_uuid` is branch-keyed, so one
+   file that several branches reference has one queue row per branch
+   and each row ages on its own clock. Eligibility therefore takes the
+   **cross-branch max**: a row is eligible only when no sibling
+   branch's row for the same `object_uri` is still within grace.
+   Otherwise a fork's parent could delete, inside its own expired
+   window, a carried file a child had only just released. The same
+   widening applies to the refcount probes; see
+   [ADR 0024 §4](0024-incremental-snapshot.md).
+
 4. **Enforced query runtime cap.** `read_data`, `audit_data`, and
    their callees wrap the returned `BatchStream` so each `next()` is
    bounded by `(T_q + query_timeout) - now`, where `T_q` is the
