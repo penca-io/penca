@@ -238,8 +238,8 @@ services:
       # QUERY_TIMEOUT_SECONDS). The max is a conservative bound: Purge rides
       # the snapshot loop today, but CHA-502 may move it.
       HOT_PURGE_GRACE_SECONDS: "${HOT_PURGE_GRACE_SECONDS:-60}"
-      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-5}"
-      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-30}"
+      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-1}"
+      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-5}"
       OBJECT_STORAGE_PROVIDER: s3
       OBJECT_STORAGE_BUCKET: penca
       OBJECT_STORAGE_FORMAT: lance
@@ -273,12 +273,13 @@ services:
       # Default tick: 5s — keeps the unattended-happy-path latency
       # bounded without burning cycles. Persist is the hot->cold relief sweep
       # and wants the shorter cadence; snapshot amortizes compaction, Purge and
-      # tx-log GC over a longer one. Both shipped profiles override them
-      # (CHA-517): `dev` pins persist to 1s so an interactive stack does not sit
-      # on unpersisted hot data, and `test` pins both to -1 (boot and idle) so
-      # neither loop can race a suite's manual Persist/Snapshot/Purge.
-      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-5}"
-      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-30}"
+      # tx-log GC over a longer one. Persist at 1s keeps an interactive stack off
+      # the slower persist-merge read path and stops a fork having to flush a
+      # backlog first; snapshot at 5s avoids rewriting baselines every second.
+      # The `test` profile pins both to -1 (boot and idle) so neither loop can
+      # race a suite's manual Persist/Snapshot/Purge.
+      SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-1}"
+      SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-5}"
       SCHEDULER_LIST_PAGE_SIZE: "${SCHEDULER_LIST_PAGE_SIZE:-100}"
       # Universal grace window (ADR 0019) — MUST equal the lifecycle
       # + query servicers' value. The scheduler bounds its

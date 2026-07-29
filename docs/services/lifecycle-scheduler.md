@@ -161,8 +161,8 @@ All values are required from environment variables; defaults live in
 |---|---|
 | `QUERY_SERVICE_ADDR` | gRPC URL of the `query` service (catalog/branch discovery) |
 | `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service — the branch ops, `Purge`, `PurgeTxLog`, and the `ListModifiedTables`/`ListPersistedTables` dirty-set RPCs |
-| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | Time between the end of one persist tick and the start of the next. Compose default `5s`; the `dev` profile pins `1s` (CHA-517 — an interactive stack should not accumulate unpersisted hot data). **Non-positive** disables the persist loop alone: boot and idle. |
-| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | Same, for the snapshot loop (Snapshot + Purge + PurgeTxLog). Compose default `30s`; the `dev` profile pins `5s`. **Non-positive** disables the snapshot loop alone. The `test` profile pins **both** to `-1` so neither loop can race a suite's manual lifecycle calls. |
+| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | Time between the end of one persist tick and the start of the next. Compose default `1s` — an interactive stack should not accumulate unpersisted hot data, and a fork should not have to flush a backlog first. **Non-positive** disables the persist loop alone: boot and idle. |
+| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | Same, for the snapshot loop (Snapshot + Purge + PurgeTxLog). Compose default `5s` — long enough not to rewrite baselines every second. **Non-positive** disables the snapshot loop alone. The `test` profile pins **both** to `-1` so neither loop can race a suite's manual lifecycle calls. |
 | `SCHEDULER_LIST_PAGE_SIZE` | Max `table_uuid`s requested per list-tables page. The scheduler drains every page before moving on. |
 | `QUERY_TIMEOUT_SECONDS` | Universal grace window in seconds. MUST equal the value the `query` + `lifecycle` services read from the same env var (ADR 0019). The scheduler uses it to bound the `ListPersistedTables` upper edge at `now - QUERY_TIMEOUT_SECONDS`. |
 
