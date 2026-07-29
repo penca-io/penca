@@ -46,10 +46,6 @@ import "penca_proto/external/v1/common.proto";
 // __penca_system__ rows. See common.proto for the full resolution
 // rules.
 
-// ===========================================================================
-// Catalog
-// ===========================================================================
-//
 // A Catalog is the top-level container for schemas and tables. It serves
 // as the boundary for billing, access control, and resource isolation.
 // Catalog mutations are not tx-tracked: they bootstrap per-catalog
@@ -94,17 +90,15 @@ message CreateCatalogResponse {
 // is an identifier — pass it to address the catalog by name without
 // supplying the UUID. UUID is the stable identity across rename.
 message UpdateCatalogRequest {
-  // --- Identifier ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   // CHA-236: when set, renames the catalog. Returns ALREADY_EXISTS if
   // another catalog already uses this name. UUID is the stable identity
   // across rename; clients persisting `catalog_uuid` are unaffected.
   optional string new_catalog_name = 3;
-  // --- Mutable fields ---
   string owner = 4;
   string description = 5;
-  // CHA-433: retention is schema-broadest; catalog no longer carries a policy.
+  // Retention is schema-broadest; a catalog carries no retention policy.
   reserved 6;
   reserved "default_retention_config";
 }
@@ -124,10 +118,6 @@ message DeleteCatalogResponse {
   string catalog_uuid = 1;
 }
 
-// ===========================================================================
-// Branch
-// ===========================================================================
-
 // Creates a new branch within a catalog. Branches are catalog-scoped
 // (CHA-184) — every schema visible on the source branch is materialized
 // onto the new branch as a single fork tx, so the request takes only
@@ -142,11 +132,9 @@ message DeleteCatalogResponse {
 //   - catalog_uuid
 //   - catalog_name
 message CreateBranchRequest {
-  // --- Identifier block (catalog) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
 
-  // --- Domain fields ---
   string branch_name = 3;
 
   // Client-provided UUID for idempotent creation. If omitted, the
@@ -159,7 +147,7 @@ message CreateBranchRequest {
   optional string source_branch_uuid = 6;
   optional string source_branch_name = 7;
 
-  // --- Tx metadata for the per-branch table-materialization tx ---
+  // Tx metadata for the per-branch table-materialization tx
   // CreateBranch always atomically creates one auto-commit tx on the new
   // branch tagged with the supplied `author` / `comment` (CHA-174 unifies
   // these across every tx-creating WriteService RPC). Required (non-
@@ -195,7 +183,6 @@ message CreateBranchResponse {
 //   - catalog_name + branch_uuid
 //   - catalog_name + branch_name
 message DeleteBranchRequest {
-  // --- Identifier block (catalog + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string branch_uuid = 3;
@@ -215,19 +202,15 @@ message DeleteBranchResponse {}
 //   - catalog_name
 // Source and target branches: provide UUID or name for each.
 message MergeBranchRequest {
-  // --- Identifier block (catalog) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
 
-  // --- Source branch ---
   optional string source_branch_uuid = 3;
   optional string source_branch_name = 4;
 
-  // --- Target branch ---
   optional string target_branch_uuid = 5;
   optional string target_branch_name = 6;
 
-  // --- Metadata ---
   string comment = 7;
   string author = 8;
 }
@@ -239,10 +222,6 @@ message MergeBranchResponse {
   // on the per-row audit trail (see AuditData on QueryService).
   int64 commit_micros = 1;
 }
-
-// ===========================================================================
-// UpdateBranch
-// ===========================================================================
 
 // Updates a branch's mutable fields. Currently only `branch_name`
 // (rename, CHA-236). Branches are catalog-scoped (CHA-184); pass the
@@ -256,7 +235,6 @@ message MergeBranchResponse {
 //   - catalog_name + branch_uuid
 //   - catalog_name + branch_name
 message UpdateBranchRequest {
-  // --- Identifier block (catalog + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string branch_uuid = 3;
@@ -272,10 +250,6 @@ message UpdateBranchResponse {
   Branch branch = 1;
 }
 
-// ===========================================================================
-// Schema
-// ===========================================================================
-//
 // A Schema is a logical grouping of tables within a catalog. It provides
 // a namespace so that table names only need to be unique within their
 // schema, not across the entire catalog.
@@ -328,13 +302,11 @@ message CreateSchemaResponse {
 // is an identifier — pass it to address the schema by name without
 // supplying the UUID.
 message UpdateSchemaRequest {
-  // --- Identifier block ---
   optional string schema_uuid = 1;
   optional string schema_name = 2;
   // CHA-236: when set, renames the schema. See
   // `UpdateCatalogRequest.new_catalog_name`.
   optional string new_schema_name = 3;
-  // --- Mutable fields ---
   string description = 4;
   // Full replacement: an update writes this value verbatim, so retention must
   // be re-sent on every UpdateSchema. CHA-433 makes retention_duration_seconds
@@ -393,10 +365,6 @@ message DeleteSchemaResponse {
   string schema_uuid = 1;
 }
 
-// ===========================================================================
-// Table
-// ===========================================================================
-//
 // CHA-164: Table operations participate in MVCC alongside data writes.
 // CreateTable / UpdateTable / DeleteTable rows carry a `tx_uuid` and
 // resolve visibility via JOIN against `commit_tx_log_partition(catalog,
@@ -420,15 +388,12 @@ message DeleteSchemaResponse {
 //   - catalog_name + schema_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message CreateTableRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
   optional string branch_uuid = 5;
   optional string branch_name = 6;
-
-  // --- Domain fields ---
 
   // Human-readable table name. Must be unique within the schema on this
   // branch.
@@ -476,10 +441,6 @@ message CreateTableResponse {
   string table_uuid = 1;
 }
 
-// ===========================================================================
-// Index DDL (transactional via CHA-164) — CHA-455
-// ===========================================================================
-//
 // Index definitions live in the auditable `index_metadata` store
 // (`__penca_system__.indexes`), addressed like table DDL: a within-catalog
 // identifier block + the target table (by uuid or name) + the CHA-164
@@ -493,7 +454,6 @@ message CreateTableIndexDefinition {
 }
 
 message CreateIndexRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -505,7 +465,6 @@ message CreateIndexRequest {
   optional string table_uuid = 7;
   optional string table_name = 8;
 
-  // --- Domain fields ---
   // Index name; unique only within the target table.
   string index_name = 9;
   repeated string columns = 10;
@@ -522,7 +481,6 @@ message CreateIndexResponse {
 }
 
 message UpdateIndexRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -549,7 +507,6 @@ message UpdateIndexResponse {
 }
 
 message DeleteIndexRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -581,7 +538,6 @@ message DeleteIndexResponse {
 //   - catalog_name + schema_name + table_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message UpdateTableRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -595,7 +551,6 @@ message UpdateTableRequest {
   // `UpdateCatalogRequest.new_catalog_name`.
   optional string new_table_name = 9;
 
-  // --- Domain fields ---
   bytes arrow_schema = 10;
   repeated string primary_keys = 11;
   repeated string partition_keys = 12;
@@ -630,7 +585,6 @@ message UpdateTableResponse {
 //   - catalog_name + schema_name + table_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message DeleteTableRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -653,10 +607,6 @@ message DeleteTableResponse {
   string table_uuid = 1;
 }
 
-// ===========================================================================
-// Transaction
-// ===========================================================================
-
 // Begins a new transaction on a branch.
 //
 // Sufficient identifier combinations:
@@ -665,15 +615,12 @@ message DeleteTableResponse {
 //   - catalog_name + schema_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message BeginTxRequest {
-  // --- Identifier block (schema + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
   optional string branch_uuid = 5;
   optional string branch_name = 6;
-
-  // --- Domain fields ---
 
   // Free-text description of what this transaction does.
   string comment = 7;
@@ -719,13 +666,11 @@ message BeginTxResponse {
 // belong to the supplied branch surfaces as NOT_FOUND from the
 // leaf-partition lookup.
 message CommitTxRequest {
-  // --- Identifier block (catalog + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string branch_uuid = 3;
   optional string branch_name = 4;
 
-  // --- Domain fields ---
   string tx_uuid = 5;
 }
 
@@ -762,13 +707,11 @@ message CommitTxResponse {
 // doesn't belong to the supplied branch surfaces as NOT_FOUND from
 // the leaf-partition lookup.
 message AbortTxRequest {
-  // --- Identifier block (catalog + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string branch_uuid = 3;
   optional string branch_name = 4;
 
-  // --- Domain fields ---
   string tx_uuid = 5;
 }
 
@@ -780,10 +723,6 @@ message AbortTxResponse {
   // AbortTx call.
   int64 aborted_at_micros = 1;
 }
-
-// ===========================================================================
-// Data Mutations
-// ===========================================================================
 
 // The row payload of a write — any combination of upserts and deletes.
 // The target table is identified at the request level (WriteDataRequest),
@@ -852,7 +791,6 @@ message Change {
 // resolves catalog-wide (the schema identifier is not consulted); a
 // by-name target resolves the schema first.
 message WriteDataRequest {
-  // --- Identifier block (schema + branch + table) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -885,10 +823,6 @@ message WriteDataResponse {
   // referenced a lapsed tx_uuid.
   optional int64 commit_micros = 1;
 }
-
-// ===========================================================================
-// Service
-// ===========================================================================
 
 // WriteService owns every Penca write: catalog/schema/table DDL,
 // branching, transactions, and data mutations. Schema and table DDL
