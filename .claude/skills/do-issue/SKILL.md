@@ -339,17 +339,23 @@ pr_state=$(gh pr view --json state -q .state 2>/dev/null || echo "NOT_OPEN")
 # even at "0 queued, 0 running" — a wait-loop built on it never terminates.
 # No `Jobs:` line at all means the daemon is down or unreachable ("Daemon not
 # running…"), which is NOT idle — report `unknown` so the sweep blocks instead of
-# declaring itself clean without ever having queried a queue.
+# declaring itself clean without ever having queried a queue. `unknown` groups
+# with busy below: it keeps the loop alive on the tight cadence (a daemon restart
+# resolves itself) and never lets the drain reach "ready for merge" on an
+# uncertified sweep. Do NOT turn it into a bare `exit` — a tick that ends with no
+# ScheduleWakeup and no stop just dies, stalling the ticket while looking idle.
+# If it stays `unknown` across several ticks the daemon is genuinely down: say so
+# via SendUserMessage (plain text between tool calls does not render mid-loop —
+# see .claude/memory/feedback_send_user_message_mid_loop.md) and stop the loop
+# deliberately with ScheduleWakeup(stop: true).
 roborev_busy=$(roborev status 2>&1 \
   | awk '/^Jobs:/ { print ($2 + $4 > 0) ? 1 : 0; found=1 } END { if (!found) print "unknown" }')
-if [ "$roborev_busy" = "unknown" ]; then
-  echo "roborev unreachable — cannot certify the review sweep; surface to the user" >&2
-  exit
-fi
-open_orch=$(kata list --label cha-NNN --status open --json 2>/dev/null \
-  | jq '[.issues[] | .labels[] | select(startswith("orch:"))] | length')
 
-if [ "$roborev_busy" = "1" ] || [ "$open_orch" -gt 0 ] || [ "$pr_state" = "NOT_OPEN" ]; then
+open_orch=$(kata list --label cha-NNN --status open --json 2>/dev/null \
+  | jq '[.issues[]? | .labels[] | select(startswith("orch:"))] | length')
+
+if [ "$roborev_busy" = "unknown" ] || [ "$roborev_busy" = "1" ] \
+   || [ "$open_orch" -gt 0 ] || [ "$pr_state" = "NOT_OPEN" ]; then
   exit  # ScheduleWakeup ~10s — work could appear soon.
 else
   exit  # ScheduleWakeup ~45s — waiting on human merge.
