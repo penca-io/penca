@@ -2,18 +2,18 @@
 catalog-scoped, not branch-scoped.
 
 Once a fork carries a parent segment by reference, the child's
-referencing row lives in the CHILD's partition. ``eligible_segment_
-delete_set_rows`` probes both of its ``NOT EXISTS`` refcount arms with
-``branch_uuid = $1``, so the parent's sweep cannot see the child's
-reference and deletes a file the child still reads.
+referencing row lives in the CHILD's partition. When
+``eligible_segment_delete_set_rows`` probed its ``NOT EXISTS`` refcount
+arms with ``branch_uuid = $1``, the parent's sweep could not see the
+child's reference and deleted a file the child still reads.
 
-One test per arm the gate has to get right: the base-segment refcount,
+One test per thing the gate has to get right: the base-segment refcount,
 the index-sidecar refcount (a carried sidecar shares its file the same
-way), and the grace clock (branch-keyed delete-set rows mean the
-retirement that drops the last reference refreshes only its own branch's
-row). Each pairs its survival assertion with a positive control, because
-"the row is still there" is also what a sweep that never considered the
-URI eligible looks like.
+way), and the grace clock (the same file is retired once per branch that
+carried it, so the delete set's single row must hold the latest of those
+clocks). Each pairs its survival assertion with a positive control,
+because "the row is still there" is also what a sweep that never
+considered the URI eligible looks like.
 
 The cross-branch reference is synthesized with direct SQL rather than
 produced by a real fork snapshot: this pins the GC gate on its own,
@@ -154,15 +154,14 @@ def _sidecar_rows(catalog_uuid, branch_uuid, snapshot_uuid=None):
     return [(r[0], r[1]) for r in rows]
 
 
-def _age_delete_set_rows(catalog_uuid, branch_uuid, uri):
-    """Push a branch's delete-set rows for ``uri`` past the grace window."""
+def _age_delete_set_rows(catalog_uuid, uri):
+    """Push the delete-set row for ``uri`` past the grace window."""
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     get_pg_driver().execute_no_result(
-        SQL(
-            "UPDATE {tbl} SET written_at_micros = %s"
-            " WHERE branch_uuid = %s AND object_uri = %s"
-        ).format(tbl=Identifier(tbl)),
-        (_now_micros() - 10_000_000, branch_uuid, uri),
+        SQL("UPDATE {tbl} SET written_at_micros = %s WHERE object_uri = %s").format(
+            tbl=Identifier(tbl)
+        ),
+        (_now_micros() - 10_000_000, uri),
     )
 
 
@@ -172,27 +171,31 @@ def _segment_uris(catalog_uuid, branch_uuid, snapshot_uuid):
     )
 
 
-def _delete_set_rows_for_uris(catalog_uuid, branch_uuid, uris):
+def _delete_set_rows_for_uris(catalog_uuid, uris):
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     return get_pg_driver().execute(
         SQL(
-            "SELECT object_uri, written_at_micros FROM {tbl}"
-            " WHERE branch_uuid = %s AND object_uri = ANY(%s)"
+            "SELECT object_uri, written_at_micros FROM {tbl} WHERE object_uri = ANY(%s)"
         ).format(tbl=Identifier(tbl)),
-        (branch_uuid, list(uris)),
+        (list(uris),),
     )
 
 
-def _insert_delete_set_row(catalog_uuid, branch_uuid, table_uuid, uri, written_at):
+def _enqueue_delete_set_row(catalog_uuid, uri, written_at):
+    """Enqueue ``uri`` for GC as a retirement would.
+
+    Mirrors `insert_segment_delete_set_rows`: keyed on ``object_uri``
+    alone, so a second enqueue of the same file refreshes the one row's
+    grace clock rather than adding another.
+    """
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     get_pg_driver().execute_no_result(
         SQL(
-            "INSERT INTO {tbl}"
-            " (segment_delete_uuid, branch_uuid, table_uuid, object_uri,"
-            "  written_at_micros)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            "INSERT INTO {tbl} (object_uri, written_at_micros) VALUES (%s, %s)"
+            " ON CONFLICT (object_uri)"
+            " DO UPDATE SET written_at_micros = EXCLUDED.written_at_micros"
         ).format(tbl=Identifier(tbl)),
-        (str(uuid4()), branch_uuid, table_uuid, uri, written_at),
+        (uri, written_at),
     )
 
 
@@ -302,14 +305,12 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
 
     # The parent retires the snapshot that produced the file and
     # enqueues it for GC, already past the grace window.
-    _insert_delete_set_row(
-        catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
-    )
+    _enqueue_delete_set_row(catalog_uuid, shared_uri, _now_micros() - 10_000_000)
     _drop_snapshot_rows(catalog_uuid, main_branch, snap_main)
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    remaining = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
     assert len(remaining) == 1, (
         "sweep deleted a cold file that another branch's snapshot still"
         " references. The refcount gate is catalog-wide, not branch-scoped:"
@@ -332,9 +333,9 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
         " mean nothing."
     )
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    drained = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    drained = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
     assert drained == [], (
         "the delete-set row survived a sweep with zero remaining references,"
         " so phase 1's survival proves nothing about the refcount gate."
@@ -419,12 +420,10 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
         uri for _u, uri in _sidecar_rows(catalog_uuid, child_branch)
     }, "setup failed: the child must hold a reference to the parent's sidecar"
 
-    _insert_delete_set_row(
-        catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
-    )
+    _enqueue_delete_set_row(catalog_uuid, shared_uri, _now_micros() - 10_000_000)
     _drop_snapshot_rows(catalog_uuid, main_branch, snap_main)
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
     assert _sidecar_rows(catalog_uuid, main_branch) == [], (
         "the retirement simulation did not take: the parent still holds its"
@@ -433,9 +432,9 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
         " scoped."
     )
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    remaining = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
     assert len(remaining) == 1, (
         "sweep deleted a cold INDEX SIDECAR that another branch's snapshot"
         f" still references. {shared_uri} is referenced by branch"
@@ -447,9 +446,9 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
     # zero references left, so the same sweep drains it.
     _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    assert _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri]) == [], (
+    assert _delete_set_rows_for_uris(catalog_uuid, [shared_uri]) == [], (
         "the delete-set row survived a sweep with zero remaining sidecar"
         " references, so the survival above proves nothing about the sidecar"
         " arm. Either the sweep never treated the URI as eligible, or the"
@@ -457,15 +456,19 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
     )
 
 
-def test_parent_sweep_respects_another_branchs_grace_window():
-    """The grace clock is cross-branch too.
+def test_later_retirement_refreshes_a_shared_files_grace_window():
+    """The grace clock is cross-branch, and one enqueue per file is what
+    makes it so.
 
-    ``naming::segment_delete_uuid`` is branch-keyed, so when a retirement
-    on branch B drops the last reference to a file the parent enqueued
-    long ago, only B's delete-set row gets a fresh ``written_at_micros``.
-    Without a self-join arm the parent's own already-expired row goes
-    eligible the instant B drops that reference, deleting the file inside
-    the grace window a concurrent reader on B relies on.
+    Carry-forward means the same physical file is retired once per branch
+    that carried it, at different times. `segment_delete_set` is keyed on
+    ``object_uri`` alone (CHA-531), so those retirements land on one row
+    and the enqueue's ``ON CONFLICT`` refresh advances its
+    ``written_at_micros`` to the latest of them. That is the whole
+    cross-branch grace mechanism: without it, an early retirement's
+    already-expired clock would make the file eligible the instant a later
+    retirement dropped the last reference, deleting it inside the window a
+    reader pinned by that later retirement still relies on.
     """
     client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
         setup_partitioned_table("fgc")
@@ -486,53 +489,45 @@ def test_parent_sweep_respects_another_branchs_grace_window():
     assert parent_rows
     _shared_seg_uuid, shared_uri = parent_rows[0]
 
-    sibling_branch = client.create_branch(
-        f"fgc_grace_{uuid4().hex[:6]}",
-        catalog_uuid=catalog_uuid,
-        author="test",
-        comment="cha-531",
-    ).branch_uuid
-
-    # Zero live references, but two delete-set rows for the same file: the
-    # parent's is long expired, the sibling's was just written.
+    # Zero live references, and the file's first retirement is long expired.
     _drop_snapshot_rows(catalog_uuid, main_branch, snap_main)
-    _insert_delete_set_row(
-        catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
-    )
-    # Stamped a minute ahead, not at "now". QUERY_TIMEOUT_SECONDS is 2s in
-    # docker/test.env, and this timestamp comes from the test host's clock
-    # while the threshold comes from Postgres's — gRPC latency plus any
-    # container/host skew would eat a 2s margin and flip the row out of
+    _enqueue_delete_set_row(catalog_uuid, shared_uri, _now_micros() - 10_000_000)
+
+    # A later retirement of the same carried file, as another branch would
+    # issue. Stamped a minute ahead, not at "now": QUERY_TIMEOUT_SECONDS is
+    # 2s in docker/test.env, and this timestamp comes from the test host's
+    # clock while the threshold comes from Postgres's — gRPC latency plus
+    # any container/host skew would eat a 2s margin and flip the row out of
     # grace, failing the test for a reason it does not test. Only
     # `_age_delete_set_rows` below should move it.
-    _insert_delete_set_row(
-        catalog_uuid,
-        sibling_branch,
-        table_uuid,
-        shared_uri,
-        _now_micros() + 60_000_000,
+    _enqueue_delete_set_row(catalog_uuid, shared_uri, _now_micros() + 60_000_000)
+
+    rows = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
+    assert len(rows) == 1, (
+        f"{shared_uri} must hold exactly one delete-set row after two"
+        f" retirements; got {len(rows)}. A per-branch row would give the file"
+        " independent grace clocks for the sweep to reconcile."
     )
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    remaining = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
     assert len(remaining) == 1, (
-        f"sweep deleted {shared_uri} while branch {sibling_branch} still held"
-        " a within-grace delete-set row for it. The grace gate must be"
-        " cross-branch: the retirement that dropped the last reference"
-        " refreshed only the retiring branch's row."
+        f"sweep deleted {shared_uri} even though a later retirement had"
+        " refreshed its grace clock. The second enqueue must advance"
+        " written_at_micros, not be discarded as a duplicate."
     )
 
-    # Positive control: age the sibling's row out of grace and the same
-    # sweep drains the file, proving the grace arm — not some unrelated
+    # Positive control: age the row out of grace and the same sweep drains
+    # the file, proving the refreshed clock — not some unrelated
     # ineligibility — was what spared it above.
-    _age_delete_set_rows(catalog_uuid, sibling_branch, shared_uri)
+    _age_delete_set_rows(catalog_uuid, shared_uri)
 
-    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    drained = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    drained = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
     assert drained == [], (
-        "with every delete-set row for this file past grace and zero live"
+        "with the delete-set row for this file past grace and zero live"
         f" references, the sweep must drain {shared_uri}; it did not, so the"
-        " assertion above proves nothing about the grace arm."
+        " assertion above proves nothing about the grace clock."
     )

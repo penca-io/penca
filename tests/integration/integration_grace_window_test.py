@@ -122,8 +122,8 @@ def _commit_tx_writing_rows(
     return committed.commit_micros
 
 
-def _count_segment_delete_set_rows(catalog_uuid, branch_uuid):
-    """Count rows in ``segment_delete_set`` for ``branch_uuid``.
+def _count_segment_delete_set_rows(catalog_uuid):
+    """Count rows in ``segment_delete_set`` for ``catalog_uuid``.
 
     The table is introduced by ADR 0019 §"Four-part mechanism" item 3.
     Pre-mechanism the table does not exist; this helper raises
@@ -132,10 +132,7 @@ def _count_segment_delete_set_rows(catalog_uuid, branch_uuid):
     """
     parent = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     rows = get_pg_driver().execute(
-        SQL("SELECT count(*) FROM {tbl} WHERE branch_uuid = %s").format(
-            tbl=Identifier(parent)
-        ),
-        (branch_uuid,),
+        SQL("SELECT count(*) FROM {tbl}").format(tbl=Identifier(parent)),
     )
     return rows[0][0]
 
@@ -299,7 +296,7 @@ class TestSegmentDeleteSetSweep:
         # count depends on how many input segments compact folded;
         # ``>= 1`` is sufficient — the precise inventory is in the
         # lifecycle test suite's compact-segment metadata pins.
-        pre_grace = _count_segment_delete_set_rows(catalog_uuid, branch_uuid)
+        pre_grace = _count_segment_delete_set_rows(catalog_uuid)
         assert pre_grace >= 1, (
             "Compact wave must insert at least one segment_delete_set "
             f"row for the old URIs. Got {pre_grace}. ADR 0019: defer "
@@ -310,9 +307,8 @@ class TestSegmentDeleteSetSweep:
         # still within their grace window.
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        mid_grace = _count_segment_delete_set_rows(catalog_uuid, branch_uuid)
+        mid_grace = _count_segment_delete_set_rows(catalog_uuid)
         assert mid_grace == pre_grace, (
             "sweep_segments within grace must not delete set rows — "
             f"pre={pre_grace}, mid={mid_grace}. ADR 0019: sweep is "
@@ -324,9 +320,8 @@ class TestSegmentDeleteSetSweep:
         time.sleep(GRACE_WAIT_SECONDS)
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        post_grace = _count_segment_delete_set_rows(catalog_uuid, branch_uuid)
+        post_grace = _count_segment_delete_set_rows(catalog_uuid)
         assert post_grace == 0, (
             "sweep_segments past grace must remove all set rows; got "
             f"{post_grace}. ADR 0019: sweep deletes the cold file "

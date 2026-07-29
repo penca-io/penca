@@ -261,37 +261,6 @@ pub fn table_snapshot_index_uuid(table_snapshot_uuid: &Uuid, index_uuid: Option<
     row_uuid_for_pk(table_snapshot_uuid, &[&index_disc])
 }
 
-/// Deterministic UUID for a `segment_delete_set` row, identifying one
-/// `(branch, table, object_uri)` deferred file delete.
-///
-/// Rooted on a catalog-scoped `"segment_delete"` anchor — same trick
-/// as [`table_purge_uuid`]: the arity-3 PK tuple
-/// `(branch, table, uri)` would collide with
-/// [`table_snapshot_uuid`] if rooted on the catalog UUID, so the
-/// anchor keeps the hash-input space disjoint without a discriminator
-/// tag in the outer call.
-///
-/// Determinism also makes the in-tx INSERT replay-safe: a compact tx
-/// that crashed after PG commit but before file delete cannot land a
-/// duplicate row when the unsealed segments are picked up again.
-pub fn segment_delete_uuid(
-    catalog_uuid: &Uuid,
-    branch_uuid: &Uuid,
-    table_uuid: &Uuid,
-    object_uri: &str,
-) -> Uuid {
-    let segment_delete_anchor =
-        deterministic_uuid_from(&[&catalog_uuid.to_string(), "segment_delete"]);
-    row_uuid_for_pk(
-        &segment_delete_anchor,
-        &[
-            &branch_uuid.to_string(),
-            &table_uuid.to_string(),
-            object_uri,
-        ],
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1751,25 +1751,24 @@ class PencaClient:
         self,
         catalog_uuid: str | None = None,
         catalog_name: str | None = None,
-        branch_uuid: str | None = None,
-        branch_name: str | None = None,
     ) -> SweepSegmentsResponse:
         """Physically delete cold segment files queued for removal by
-        past compact waves on a branch (CHA-233 / ADR 0019).
+        past compact waves in a catalog (CHA-233 / ADR 0019).
 
         Compact's merge tx enqueues each replaced URI in
         ``segment_delete_set`` atomically with the URI swap;
         ``sweep_segments`` reads rows whose
         ``written_at_micros + query_timeout < now``, deletes the
         cold file, then deletes the set row. Idempotent.
+
+        Catalog-scoped, not branch-scoped: carry-forward makes one cold
+        file reachable from any branch, so the sweep's reference-count
+        gate spans the whole catalog (CHA-531).
         """
         catalog_uuid, catalog_name = self._get_catalog(catalog_uuid, catalog_name)
-        branch_uuid, branch_name = self._get_branch(branch_uuid, branch_name)
         request = SweepSegmentsRequest()
         self._set_optional(request, "catalog_uuid", catalog_uuid)
         self._set_optional(request, "catalog_name", catalog_name)
-        self._set_optional(request, "branch_uuid", branch_uuid)
-        self._set_optional(request, "branch_name", branch_name)
 
         try:
             return self._lifecycle.SweepSegments(request)

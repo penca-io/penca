@@ -143,10 +143,7 @@ where
 
     #[tracing::instrument(
         skip_all,
-        fields(
-            catalog = ?request.get_ref().catalog_uuid,
-            branch = ?request.get_ref().branch_uuid,
-        ),
+        fields(catalog = ?request.get_ref().catalog_uuid),
     )]
     async fn sweep_segments(
         &self,

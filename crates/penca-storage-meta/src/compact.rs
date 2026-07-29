@@ -9,7 +9,6 @@ use penca_core::naming;
 use penca_db::driver::{DbDriver, SqlValue, format_sql_uuid_array};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
-use uuid::Uuid;
 
 use crate::helpers::{epoch, parse_uuid, qi};
 use crate::{LifecycleManager, Result};
@@ -170,26 +169,28 @@ impl LifecycleManager {
 
     /// Insert one `segment_delete_set` row per `object_uri` — cold
     /// files a compact merge tx is replacing or a snapshot retirement
-    /// tx is releasing. Each row's deterministic
-    /// `segment_delete_uuid` is derived here from
-    /// `naming::segment_delete_uuid` so the uuid↔uri pairing lives in
-    /// one place next to the `ON CONFLICT` arm that depends on it.
-    /// `written_at_micros` is stamped via `DEFAULT {epoch}` so the
-    /// grace clock matches the PG server time used by every other
-    /// lifecycle commit. One `unnest` statement regardless of batch
-    /// size: retirement enqueues every file of a retired snapshot on
-    /// the Snapshot RPC's critical path under the per-table advisory
-    /// lock, so per-row round-trips don't scale.
+    /// tx is releasing. `written_at_micros` is stamped via `DEFAULT
+    /// {epoch}` so the grace clock matches the PG server time used by
+    /// every other lifecycle commit. One `unnest` statement regardless
+    /// of batch size: retirement enqueues every file of a retired
+    /// snapshot on the Snapshot RPC's critical path under the
+    /// per-table advisory lock, so per-row round-trips don't scale.
     ///
-    /// The deterministic `segment_delete_uuid` collapses re-enqueues
-    /// of one URI onto one row, and the conflict arm REFRESHES
+    /// `object_uri` is the whole key, so re-enqueues of one URI
+    /// collapse onto one row and the conflict arm REFRESHES
     /// `written_at_micros`: the grace clock restarts at the LAST
-    /// enqueue. Under carry-forward (ADR 0024 §4) the last enqueue is
+    /// enqueue. Under carry-forward (ADR 0024 §4) that last enqueue is
     /// the retirement that dropped the file's final reference —
     /// without the refresh, a shared file already queued by an earlier
     /// retirement would be sweep-eligible the instant its refcount
     /// hits zero, inside the query-timeout window of plans pinned to
-    /// the just-retired snapshot. Compact-retry re-enqueues only
+    /// the just-retired snapshot. Because the key is catalog-wide
+    /// (CHA-531), that refresh spans fork edges too: a child
+    /// retiring a URI it carried from its parent extends the same row
+    /// the parent's own retirement wrote, so the grace window a
+    /// concurrent reader on either branch relies on is the maximum
+    /// across all of them, computed at enqueue rather than
+    /// reconstructed by the sweep. Compact-retry re-enqueues only
     /// extend grace (harmless).
     ///
     /// Designed for in-tx use — caller passes `&tx` from inside the
@@ -202,53 +203,30 @@ impl LifecycleManager {
     pub async fn insert_segment_delete_set_rows(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
-        branch_uuid: &str,
-        table_uuid: &str,
         object_uris: &[String],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let branch = parse_uuid(branch_uuid);
-        let table_id = parse_uuid(table_uuid);
-        let segment_delete_uuid_strs: Vec<String> = object_uris
-            .iter()
-            .map(|uri| naming::segment_delete_uuid(&catalog, &branch, &table_id, uri).to_string())
-            .collect();
         let table = naming::segment_delete_set_table(&catalog);
-        // The uuid array binds as `text[]` (SqlValue has no uuid-array
-        // variant) and casts parameter-side, keeping one cached plan
-        // shape for every batch size.
         let sql = format!(
-            "INSERT INTO {table} \
-                (segment_delete_uuid, branch_uuid, table_uuid, object_uri) \
-             SELECT pair_uuid, $1, $2, pair_uri \
-             FROM unnest($3::text[]::uuid[], $4::text[]) \
-                  AS pair(pair_uuid, pair_uri) \
-             ON CONFLICT (branch_uuid, segment_delete_uuid) \
+            "INSERT INTO {table} (object_uri) \
+             SELECT unnest($1::text[]) \
+             ON CONFLICT (object_uri) \
              DO UPDATE SET written_at_micros = {epoch}",
             table = qi(&table),
             epoch = epoch(),
         );
         driver
-            .execute_no_result_params(
-                &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                    SqlValue::TextArray(segment_delete_uuid_strs),
-                    SqlValue::TextArray(object_uris.to_vec()),
-                ],
-            )
+            .execute_no_result_params(&sql, &[SqlValue::TextArray(object_uris.to_vec())])
             .await?;
         Ok(())
     }
 
-    /// Read every `segment_delete_set` row past the grace window for
-    /// a branch — `now_micros - written_at_micros > query_timeout`, the
+    /// Read every `segment_delete_set` row in the catalog past the grace
+    /// window — `now_micros - written_at_micros > query_timeout`, the
     /// cold-segment GC grace (ADR 0019's `query_timeout` bound) — whose file
-    /// is at snapshot reference count zero (ADR 0024 §4). Returns
-    /// `(segment_delete_uuid, object_uri)` pairs; the caller deletes the cold
-    /// file then calls
-    /// [`Self::delete_segment_delete_set_row`] per row.
+    /// is at snapshot reference count zero (ADR 0024 §4). Returns the
+    /// `object_uri`s; the caller deletes the cold file then calls
+    /// [`Self::delete_segment_delete_set_row`] per URI.
     ///
     /// The `NOT EXISTS` arm is the refcount gate: under carry-forward
     /// one physical file is referenced by N
@@ -265,41 +243,31 @@ impl LifecycleManager {
     /// (TODO(CHA-435)), a hard crash mid-snapshot permanently pins
     /// every shared URI its orphan rows reference.
     ///
-    /// CHA-531 widened that blast radius, but along a different axis
-    /// than the file set. The URIs an orphan can pin are unchanged —
-    /// still only what that snapshot touched, i.e. the branch's own
-    /// new files plus the ones it carried from its parent. What
-    /// changed is WHOSE queue those orphans block: because the arms no
-    /// longer filter on `branch_uuid`, and every branch that carried a
-    /// URI gets its own branch-keyed delete-set row on retirement, one
-    /// branch's orphans now stall the sweep of every OTHER branch
-    /// holding a queue row for the same URI. Before, an orphan could
-    /// only ever block its own branch's rows. The reaper is therefore
-    /// a stronger requirement than it was. A still-referenced
-    /// row stays queued; the retirement that drops the last reference
+    /// CHA-531 widened which snapshots can produce such an orphan —
+    /// carry-forward means a child's in-flight snapshot references the
+    /// parent's files — but not the shape of the pin: the delete set
+    /// holds one row per file, so an orphan blocks exactly the files
+    /// it references and nothing else. A still-referenced row stays
+    /// queued; the retirement that drops the last reference
     /// re-enqueues the URI and refreshes its grace clock (see
     /// [`Self::insert_segment_delete_set_rows`]). Persist-compaction
     /// URIs never appear in the snapshot segment table, so the gate is
     /// a structural no-op for them.
     ///
-    /// The candidate scan is partition-pruned by `branch_uuid`, but the
-    /// three probes — two refcount, one grace — are **catalog-wide**:
-    /// carry-forward crosses fork edges, so a child branch's snapshot
-    /// can reference a file the parent wrote, and a branch-scoped probe
-    /// would not see it. The `(branch_uuid, written_at_micros)` index
-    /// serves the eligibility scan; the per-leaf `object_uri` indexes
-    /// serve the refcount probes (base segments via `idx_..._tssm_uri`,
-    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455) and the
-    /// delete-set's own `idx_..._sds_uri` serves the grace probe.
+    /// Both the candidate scan and the two refcount probes are
+    /// **catalog-wide**: carry-forward crosses fork edges, so a child
+    /// branch's snapshot can reference a file the parent wrote, and a
+    /// branch-scoped probe would not see it. `idx_..._sds_age` serves
+    /// the eligibility scan; the per-leaf `object_uri` indexes serve
+    /// the refcount probes (base segments via `idx_..._tssm_uri`,
+    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455).
     ///
-    /// Cost note (CHA-531): a catalog-wide correlated `NOT EXISTS`
-    /// plans as one index probe per branch leaf, so each candidate row
-    /// costs O(branches) probes rather than one. Combined with the
-    /// note above — refcount-pinned rows sit in the expired range and
-    /// are re-scanned by every sweep — a standing blocked set now
-    /// costs O(blocked_rows x branches) per sweep per branch. ADR
-    /// 0019's "`segment_delete_set` itself is small" premise no longer
-    /// bounds the work on its own; the triage signal is
+    /// Cost note: a catalog-wide correlated `NOT EXISTS` plans as one
+    /// index probe per branch leaf, so each candidate row costs
+    /// O(branches) probes rather than one. Combined with the note
+    /// above — refcount-pinned rows sit in the expired range and are
+    /// re-scanned by every sweep — a standing blocked set costs
+    /// O(blocked_rows x branches) per sweep. The triage signal is
     /// `sweep_segments`' `eligible`/`deleted` pair (penca-api's
     /// `lifecycle::sweep`), which should be read against that
     /// baseline.
@@ -308,10 +276,9 @@ impl LifecycleManager {
     pub async fn eligible_segment_delete_set_rows(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
-        branch_uuid: &str,
         now_micros: i64,
         query_timeout_micros: i64,
-    ) -> Result<Vec<(Uuid, String)>> {
+    ) -> Result<Vec<String>> {
         let catalog = parse_uuid(catalog_uuid);
         let table = naming::segment_delete_set_table(&catalog);
         let seg_table = naming::table_snapshot_segment_metadata_table(&catalog);
@@ -321,40 +288,27 @@ impl LifecycleManager {
         // queued URI while ANY base segment OR sidecar row still
         // references it — otherwise an older segment's retirement would
         // make a file eligible while a younger carried sidecar still
-        // points at it. One NOT EXISTS arm per referencing table, plus
-        // the cross-branch grace arm below.
+        // points at it. One NOT EXISTS arm per referencing table.
         let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
-        // CHA-531: neither referencing arm filters on `branch_uuid`.
-        // Carry-forward crosses fork edges, so a child's snapshot rows
-        // reference a file the parent wrote while living in the CHILD's
-        // partition; a branch-scoped probe cannot see them and the
-        // parent's sweep would delete a file the child still reads.
+        // CHA-531: neither arm filters on `branch_uuid`. Carry-forward
+        // crosses fork edges, so a child's snapshot rows reference a
+        // file the parent wrote while living in the CHILD's partition;
+        // a branch-scoped probe cannot see them and the sweep would
+        // delete a file the child still reads.
         //
-        // The third arm makes the grace clock cross-branch for the same
-        // reason. `naming::segment_delete_uuid` is branch-keyed, so the
-        // retirement that drops the last reference refreshes only the
-        // RETIRING branch's row. Without this arm the parent's own
-        // already-expired row would go eligible the instant a child
-        // dropped that last reference, deleting the file inside the
-        // grace window a concurrent reader relies on.
+        // There is no cross-branch grace arm to go with them: the
+        // delete set is keyed on `object_uri` alone, so a URI has one
+        // row and one clock, and the enqueue's `ON CONFLICT` refresh
+        // already advanced it to the last retirement on any branch.
         //
-        // Branch teardown is outside that contract, deliberately.
-        // `drop_branch_partitions` drops the child's segment AND
-        // delete-set partitions in one CASCADE, so dropping a branch
-        // clears arms 1/2 and removes the very row arm 3 would key on
-        // — the parent's already-expired row goes eligible on the next
-        // sweep with no residual grace. Readers of a dropped branch are
-        // fenced by DeleteBranch itself, not by this window.
-        //
-        // `written_at_micros < $2` keeps the column on the LHS so the
-        // `(branch_uuid, written_at_micros)` index leg is reliably
-        // used for the range scan after partition pruning. The `$2 -
-        // written_at_micros > $3` form is semantically equivalent
-        // but not consistently sargable across PG planner versions.
+        // `written_at_micros < $1` keeps the column on the LHS so
+        // `idx_..._sds_age` is reliably used for the range scan. The
+        // `$1 - written_at_micros > $2` form is semantically
+        // equivalent but not consistently sargable across PG planner
+        // versions.
         let sql = format!(
-            "SELECT segment_delete_uuid, object_uri FROM {table} sds \
-             WHERE sds.branch_uuid = $1 \
-               AND sds.written_at_micros < $2 \
+            "SELECT object_uri FROM {table} sds \
+             WHERE sds.written_at_micros < $1 \
                AND NOT EXISTS (\
                  SELECT 1 FROM {seg_table} seg \
                  WHERE seg.object_uri = sds.object_uri\
@@ -362,63 +316,39 @@ impl LifecycleManager {
                AND NOT EXISTS (\
                  SELECT 1 FROM {seg_index_table} six \
                  WHERE six.object_uri = sds.object_uri\
-               ) \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {table} other \
-                 WHERE other.object_uri = sds.object_uri \
-                   AND other.written_at_micros >= $2\
                )",
             table = qi(&table),
             seg_table = qi(&seg_table),
             seg_index_table = qi(&seg_index_table),
         );
         let rows = driver
-            .execute_params(
-                &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::Int64(now_micros - query_timeout_micros),
-                ],
-            )
+            .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
             .await?;
         Ok(rows
             .iter()
-            .map(|r| {
-                (
-                    r.get::<Uuid, _>("segment_delete_uuid"),
-                    r.get::<String, _>("object_uri"),
-                )
-            })
+            .map(|r| r.get::<String, _>("object_uri"))
             .collect())
     }
 
-    /// Delete one `segment_delete_set` row by `(branch,
-    /// segment_delete_uuid)` PK. Called by the sweep only after the
-    /// cold-file delete succeeds — a transient cold-storage failure
-    /// leaves the row in place for the next sweep to retry.
+    /// Delete one `segment_delete_set` row by its `object_uri` PK.
+    /// Called by the sweep only after the cold-file delete succeeds —
+    /// a transient cold-storage failure leaves the row in place for
+    /// the next sweep to retry.
     ///
     /// 1 SQL query.
     pub async fn delete_segment_delete_set_row(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
-        branch_uuid: &str,
-        segment_delete_uuid: &str,
+        object_uri: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let table = naming::segment_delete_set_table(&catalog);
         let sql = format!(
-            "DELETE FROM {table} \
-             WHERE branch_uuid = $1 AND segment_delete_uuid = $2",
+            "DELETE FROM {table} WHERE object_uri = $1",
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(
-                &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(segment_delete_uuid)?,
-                ],
-            )
+            .execute_no_result_params(&sql, &[SqlValue::Text(object_uri.to_string())])
             .await?;
         Ok(())
     }

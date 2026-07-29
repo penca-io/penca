@@ -136,13 +136,11 @@ def _base_segment_tuples(catalog_uuid, branch_uuid, snapshot_uuid):
     return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
-def _delete_set_has_uri(catalog_uuid, branch_uuid, uri):
+def _delete_set_has_uri(catalog_uuid, uri):
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     rows = get_pg_driver().execute(
-        SQL("SELECT 1 FROM {tbl} WHERE branch_uuid = %s AND object_uri = %s").format(
-            tbl=Identifier(tbl)
-        ),
-        (branch_uuid, uri),
+        SQL("SELECT 1 FROM {tbl} WHERE object_uri = %s").format(tbl=Identifier(tbl)),
+        (uri,),
     )
     return len(rows) > 0
 
@@ -376,7 +374,7 @@ class TestRowUuidIndexCarryForwardAndGc:
             table_uuid,
             pa.table({"name": ["alice"], "value": [2]}, schema=USER_SCHEMA),
         )
-        assert _delete_set_has_uri(catalog_uuid, branch, sidecar_uri), (
+        assert _delete_set_has_uri(catalog_uuid, sidecar_uri), (
             "retiring the base segment must enqueue its built row_uuid sidecar"
             " uri into segment_delete_set"
         )

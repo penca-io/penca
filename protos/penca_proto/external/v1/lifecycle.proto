@@ -261,11 +261,13 @@ message PurgeTxLogResponse {}
 // no-op. A transient cold-storage failure leaves the corresponding
 // row in place for the next sweep to retry. ADR 0019 §"Four-part
 // mechanism" item 3 covers the design.
+// Catalog-scoped: `segment_delete_set` holds one row per cold file for the
+// whole catalog, and carry-forward makes a file reachable from any branch, so
+// the sweep's reference-count gate must see every branch at once (CHA-531).
 message SweepSegmentsRequest {
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
-  optional string branch_uuid = 5;
-  optional string branch_name = 6;
+  reserved 5, 6;  // branch_uuid / branch_name, removed in CHA-531
 }
 
 message SweepSegmentsResponse {}

@@ -340,14 +340,7 @@ where
     // `query_timeout` and still found the file.
     if !uris_to_defer_delete.is_empty() {
         let defer_uris: Vec<String> = uris_to_defer_delete.into_iter().collect();
-        LifecycleManager::insert_segment_delete_set_rows(
-            &tx,
-            &catalog_str,
-            &branch_str,
-            &table_str,
-            &defer_uris,
-        )
-        .await?;
+        LifecycleManager::insert_segment_delete_set_rows(&tx, &catalog_str, &defer_uris).await?;
     }
 
     tx.commit()

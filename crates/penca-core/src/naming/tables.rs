@@ -133,7 +133,9 @@ pub const COMPACT_SEGMENT_METADATA: &str = "compact_segment_metadata";
 /// query_timeout < now` and deletes the file then the row. Holds
 /// both persist-compact and snapshot-compact deferred deletes — no
 /// `kind` discriminator since the sweep only cares about
-/// `object_uri`.
+/// `object_uri`. Catalog-wide and keyed on `object_uri` alone
+/// (CHA-531): a queued delete is a fact about the file, and
+/// carry-forward lets one file be referenced from any branch.
 pub const SEGMENT_DELETE_SET: &str = "segment_delete_set";
 /// CHA-412 / ADR 0026 §5: the cold-index materialization metadata, split
 /// into a snapshot parent/child pair mirroring `table_snapshot_metadata`
@@ -333,10 +335,6 @@ pub fn table_snapshot_segment_metadata_partition(
     partition_name(catalog_uuid, branch_uuid, TABLE_SNAPSHOT_SEGMENT_METADATA)
 }
 
-pub fn segment_delete_set_partition(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> String {
-    partition_name(catalog_uuid, branch_uuid, SEGMENT_DELETE_SET)
-}
-
 pub fn compact_segment_metadata_partition(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> String {
     partition_name(catalog_uuid, branch_uuid, COMPACT_SEGMENT_METADATA)
 }
@@ -483,7 +481,6 @@ mod tests {
             table_snapshot_metadata_partition(&CAT, &BR),
             table_snapshot_segment_metadata_partition(&CAT, &BR),
             compact_segment_metadata_partition(&CAT, &BR),
-            segment_delete_set_partition(&CAT, &BR),
             table_snapshot_index_metadata_partition(&CAT, &BR),
             table_snapshot_segment_index_metadata_partition(&CAT, &BR),
             abort_seq_num_partition(&CAT, &BR),
