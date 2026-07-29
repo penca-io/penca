@@ -26,12 +26,18 @@ import re
 import time
 from uuid import uuid4
 
+import pytest
+
 from .integration_helpers import (
     SCALAR_BTREE,
     USER_SCHEMA,
     container_log,
     make_client,
 )
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 
 def _own_close_re(span: str) -> re.Pattern[str]:

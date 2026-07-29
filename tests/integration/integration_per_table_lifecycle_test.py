@@ -46,6 +46,7 @@ import time
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client.naming import (
     abort_tx_log_partition,
@@ -658,6 +659,9 @@ class TestPerTableLifecycle:
         )[0][0]
         assert abort_count == 1, "abort_tx_log row must survive per-table persist"
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_lock_serialization_per_table(self):
         """Persist's lock key is ``persist:{table_uuid}:{branch_uuid}``
         (ADR 0019 §"Lock scoping").

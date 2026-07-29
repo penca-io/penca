@@ -24,11 +24,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from .integration_helpers import (
     demo_catalog_names,
     make_client,
     reaped_demo_catalogs,
 )
+
+# The demo_ catalog prefix has more than one producer (audit_demo.py,
+# oltp_demo.py) and reaped_demo_catalogs deletes every match, so two of these
+# running concurrently reap each other's live catalog. They conflict only with
+# EACH OTHER, not with the stack, so one xdist worker is enough — `serial`
+# would hoist them onto the sequential phase that gates the whole recipe, and
+# the oltp demo is expensive.
+pytestmark = pytest.mark.xdist_group("demo_catalogs")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_PATH = _REPO_ROOT / "examples" / "oltp_demo.py"

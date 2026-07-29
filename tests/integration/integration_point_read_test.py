@@ -798,6 +798,9 @@ def _assert_ids_pushdown(since: int, context: str) -> None:
     )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestSqlPointLookupIdsPushdown:
     """CHA-426: point SQL statements restrict the read via the ids PK batch."""
 

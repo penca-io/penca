@@ -2166,6 +2166,9 @@ class TestWriteDataByUuidSchemaAgnostic:
         )
         assert result.num_rows == 0
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_write_data_by_uuid_resolves_table_metadata_once(self):
         """A by-``table_uuid`` WriteData must issue the SAME number of
         ``__penca_system__.tables`` merge SELECTs as a by-``table_uuid``

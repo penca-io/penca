@@ -37,6 +37,7 @@ Invocation: ``just integration-test cha368_filter_engine``.
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client.naming import upsert_log_table
 
@@ -130,6 +131,9 @@ def _count_exclusion_probes(pg, upsert_log: str) -> int:
 class TestSingleFilterEngine:
     """CHA-368: DataFusion is the sole user-filter engine; PG never filters."""
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_all_hot_resolve_reads_unfiltered_delta(self):
         """RT-1: an all-hot filtered read must make Postgres return the full
         visible hot delta (4 rows), not just the 2 that match ``value > 25``.
@@ -212,6 +216,9 @@ class TestSingleFilterEngine:
             f"got {result.num_rows} — the residual likely skipped later batches"
         )
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_mixed_read_retires_exclusion_probe(self):
         """RT-3: a mixed hot+cold read must not fire the hot exclusion probe
         (Query B). RED today: the 4-probe merge fires ``hot_exclusion_row_uuids``

@@ -1277,6 +1277,11 @@ class TestCompactPersistSegments:
         assert seal_states_after == seal_states_before
         assert csm_total_after == csm_total_before
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Heavy compaction against the pinned 2s QUERY_TIMEOUT_SECONDS: this
+    # timed out under more workers than cores. Cheap to serialize, and a
+    # queue flake costs a failed merge that only the queue can surface.
+    @pytest.mark.serial
     def test_cascade_seal_when_active_full_and_next_uncompacted_breaches(self):
         """Stall regression: with an active at ``max_segment_bytes`` and
         a near-max uncompacted segment leading input order, the wave
@@ -2602,6 +2607,11 @@ class TestChunkedPersistAndSnapshot:
             "chunk row_counts must sum to the input row count"
         )
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Heavy compaction against the pinned 2s QUERY_TIMEOUT_SECONDS: this
+    # timed out under more workers than cores. Cheap to serialize, and a
+    # queue flake costs a failed merge that only the queue can surface.
+    @pytest.mark.serial
     def test_persist_chunked_segments_compact_normally(self):
         """``compact_persist_segments`` over the chunk siblings produced
         by an oversized persist must NOT stall: the call returns, every

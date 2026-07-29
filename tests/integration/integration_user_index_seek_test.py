@@ -31,9 +31,14 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 
 from .integration_helpers import container_log, make_client, poll_log_for
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 # Proto ``IndexType`` value (common.proto): INDEX_TYPE_SCALAR_BTREE = 1.
 INDEX_TYPE_SCALAR_BTREE = 1

@@ -35,6 +35,7 @@ dev = [
     "matplotlib>=3.10.9",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
+    "pytest-xdist>=3.6",
     "ruff>=0.15.0",
     "streamlit>=1.58.0",
     "ty>=0.0.15",
@@ -103,3 +104,20 @@ unresolved-attribute = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["packages/penca-client/tests/unit", "packages/penca-proto/tests"]
+# The parallel/serial split selects on a bare string, so a typo'd mark
+# (`serail`) would otherwise degrade to a warning and drop a side-channel
+# reader into the `-n auto` phase — an intermittent race instead of an error.
+#
+# It must be the ini form. `addopts = ["--strict-markers"]` is inert on pytest
+# 9: the flag only appends to `override_ini`, but `Config.parse` builds
+# `_inicfg` from the command line before injecting `addopts`, and never
+# recomputes it — so the `MarkGenerator` check reads the unset default. The ini
+# key below is read from `_inicfg` and does fail collection.
+#
+# This does NOT guard the `-m` EXPRESSION — `-m "not serail"` silently matches
+# everything — which is why the recipe's phases must not both be allowed to
+# collect zero tests.
+strict_markers = true
+markers = [
+    "serial: tests that must run alone, outside the -n auto parallel phase. Two reasons, and only the first goes away with CHA-519: (a) the test reads a process-global side channel — container stdout via container_log/poll_log_for, or pg_stat_statements reset+count — which a concurrent worker pollutes; (b) the test deliberately parks or saturates servicer PG connections for a sustained portion of its run — an advisory lock or LOCK TABLE held across assertions, or a churn thread looping RPCs for the test duration — while asserting a bounded time or zero errors, so concurrent workers contending for the same servicer PG pool would make it flaky in both directions. A single bounded pair of concurrent RPCs is not this. Tests that merely conflict with EACH OTHER rather than with the whole stack do not belong here — pin those to one xdist worker with `xdist_group` instead (see the demo smoke tests).",
+]

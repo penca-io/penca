@@ -39,6 +39,10 @@ from .integration_helpers import (
 )
 from .integration_point_read_test import _sql_steps_via
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
+
 # name (PK) + a Utf8 non-PK column to index + an int64 payload.
 _SCHEMA = pa.schema(
     [

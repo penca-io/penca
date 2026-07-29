@@ -5487,6 +5487,9 @@ def _await_statement_cache_event(
     return window
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanReuse:
     """CHA-355: a statement query plans once — DoGet reuses the
@@ -5533,6 +5536,9 @@ class TestFlightSqlPlanReuse:
         )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestFlightSqlPlanReuseMiss:
     """CHA-355 cache-miss path. Not parametrized over `driver`: the
     two-connection ticket replay is below the ADBC/JDBC layer — both drivers
@@ -5741,6 +5747,9 @@ def _count_grpc_handler_closes(window: str, span_name: str, branch_uuid: str) ->
     )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestFlightSqlPlanningResolutionCount:
     """CHA-367: one Flight SQL SELECT must issue exactly 1 ``get_schema`` and

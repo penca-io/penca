@@ -133,6 +133,9 @@ class TestQueryService:
         assert response.table_uuid == table_uuid
         assert response.table_name == "name_resolve_table"
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_get_table_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_table by-name must issue the same number of
         ``__penca_system__.tables`` merge SELECTs as a get_table by-uuid.
@@ -200,6 +203,9 @@ class TestQueryService:
             f"table row (CHA-365 Layer A: carry it on ReadRequestScope and reuse)"
         )
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_get_schema_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_schema by-name must issue the same number of
         ``__penca_system__.schemas`` merge SELECTs as a get_schema by-uuid.
