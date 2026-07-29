@@ -467,11 +467,17 @@ impl LifecycleManager {
     /// not-yet-covered segments produce no carried row and are built fresh by
     /// the lifecycle (materialize-on-next-snapshot).
     ///
+    /// The prior sidecars are read from `source_branch_uuid` and the new rows
+    /// are written under `branch_uuid`, mirroring
+    /// [`Self::insert_carried_snapshot_segments`]. They differ on a fork's
+    /// first snapshot and are the same branch otherwise.
+    ///
     /// 1 SQL query (no-op on empty input). `pairs`: `(new_seg, prior_seg)`.
     pub async fn insert_carried_segment_indexes(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
         branch_uuid: &str,
+        source_branch_uuid: &str,
         new_parent_index_uuid: &str,
         index_slug: &str,
         pairs: &[(String, String)],
@@ -509,7 +515,7 @@ impl LifecycleManager {
              FROM UNNEST({new_seg_arr}, {new_sidecar_arr}, {prior_sidecar_arr}) \
                     AS n(new_seg, new_sidecar, prior_sidecar) \
              JOIN {table} old \
-               ON old.branch_uuid = $1 \
+               ON old.branch_uuid = $3 \
               AND old.segment_index_uuid = n.prior_sidecar \
               AND old.commit_micros IS NOT NULL \
              ON CONFLICT (branch_uuid, segment_index_uuid) DO UPDATE \
@@ -529,6 +535,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(branch_uuid)?,
                     SqlValue::uuid_str(new_parent_index_uuid)?,
+                    SqlValue::uuid_str(source_branch_uuid)?,
                 ],
             )
             .await?;

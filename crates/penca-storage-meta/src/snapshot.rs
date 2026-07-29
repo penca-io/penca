@@ -473,9 +473,18 @@ impl LifecycleManager {
     /// so carried rows ride the same two-phase visibility gate as written
     /// rows.
     ///
+    /// The prior rows are read from `source_branch_uuid` and the new
+    /// rows are written under `branch_uuid`. The two differ on a fork's
+    /// first snapshot, where the child references segments the parent
+    /// wrote; they are the same branch for an ordinary same-branch
+    /// carry-forward. Splitting them is what keeps a carried row in the
+    /// referencing branch's own partition — the `object_uri` still names
+    /// the branch that WROTE the file, so ownership is the column, not
+    /// the path.
+    ///
     /// One `UNNEST … JOIN` query: the three parallel spec arrays (new
     /// uuid, chunk_idx, prior uuid) join the segment table on the prior
-    /// uuid + `branch_uuid`. Deterministic new uuids
+    /// uuid + `source_branch_uuid`. Deterministic new uuids
     /// (`table_snapshot_segment_uuid(new_snap, chunk_idx)`) make the
     /// `ON CONFLICT DO UPDATE` crash-retry-idempotent, mirroring
     /// [`Self::insert_snapshot_segment`]. Inline `ARRAY[…]` literals (not
@@ -502,6 +511,7 @@ impl LifecycleManager {
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
         branch_uuid: &str,
+        source_branch_uuid: &str,
         table_snapshot_uuid: &str,
         specs: &[CarriedSegmentSpec],
     ) -> Result<()> {
@@ -526,14 +536,14 @@ impl LifecycleManager {
              (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, \
               table_uuid, chunk_idx, object_uri, \"offset\", length, \
               row_count, size_bytes, format, metadata, statistics) \
-             SELECT new.uuid, $1, old.branch_uuid, old.table_uuid, new.idx, \
+             SELECT new.uuid, $1, $2, old.table_uuid, new.idx, \
                     old.object_uri, old.\"offset\", old.length, old.row_count, \
                     old.size_bytes, old.format, old.metadata, old.statistics \
              FROM UNNEST({new_arr}, {idx_arr}, {prior_arr}) \
                   AS new(uuid, idx, old_uuid) \
              JOIN {table} old \
                ON old.table_snapshot_segment_uuid = new.old_uuid \
-              AND old.branch_uuid = $2 \
+              AND old.branch_uuid = $3 \
              ON CONFLICT (branch_uuid, table_snapshot_segment_uuid) DO UPDATE \
                 SET table_snapshot_uuid = EXCLUDED.table_snapshot_uuid, \
                     chunk_idx = EXCLUDED.chunk_idx, \
@@ -560,6 +570,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(table_snapshot_uuid)?,
                     SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::uuid_str(source_branch_uuid)?,
                 ],
             )
             .await?;

@@ -553,6 +553,9 @@ impl LifecycleManager {
             table_uuid: &table_uuid,
             catalog_str: &catalog_str,
             branch_str: &branch_str,
+            // IMPL-B (CHA-531) is what routes a fork's parent in here; until
+            // then every snapshot's baseline is its own branch.
+            source_branch_str: &branch_str,
             table_str: &table_str,
             snap_uuid: &snap_uuid,
             snap_str: &snap_str,
@@ -1143,10 +1146,15 @@ impl LifecycleManager {
             .iter()
             .map(|spec| spec.prior_seg_uuid_str.clone())
             .collect();
+        // The prior sidecars belong to the baseline snapshot, so they are read
+        // from the source branch: on a fork they live in the parent's partition,
+        // and looking in the child's would classify every carried segment as
+        // uncovered and read the base files back to rebuild sidecars that
+        // already exist.
         let existing = penca_storage_meta::LifecycleManager::list_segment_index_metadata(
             pool,
             ctx.catalog_str,
-            ctx.branch_str,
+            ctx.source_branch_str,
             &prior_segs,
         )
         .await?;
@@ -1250,6 +1258,7 @@ impl LifecycleManager {
                 pool,
                 ctx.catalog_str,
                 ctx.branch_str,
+                ctx.source_branch_str,
                 &user_parent,
                 &index.index_uuid,
                 pairs,
@@ -1447,6 +1456,7 @@ impl LifecycleManager {
                     pool,
                     ctx.catalog_str,
                     ctx.branch_str,
+                    ctx.source_branch_str,
                     ctx.snap_str,
                     &carried_specs,
                 )
@@ -1481,6 +1491,7 @@ impl LifecycleManager {
                     pool,
                     ctx.catalog_str,
                     ctx.branch_str,
+                    ctx.source_branch_str,
                     &parent_index_uuid,
                     "row_uuid",
                     &carry_pairs,
@@ -1632,6 +1643,12 @@ struct SnapshotWriteCtx<'a> {
     table_uuid: &'a Uuid,
     catalog_str: &'a str,
     branch_str: &'a str,
+    /// The branch whose prior snapshot supplies the carried baseline. Differs
+    /// from `branch_str` only on a fork's first snapshot, where the baseline is
+    /// the parent's; every carry-forward read (prior sidecar lookups) and every
+    /// carried-row JOIN sources from here, while the rows themselves are written
+    /// under `branch_str`.
+    source_branch_str: &'a str,
     table_str: &'a str,
     snap_uuid: &'a Uuid,
     snap_str: &'a str,
