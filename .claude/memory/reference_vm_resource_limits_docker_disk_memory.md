@@ -25,6 +25,12 @@ interact, so they live together.
   (~1 min/file). Safe for **subsets only** — see
   [[feedback_integration_suite_full_fresh_before_pr]] for why the full suite
   needs a fresh stack.
+- **Chunk the files DISJOINTLY — each file exactly once per stack.** Never
+  re-run the same test file against a persistent stack: fixed-name tests (e.g.
+  `branch_inheritance_read`) fail on the 2nd run with
+  `AlreadyExistsError: catalog name already in use`. That is a **false** failure
+  from state pollution, not a bug you introduced. `just penca-down` +
+  `penca-up` resets to a clean stack when you need to re-run one.
 - **`COMPOSE_PROJECT_NAME` is NOT in `docker/*.env`.** The Justfile *exports*
   it, so sourcing the env files alone leaves it unset and every test that reads
   it to fetch container logs dies with `KeyError: 'COMPOSE_PROJECT_NAME'`. Cost

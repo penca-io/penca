@@ -167,7 +167,7 @@ The `event` field controls the review type:
 gh api repos/{owner}/{repo}/pulls/{number}/reviews \
   --method POST \
   --field commit_id="<SHA>" \
-  --field event="REQUEST_CHANGES" \
+  --field event="COMMENT" \
   --field body="## Penca PR Review Summary
 
 <high-level summary of findings>" \

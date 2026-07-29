@@ -173,21 +173,29 @@ per-entry-point is how one driver's users get an actionable message and
 another's get an internal DataFusion error for the same mistake.
 
 - **Belongs in the validation module** — anything on the typed wire shape:
-  primary-key list dedup / membership / non-empty, retention-config bounds,
-  version-uuid format, `arrow_schema` field constraints, cross-field
-  references. `validation::write::validate_create_table` is the canonical
-  example; fold new per-field checks into the existing sibling rather than
-  adding a parallel one.
+  retention-config bounds, version-uuid format, `arrow_schema` field
+  constraints, supported column types, cross-field references.
+  `validation::write::validate_create_table` is the canonical example; fold
+  new per-field checks into the existing sibling rather than adding a
+  parallel one.
 - **Stays SQL-side** — anything sqlparser-syntactic with no gRPC equivalent:
   AST-flag rejections (`IF NOT EXISTS`, `OR REPLACE`, `INHERITS`, `STRICT`),
   `Expr::Identifier` checks in `PRIMARY KEY(...)` (sqlparser yields `Expr`,
   gRPC takes `Vec<String>`), 3-part name rejection, `DEFAULT`-clause
   rejection, and SQL-type → Arrow-type translator rejections.
+- **Moves down to the penca-api boundary** when the check must also protect
+  **in-process** callers, which never traverse the servicer. The primary-key
+  dedup / membership / non-empty checks sit in
+  `penca-api::write::create_table` for exactly this reason, and that
+  placement is deliberate — see the comment there. Both wire paths still get
+  identical wording, because both reach `create_table`.
 
-`penca-api::write::validate_create_table_primary_keys` is the legacy
-placement this rule corrects away from — don't copy it for new checks.
-Inventory the candidates before writing a fix; don't reflexively put
-validation where you happen to be editing.
+The two live side by side in `create_table` and the asymmetry is intentional:
+the column-type gate is enforced upstream in the validation module, so any
+future in-process caller must replicate the `CanonicalType::from_arrow` check
+itself, while the PK checks come along for free. Read that comment before
+"fixing" either one. Inventory the candidates before writing a fix; don't
+reflexively put validation where you happen to be editing.
 
 ## Proto messages as canonical types
 

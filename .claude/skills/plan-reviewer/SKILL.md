@@ -20,7 +20,9 @@ kata list --label cha-NNN --label plan-draft --json
 
 # Then per task:
 kata show <qualified_id> --json
-# → {issue: {title, body, labels, ...}, relationships: {blocked_by: [...], blocks: [...]}, ...}
+# → {kata_api_version, issue: {title, body, short_id, status, ...},
+#    labels: [{label, ...}], links: [{from:{short_id}, to:{short_id}, type}], comments}
+# NOTE: there is no `.relationships` key — blocked-by edges are in `.links[]`. See check 6.
 ```
 
 If the user supplies the `cha-NNN` slug directly, list with that label. Otherwise, derive it from the current branch name (`git rev-parse --abbrev-ref HEAD` → grep `cha-[0-9]+`).
