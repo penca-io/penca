@@ -1589,12 +1589,19 @@ mod tests {
         assert_eq!(snapshot, ReadSnapshot::LatestSeq(7_654_321));
     }
 
-    // A supplied `open_tx_uuid` that is not an open tx must ERROR, not fall
-    // through to `LatestSeq`. The downgrade is silently wrong data: reads inside
-    // an aborted or expired tx would resolve at committed-latest while the caller
-    // believes it is inside a transaction. `None` is the only legitimate
-    // fall-through — that means "no tx supplied", covered by the tests either
-    // side of this one.
+    // A supplied `open_tx_uuid` with no `begin_tx_log` row must ERROR, not fall
+    // through to `LatestSeq`. `None` is the only legitimate fall-through — that
+    // means "no tx supplied", covered by the tests either side of this one.
+    //
+    // This pins the row-absent inputs only: never begun, wrong branch, or ledger
+    // already GC'd. An aborted or expired tx does NOT reach here — its
+    // `begin_tx_log` row survives until Purge's grace window drops it
+    // (`purge_tx_log.rs`), so the bare `SELECT began_at_seq_num` still returns
+    // `Some` and resolution yields a live `OpenTx`. That arm is the more damaging
+    // one and it is pinned at the integration level instead
+    // (`test_read_with_aborted_tx_raises_failed_precondition`), because a stub
+    // driver cannot return a row here: sqlx `PgRow` is not constructible in a
+    // unit test — see `seq_frontier_from_counter` above.
     #[tokio::test]
     async fn resolve_read_snapshot_dead_open_tx_is_an_error() {
         let catalog = uuid::Uuid::nil().to_string();
