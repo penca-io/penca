@@ -22,8 +22,8 @@ use penca_core::naming::{
     table_snapshot_uuid,
 };
 use penca_core::{
-    ColdStoragePlan, CommittedAtBounds, Format, PersistPlan, PersistSegment, Plan, SnapshotPlan,
-    SnapshotSegment,
+    BaseColdStorage, ColdStoragePlan, CommittedAtBounds, Format, PersistPlan, PersistSegment, Plan,
+    SnapshotPlan, SnapshotSegment,
 };
 use penca_db::driver::pg::PgDriver;
 use penca_dl::driver::DlDriver;
@@ -471,32 +471,31 @@ impl LifecycleManager {
         //
         // Single-level only: `read_branch_lineage` returns one immediate parent
         // (CHA-509 tracks recursion, CHA-515 guards main-only forks).
-        let fork_base = if prev_snap_watermark.is_some() {
+        let fork_edge = if prev_snap_watermark.is_some() {
             None
         } else {
-            match self
-                .query_manager
+            self.query_manager
                 .read_branch_lineage(pool, &catalog_str, &branch_str)
                 .await?
-            {
-                Some((parent_branch_uuid, fork_commit_seq_num)) => {
-                    let base = self
-                        .query_manager
-                        .read_snapshot_segments_for_table(
-                            pool,
-                            &catalog_str,
-                            &parent_branch_uuid,
-                            &table_str,
-                            Some(snapshotted_at_micros),
-                            Some(fork_commit_seq_num),
-                            None,
-                        )
-                        .await?;
-                    base.snapshotted_at_micros
-                        .map(|_| (parent_branch_uuid, base))
-                }
-                None => None,
+        };
+        let fork_base = match &fork_edge {
+            Some((parent_branch_uuid, fork_commit_seq_num)) => {
+                let base = self
+                    .query_manager
+                    .read_snapshot_segments_for_table(
+                        pool,
+                        &catalog_str,
+                        parent_branch_uuid,
+                        &table_str,
+                        Some(snapshotted_at_micros),
+                        Some(*fork_commit_seq_num),
+                        None,
+                    )
+                    .await?;
+                base.snapshotted_at_micros
+                    .map(|_| (parent_branch_uuid.clone(), base))
             }
+            None => None,
         };
         // `source_branch` is the branch the carried rows are READ from; the new
         // rows are always written under `branch_str`. The two differ only here.
@@ -656,6 +655,37 @@ impl LifecycleManager {
             // reference, its touched ones stream and rewrite), derive the
             // touched set, split prior segments into the rewrite subset +
             // carried map, then stream-merge-pack the touched subset.
+            //
+            // CHA-531: the delta read is scoped to THIS branch's persist log,
+            // but the carried baseline is the parent's snapshot. Rows the
+            // parent persisted after that snapshot and before the fork sit in
+            // neither, so on a fork's first snapshot the parent's tail joins
+            // the delta as a base source — its partitions land in
+            // `delta_groups`, get marked touched, and are rewritten, while
+            // untouched ones stay carried.
+            //
+            // The parent's SNAPSHOT is dropped from that base source: it is the
+            // carried baseline here, not a merge input. Leaving it in would
+            // materialize the whole parent table into `delta_groups`, mark
+            // every partition touched, and defeat the ticket.
+            let base_cold = match &fork_edge {
+                Some((parent_branch_uuid, fork_commit_seq_num)) => self
+                    .query_manager
+                    .enumerate_base_cold_source(
+                        pool,
+                        &catalog_str,
+                        parent_branch_uuid,
+                        &table_str,
+                        snapshotted_at_micros,
+                        *fork_commit_seq_num,
+                    )
+                    .await?
+                    .and_then(|mut base| {
+                        base.cold.snapshot = None;
+                        base.cold.persist.is_some().then_some(base)
+                    }),
+                None => None,
+            };
             let (delta_groups, delete_segments, exclusion_set) = self
                 .resolve_windowed_delta(
                     pool,
@@ -668,6 +698,7 @@ impl LifecycleManager {
                     &merge_snapshot,
                     prev_snap_watermark,
                     snapshotted_at_micros,
+                    base_cold,
                 )
                 .await?;
 
@@ -880,6 +911,11 @@ impl LifecycleManager {
         merge_snapshot: &penca_merge::ReadSnapshot,
         prev_snap_watermark: Option<i64>,
         snapshotted_at_micros: i64,
+        // CHA-531: on a fork's first snapshot, the parent's post-snapshot
+        // persist tail (seq-capped at the fork) as a second source layered
+        // under this branch's own. `None` on every other snapshot, which keeps
+        // them byte-identical.
+        base_cold: Option<BaseColdStorage>,
     ) -> Result<
         (
             Vec<(Option<String>, RecordBatch)>,
@@ -930,7 +966,7 @@ impl LifecycleManager {
                 snapshot: None,
                 persist: persist_plan,
             }),
-            base_cold_storage: None,
+            base_cold_storage: base_cold,
         };
         let tiers = penca_merge::resolve_log_tiers(&penca_merge::MergeReadRequest {
             plan: &delta_plan,

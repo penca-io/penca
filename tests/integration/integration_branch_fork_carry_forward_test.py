@@ -69,6 +69,29 @@ def _storage_tuples(catalog_uuid, branch_uuid, snapshot_uuid):
     return {(r[0], r[1], r[2], r[3]) for r in rows}
 
 
+def _segment_row_count(catalog_uuid, branch_uuid, snapshot_uuid):
+    """Number of committed segment ROWS under one snapshot.
+
+    ``_storage_tuples`` returns a *set*, so two carried rows for the same
+    slice — distinct ``table_snapshot_segment_uuid``, identical storage
+    columns, which is exactly the shape ``insert_carried_snapshot_
+    segments`` produces — collapse into one element and a set-cardinality
+    assertion cannot see the duplicate. The read path dedupes on primary
+    key, so the content arm cannot see it either. Counting rows is the
+    only arm that excludes a double-carry.
+    """
+    seg_parent = f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT count(*) FROM {seg}"
+            " WHERE branch_uuid = %s AND table_snapshot_uuid = %s"
+            "   AND commit_micros IS NOT NULL"
+        ).format(seg=Identifier(seg_parent)),
+        (branch_uuid, snapshot_uuid),
+    )
+    return int(rows[0][0])
+
+
 def _make_env():
     """Catalog + schema + partitioned table on ``main``."""
     client = make_client()
@@ -94,10 +117,14 @@ def _make_env():
     return client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid
 
 
-def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
-    """One write cycle on a branch: mutate → commit → persist → snapshot.
+def _write_and_persist(
+    client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts
+):
+    """mutate → commit → persist, stopping short of a snapshot.
 
-    Returns the resulting snapshot uuid.
+    Split out of ``_cycle`` so a test can leave a branch with a persist
+    tail its last snapshot does not cover — the state a fork must still
+    inherit (CHA-531).
     """
     tx = client.begin_tx(
         catalog_uuid=catalog_uuid,
@@ -117,6 +144,21 @@ def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upsert
         schema_uuid=schema_uuid,
         branch_uuid=branch_uuid,
         table_uuid=table_uuid,
+    )
+
+
+def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
+    """One write cycle on a branch: mutate → commit → persist → snapshot.
+
+    Returns the resulting snapshot uuid.
+    """
+    _write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=branch_uuid,
+        upserts=upserts,
     )
     response = client.snapshot(
         catalog_uuid=catalog_uuid,
@@ -233,13 +275,15 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
     # files but still pays O(table) bytes" outcome this test exists to
     # catch, so pin the counts, not just the sets.
     assert len(child_tuples) == 3, (
-        "the child's snapshot must hold exactly three segment rows (bob and"
-        " carol carried, alice rewritten); extra rows mean untouched"
+        "the child's snapshot must hold exactly three storage slices (bob and"
+        " carol carried, alice rewritten); extra slices mean untouched"
         f" partitions were re-materialized as well: {sorted(child_tuples)}"
     )
-    assert len(rewritten) == 1, (
-        "exactly one partition (alice) was touched, so exactly one segment"
-        f" row may be freshly written: {sorted(rewritten)}"
+    assert _segment_row_count(catalog_uuid, child_branch, snap_child) == 3, (
+        "the child's snapshot must hold exactly three segment ROWS. The set"
+        " assertion above cannot see a partition that is carried twice (two"
+        " rows, one storage slice), which is the one row-cardinality defect a"
+        " first-cut carry-forward is most likely to produce."
     )
 
     # (iv) Content: the child sees its own alice plus the inherited
@@ -262,3 +306,82 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         table_uuid=table_uuid,
         branch_uuid=main_branch,
     ) == [("alice", 1), ("bob", 2), ("carol", 3)]
+
+
+def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
+    """The parent persists ``dave`` WITHOUT snapshotting, then the fork is
+    taken. ``dave`` sits in neither the carried baseline (the parent's
+    older snapshot) nor the child's own persist log, so the child's first
+    snapshot must fold the parent's post-snapshot tail into its delta or
+    the row is silently lost.
+
+    This is the correctness hole that carrying the parent's snapshot as a
+    baseline opens: before the change the child took the full-rewrite
+    path, whose ``base_cold_storage`` fold picked the tail up for free.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+
+    _cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    # The tail: committed and persisted on the parent, never snapshotted.
+    _write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table({"name": ["dave"], "value": [4]}, schema=USER_SCHEMA),
+    )
+
+    child_branch = client.create_branch(
+        f"fcf_tail_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-531",
+    ).branch_uuid
+
+    _cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+        upserts=pa.table({"name": ["alice"], "value": [99]}, schema=USER_SCHEMA),
+    )
+
+    # Read AFTER the child's own snapshot: the child's baseline now covers
+    # the fork, so the read path stops folding the parent's cold source
+    # (the CHA-178 read gate) and the answer comes from the child's
+    # snapshot alone. That is what makes this a snapshot-write assertion
+    # rather than a read-path one.
+    assert _read_pairs(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+    ) == [("alice", 99), ("bob", 2), ("carol", 3), ("dave", 4)], (
+        "the child's first snapshot dropped the parent's persisted-but-not-"
+        "snapshotted rows: they are in neither the carried baseline nor the"
+        " child's own persist log, so the fork's delta must fold the parent's"
+        " post-snapshot tail (seq-capped at the fork edge)."
+    )
+
+    # The parent keeps its own view — the fork neither snapshotted on its
+    # behalf nor consumed its tail.
+    assert _read_pairs(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+    ) == [("alice", 1), ("bob", 2), ("carol", 3), ("dave", 4)]
