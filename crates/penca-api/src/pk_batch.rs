@@ -1,4 +1,4 @@
-//! Canonical PK-batch decode / validate / derive kernel (CHA-398).
+//! Canonical PK-batch decode / validate / derive kernel.
 //!
 //! One Arrow IPC wire shape is shared by `Change.deletes` (write path)
 //! and `ReadDataRequest.ids` / `AuditDataRequest.ids` (read paths): a
@@ -73,9 +73,7 @@ fn validate_pk_batch_schema(
 
 /// Reject null values in PK columns — a NULL renders as `""` under
 /// arrow display and would mint a row identity colliding with a
-/// genuinely-empty-string key. Shared by the validated-batch entry
-/// points and the upsert path (which selects PK columns by name from
-/// user-shape batches rather than validating a PK-only batch).
+/// genuinely-empty-string key.
 pub(crate) fn ensure_no_null_pks(
     pk_columns: &[&dyn arrow::array::Array],
     primary_keys: &[String],
@@ -127,11 +125,10 @@ pub(crate) fn row_uuid_for_row(
     Ok(naming::row_uuid_for_pk(table_uuid, &pk_refs))
 }
 
-/// The `ids` request-field gate shared by `read_data` and
-/// `plan_audit`: empty bytes = no restriction (`None`), anything else
-/// decodes through [`row_uuids_from_pk_ipc`] with the `"ids"` field
-/// label (this gate is ids-specific by construction — the write path's
-/// `deletes` field has no empty-means-unrestricted semantics).
+/// The `ids` request-field gate shared by `read_data` and `plan_audit`: empty
+/// bytes = no restriction (`None`), anything else decodes through
+/// [`row_uuids_from_pk_ipc`]. Ids-specific by construction — the write path's
+/// `deletes` field has no empty-means-unrestricted semantics.
 pub(crate) fn optional_row_uuids(
     ids_bytes: &[u8],
     table_uuid: &Uuid,

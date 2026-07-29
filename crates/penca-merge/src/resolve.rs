@@ -61,12 +61,11 @@ pub(crate) fn extract_committed_at_bounds(
     }
 }
 
-/// CHA-429: the per-row `commit_seq_num <= N` upper bound the cold merge SQL
-/// must apply for a seq-axis read. `AsOfSeq` carries one (`<= N`); `OpenTx`
-/// carries `began_at_seq_num - 1` (CHA-444: snapshot isolation moved to the
-/// read side after Persist's `oldest_open_began_at` write-time clamp was
-/// dropped — see [`ReadSnapshot::plan_commit_seq_upper`]); `AsOfMicros` folds
-/// its visibility into the committed_at window, so it has none.
+/// The per-row `commit_seq_num <= N` upper bound the cold merge SQL must apply
+/// for a seq-axis read. `AsOfSeq` carries one (`<= N`); `OpenTx` carries
+/// `began_at_seq_num - 1` (snapshot isolation is enforced read-side — see
+/// [`ReadSnapshot::plan_commit_seq_upper`]); `AsOfMicros` folds its visibility
+/// into the committed_at window, so it has none.
 ///
 /// Same bound the planner uses to skip whole cold segments
 /// ([`ReadSnapshot::plan_commit_seq_upper`]) — the per-row filter here and
@@ -75,11 +74,11 @@ pub(crate) fn cold_commit_seq_upper(snapshot: &ReadSnapshot) -> Option<i64> {
     snapshot.plan_commit_seq_upper()
 }
 
-/// CHA-443 (IMPL-5): fold the cold-tier seq fence `W_persist`
+/// Fold the cold-tier seq fence `W_persist`
 /// (`PersistPlan.commit_seq.max_seq`) together with the `AsOfSeq` visibility
-/// cap into a single inclusive `commit_seq_num <= N` bound, `min` of the two. The
-/// tier fence (cold serves `commit_seq_num <= W_persist`) replaces the old
-/// `committed_at < hot_min` cold upper; the as-of cap is the seq-axis time
+/// cap into a single inclusive `commit_seq_num <= N` bound, `min` of the two.
+/// The tier fence means cold serves `commit_seq_num <= W_persist`; the as-of
+/// cap is the seq-axis time
 /// travel. Either may be absent (e.g. the snapshot-write path carries no
 /// `commit_seq`, an `AsOfMicros` read carries no as-of seq); `None` for both
 /// leaves the cold read unbounded above on the seq axis (the committed_at
@@ -115,9 +114,8 @@ pub(crate) async fn resolve_hot<D: DbDriver<Row = PgRow>>(
     };
 
     let (_min, hot_max) = extract_committed_at_bounds(hot_plan.committed_at.as_ref());
-    // CHA-443 (IMPL-5): the hot↔cold tier fence is now the seq lower
-    // `commit_seq_num > W_persist` carried on `commit_seq.min_seq` (not the old
-    // `committed_at > hot_min`). `None` pre-Persist.
+    // The hot↔cold tier fence is the seq lower `commit_seq_num > W_persist`,
+    // carried on `commit_seq.min_seq`. `None` pre-Persist.
     let tier_seq_lower = hot_plan.commit_seq.and_then(|c| c.min_seq);
     if let Some(w) = tier_seq_lower {
         tracing::Span::current().record("hot_tier_seq_lower", w);
@@ -136,8 +134,7 @@ pub(crate) async fn resolve_hot<D: DbDriver<Row = PgRow>>(
 
     // Non-cursor one-shot: the next step (dedup by `row_uuid`) needs the
     // full resolved set in memory, so the cursor's per-batch round-trips
-    // would be pure overhead. Mirrors the Python `_resolve_hot` shape
-    // (`packages/penca/src/penca/lib/merge/read.py`).
+    // would be pure overhead.
     let batch = execute_query_as_batch(driver, &sql, &[], &out_schema).await?;
     tracing::Span::current().record("resolved_rows", batch.num_rows() as i64);
     Ok(batch)
@@ -151,9 +148,8 @@ pub(crate) async fn resolve_hot<D: DbDriver<Row = PgRow>>(
         resolved_rows = tracing::field::Empty,
     ),
 )]
-// CHA-429 added the `commit_seq_upper` cold seq bound; CHA-368 dropped the user
-// filter (now a shared post-dedup residual). The remaining cold-read param set
-// (plan + dl + schemas + committed_at/seq bounds) is irreducible here.
+// The cold-read param set (plan + dl + schemas + committed_at/seq bounds) is
+// irreducible here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_cold<L: DlDriver + ?Sized>(
     plan: &Plan,
@@ -178,19 +174,18 @@ pub(crate) async fn resolve_cold<L: DlDriver + ?Sized>(
         persist_committed_at.is_some(),
     );
 
-    // CHA-352: snapshot-only cold plan (no persist segments) — the cold
-    // resolution query would scan empty `upsert_log`/`delete_log` and
-    // return nothing, yet still pays a fresh DataFusion SessionContext
-    // build + query plan (~6 ms). Skip it. The persist tier is all this
-    // query covers; snapshot rows are read separately via
-    // `scan_snapshot`.
+    // Snapshot-only cold plan (no persist segments): the cold resolution query
+    // would scan empty `upsert_log`/`delete_log` and return nothing, yet still
+    // pay a fresh DataFusion SessionContext build + query plan (~6 ms). This
+    // query only covers the persist tier; snapshot rows are read separately
+    // via `scan_snapshot`.
     if cold_plan.persist.is_none() {
         tracing::Span::current().record("resolved_rows", 0i64);
         return Ok(RecordBatch::new_empty(out_schema));
     }
 
     let (committed_from, committed_to) = extract_committed_at_bounds(persist_committed_at);
-    // CHA-443 (IMPL-5): fold the cold tier upper `W_persist` into the seq bound.
+    // Fold the cold tier upper `W_persist` into the seq bound.
     let tier_seq_upper = cold_plan
         .persist
         .as_ref()
@@ -214,16 +209,15 @@ pub(crate) async fn resolve_cold<L: DlDriver + ?Sized>(
 /// Union two resolved batches (hot + cold) and keep the row with the
 /// latest `commit_micros` per `row_uuid`.
 ///
-/// CHA-429 moved every *within-tier* ordering site onto `commit_seq_num`, but
-/// this *cross-tier* dedup intentionally still keys on
-/// `commit_micros`. It is correct: the hot/cold partition is strict
-/// on `commit_micros` (cold serves `< hot_min`, hot serves `>=
-/// hot_min` — ADR 0019 / CHA-233), so no `committed_at`/`seq` inversion can
-/// straddle the tier boundary, and the resolved batch carries no
-/// `commit_seq_num` column to key on anyway. The within-tier ties that
-/// motivated the seq move (same `commit_micros`, different `commit_seq_num`)
-/// only occur *inside* a tier, where the per-tier merge SQL already broke
-/// them on `commit_seq_num`.
+/// Every *within-tier* ordering site keys on `commit_seq_num`, but this
+/// *cross-tier* dedup intentionally keys on `commit_micros`. It is correct:
+/// the hot/cold partition is strict on `commit_micros` (cold serves
+/// `< hot_min`, hot serves `>= hot_min` — ADR 0019), so no
+/// `committed_at`/`seq` inversion can straddle the tier boundary, and the
+/// resolved batch carries no `commit_seq_num` column to key on anyway. The
+/// ties that motivate keying on seq (same `commit_micros`, different
+/// `commit_seq_num`) only occur *inside* a tier, where the per-tier merge SQL
+/// already broke them on `commit_seq_num`.
 pub(crate) fn union_latest(
     schema: &SchemaRef,
     a: &RecordBatch,
@@ -242,14 +236,14 @@ pub(crate) fn union_latest(
     dedup_by_row_uuid(&combined)
 }
 
-/// Keep only the live (`is_delete = false`) rows of a resolved batch (CHA-368).
+/// Keep only the live (`is_delete = false`) rows of a resolved batch.
 ///
 /// The dropped tombstones have already contributed their `row_uuid` to the
-/// exclusion set upstream, so this only trims the emitted delta. This also
-/// makes the CHA-444 hot-shadows-cold gap moot by construction: the resolves
-/// are unfiltered, so `union_latest` always sees the newer hot version and
-/// keeps it (higher `commit_micros` by the tier fence); the residual then drops
-/// it if the filter excludes it — no stale cold version can survive.
+/// exclusion set upstream, so this only trims the emitted delta. A stale cold
+/// version can never survive here: the resolves are unfiltered, so
+/// `union_latest` always sees the newer hot version and keeps it (higher
+/// `commit_micros` by the tier fence), and the residual then drops it if the
+/// filter excludes it.
 pub(crate) fn filter_live_rows(batch: &RecordBatch) -> Result<RecordBatch, MergeError> {
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
@@ -263,21 +257,17 @@ pub(crate) fn filter_live_rows(batch: &RecordBatch) -> Result<RecordBatch, Merge
     Ok(compute::filter_record_batch(batch, &keep)?)
 }
 
-/// Fan out the four tier probes (hot/cold × resolve/exclusion), union
-/// the two resolved batches by latest `commit_micros` per
-/// `row_uuid`, and fold every shadowing `row_uuid` into the exclusion
-/// set. Returns the resolved batch + the exclusion set used to filter
-/// the snapshot stream in Phase 3.
+/// Fan out the per-tier resolves, union the two resolved batches by latest
+/// `commit_micros` per `row_uuid`, and fold every shadowing `row_uuid` into
+/// the exclusion set. Returns the resolved batch + the exclusion set used to
+/// filter the snapshot stream in Phase 3.
 ///
-/// CHA-368: `resolve_hot` and `resolve_cold` each return the latest committed
-/// version per `row_uuid` across BOTH logs — visible upserts (`is_delete =
-/// false`) and winning tombstones (`is_delete = true`). Their cross-tier
-/// latest-wins union yields one row per touched `row_uuid`; the full `row_uuid`
-/// set of that union IS the exclusion set (it shadows same-uuid snapshot rows),
-/// and the `is_delete = false` subset is the live delta. This retires the two
-/// Query-B exclusion probes (one scan per tier now) and, with them, the CHA-352
-/// empty-hot gate — there is no longer a cheap probe to gate `resolve_hot` on
-/// (its cost at zero rows is measured in the CHA-368 follow-up).
+/// `resolve_hot` and `resolve_cold` each return the latest committed version
+/// per `row_uuid` across BOTH logs — visible upserts (`is_delete = false`) and
+/// winning tombstones (`is_delete = true`). Their cross-tier latest-wins union
+/// yields one row per touched `row_uuid`; the full `row_uuid` set of that union
+/// IS the exclusion set (it shadows same-uuid snapshot rows), and the
+/// `is_delete = false` subset is the live delta.
 #[tracing::instrument(
     skip_all,
     fields(
@@ -306,9 +296,8 @@ where
     let resolved_schema_ref = resolved_schema(user_schema);
     let commit_seq_upper = cold_commit_seq_upper(snapshot);
 
-    // One scan per tier — no separate exclusion probes, no empty-hot gate. Arm
-    // order is load-bearing for failure attribution (errors surface in arm
-    // order): hot then cold.
+    // One scan per tier. Arm order is load-bearing for failure attribution
+    // (errors surface in arm order): hot then cold.
     let (hot_a, cold_a) = tokio::try_join!(
         resolve_hot(plan, driver, user_cols, user_schema, snapshot, row_uuids),
         resolve_cold(
@@ -336,7 +325,7 @@ where
 }
 
 /// Compose the hot + cold resolved batches into the `(live delta, exclusion
-/// set)` pair (CHA-368). Shared by the mixed and all-cold builders, which differ
+/// set)` pair. Shared by the mixed and all-cold builders, which differ
 /// only in how they obtain `hot_a`/`cold_a` (the mixed path fans out both
 /// probes; the all-cold path passes an empty `hot_a`).
 ///
@@ -344,7 +333,7 @@ where
 /// `row_uuid` carrying the winner's `is_delete` flag. From that composed batch:
 /// the **exclusion set** is EVERY touched `row_uuid` (upsert-winner or
 /// tombstone-winner — each shadows a same-uuid snapshot row), derived BEFORE any
-/// residual so it stays filter-independent (CHA-142); the **live delta** is the
+/// residual so it stays filter-independent; the **live delta** is the
 /// surviving `is_delete = false` rows (tombstones only contributed their
 /// `row_uuid` to the exclusion set).
 fn compose_resolved_and_exclusion(
@@ -359,21 +348,18 @@ fn compose_resolved_and_exclusion(
 }
 
 /// Cold-only sibling of [`build_resolved_and_exclusion_set`] for plans
-/// with no hot tier (`plan.hot_storage == None`): the cold resolve and
-/// the cold exclusion probe run concurrently, the resolved batch is
-/// deduped by latest `commit_micros` per `row_uuid`, and every
-/// shadowing `row_uuid` is folded into the exclusion set. No hot probe
-/// appears in the flow. Arm order in the `try_join!` is load-bearing
-/// for failure attribution (errors surface in arm order), matching the
-/// merged path.
+/// with no hot tier (`plan.hot_storage == None`): the resolved batch is
+/// deduped by latest `commit_micros` per `row_uuid`, and every shadowing
+/// `row_uuid` is folded into the exclusion set. No hot probe appears in
+/// the flow.
 ///
 /// `snapshot` supplies the read-time seq upper bound
 /// ([`cold_commit_seq_upper`]) — for the lifecycle snapshot writer's
 /// `AsOfMicros` read it folds to `None` (cold visibility is decided by the
-/// plan's persist `committed_at` window), but CHA-441 made `read_data` route
-/// fully-cold user reads here, so an `OpenTx` (`began_at_seq_num - 1`) or
-/// `AsOfSeq` read must thread its per-row seq cutoff exactly as the mixed path
-/// does — otherwise a row committed after an open tx began would leak from cold.
+/// plan's persist `committed_at` window). `read_data` routes fully-cold user
+/// reads here too, so an `OpenTx` (`began_at_seq_num - 1`) or `AsOfSeq` read
+/// must thread its per-row seq cutoff exactly as the mixed path does —
+/// otherwise a row committed after an open tx began would leak from cold.
 #[tracing::instrument(
     skip_all,
     fields(
@@ -397,18 +383,14 @@ where
 {
     let resolved_schema_ref = resolved_schema(user_schema);
 
-    // CHA-441: thread the read-time seq upper into the cold resolve exactly as
-    // the mixed path (`build_resolved_and_exclusion_set`) does. `AsOfMicros`
-    // (lifecycle snapshot writer) folds to `None` — no seq-axis bound, cold
-    // visibility rides the plan's `committed_at` window. `OpenTx` /  `AsOfSeq`
-    // reads, now routed here by the CHA-441 hot existence gate, carry their
-    // `commit_seq_num <=` cutoff so a post-`began_at` commit can't leak from cold.
+    // Thread the read-time seq upper into the cold resolve exactly as the mixed
+    // path (`build_resolved_and_exclusion_set`) does. `AsOfMicros` (lifecycle
+    // snapshot writer) folds to `None` — no seq-axis bound, cold visibility
+    // rides the plan's `committed_at` window. `OpenTx` / `AsOfSeq` reads carry
+    // their `commit_seq_num <=` cutoff so a post-`began_at` commit can't leak
+    // from cold.
     let commit_seq_upper = cold_commit_seq_upper(snapshot);
 
-    // CHA-368: one cold scan — the resolve returns the latest committed version
-    // per row_uuid across both cold logs (upserts + tombstones, is_delete
-    // flagged), so the exclusion set falls out of its row_uuid set and the live
-    // delta is the is_delete = false subset. No separate cold exclusion probe.
     let cold_a = resolve_cold(
         plan,
         dl,
@@ -466,7 +448,7 @@ fn dedup_by_row_uuid(batch: &RecordBatch) -> Result<RecordBatch, MergeError> {
 mod tests {
     use super::fold_cold_seq_upper;
 
-    // CHA-443 (IMPL-5): the cold seq upper folds the tier fence `W_persist`
+    // The cold seq upper folds the tier fence `W_persist`
     // with the `AsOfSeq` visibility cap into one inclusive `<= min(..)` bound.
     #[test]
     fn fold_cold_seq_upper_takes_min_when_both_present() {

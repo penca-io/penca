@@ -43,8 +43,6 @@ from psycopg.pq import Format
 from psycopg.sql import Composable
 from psycopg_pool import ConnectionPool
 
-# ── Postgres driver (white-box test access) ───────────────────────────
-
 
 class DbDriver(ABC):
     """Executes queries against a transactional database."""
@@ -324,9 +322,6 @@ class _PsycopgTxDriver(DbDriver):
         pass
 
 
-# ── Test helpers ──────────────────────────────────────────────────────
-
-# Common test schema
 USER_SCHEMA = pa.schema(
     [
         pa.field("name", pa.utf8()),
@@ -656,8 +651,6 @@ def lookup_data_log_prefix_uuid(branch_uuid: str, table_uuid: str) -> str:
     return row_uuid_for_pk(table_uuid, [branch_uuid])
 
 
-# ── pg_stat_statements white-box counters (CHA-365) ───────────────────
-#
 # The metadata-resolution amplification CHA-365 fixes is invisible at the
 # gRPC wire (responses are byte-identical) — the only observable is how
 # many ``__penca_system__.{tables,schemas}`` merge SELECTs a single RPC

@@ -26,11 +26,7 @@ if _version_not_supported:
 
 
 class LifecycleServiceStub(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -96,11 +92,7 @@ class LifecycleServiceStub(object):
 
 
 class LifecycleServiceServicer(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def Persist(self, request, context):
         """Persists a single table's committed hot data into cold storage.
@@ -169,7 +161,7 @@ class LifecycleServiceServicer(object):
     def ListModifiedTables(self, request, context):
         """Enumerates `table_uuid`s touched by committed transactions on a branch
         within a `modified_at` window — the scheduler's per-tick dirty-table
-        discovery (CHA-445; formerly on StorageMetadataService).
+        discovery.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -178,7 +170,7 @@ class LifecycleServiceServicer(object):
     def ListPersistedTables(self, request, context):
         """Enumerates `table_uuid`s with a committed `table_persist_metadata` row in
         a `persisted_at` window — drives the scheduler's per-tick Purge
-        enumeration (CHA-445).
+        enumeration.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -277,11 +269,7 @@ def add_LifecycleServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class LifecycleService(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def Persist(request,

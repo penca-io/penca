@@ -1,12 +1,11 @@
-//! CHA-485 / CHA-492: covering-index seek selection — map a read's equality
-//! bindings onto the user secondary indexes declared for the plan's snapshot,
-//! producing internal `seeks` entries (never on the proto).
+//! Covering-index seek selection — map a read's equality bindings onto the
+//! user secondary indexes declared for the plan's snapshot, producing internal
+//! `seeks` entries (never on the proto).
 //!
-//! CHA-492 rewires the *source* of the bindings: the covering-index equalities
-//! now arrive as structured `ReadDataRequest.indexes` wire tuples (decoded +
-//! validated against the DEFINED index set by [`decode_index_seek`]), not a
-//! re-parse of the SQL `filter` string. [`select_from_bindings`] then matches
-//! those bindings against the snapshot's MATERIALIZED indexes:
+//! Equalities arrive as structured `ReadDataRequest.indexes` wire tuples,
+//! decoded and validated against the DEFINED index set by
+//! [`decode_index_seek`]. [`select_from_bindings`] matches those bindings
+//! against the snapshot's MATERIALIZED indexes:
 //!
 //! - a MATERIALIZED index (in `snapshot_plan.indexes`) becomes a seek entry —
 //!   a pure accelerator riding the snapshot scan as *selection* (the residual
@@ -30,21 +29,21 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-/// The decoded structured `ReadDataRequest.indexes` seek (CHA-492): the
-/// per-column equality bindings that feed [`select_from_bindings`], plus the
-/// SQL residual carrying the same equality into the merge fallback (and the
-/// sole restriction when the index is defined but not yet materialized).
+/// The decoded structured `ReadDataRequest.indexes` seek: the per-column
+/// equality bindings that feed [`select_from_bindings`], plus the SQL residual
+/// carrying the same equality into the merge fallback (and the sole
+/// restriction when the index is defined but not yet materialized).
 #[derive(Debug)]
 pub(crate) struct DecodedIndexSeek {
     pub(crate) bindings: HashMap<String, Vec<String>>,
     pub(crate) residual: String,
 }
 
-/// Decode + validate the wire `ReadDataRequest.indexes` seek batch (CHA-492),
-/// pre-plan. The batch's columns are index-key columns carrying the equality
-/// values; they may span the UNION of several covering indexes (CHA-485
-/// multi-index), and column ORDER is not significant — `select_from_bindings`
-/// binds by name and orders each probe by the index's own declared key columns.
+/// Decode + validate the wire `ReadDataRequest.indexes` seek batch, pre-plan.
+/// The batch's columns are index-key columns carrying the equality values;
+/// they may span the UNION of several covering indexes, and column ORDER is
+/// not significant — `select_from_bindings` binds by name and orders each
+/// probe by the index's own declared key columns.
 /// Rejected with `InvalidRequest` when: the IPC is malformed; a column belongs
 /// to NO defined index; a column's type disagrees with the table schema; a
 /// value is null; or the batch nets zero rows. On success returns the equality
@@ -82,13 +81,12 @@ pub(crate) fn decode_index_seek(
 
     let schema = batch.schema();
     let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-    // Every batch column must belong to SOME defined index (the batch may be
-    // the UNION of several covered indexes' key columns — CHA-485 multi-index —
-    // so an exact per-index column-set match is too strict), but the columns
-    // need NOT reproduce one index's exact set or key ORDER: select_from_bindings
-    // binds by name and orders each probe by that index's declared key columns.
-    // Materialized-vs-not is classified later; a column in no defined index is
-    // an undefined seek, rejected here pre-plan.
+    // Every batch column must belong to SOME defined index. An exact
+    // per-index column-set match would be too strict: the batch may be the
+    // UNION of several covered indexes' key columns, and need reproduce
+    // neither one index's exact set nor its key ORDER. Materialized-vs-not is
+    // classified later; a column in no defined index is an undefined seek and
+    // is rejected here, pre-plan.
     let defined_columns: HashSet<&str> = defined_indexes
         .iter()
         .flat_map(|ix| ix.columns.iter().map(String::as_str))
@@ -219,13 +217,13 @@ fn sql_literal(value: &str, data_type: &DataType) -> String {
     }
 }
 
-/// CHA-485: select covering user indexes for `filter` by re-parsing the SQL
-/// fragment — the gRPC path that carries a `filter` but NO structured `indexes`
-/// batch (e.g. an `ids`-restricted read with a covering filter). The SQL query
-/// path now sends wire `indexes` tuples instead ([`decode_index_seek`] +
-/// [`select_from_bindings`]); this re-parse is retained ONLY for callers that
-/// don't populate `indexes`. Empty when nothing covers. `max_probe_tuples == 0`
-/// is the operator kill switch (honored before the parse).
+/// Select covering user indexes for `filter` by re-parsing the SQL fragment.
+/// For callers that carry a `filter` but NO structured `indexes` batch (e.g. a
+/// gRPC `ids`-restricted read with a covering filter) — the SQL query path
+/// sends wire tuples and goes through [`decode_index_seek`] +
+/// [`select_from_bindings`] instead. Empty when nothing covers.
+/// `max_probe_tuples == 0` is the operator kill switch, honored before the
+/// parse.
 pub(crate) async fn select_index_seeks<L: DlDriver + ?Sized>(
     dl: &L,
     filter: &str,
@@ -239,9 +237,9 @@ pub(crate) async fn select_index_seeks<L: DlDriver + ?Sized>(
     let bindings = equality_bindings(dl, filter, user_schema).await;
     let entries = select_from_bindings(&bindings, snapshot, max_probe_tuples);
     if !entries.is_empty() {
-        // The acceptance marker the integration suite scrapes
-        // (integration_user_index_seek_test.py): one event per read that
-        // selected covering indexes, entry count as a bare-int field.
+        // Scraped by tests/integration/integration_user_index_seek_test.py —
+        // one event per read that selected covering indexes, entry count as a
+        // bare-int field. The field names are a test contract.
         tracing::debug!(
             index_seek = true,
             index_seek_entries = entries.len(),
@@ -252,9 +250,8 @@ pub(crate) async fn select_index_seeks<L: DlDriver + ?Sized>(
     entries
 }
 
-/// The pure matching policy: which declared indexes are fully bound, and
-/// their probe tuples. Fed the CHA-492 wire bindings (or the CHA-485 filter
-/// re-parse); split out for direct unit testing (no session, no IO).
+/// The pure matching policy: which declared indexes are fully bound, and their
+/// probe tuples. Split out for direct unit testing (no session, no IO).
 pub(crate) fn select_from_bindings(
     bindings: &HashMap<String, Vec<String>>,
     snapshot: &SnapshotPlan,
@@ -271,8 +268,8 @@ pub(crate) fn select_from_bindings(
     // winner-picking are the profile-gated follow-up.
     let mut seen_key_sets: HashSet<Vec<String>> = HashSet::new();
     let mut entries: Vec<IndexSeek> = Vec::new();
-    // SnapshotPlan.indexes is sorted by index_uuid (meta_plan), so the
-    // dedup deterministically keeps the lowest uuid.
+    // `SnapshotPlan.indexes` arrives sorted by index_uuid, so the dedup
+    // deterministically keeps the lowest uuid.
     for def in &snapshot.indexes {
         let mut sorted_keys = def.key_columns.clone();
         sorted_keys.sort();
@@ -482,8 +479,8 @@ mod tests {
 
     #[test]
     fn identical_key_sets_dedupe_to_first_def() {
-        // SnapshotPlan.indexes arrives sorted by index_uuid (meta_plan), so
-        // "first def" IS the lowest uuid.
+        // SnapshotPlan.indexes arrives sorted by index_uuid, so "first def"
+        // IS the lowest uuid.
         let snapshot = snapshot_with(&[(IDX_A, &["city"]), (IDX_B, &["city"])]);
         let entries = select_from_bindings(&bindings(&[("city", &["paris"])]), &snapshot, CAP);
         assert_eq!(entries.len(), 1, "duplicate key-column sets collapse");
@@ -521,8 +518,6 @@ mod tests {
         let snapshot = snapshot_with(&[(IDX_A, &["city"])]);
         assert!(select_from_bindings(&HashMap::new(), &snapshot, CAP).is_empty());
     }
-
-    // ---- CHA-492 residual formatting --------------
 
     #[test]
     fn sql_literal_quotes_and_escapes_strings() {
@@ -593,8 +588,6 @@ mod tests {
         let residual = index_residual(&["city".to_string()], &[DataType::Utf8], &batch).unwrap();
         assert_eq!(residual, r#"("city" = 'paris') OR ("city" = 'oslo')"#);
     }
-
-    // ---- CHA-492 decode + validation -------------
 
     #[test]
     fn decode_index_seek_accepts_defined_columns() {

@@ -155,7 +155,7 @@ class TestAuditCommitSeqNum:
         _commit_upsert(client, ctx, ["dave"], [40])  # tx2
         _commit_delete(client, ctx, ["bob"])  # tx3 (delete-log row)
 
-        # --- all-hot audit ---
+        # all-hot audit
         upserts_hot, deletes_hot = _audit(client, ctx)
         assert "commit_seq_num" in upserts_hot.schema.names, (
             "audit_data upserts must carry a commit_seq_num column (CHA-430)"

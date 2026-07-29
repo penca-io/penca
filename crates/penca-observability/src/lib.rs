@@ -2,7 +2,7 @@
 //!
 //! The filter directive is owned by the deployment environment, not by
 //! this crate — `docker/compose.yml` sets `RUST_LOG` on every servicer
-//! (CHA-329) and operators / `docker/test.env` override per environment.
+//! and operators / `docker/test.env` override per environment.
 //! [`init_tracing`] reads that env var via
 //! `EnvFilter::from_default_env`; when `RUST_LOG` is unset the filter
 //! falls back to ERROR-only, surfacing the misconfiguration loudly
@@ -20,7 +20,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 /// `RUST_LOG`-derived `EnvFilter`. Call exactly once per binary at the
 /// top of `main`.
 pub fn init_tracing() {
-    // CHA-353: when `PENCA_SPAN_TIMING` is set non-empty, emit a
+    // When `PENCA_SPAN_TIMING` is set non-empty, emit a
     // span-close event carrying `time.busy` / `time.idle` for every
     // enabled span. Off by default (no per-span output, zero overhead);
     // opt-in for latency debugging — combine with a `…=trace` filter to

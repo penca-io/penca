@@ -75,8 +75,8 @@ impl HotStorageClient {
     /// all rows before returning, `read_stream` pulls rows incrementally via
     /// the driver's [`fetch_stream`](DbDriver::fetch_stream), accumulating
     /// `batch_size` rows per `RecordBatch` before yielding. Used by the query
-    /// manager's `read_data` read path (CHA-86) for upsert logs that may
-    /// contain millions of rows.
+    /// manager's `read_data` path for upsert logs that may contain millions of
+    /// rows.
     ///
     /// Works with both `PgDriver` (pool) and `PgTransactionDriver` — both
     /// implement true server-side cursor streaming. For transaction drivers,
@@ -218,7 +218,7 @@ impl HotStorageClient {
     }
 
     /// Emit per-(tx, table) summary rows into the per-branch
-    /// `tx_table_log` partition table (CHA-181). One row per distinct
+    /// `tx_table_log` partition table. One row per distinct
     /// `(tx_uuid, branch_uuid, table_uuid)` triple. `ON CONFLICT DO
     /// NOTHING` keeps emission idempotent across multiple `WriteData`
     /// calls within the same penca tx.
@@ -256,8 +256,8 @@ impl HotStorageClient {
         Ok(())
     }
 
-    /// Distinct `table_uuid`s a branch's committed txs have written to
-    /// (CHA-181). Joins the branch's `tx_table_log` partition with its
+    /// Distinct `table_uuid`s a branch's committed txs have written to.
+    /// Joins the branch's `tx_table_log` partition with its
     /// `commit_tx_log` partition on `tx_uuid` and filters to committed rows
     /// only — aborted/expired-tx rows in `tx_table_log` are dropped.
     ///

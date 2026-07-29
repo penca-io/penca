@@ -33,7 +33,7 @@ impl HotStorageClient {
     ///
     /// **Precondition:** caller has verified the merge is fast-forward
     /// (target has no commits past source's fork point). Non-FF conflict
-    /// detection is tracked by CHA-5.
+    /// detection is TODO(CHA-5).
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         level = "debug",
@@ -78,7 +78,6 @@ impl HotStorageClient {
         let user_cols_l = qualify_user_cols::<PgDialect>("l", &user_cols);
         let lead = leading_comma_if_nonempty(&user_cols);
 
-        // Step 1 (hot-tier-specific): build canonical-shape source SQLs.
         // Source upsert/delete logs JOIN to `source_committed_tx` for the
         // commit timestamp; `write_seq_num` is per-row.
         let upsert_source = format!(
@@ -91,26 +90,22 @@ impl HotStorageClient {
              FROM {sd} d JOIN source_committed_tx c USING (tx_uuid)) _d"
         );
 
-        // Step 2 (shared, CHA-243): the latest/deletes CTEs and both
-        // composite-tiebreaker tombstone-shadow predicates (upsert-visible
-        // for the upsert INSERT below, mirror delete-visible for the
-        // delete INSERT). Single source of truth for the composite
-        // semantic — keeps branch-merge in lockstep with the read-path
-        // resolution in `penca_merge::sql::build_merge_resolved`.
+        // Shared with the read path: one source of truth for the composite
+        // tiebreaker semantic, keeping branch-merge in lockstep with
+        // `penca_merge::sql::build_merge_resolved`.
         let composite = build_composite_merge_resolution::<PgDialect>(
             &upsert_source,
             &delete_source,
             &user_cols,
-            // CHA-429: branch-merge discards source tx identities (no per-tx
+            // Branch-merge discards source tx identities (no per-tx
             // seq), so it orders latest-wins on committed_at, not commit_seq_num.
             "commit_micros",
         );
 
-        // Step 3 (hot-tier-specific): shared CTE prefix re-emitted into
-        // each INSERT (Postgres WITH is statement-scoped, INSERTs plan
-        // independently). `source_committed_tx` doesn't need an
+        // The shared CTE prefix is re-emitted into each INSERT because
+        // Postgres `WITH` is statement-scoped. `source_committed_tx` needs no
         // "is-committed" sentinel — commit_tx_log is committed-only by
-        // construction (aborts go to `abort_tx_log`), the JOIN against
+        // construction (aborts go to `abort_tx_log`), so the JOIN against
         // {stx} is the filter.
         let shared_ctes = format!(
             "WITH source_committed_tx AS (\

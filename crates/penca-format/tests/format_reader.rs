@@ -4,14 +4,14 @@
 //! default, and Parquet) selected per-deployment by `OBJECT_STORAGE_FORMAT`.
 //! The read contract must hold identically for both: no predicate filtering
 //! (ADR 0022/0023 — the reader returns every row in the slice, projected),
-//! schema-evolution null-fill (CHA-252), and `(offset, length)` slicing
-//! (CHA-168). These tests write a fixture through each format's writer and
-//! assert the contract through its reader, so a format-specific divergence
-//! (the class of bug CHA-369 fixed) fails here rather than only in production.
+//! schema-evolution null-fill, and `(offset, length)` slicing. These tests
+//! write a fixture through each format's writer and assert the contract
+//! through its reader, so a format-specific divergence fails here rather than
+//! only in production.
 //!
 //! The Python integration suite (`integration_query_test.py`) exercises only
-//! the configured write format (Lance) end-to-end; the full-stack
-//! per-format pass is tracked separately (see CHA-373).
+//! the configured write format (Lance) end-to-end.
+//! TODO(CHA-373): full-stack per-format pass.
 
 use std::sync::Arc;
 
@@ -109,8 +109,8 @@ fn base_batch(n: i64) -> RecordBatch {
 }
 
 /// The reader returns every row — it does no predicate filtering. Run over an
-/// `Int32` column too (the shape the deleted parquet `RowFilter` aborted on,
-/// CHA-369) to pin that a non-default column type round-trips on both formats.
+/// `Int32` column too — the shape a parquet `RowFilter` once aborted on — to
+/// pin that a non-default column type round-trips on both formats.
 #[tokio::test]
 async fn format_reader_returns_all_rows() {
     for fmt in ALL_FORMATS {
@@ -141,7 +141,7 @@ async fn format_reader_returns_all_rows() {
     }
 }
 
-/// CHA-252: a read whose output schema adds a column absent from the segment
+/// A read whose output schema adds a column absent from the segment
 /// (schema evolution — `ALTER TABLE ADD COLUMN` does not rewrite old segments)
 /// must succeed by null-filling the added column. Both readers route through
 /// `present_columns` + `null_fill_to_schema`, so the behavior must match.
@@ -172,7 +172,7 @@ async fn format_reader_null_fills_added_column() {
     }
 }
 
-/// CHA-168: a compacted segment is read as a `(offset, length)` slice of the
+/// A compacted segment is read as a `(offset, length)` slice of the
 /// merged file. Parquet expresses this as a `RowSelection`, Lance as a
 /// `ReadBatchParams::Range`; both must yield exactly the requested sub-range.
 #[tokio::test]

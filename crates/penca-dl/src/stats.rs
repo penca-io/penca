@@ -1,19 +1,4 @@
-//! Segment-statistics module for cold-tier pruning (CHA-82).
-//!
-//! Exposes the symbol surface that snapshot-pruning paths target:
-//!
-//! - [`compute_segment_statistics`] — writer-side encoder; derives
-//!   per-column min/max/null_count + table-level row_count from a
-//!   `RecordBatch` and returns opaque bytes.
-//! - [`parse_segment_statistics`] — reader-side decoder; degrades to
-//!   `None` for missing / malformed entries.
-//! - [`SegmentPruningStats`] — `PruningStatistics` impl over a vec of
-//!   parsed per-segment stats; consumed by
-//!   [`prune_segments_by_stats`].
-//! - [`prune_segments_by_stats`] — shared snapshot-side pruning entry
-//!   point; one call site in `penca_merge::stream_merged` Phase 3.
-//! - [`aggregate_table_statistics`] — table-level `Precision::Inexact`
-//!   fold for `TableProvider::statistics()` CBO cardinality.
+//! Segment statistics for cold-tier pruning.
 //!
 //! Persist-side reader-tier pruning is OUT OF SCOPE; persist segments
 //! carry stats for `TableProvider::statistics()` aggregation only.
@@ -21,17 +6,13 @@
 //!
 //! ## Encoding (v0)
 //!
-//! Per-segment stats are serialized as serde_json bytes carrying a
-//! [`SegmentStatsV0`] payload (typed per-column min/max + null_count +
-//! row_count). This is a deviation from the plan's "Arrow Statistics
-//! Schema bytes" mechanism — see the long-form note in this file's
-//! impl: the canonical Arrow Statistics Schema requires complex
-//! MapArray + DenseUnion construction (~300 LOC) for interop with
-//! external tools that consume Arrow stats, but Penca segments stay
-//! within Penca. The bytes encoding is a private impl detail; the
-//! observable `PruningPredicate` behavior is identical. A follow-up
-//! ticket can migrate the bytes encoding to canonical Arrow Statistics
-//! Schema if cross-tool interop becomes a requirement.
+//! Per-segment stats are serde_json bytes carrying a [`SegmentStatsV0`]
+//! payload, NOT the canonical Arrow Statistics Schema. The canonical form
+//! requires complex MapArray + DenseUnion construction (~300 LOC) whose only
+//! payoff is interop with external tools that consume Arrow stats, and Penca
+//! segments stay within Penca. The bytes encoding is a private impl detail;
+//! the observable `PruningPredicate` behavior is identical, so this can migrate
+//! if cross-tool interop ever becomes a requirement.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -48,9 +29,9 @@ use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::stats::{ColumnStatistics, Precision, Statistics};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
-// Re-exported: `ParsedColumnStats` exposes `ScalarValue` in this
-// module's public API, so consumers without a datafusion dependency
-// (penca-api's CHA-406 label derivation) can name and use it.
+// Re-exported because `ParsedColumnStats` exposes `ScalarValue` in this
+// module's public API, and consumers without a datafusion dependency must
+// still be able to name it.
 pub use datafusion::scalar::ScalarValue;
 use half::f16;
 use penca_core::types::CanonicalType;
@@ -69,21 +50,14 @@ pub struct ParsedSegmentStats {
     pub per_column: Vec<ParsedColumnStats>,
 }
 
-// ----- v0 wire format --------------------------------------------------
-//
-// Per-column entries are keyed by **column name**, not by position. The
-// writer's batch schema does not always match the reader's user schema:
+// v0 wire format: per-column entries are keyed by **column name**, not by
+// position. The writer's batch schema does not always match the reader's
+// user schema:
 // snapshot/persist writes go through `snapshot_read_schema(user_schema)`
 // which prepends `row_uuid`, so a positional encoding would offset every
 // user-column lookup by one (and silently degrade to keep-all via
-// PerSegmentBuilders' type-mismatch fallthrough).
-//
-// Keying by name lets writer + reader disagree on schema shape (extra
-// prepended cols, column reordering, projection) and still resolve each
-// user column's stats correctly. Unknown columns at parse time degrade
-// to "no stats for that column" (None min/max/null_count); duplicates
-// resolve to the first match.
-
+// PerSegmentBuilders' type-mismatch fallthrough). Keying by name lets the two
+// sides disagree on schema shape and still resolve correctly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentStatsV0 {
     row_count: u64,
@@ -208,12 +182,8 @@ impl TypedScalarV0 {
 }
 
 fn data_type_is_prunable(dt: &DataType) -> bool {
-    // A type drives segment pruning only if it is both an ordered scalar
-    // (CanonicalType::is_prunable, the target) AND the stats machinery
-    // actually has builder + min/max + TypedScalarV0 arms for it. The
-    // second gate matters: marking a type prunable without a
-    // `PerSegmentBuilders` arm would panic in `build_array`. The widen
-    // tasks extend `stats_has_builder` as they add each type's machinery.
+    // Both gates are load-bearing: marking a type prunable without a
+    // `PerSegmentBuilders` arm would panic in `build_array`.
     CanonicalType::from_arrow(dt).is_ok_and(|ct| ct.is_prunable() && stats_has_builder(&ct))
 }
 
@@ -221,11 +191,9 @@ fn data_type_is_prunable(dt: &DataType) -> bool {
 /// build pruning arrays for (a subset of the prunable target set).
 ///
 /// `Time32`/`Time64` and tz-aware / non-microsecond `Timestamp` are
-/// `is_prunable()` but intentionally absent here: they round-trip through
-/// the codec (CHA-386) yet their multi-unit / tz-carrying stats machinery
-/// is deferred to CHA-390, so they ship null stats (keep-all) for now —
-/// the same safe degrade `LargeUtf8`/`Utf8View` use. `Date64` (single
-/// `ScalarValue::Date64`) is supported.
+/// `is_prunable()` but intentionally absent here: their multi-unit /
+/// tz-carrying stats machinery is TODO(CHA-390), so they ship null stats
+/// (keep-all) — the same safe degrade `LargeUtf8`/`Utf8View` use.
 fn stats_has_builder(ct: &CanonicalType) -> bool {
     matches!(
         ct,
@@ -252,8 +220,6 @@ fn stats_has_builder(ct: &CanonicalType) -> bool {
             | CanonicalType::Decimal256 { .. }
     )
 }
-
-// ----- compute (writer side) -------------------------------------------
 
 pub fn compute_segment_statistics(batch: &RecordBatch) -> Vec<u8> {
     let schema = batch.schema();
@@ -290,13 +256,10 @@ pub fn compute_segment_statistics(batch: &RecordBatch) -> Vec<u8> {
     match serde_json::to_vec(&payload) {
         Ok(bytes) => bytes,
         Err(err) => {
-            // Serializing a SegmentStatsV0 over TypedScalarV0 cannot fail
-            // for any input compute_segment_statistics produces — the
-            // variants are all simple primitive / String shapes serde
-            // round-trips. If this ever fires, the segment ships with
-            // empty stats (no pruning possible) and the operator gets a
-            // structured event with the error rather than a silent
-            // degrade.
+            // Unreachable for any input this fn produces: every
+            // TypedScalarV0 variant is a primitive / String shape serde
+            // round-trips. If it ever fires the segment ships without stats
+            // (keep-all), so the event is the only signal of the degrade.
             tracing::error!(
                 target: "penca_dl::stats",
                 err = %err,
@@ -506,8 +469,6 @@ fn column_min_max(array: &ArrayRef, dt: &DataType) -> (Option<ScalarValue>, Opti
     }
 }
 
-// ----- parse (reader side) ---------------------------------------------
-
 pub fn parse_segment_statistics(bytes: &[u8], schema: &SchemaRef) -> ParsedSegmentStats {
     let empty = ParsedSegmentStats {
         row_count: 0,
@@ -526,11 +487,9 @@ pub fn parse_segment_statistics(bytes: &[u8], schema: &SchemaRef) -> ParsedSegme
         Ok(p) => p,
         Err(_) => return empty,
     };
-    // Build a name → ColumnStatsV0 lookup so reader/writer schemas can
-    // disagree on column ordering or presence (e.g. writer uses
-    // snapshot_read_schema = [row_uuid, …user_cols] while reader passes
-    // bare user_schema). Unknown columns at parse time degrade to "no
-    // stats for that column"; duplicates resolve to first match.
+    // Resolve by name, not position: reader/writer schemas can disagree on
+    // column ordering or presence. An unknown column degrades to "no stats for
+    // that column"; duplicates resolve to the first match.
     let per_column = schema
         .fields()
         .iter()
@@ -557,8 +516,6 @@ pub fn parse_segment_statistics(bytes: &[u8], schema: &SchemaRef) -> ParsedSegme
     }
 }
 
-// ----- PruningStatistics impl ------------------------------------------
-
 pub struct SegmentPruningStats {
     pub schema: SchemaRef,
     pub parsed: Vec<ParsedSegmentStats>,
@@ -575,14 +532,11 @@ impl SegmentPruningStats {
     {
         let idx = self.column_index(name)?;
         let dt = self.schema.field(idx).data_type().clone();
-        // Short-circuit unsupported types here so push_scalar never sees
-        // BuilderKind::Unsupported. PruningStatistics::None means "no
-        // stats for this column" — DataFusion treats that as keep-all
-        // for any predicate referencing the column, which is the
-        // correct behavior for a column we never compute stats over.
-        // Keeping this check at planning time (vs per-segment in
-        // push_scalar) saves N pointless append-side calls for a column
-        // we never compute stats over.
+        // `None` here means "no stats for this column", which DataFusion
+        // treats as keep-all — correct for a column we never compute stats
+        // over. Short-circuiting at planning time (rather than per-segment in
+        // push_scalar) also keeps `PerSegmentBuilders::new` from ever seeing
+        // an unprunable type, which would hit its panic arm.
         if !data_type_is_prunable(&dt) {
             return None;
         }
@@ -600,10 +554,9 @@ impl SegmentPruningStats {
 
 struct PerSegmentBuilders {
     kind: BuilderKind,
-    /// Schema column name this builder is accumulating stats for.
-    /// Used in diagnostic events (`warn_mismatch`) so the operator
-    /// sees *which* column drifted. `"<row-count>"` / `"<null-count>"`
-    /// for the U64 metadata-array variants.
+    /// Schema column name this builder is accumulating stats for; reported in
+    /// `warn_mismatch` so the operator sees *which* column drifted.
+    /// `"<row-count>"` / `"<null-count>"` for the U64 metadata-array variants.
     column_name: String,
 }
 
@@ -625,14 +578,12 @@ enum BuilderKind {
     TsMicro(TimestampMicrosecondBuilder),
     Dec128(Decimal128Builder),
     Dec256(Decimal256Builder),
-    /// `UInt64` carries double duty: a real `UInt64` *column* builder
-    /// (reached via `push_scalar` for `ScalarValue::UInt64`) AND the
-    /// `null_counts` / `row_counts` metadata arrays (DataFusion requires
-    /// those to be `UInt64` regardless of the source column type, reached
-    /// via `push_u64`). The two entry points never mix on one builder
-    /// instance — a metadata builder is constructed by `new_u64` and only
-    /// ever sees `push_u64`; a column builder is constructed by `new` and
-    /// only ever sees `push_scalar`.
+    /// `UInt64` carries double duty: a real `UInt64` *column* builder (via
+    /// `push_scalar`) AND the `null_counts` / `row_counts` metadata arrays,
+    /// which DataFusion requires to be `UInt64` regardless of the source
+    /// column type (via `push_u64`). The two entry points must never mix on
+    /// one instance: `new_u64` builders only ever see `push_u64`, `new`
+    /// builders only ever see `push_scalar`.
     U64(UInt64Builder),
 }
 
@@ -665,9 +616,8 @@ impl PerSegmentBuilders {
             DataType::Decimal128(precision, scale) => BuilderKind::Dec128(
                 Decimal128Builder::new()
                     .with_precision_and_scale(*precision, *scale)
-                    // The (precision, scale) come from a Decimal128 column
-                    // that a Decimal128Array already materialized for
-                    // upstream, so the pair is Arrow-valid by construction.
+                    // (precision, scale) come from a materialized
+                    // Decimal128Array, so the pair is Arrow-valid.
                     .expect("Decimal128 precision/scale already valid for a materialized array"),
             ),
             DataType::Decimal256(precision, scale) => BuilderKind::Dec256(
@@ -697,29 +647,17 @@ impl PerSegmentBuilders {
     }
 
     /// Append a typed scalar to whichever per-segment builder this
-    /// `PerSegmentBuilders` holds. Behavior on the mismatch axes:
+    /// `PerSegmentBuilders` holds. A `None` scalar, or a matching variant
+    /// carrying `None`, appends a null.
     ///
-    /// - **scalar variant matches builder kind, has a value** — appends
-    ///   the value. The happy path.
-    /// - **scalar is `None` or `Some(<matching variant>(None))`** —
-    ///   appends a null (no stats recorded for this segment-column).
-    /// - **scalar variant does NOT match builder kind** — appends a
-    ///   null AND emits a `tracing::warn!` event with column name +
-    ///   segment index. This case should be structurally impossible
-    ///   after the name-keyed `SegmentStatsV0` fix (writer/reader
-    ///   resolve the same `ScalarValue` variant per column name); if
-    ///   it ever fires, either the proto/DDL column type changed
-    ///   without updating both ends, or a new `TypedScalarV0` variant
-    ///   was added without a corresponding `BuilderKind`. The warn
-    ///   surfaces it; the null keeps the builder length consistent
-    ///   with `num_containers()` so `PruningPredicate::prune` doesn't
-    ///   error.
-    /// - **builder kind is `U64`** — a real `UInt64` column builder:
-    ///   appends the `ScalarValue::UInt64` value (CHA-386 made `UInt64`
-    ///   a prunable column type). The same `U64` variant also backs the
-    ///   `null_count` / `row_count` metadata arrays, but those go
-    ///   through `push_u64`, never `push_scalar`, so the two roles never
-    ///   collide on one builder instance.
+    /// A scalar variant that does NOT match the builder kind appends a null and
+    /// warns. It should be structurally impossible — name-keyed
+    /// `SegmentStatsV0` makes writer and reader resolve the same `ScalarValue`
+    /// variant per column — so firing means either a column type changed
+    /// without updating both ends, or a new `TypedScalarV0` variant was added
+    /// without a matching `BuilderKind`. The null (rather than a skip) is
+    /// required: builder length must stay equal to `num_containers()` or
+    /// `PruningPredicate::prune` errors.
     fn push_scalar(&mut self, value: &Option<ScalarValue>, seg_idx: usize) {
         match (&mut self.kind, value) {
             (BuilderKind::Bool(b), Some(ScalarValue::Boolean(Some(v)))) => b.append_value(*v),
@@ -952,20 +890,17 @@ impl PruningStatistics for SegmentPruningStats {
     }
 }
 
-// ----- prune_segments_by_stats -----------------------------------------
-
 /// Prune snapshot segments by per-column statistics using a pre-built
 /// physical predicate.
 ///
-/// `predicate` is the residual filter's physical predicate. CHA-353: this
-/// pruning and the residual filter come from the same full-planning path
-/// (`penca_merge::full_plan_predicate`) over the same filter string — so a
+/// `predicate` is the residual filter's physical predicate. This pruning and
+/// the residual filter come from the same full-planning path
+/// (`penca_merge::full_plan_predicate`) over the same filter string, so a
 /// segment pruned here is guaranteed to contain no row the residual would keep
 /// — the two layers cannot disagree. `None` (no filter) keeps every segment.
-/// Any failure to
-/// build the [`PruningPredicate`] or evaluate it degrades to keep-all: pruning
-/// is an optimization, and the residual filter still enforces correctness on
-/// the rows that are read.
+/// Any failure to build or evaluate the [`PruningPredicate`] degrades to
+/// keep-all: pruning is an optimization, and the residual filter still enforces
+/// correctness on the rows that are read.
 pub fn prune_segments_by_stats<S>(
     segments: &[S],
     get_stats: impl Fn(&S) -> &[u8],
@@ -997,8 +932,6 @@ pub fn prune_segments_by_stats<S>(
     }
 }
 
-// ----- aggregate_table_statistics --------------------------------------
-
 pub fn aggregate_table_statistics(parsed: &[ParsedSegmentStats], schema: &SchemaRef) -> Statistics {
     if parsed.is_empty() {
         return Statistics::new_unknown(schema);
@@ -1014,10 +947,9 @@ pub fn aggregate_table_statistics(parsed: &[ParsedSegmentStats], schema: &Schema
     }
 }
 
-/// Fold the per-segment stats at `col_idx` into a single
-/// `ColumnStatistics`: min-of-min via [`scalar_less`], max-of-max,
-/// sum null_count. `null_count` is `Absent` iff zero segments reported
-/// a value, `Inexact(sum)` otherwise.
+/// Fold the per-segment stats at `col_idx` into a single `ColumnStatistics`.
+/// `null_count` is `Absent` iff zero segments reported a value,
+/// `Inexact(sum)` otherwise.
 fn fold_column_stats(parsed: &[ParsedSegmentStats], col_idx: usize) -> ColumnStatistics {
     let mut min_acc: Option<ScalarValue> = None;
     let mut max_acc: Option<ScalarValue> = None;
@@ -1088,9 +1020,9 @@ fn scalar_less(a: &ScalarValue, b: &ScalarValue) -> Option<bool> {
         (Date32(Some(x)), Date32(Some(y))) => Some(x < y),
         (Date64(Some(x)), Date64(Some(y))) => Some(x < y),
         (TimestampMicrosecond(Some(x), _), TimestampMicrosecond(Some(y), _)) => Some(x < y),
-        // Same-scale unscaled i128 compare. Aggregate-fold callers pair
-        // min-with-min / max-with-max from the same column, so precision
-        // and scale match by construction.
+        // Comparing raw unscaled values is only valid at equal scale. The
+        // aggregate fold pairs min-with-min / max-with-max from one column, so
+        // the guard holds by construction and never silently drops a compare.
         (Decimal128(Some(x), _, sx), Decimal128(Some(y), _, sy)) if sx == sy => Some(x < y),
         (Decimal256(Some(x), _, sx), Decimal256(Some(y), _, sy)) if sx == sy => Some(x < y),
         _ => None,
@@ -1216,10 +1148,9 @@ mod tests {
 
     #[test]
     fn aggregate_fold_orders_date32_across_segments() {
-        // Guards `scalar_less` coverage for a new prunable type: segments
-        // folded with the global min/max NOT in the first segment must
-        // still yield the true global bounds. A missing `scalar_less` arm
-        // pins the fold to the first segment (the bug hvxj caught).
+        // Guards `scalar_less` coverage for each prunable type: the global
+        // min/max deliberately sit OUTSIDE the first segment, because a missing
+        // `scalar_less` arm silently pins the fold to the first segment.
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
         let seg = |lo: i32, hi: i32| ParsedSegmentStats {
@@ -1244,7 +1175,6 @@ mod tests {
 
     #[test]
     fn decimal128_and_timestamp_min_max_round_trip() {
-        // Decimal128: column_min_max preserves precision + scale.
         let dec: ArrayRef = Arc::new(
             Decimal128Array::from(vec![12345i128, 100, 99999])
                 .with_precision_and_scale(10, 2)
@@ -1254,7 +1184,6 @@ mod tests {
         assert_eq!(min, Some(ScalarValue::Decimal128(Some(100), 10, 2)));
         assert_eq!(max, Some(ScalarValue::Decimal128(Some(99999), 10, 2)));
 
-        // Timestamp(µs): min/max survive a compute → parse segment round-trip.
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1275,19 +1204,9 @@ mod tests {
 
     #[test]
     fn unprunable_column_short_circuits_min_max() {
-        // Coverage for `build_array`'s `data_type_is_prunable` short-circuit.
-        // A schema with a `Binary`
-        // column alongside a prunable `Int32` column: pruning on the
-        // Int32 column should produce a typed min/max array; pruning on
-        // the Binary column should produce `None` immediately (no per-
-        // segment loop, no builder construction, no `push_scalar` path).
-        //
-        // Without the short-circuit, `build_array` for the Binary column
-        // would fall into `PerSegmentBuilders::new`'s `panic!` unprunable
-        // arm — this test guards both the short-circuit (`None` for
-        // unprunable) and the still-functional path (`Some` for prunable).
-        // (Binary is the unprunable column here because Date32 — the prior
-        // choice — became prunable in CHA-386.)
+        // Without `build_array`'s `data_type_is_prunable` short-circuit, the
+        // Binary column would reach `PerSegmentBuilders::new`'s `panic!`
+        // unprunable arm — so no panic here is itself the assertion.
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("amount", DataType::Int32, false),
             Field::new("when", DataType::Binary, false),
@@ -1302,8 +1221,7 @@ mod tests {
                         max: Some(ScalarValue::Int32(Some(20))),
                         null_count: Some(0),
                     },
-                    // Binary has no min/max in our v0 format (unprunable
-                    // type -> writer records None min/max).
+                    // Binary is unprunable, so the writer records None min/max.
                     ParsedColumnStats {
                         min: None,
                         max: None,
@@ -1313,7 +1231,6 @@ mod tests {
             }],
         };
 
-        // Prunable column: PruningStatistics::min_values returns Some.
         let amount_col = datafusion::common::Column::new_unqualified("amount");
         let amount_min = stats.min_values(&amount_col);
         assert!(
@@ -1322,10 +1239,6 @@ mod tests {
         );
         assert_eq!(amount_min.unwrap().len(), 1);
 
-        // Unprunable column: build_array's short-circuit returns None
-        // BEFORE PerSegmentBuilders::new gets called (which would panic
-        // for Date32 since the Unsupported variant is gone). No panic
-        // here proves the short-circuit fires.
         let when_col = datafusion::common::Column::new_unqualified("when");
         assert!(
             stats.min_values(&when_col).is_none(),
@@ -1335,24 +1248,13 @@ mod tests {
             stats.max_values(&when_col).is_none(),
             "unprunable Binary column should short-circuit to None for max_values too"
         );
-        // null_counts intentionally NOT short-circuited — the writer
-        // records null_count for every column regardless of prunability,
-        // so DataFusion can consult it for any column type.
+        // null_counts is intentionally NOT short-circuited: the writer records
+        // null_count for every column regardless of prunability.
         assert!(
             stats.null_counts(&when_col).is_some(),
             "null_counts should be available for any column, prunable or not"
         );
     }
-
-    // ── CHA-386 R4: prunability widened to the ordered Phase-1 types ──
-    //
-    // These FAIL today: `data_type_is_prunable` matches only Boolean/
-    // Int32/Int64/Float32/Float64/Utf8, and `column_min_max` returns
-    // `(None, None)` for everything else. Closed by T_stats, which routes
-    // prunability through `CanonicalType::is_prunable` and adds the
-    // `column_min_max` arms. (T_stats must also update
-    // `unprunable_column_short_circuits_min_max` above, which asserts
-    // Date32 is unprunable.)
 
     #[test]
     fn ordered_phase1_types_are_prunable() {
@@ -1387,9 +1289,8 @@ mod tests {
 
     #[test]
     fn unsigned_and_int8_prunable_with_min_max_round_trip() {
-        // CHA-386 rxsr: unsigned ints + Int8 are ordered scalars and must
-        // drive segment pruning — prunable, with column_min_max bounds and
-        // a compute -> parse round-trip (incl. u64::MAX, which exceeds i64).
+        // The u64::MAX case matters: it exceeds i64, so a signed intermediate
+        // in the serde round-trip would corrupt it.
         for dt in [
             DataType::Int8,
             DataType::UInt8,
@@ -1418,9 +1319,8 @@ mod tests {
 
     #[test]
     fn float16_and_decimal256_prunable_with_round_trip() {
-        // CHA-386 gf15: Float16 + Decimal256 are ordered scalars that must
-        // drive segment pruning — prunable, with min/max round-tripping
-        // through the serde forms (f16 bits, i256 little-endian bytes).
+        // Both round-trip through indirect serde forms — f16 bits, i256
+        // little-endian bytes — so min/max are the real assertion here.
         for dt in [DataType::Float16, DataType::Decimal256(40, 10)] {
             assert!(data_type_is_prunable(&dt), "{dt:?} must be prunable");
         }
@@ -1468,9 +1368,8 @@ mod tests {
 
     #[test]
     fn date64_prunable_temporal_pruning_deferred() {
-        // CHA-386 gr4m: Date64 drives segment pruning. Time32/Time64 and
-        // tz-aware Timestamp round-trip through the codec but defer pruning
-        // to CHA-390 (null stats -> keep-all), so they are NOT prunable yet.
+        // Time32/Time64 and tz-aware Timestamp round-trip through the codec
+        // but ship null stats (keep-all) — pruning is TODO(CHA-390).
         assert!(data_type_is_prunable(&DataType::Date64));
         for dt in [
             DataType::Time32(TimeUnit::Millisecond),

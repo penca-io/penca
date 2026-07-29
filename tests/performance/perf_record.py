@@ -27,10 +27,6 @@ import socket
 import subprocess
 from uuid import uuid4
 
-# ---------------------------------------------------------------------------
-# Hierarchy mapping (pure)
-# ---------------------------------------------------------------------------
-
 # Files placed directly under tests/performance/ (no subdirectory) belong to
 # this default type.
 _DEFAULT_TYPE = "performance"
@@ -87,11 +83,6 @@ def extract_params(params: dict) -> dict:
     return {key: _json_safe(value) for key, value in params.items()}
 
 
-# ---------------------------------------------------------------------------
-# Run context
-# ---------------------------------------------------------------------------
-
-
 def _git(args: list[str]) -> str:
     """Best-effort ``git`` value for run provenance.
 
@@ -125,11 +116,6 @@ def run_context() -> dict:
         "hostname": socket.gethostname(),
         "ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
-
-
-# ---------------------------------------------------------------------------
-# Recording machinery
-# ---------------------------------------------------------------------------
 
 
 class PerfSink:

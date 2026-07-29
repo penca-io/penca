@@ -1,25 +1,17 @@
 //! Identifier resolution helpers for flexible request handling.
 //!
-//! Each entity has two resolvers — `resolve_<entity>_by_uuid` and
-//! `resolve_<entity>_by_name` — that return the whole resolved object
-//! ([`Catalog`] / [`Branch`] / [`Schema`] / [`Table`]); callers read
-//! whatever field they need off it. Four dispatchers (`resolve_catalog` /
-//! `resolve_branch` / `resolve_schema` / `resolve_table`) take the
-//! `(X_uuid, X_name)` option pair and apply the precedence rule once.
-//!
-//! Post-CHA-236 namespace UUIDs are server-minted random values, so name →
-//! uuid resolution is a database lookup, not a hash:
+//! Namespace UUIDs are server-minted random values, so name → uuid resolution
+//! is a database lookup, not a hash:
 //!
 //! - catalog / branch ← `catalog_store` / `branch_store` SELECT (non-MVCC
-//!   PG tables; the name lookup is snapshot-blind by design — see
-//!   [CHA-240](https://linear.app/chapala/issue/CHA-240) and ADR 0020).
+//!   PG tables; the name lookup is snapshot-blind by design — ADR 0020).
 //! - schema / table ← `__penca_system__.{schemas,tables}` `stream_merged`
 //!   under the caller's `ReadSnapshot`, so a name resolves under the same
 //!   time-travel window as the subsequent data read (a table renamed
 //!   `foo → bar` at T=200 still resolves from `table_name="foo"` at
 //!   `as_of_micros=150`).
 //!
-//! **Table resolution is asymmetric by identifier (CHA-381):**
+//! **Table resolution is asymmetric by identifier:**
 //! [`QueryManager::resolve_table_by_uuid`] is **catalog-wide** — it matches
 //! `__penca_system__.tables` on `row_uuid` alone (no schema scoping), so a
 //! table resolves by `table_uuid` regardless of which schema holds it and
@@ -42,21 +34,6 @@ use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-
-// ===========================================================================
-// Entity resolvers (CHA-381) — return the whole resolved object.
-//
-// Each `resolve_<entity>_by_{uuid,name}` resolves a single identifier and
-// returns the full proto object (callers read whatever field they need off
-// it). The four `resolve_<entity>` dispatchers encode the precedence rule
-// (uuid wins; else name; else InvalidRequest) in one place so call sites that
-// carry the `(X_uuid, X_name)` option pair don't each repeat it.
-//
-// `resolve_table_by_uuid` is CATALOG-WIDE (schema-agnostic): it resolves a
-// table by `table_uuid` regardless of which schema it lives in (via
-// `get_table_by_uuid`). `resolve_table_by_name` stays schema-scoped — the
-// name lookup needs the schema parent.
-// ===========================================================================
 
 /// Resolve a [`Catalog`] by `catalog_uuid`. NOT_FOUND if absent (a
 /// `catalog_store` read, so the uuid path resolves existence, not just
@@ -126,9 +103,7 @@ pub async fn resolve_branch_by_name(
         .ok_or_else(|| ApiError::NotFound(format!("branch not found: {branch_name}")))
 }
 
-/// Resolve the catalog's `main` branch UUID. Shared by the CreateBranch
-/// main-only guard (CHA-515) and the DeleteCatalog cascade, which both need
-/// main's UUID and would otherwise duplicate the lookup + parse.
+/// Resolve the catalog's `main` branch UUID.
 pub async fn resolve_main_branch_uuid(
     driver: &impl DbDriver<Row = PgRow>,
     catalog_uuid: &Uuid,
@@ -353,9 +328,7 @@ fn parse_uuid(s: &str) -> Result<Uuid, ApiError> {
 /// Parse a UUID string that the resolver layer itself produced — a validated
 /// request id echoed back on a resolved object, or a stored row column. A
 /// failure here is server-side corruption, not bad client input, so it
-/// surfaces as `Internal` rather than `InvalidRequest`. Used by the scope
-/// constructors and handlers that read `Uuid`-typed fields off a resolved
-/// `Catalog` / `Branch` / `Schema` / `Table`.
+/// surfaces as `Internal` rather than `InvalidRequest`.
 pub fn parse_resolved_uuid(s: &str, what: &str) -> Result<Uuid, ApiError> {
     s.parse::<Uuid>()
         .map_err(|e| ApiError::Internal(format!("resolved {what} '{s}' is not a valid uuid: {e}")))

@@ -43,8 +43,6 @@ def _qi(name: str) -> str:
 
 
 class TestWriteService:
-    # -- Table CUD ---------------------------------------------------------
-
     def test_create_table(self):
         client = make_client()
         catalog_uuid, main_branch_uuid = client.create_catalog(
@@ -196,7 +194,6 @@ class TestWriteService:
             comment="create_table",
         )
 
-        # Insert a row with the original schema.
         branch = client.create_branch(
             "evo_branch",
             catalog_uuid=catalog_uuid,
@@ -235,7 +232,6 @@ class TestWriteService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Evolve the schema: add a nullable column.
         new_schema = pa.schema(
             [
                 pa.field("name", pa.utf8()),
@@ -254,7 +250,6 @@ class TestWriteService:
             comment="update_table",
         )
 
-        # Insert a row with the new schema.
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -280,7 +275,6 @@ class TestWriteService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Read back — old row has NULL for the new column, new row has value.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -326,8 +320,6 @@ class TestWriteService:
                 schema_uuid=schema_uuid,
                 table_uuid=table_uuid,
             )
-
-    # -- Branching ---------------------------------------------------------
 
     def test_create_branch(self):
         client = make_client()
@@ -774,8 +766,6 @@ class TestWriteService:
         )
         assert response is not None
 
-    # -- CHA-242: within-upserts row_uuid uniqueness ----------------------
-    #
     # Two upserts in one ``Change`` with the same ``row_uuid`` produce
     # the same ``version_uuid = hash(row_uuid, tx_uuid)``, and
     # ``insert_upserts``' ``ON CONFLICT (version_uuid) DO UPDATE``
@@ -830,7 +820,6 @@ class TestWriteService:
         client = make_client()
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
 
-        # Seed ('alice', 10).
         seed_tx = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -921,7 +910,6 @@ class TestWriteService:
             branch_uuid=main_branch_uuid,
         )
 
-        # First Change: insert ('alice', 1).
         client.write_data(
             tx.tx_uuid,
             Mutation(
@@ -1560,9 +1548,6 @@ class TestWriteService:
             )
 
 
-# -- Merge verification helpers ------------------------------------------
-
-
 def _count_per_log(
     catalog_uuid: str,
     schema_uuid: str,
@@ -1596,11 +1581,6 @@ def _all_tx_uuids(
     }[log]
     rows = get_pg_driver().execute(f"SELECT DISTINCT tx_uuid FROM {_qi(table)}")
     return {str(row[0]) for row in rows}
-
-
-# ===========================================================================
-# CHA-163: Multi-schema atomicity within a catalog
-# ===========================================================================
 
 
 class TestMultiSchemaTransactions:
@@ -1653,14 +1633,12 @@ class TestMultiSchemaTransactions:
             comment="create_table",
         )
 
-        # Open one tx on the catalog's main branch.
         tx = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_a_uuid,
             branch_uuid=main_branch_uuid,
         )
 
-        # Write to schema_a.table_a under tx.
         batch_a = pa.table({"name": ["alice"], "value": [10]}, schema=USER_SCHEMA)
         client.write_data(
             tx.tx_uuid,
@@ -1803,11 +1781,9 @@ class TestMultiSchemaTransactions:
             )
 
 
-# ===========================================================================
 # CHA-164: schema/table CRUD takes an optional tx_uuid. Mode-switch
 # mirrors WriteData — absent = auto-commit, present = join the open
 # tx and become visible at CommitTx. AbortTx leaves no orphan rows.
-# ===========================================================================
 
 
 class TestSchemaTxUuidMode:

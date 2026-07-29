@@ -1,29 +1,27 @@
-//! Process-lifetime cache of snapshot segment *lists* (CHA-441).
+//! Process-lifetime cache of snapshot segment *lists*.
 //!
 //! A read resolves the latest snapshot's segment list — the immutable baseline
 //! `(segments, W_snap)` for a `(catalog, branch, table)` — on its way to the
 //! cold-snapshot scan. That list is immutable between snapshot commits, so a
 //! warm current-time read can skip the Postgres round-trip `LifecycleManager`
 //! otherwise issues every read. This caches the **list** only; the decoded
-//! segment *bytes* live in the separate [`crate::cache::SegmentCache`]
-//! (CHA-252) — different artifact, different invalidation.
+//! segment *bytes* live in the separate [`crate::cache::SegmentCache`] —
+//! different artifact, different invalidation.
 //!
-//! **W_snap-keyed (CHA-492).** The key includes the resolved snapshot's `W_snap`
+//! **W_snap-keyed.** The key includes the resolved snapshot's `W_snap`
 //! (`commit_seq_num`), so an entry is content-addressed by snapshot version:
 //! every read — current-time OR time-travel — keys on the immutable snapshot it
 //! resolves to, and a new snapshot simply mints a new key (the superseded entry
-//! ages out under moka's `max_capacity` LFU). There is no staleness to guard
-//! against (same `W_snap` ⇒ same immutable segment list), so the old
-//! `LatestSeq`-only restriction and the per-hit frontier check the
-//! `(catalog,branch,table)`-only key needed are both gone; all snapshot reads
-//! consult it.
+//! ages out under moka's `max_capacity` LFU). Same `W_snap` ⇒ same immutable
+//! segment list, so there is no staleness to guard against and every snapshot
+//! read may consult it.
 //!
-//! **TTL now bounds only the retire grace.** Entries expire after a
-//! `time_to_live` the hosting service sets `<=` the snapshot-retire GC grace
+//! **TTL bounds only the retire grace.** Entries expire after a `time_to_live`
+//! the hosting service sets `<=` the snapshot-retire GC grace
 //! (`QUERY_TIMEOUT_SECONDS`): a `W_snap`-keyed entry names a *specific*
 //! snapshot's files, so once that snapshot is retired and its files GC'd the
 //! entry must not outlive them. The TTL is purely that safety bound, not a
-//! staleness knob (there is no invalidation hook).
+//! staleness knob — there is no invalidation hook.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,22 +40,22 @@ use penca_core::SnapshotSegment;
 pub struct CachedSnapshotList {
     /// The snapshot's segment list, in `chunk_idx` (write) order.
     pub segments: Vec<SnapshotSegment>,
-    /// CHA-485: user-index defs declared for the snapshot — cached alongside
-    /// the segments so a cache-served default read can still seek.
+    /// User-index defs declared for the snapshot — cached alongside the
+    /// segments so a cache-served default read can still seek.
     pub indexes: Vec<SnapshotIndexDef>,
     /// `W_snap` — the snapshot seq watermark (max `commit_seq_num` in the baseline).
     pub commit_seq_num: i64,
     /// The `commit_micros` watermark the snapshot represents.
     pub snapshotted_at_micros: i64,
-    /// Parent-level layout keys (`None` = SQL NULL, a pre-CHA-404 parent;
-    /// `Some(vec![])` = known-no-keys). Preserved for CHA-406 carry-forward.
+    /// Parent-level layout keys (`None` = SQL NULL, a parent predating layout
+    /// keys; `Some(vec![])` = known-no-keys). Preserved for carry-forward.
     pub partition_keys: Option<Vec<String>>,
     pub clustering_keys: Option<Vec<String>>,
 }
 
 /// Cache key: `(catalog, branch, table, W_snap)` — content-addressed by the
-/// resolved snapshot's seq watermark (CHA-492), so each read keys on the
-/// immutable snapshot it resolves to and a new snapshot mints a new key.
+/// resolved snapshot's seq watermark, so each read keys on the immutable
+/// snapshot it resolves to and a new snapshot mints a new key.
 type Key = (String, String, String, i64);
 
 /// In-process TTL cache of snapshot segment lists, keyed
@@ -169,8 +167,6 @@ mod tests {
 
     #[test]
     fn miss_on_distinct_w_snap() {
-        // CHA-492: same (catalog,branch,table) but a newer snapshot mints a
-        // distinct key — the superseded entry is never served to the new read.
         let cache = SnapshotListCache::new(Duration::from_secs(60), 16);
         cache.insert(key(), list(7));
         cache.run_pending();

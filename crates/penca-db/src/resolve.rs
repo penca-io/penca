@@ -7,7 +7,7 @@
 //! The SQL uses CTEs to:
 //! 1. Identify committed deletes with their latest delete event — the
 //!    `(commit_seq_num, write_seq_num)` tuple of the row with the greatest
-//!    commit-order position (CHA-431 seq tiebreaker).
+//!    commit-order position.
 //! 2. Rank upsert versions by `(commit_seq_num, write_seq_num)`
 //!    per entity column, excluding upserts that lose the lexicographic
 //!    comparison against the latest delete.
@@ -18,7 +18,7 @@
 //! The resolve is parameterized in two ways:
 //!
 //! - **entity_column** — the column the dedup partitions by. Always
-//!   `row_uuid` post-CHA-177: data tables and the system tables
+//!   `row_uuid`: data tables and the system tables
 //!   (`__penca_system__.{schemas,tables}`) all share the
 //!   `{prefix}_data_{upsert,delete}_log` shape and dedup on `row_uuid`
 //!   (= `row_uuid_for_pk(parent_table_uuid, [pk_values])`).
@@ -26,11 +26,7 @@
 //!   open transaction in the result. Implemented by UNION-ALL'ing a
 //!   synthetic row into `commit_tx_log_filtered` with a sentinel
 //!   `commit_seq_num` (`i64::MAX`) so the open tx's writes rank
-//!   latest in dedup. RYOW for sessions with an open tx; mirrors the
-//!   data-path `as_of_tx_uuid` shape proposed in CHA-165.
-//!
-//! This is the Rust port of
-//! `packages/penca/src/penca/lib/util/auditable_store.py`.
+//!   latest in dedup, giving read-your-own-writes.
 
 use crate::dialect::pg::PgDialect;
 use crate::dialect::{
@@ -77,7 +73,7 @@ pub fn resolve_cte_sql(spec: &ResolveSpec<'_>) -> String {
     let delete_table = PgDialect::quote_identifier(spec.delete_table_name);
     let commit_tx_log_table = PgDialect::quote_identifier(spec.commit_tx_log_table_name);
     let entity_col = PgDialect::quote_identifier(spec.entity_column);
-    // CHA-431: resolution orders on the seq axes `(commit_seq_num, write_seq_num)`;
+    // Resolution orders on the seq axes `(commit_seq_num, write_seq_num)`;
     // commit_micros survives only as the audit since/until window filter.
     let commit_seq = PgDialect::quote_column("t", "commit_seq_num");
 
@@ -116,9 +112,6 @@ pub fn resolve_cte_sql(spec: &ResolveSpec<'_>) -> String {
         tx_filters.join(" AND ")
     };
 
-    // Synthetic open-tx row: the open tx's writes JOIN through
-    // commit_tx_log_filtered and rank latest in the dedup ORDER BY DESC.
-    // Read-your-own-writes for sessions with an open tx.
     let open_tx_union = match spec.open_tx_uuid {
         Some(tx) => format!(
             "\n    UNION ALL\n    SELECT '{tx}'::uuid AS tx_uuid,\
@@ -127,35 +120,26 @@ pub fn resolve_cte_sql(spec: &ResolveSpec<'_>) -> String {
         None => String::new(),
     };
 
-    // CHA-431: composite `(commit_seq_num, write_seq_num)` seq tiebreaker.
     // `committed_deletes` uses `DISTINCT ON` (PG-only resolver) to keep the
     // `write_seq_num` of the row with the greatest commit-order position, not
     // the per-column max — a per-column MAX would let the two extremes come
     // from different delete rows and break the lexicographic compare below.
-    // `upserts_ranked` orders by the same composite key, and the
-    // tombstone-shadow predicate goes through the shared
-    // `lex_compare_predicate` so the composite semantic stays in
-    // lockstep with the merge-on-read SQL (see
-    // `penca_merge::sql::build_merge_resolved`). On tie the upsert
-    // wins → row visible.
+    // The tombstone-shadow predicate goes through the shared
+    // `lex_compare_predicate` so the composite semantic stays in lockstep with
+    // the merge-on-read SQL. On tie the upsert wins → row visible.
     //
-    // Aliasing convention: per-row seq columns name the half they come
-    // from — `upsert_commit_seq_num` / `upsert_write_seq_num`
-    // on the upsert side, `delete_commit_seq_num` /
-    // `delete_write_seq_num` on the delete side. The aliases on
-    // `committed_deletes` are required (the outer JOIN binds them via
-    // `cd.`); the matching aliases on `upserts_ranked` aren't
-    // required but keep the predicate symmetric and let a reader
-    // tell at a glance which side each comparand belongs to.
+    // Aliasing convention: per-row seq columns name the half they come from —
+    // `upsert_*` on the upsert side, `delete_*` on the delete side. The
+    // `committed_deletes` aliases are required (the outer JOIN binds them via
+    // `cd.`); the matching `upserts_ranked` ones are not, but keep the
+    // predicate symmetric.
     //
-    // Resolver shape diverges from the read-path's `latest LEFT JOIN
+    // This resolver's shape diverges from the read path's `latest LEFT JOIN
     // deletes` because `upserts_ranked` filters *then* ranks (so
-    // `latest_upserts` can `WHERE row_rank = 1`) and
-    // `effective_deletes` needs the pre-ranking committed_deletes set
-    // for its anti-join. The lex-predicate kernel is the only piece
-    // genuinely shared, so this resolver reaches for that primitive
-    // directly rather than the `build_composite_merge_resolution`
-    // CTE-pair helper.
+    // `latest_upserts` can `WHERE row_rank = 1`) and `effective_deletes` needs
+    // the pre-ranking committed_deletes set for its anti-join. The lex-predicate
+    // kernel is the only genuinely shared piece, hence reaching for that
+    // primitive directly rather than `build_composite_merge_resolution`.
     let tombstone_shadow_lex = lex_compare_predicate(
         &commit_seq,
         "u.write_seq_num",
@@ -234,8 +218,6 @@ pub fn resolve_sql(spec: &ResolveSpec<'_>) -> String {
 mod tests {
     use super::*;
 
-    // CHA-243: emitted-SQL lock-ins for the composite tiebreaker.
-
     fn spec_with_user_cols<'a>(user_columns: &'a [&'a str]) -> ResolveSpec<'a> {
         ResolveSpec {
             upsert_table_name: "upsert_log",
@@ -254,18 +236,12 @@ mod tests {
     #[test]
     fn resolve_cte_uses_composite_ordering_and_predicate() {
         let sql = resolve_cte_sql(&spec_with_user_cols(&["name", "value"]));
-        // CHA-431: `upserts_ranked` ranks by the seq composite
-        // `(commit_seq_num, write_seq_num)` ordering key — no timestamp axis.
         assert!(
             sql.contains("ORDER BY t.\"commit_seq_num\" DESC, u.write_seq_num DESC"),
             "upserts_ranked must order by the seq composite key: {sql}",
         );
-        // Tombstone-shadow predicate is the lex spelling of `(commit_seq_num,
-        // write_seq_num) >= (delete_commit_seq_num, delete_write_seq_num)`, emitted by
-        // the shared `lex_compare_predicate` helper. Same semantic as
-        // the merge-on-read predicate in `penca_merge::sql`. We assert
-        // the substring shape rather than the full multi-line format so
-        // the test is robust against helper-internal formatting tweaks.
+        // Asserts the substring shape rather than the full multi-line format,
+        // so the test survives helper-internal formatting tweaks.
         assert!(
             sql.contains(
                 "cd.\"row_uuid\" IS NULL OR \
@@ -280,11 +256,8 @@ mod tests {
     #[test]
     fn resolve_cte_committed_deletes_carries_write_seq() {
         let sql = resolve_cte_sql(&spec_with_user_cols(&[]));
-        // CHA-431: `committed_deletes` carries `delete_write_seq_num`
-        // alongside `delete_commit_seq_num` so the outer predicate can bind both
-        // seq ordering keys. DISTINCT ON replaces the per-column MAX-GROUP-BY:
-        // MAX across rows would mix the two extremes and break lexicographic
-        // compare.
+        // DISTINCT ON rather than a per-column MAX-GROUP-BY: MAX across rows
+        // would mix the two extremes and break the lexicographic compare.
         assert!(
             sql.contains("DISTINCT ON (d.\"row_uuid\")"),
             "committed_deletes must use DISTINCT ON to keep one row \
@@ -306,10 +279,6 @@ mod tests {
 
     #[test]
     fn resolve_cte_upserts_ranked_aliases_match_delete_side() {
-        // CHA-431: symmetric `upsert_{commit_seq_num,write_seq_num}` aliases on
-        // the `upserts_ranked` SELECT keep the predicate readable — every
-        // comparand on the delete side has a sibling on the upsert side with
-        // the same naming convention.
         let sql = resolve_cte_sql(&spec_with_user_cols(&[]));
         assert!(
             sql.contains("AS upsert_commit_seq_num"),

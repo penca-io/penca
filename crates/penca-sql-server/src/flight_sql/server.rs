@@ -1,4 +1,4 @@
-//! Per-TCP-connection driver for the Flight SQL servicer (CHA-255).
+//! Per-TCP-connection driver for the Flight SQL servicer.
 //!
 //! tonic 0.14's `Server::serve` wraps the layered service in a
 //! `BoxCloneService` that hyper clones per HTTP/2 stream, so a

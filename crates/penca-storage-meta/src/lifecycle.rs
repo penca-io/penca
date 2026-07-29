@@ -1,4 +1,4 @@
-//! Branch-coordinated lifecycle helpers (CHA-168 + CHA-221): wall-clock
+//! Branch-coordinated lifecycle helpers: wall-clock
 //! reads, persist / abort listings, by-branch metadata reads, and the
 //! branch-scoped `commit_tx_log` family GC (`delete_purge_tx_log_eligible`).
 
@@ -33,7 +33,7 @@ impl LifecycleManager {
         Ok(row.get::<i64, _>("now_micros"))
     }
 
-    /// The default bounded read snapshot (CHA-86): `AsOfMicros` pinned to
+    /// The default bounded read snapshot: `AsOfMicros` pinned to
     /// `pg_now`. Used by metadata reads that have no explicit `as_of` and
     /// no open tx — there is no unbounded read variant.
     pub async fn now_snapshot(driver: &impl DbDriver<Row = PgRow>) -> Result<ReadSnapshot> {
@@ -44,9 +44,8 @@ impl LifecycleManager {
     /// `begin_tx_log_partition`, not yet committed or aborted).
     /// Returns `None` if the tx is unknown or already settled.
     ///
-    /// Used by RYOW reads to construct
-    /// [`ReadSnapshot::OpenTx`]: the snapshot bound is the tx's
-    /// `began_at_seq_num` (CHA-429 moved OpenTx visibility onto the
+    /// Used by RYOW reads to construct [`ReadSnapshot::OpenTx`]: the snapshot
+    /// bound is the tx's `began_at_seq_num` (OpenTx visibility rides the
     /// commit-order axis, `commit_seq_num < began_at_seq_num`), and the
     /// OR-clause picks up the open tx's own uncommitted writes.
     pub async fn get_open_tx_began_at_seq_num(
@@ -56,9 +55,8 @@ impl LifecycleManager {
         tx_uuid: &Uuid,
     ) -> Result<Option<i64>> {
         let begin_part = naming::begin_tx_log_partition(catalog_uuid, branch_uuid);
-        // CHA-429: OpenTx visibility pins on the commit-order axis
-        // (`commit_seq_num < began_at_seq_num`), so name resolution for an open
-        // tx reads the seq frontier captured at BEGIN, not the micros.
+        // OpenTx visibility pins on the commit-order axis, so name resolution
+        // for an open tx reads the seq frontier captured at BEGIN, not micros.
         let sql = format!(
             "SELECT began_at_seq_num FROM {begin} \
              WHERE tx_uuid = $1 \
@@ -74,12 +72,9 @@ impl LifecycleManager {
     /// Return distinct `table_uuid`s touched by committed txs on
     /// `(catalog, branch)` with `commit_micros <= effective_target`.
     ///
-    /// Filter `commit_tx_log_partition` first, then probe
-    /// `tx_table_log_partition` via `WHERE tx_uuid IN (...)` — matches the
-    /// `feedback_tx_table_log_access_pattern` convention so the
-    /// access pattern is self-documenting and consistent with every
-    /// other call site that reaches into `tx_table_log` (CHA-181 has
-    /// `tx_uuid` leading the PK).
+    /// Filters `commit_tx_log_partition` first, then probes
+    /// `tx_table_log_partition` via `WHERE tx_uuid IN (...)` — the convention
+    /// every `tx_table_log` call site follows, since `tx_uuid` leads its PK.
     ///
     /// 1 SQL query.
     pub async fn touched_table_uuids_for_persist(
@@ -116,24 +111,21 @@ impl LifecycleManager {
     /// half-open `[min_micros, max_micros)` window. Either bound may
     /// be `None`; both `None` matches all settled-tx history.
     ///
-    /// CHA-221 (v2.1) broadened the semantic from "committed only" to
-    /// "committed OR aborted" so the scheduler's per-tick Persist phase
-    /// also runs on tables touched by aborted writes. Persist owns
-    /// aborted hot-row cleanup ([ADR 0021](`docs/decisions/0021-persist-owns-aborted-hot-cleanup.md`));
-    /// without this listing change, aborted-only tables would never
-    /// have `Persist(T)` called and their hot rows + tx-log family
-    /// metadata would leak indefinitely.
+    /// Aborted txs are included so the scheduler's per-tick Persist phase also
+    /// runs on tables touched only by aborted writes. Persist owns aborted
+    /// hot-row cleanup ([ADR 0021](`docs/decisions/0021-persist-owns-aborted-hot-cleanup.md`)),
+    /// so without them such tables would never have `Persist(T)` called and
+    /// their hot rows + tx-log family metadata would leak indefinitely.
     ///
     /// Ordered by `MAX(modified_at_micros) ASC, table_uuid ASC` where
     /// `modified_at_micros = committed_at OR aborted_at` per-row —
     /// least-recently-modified first, with a UUID tiebreak so paging
     /// is stable across calls. Paginated via `LIMIT/OFFSET`.
     ///
-    /// Filter `commit_tx_log_partition` / `abort_tx_log_partition`
-    /// first (in the union subquery), then probe
-    /// `tx_table_log_partition` by its `tx_uuid` PK leading column.
-    /// Same `feedback_tx_table_log_access_pattern` convention as
-    /// [`Self::touched_table_uuids_for_persist`].
+    /// Filters `commit_tx_log_partition` / `abort_tx_log_partition` first (in
+    /// the union subquery), then probes `tx_table_log_partition` by its
+    /// `tx_uuid` PK leading column, as [`Self::touched_table_uuids_for_persist`]
+    /// does.
     ///
     /// 1 SQL query.
     pub async fn list_modified_table_uuids_paginated(
@@ -214,14 +206,12 @@ impl LifecycleManager {
     /// paging). Paginated via `LIMIT/OFFSET` — `page_size` and `offset`
     /// are caller-resolved (see `pagination::pagination_from_request`).
     ///
-    /// Partition-pruned by `branch_uuid` (parent is LIST-partitioned by
-    /// `branch_uuid` per CHA-220) — the scan is bounded to a single
-    /// branch's partition slice. Within that slice the planner currently
-    /// has no supporting index for the `commit_micros` window so
-    /// it sequential-scans the partition. Acceptable today because
-    /// `table_persist_metadata` is one row per `(table, persist)` and
-    /// the scheduler tick window is small; if cardinality grows past
-    /// that, add a `(branch_uuid, commit_micros)` index.
+    /// Partition-pruned by `branch_uuid`, so the scan is bounded to a single
+    /// branch's slice. Within that slice there is no supporting index for the
+    /// `commit_micros` window, so it sequential-scans the partition —
+    /// acceptable while `table_persist_metadata` is one row per
+    /// `(table, persist)` and the scheduler tick window is small. If
+    /// cardinality grows past that, add a `(branch_uuid, commit_micros)` index.
     ///
     /// 1 SQL query.
     pub async fn list_persisted_table_uuids_paginated(
@@ -271,8 +261,6 @@ impl LifecycleManager {
             .collect())
     }
 
-    // ── CHA-221 branch-scoped tx-log family GC ───────────────────────
-
     /// Read S = distinct tables in `tx_table_log[B]` whose writer tx is
     /// **settled by the snapshot** (committed in `commit_tx_log[B]` with
     /// `commit_micros <= cleanup_started_at` OR aborted in
@@ -281,7 +269,7 @@ impl LifecycleManager {
     /// watermarks `MAX(last_purged_commit_seq_num)` (`Pu`) and
     /// `MAX(last_purged_aborted_seq_num)` (`Pa`) from
     /// `table_purge_metadata`, **as of `cleanup_started_at_micros`**
-    /// (CHA-444 / ADR 0027). One round-trip; no per-table queries.
+    /// (ADR 0027). One round-trip; no per-table queries.
     ///
     /// Why the settled-tx filter on `tx_table_log` entries: an
     /// in-flight open tx that has mutated table T inserts a
@@ -305,18 +293,18 @@ impl LifecycleManager {
     /// strongest-constraint / block-on-`None` rule — *not* a `None → 0`
     /// substitution.
     ///
-    /// CHA-221 v2.1 / CHA-444: the `commit_micros <= $cleanup_started_at`
-    /// filter on `table_purge_metadata` is **load-bearing**. It pins
+    /// The `commit_micros <= $cleanup_started_at` filter on
+    /// `table_purge_metadata` is **load-bearing**. It pins
     /// the per-table `Pu` / `Pa` view to what was visible at the moment
     /// `PurgeTxLog` captured its `cleanup_started_at_micros`,
     /// independent of any concurrent `Purge(T)` whose phase-2 commits
     /// during `PurgeTxLog`'s SQL execution. Without this filter, a
     /// concurrent Purge advancing `Pu(T)` mid-pass could let
     /// `MIN(Pu over S)` jump past a tx that committed after
-    /// `cleanup_started_at`, breaking the safety chain. See ADR 0021 /
-    /// CHA-221 §"Long-cleanup-race". The same `cleanup_started_at`
-    /// bound is reused on the `commit_tx_log` / `abort_tx_log` half of the
-    /// S filter so both halves see a consistent snapshot.
+    /// `cleanup_started_at`, breaking the safety chain (ADR 0021
+    /// §"Long-cleanup-race"). The same `cleanup_started_at` bound is reused on
+    /// the `commit_tx_log` / `abort_tx_log` half of the S filter so both halves
+    /// see a consistent snapshot.
     ///
     /// Reads the stored seq watermark columns (`last_purged_commit_seq_num` /
     /// `last_purged_aborted_seq_num`) directly. MUST NOT derive a
@@ -336,10 +324,8 @@ impl LifecycleManager {
         let commit_tx_log_part = naming::commit_tx_log_partition(catalog_uuid, branch_uuid);
         let abort_part = naming::abort_tx_log_partition(catalog_uuid, branch_uuid);
         let purge_table = naming::table_purge_metadata_table(catalog_uuid);
-        // CHA-444 (ADR 0027): per-table seq watermarks `Pu`
-        // (`last_purged_commit_seq_num`) and `Pa` (`last_purged_aborted_seq_num`),
-        // as-of `cleanup_started_at` (the committed_at filter pins the view
-        // against a concurrent Purge mid-pass — CHA-221 §Long-cleanup-race).
+        // The committed_at filter pins the `Pu`/`Pa` view as-of
+        // `cleanup_started_at`, against a concurrent Purge mid-pass.
         let sql = format!(
             "SELECT t.table_uuid, p.pu AS pu, p.pa AS pa \
              FROM ( \
@@ -388,11 +374,11 @@ impl LifecycleManager {
             .collect()
     }
 
-    /// CHA-221 / CHA-444's branch-scoped tx-log family DELETE — one SQL
-    /// statement that GCs `commit_tx_log[B]`, `tx_table_log[B]`, `abort_tx_log[B]`,
-    /// and `begin_tx_log[B]` for one fixed eligibility set. ADR 0027 re-axises
-    /// the eligibility onto the purge seq watermarks; `eligible` is the union
-    /// of four disjoint branches:
+    /// Branch-scoped tx-log family DELETE — one SQL statement that GCs
+    /// `commit_tx_log[B]`, `tx_table_log[B]`, `abort_tx_log[B]`, and
+    /// `begin_tx_log[B]` for one fixed eligibility set. Eligibility rides the
+    /// purge seq watermarks (ADR 0027); `eligible` is the union of four
+    /// disjoint branches:
     ///
     /// 1. **Committed** — `commit_seq_num <= pu_cutoff` (`MIN(Pu over S)`). By the
     ///    branch-min, every active table has purged this tx's committed hot
@@ -411,7 +397,7 @@ impl LifecycleManager {
     ///
     /// The seq cutoffs are bounded to the statement view by the as-of filter on
     /// `table_purge_metadata.committed_at` in the watermarks read that feeds
-    /// `compute_purge_tx_log_cutoffs` (CHA-221 §Long-cleanup-race). In-flight
+    /// `compute_purge_tx_log_cutoffs`. In-flight
     /// open txs are in none of the four branches, so their `begin_tx_log` /
     /// `tx_table_log` state is preserved.
     ///
@@ -436,8 +422,8 @@ impl LifecycleManager {
         let begin = qi(&naming::begin_tx_log_partition(catalog_uuid, branch_uuid));
         let expiry_bound = cleanup_started_at_micros.saturating_sub(expiry_grace_micros);
 
-        // CHA-444 (ADR 0027): four disjoint eligibility branches. The cutoffs
-        // are system-computed i64s, inlined directly (no injection surface).
+        // Four disjoint eligibility branches. The cutoffs are system-computed
+        // i64s, inlined directly (no injection surface).
         let mut branches: Vec<String> = Vec::new();
         // 1. Committed, purged from hot in every active table: commit_seq_num <= Pu.
         if let Some(pu) = pu_cutoff {

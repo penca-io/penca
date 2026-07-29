@@ -38,7 +38,7 @@ pub trait Dialect {
     /// in `select_cols`. Column and partition names are quoted by the
     /// implementation.
     ///
-    /// CHA-243 → CHA-431: `order_cols` is a slice (not a single string) so
+    /// `order_cols` is a slice (not a single string) so
     /// the merge-on-read SQL can break ties on a primary key via a
     /// secondary key (e.g. `(commit_seq_num, write_seq_num)`) without introducing
     /// a parallel `latest_per_partition_composite` helper.
@@ -79,7 +79,7 @@ pub fn qualify_user_cols<D: Dialect>(alias: &str, user_cols: &[&str]) -> String 
         .join(", ")
 }
 
-/// CHA-398 point-lookup restriction clause —
+/// Point-lookup restriction clause —
 /// `{prefix}{alias}row_uuid IN (<uuid literals>)`, or empty when no
 /// restriction is present. `prefix` is the composition keyword
 /// (`" WHERE "` / `" AND "`); `alias` includes the trailing dot
@@ -89,7 +89,7 @@ pub fn qualify_user_cols<D: Dialect>(alias: &str, user_cols: &[&str]) -> String 
 ///
 /// The list is inlined as literals with no cardinality cap — callers
 /// own bounding the batch size (today the gRPC message cap bounds it;
-/// large-set strategies are CHA-78's scope).
+/// large-set strategies are out of scope here).
 pub fn row_uuid_in_clause<D: Dialect>(
     row_uuids: Option<&[uuid::Uuid]>,
     prefix: &str,

@@ -1,8 +1,4 @@
-//! Per-connection logical-plan cache for statement-query plan reuse (CHA-355;
-//! renamed from `PlanCache`/`plan_uuid` to `StatementCache`/`statement_uuid` in
-//! CHA-378, renaming the per-statement key and wrapping the cached
-//! [`LogicalPlan`] in a [`StatementCacheEntry`] so further per-statement
-//! reusable artifacts can join it later).
+//! Per-connection logical-plan cache for statement-query plan reuse.
 //!
 //! A Flight SQL statement query is planned twice today: once in
 //! `GetFlightInfo` (to return the result schema) and again in `DoGet` (to
@@ -35,7 +31,7 @@
 //! only to its own plan, so no catalog/branch guard is needed. Transaction
 //! visibility is not stored either: the cached plan's
 //! `PencaTableProvider::scan` reads the live `ConnScope.open_tx_cell` at
-//! execution time (CHA-345), so a reused plan sees the same transaction state a
+//! execution time, so a reused plan sees the same transaction state a
 //! re-planned one would. Reuse changes *which plan runs*, not *which rows it
 //! sees*.
 //!
@@ -71,7 +67,7 @@ use uuid::Uuid;
 /// A statement-cache value: the reusable artifacts keyed by `statement_uuid`.
 /// Today that is only the [`LogicalPlan`]; it is a struct rather than a bare
 /// plan so further per-statement reusable artifacts can join it later without
-/// re-threading every callsite (CHA-378).
+/// re-threading every callsite.
 #[derive(Clone)]
 pub(crate) struct StatementCacheEntry {
     pub(crate) plan: LogicalPlan,
