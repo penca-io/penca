@@ -850,14 +850,12 @@ integration-test *services:
     # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
     # Runs even if phase 1 failed, so one invocation reports both.
     #
-    # The cap protects the REQUEST DEADLINE, not the connection table. Each
-    # servicer holds PG_POOL_MAX=4 (docker/compose.yml), so surplus workers
-    # queue on pool acquisition *inside* the request, against the absolute
-    # QUERY_TIMEOUT_SECONDS=2 (docker/test.env) — surfacing as
-    # RESOURCE_EXHAUSTED in whatever read-path test happened to be running,
-    # which reads like a product bug rather than contention. PENCA_TEST_JOBS
-    # only lowers the ceiling, since `--maxprocesses` bounds `-n auto` from
-    # above; inert on CI, where ubuntu-latest gives public repos 4 cores.
+    # Worker count is bounded by the servicers' PG pools, not by cores. At 4
+    # workers against the default pool of 4, 28 tests failed — every one of
+    # them with "pool timed out while waiting for an open connection" and
+    # nothing else. docker/test.env raises PG_POOL_MAX for the test profile so
+    # the pool is no longer the binding constraint; if that override is ever
+    # dropped, lower this cap to match or the parallel phase goes red.
     #
     # PENCA_TEST_JOBS binds `-n`, not `--maxprocesses`, so it can raise as well
     # as lower. That matters because `--maxprocesses` is only a ceiling on

@@ -127,7 +127,7 @@ services:
     environment:
       DATABASE_URL: postgres://penca:penca@postgres:5432/penca
       PG_POOL_MIN: "1"
-      PG_POOL_MAX: "4"
+      PG_POOL_MAX: "${PG_POOL_MAX:-4}"
       BIND_ADDR: "0.0.0.0:50052"
       QUERY_DEFAULT_PAGE_SIZE: "100"
       QUERY_DEFAULT_STREAM_BATCH_SIZE: "1024"
@@ -177,7 +177,7 @@ services:
     environment:
       DATABASE_URL: postgres://penca:penca@postgres:5432/penca
       PG_POOL_MIN: "1"
-      PG_POOL_MAX: "4"
+      PG_POOL_MAX: "${PG_POOL_MAX:-4}"
       BIND_ADDR: "0.0.0.0:50053"
       WRITE_DEFAULT_TX_TIMEOUT_SECONDS: "60"
       WRITE_MAX_TX_TIMEOUT_SECONDS: "3600"
@@ -220,7 +220,7 @@ services:
     environment:
       DATABASE_URL: postgres://penca:penca@postgres:5432/penca
       PG_POOL_MIN: "1"
-      PG_POOL_MAX: "4"
+      PG_POOL_MAX: "${PG_POOL_MAX:-4}"
       BIND_ADDR: "0.0.0.0:50054"
       LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES: "${LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES:-67108864}"
       LIFECYCLE_SEGMENT_READ_CONCURRENCY: "4"
@@ -299,7 +299,7 @@ services:
       # + write under a per-(branch, table) advisory lock (CHA-121, ADR 0006).
       DATABASE_URL: postgres://penca:penca@postgres:5432/penca
       PG_POOL_MIN: "1"
-      PG_POOL_MAX: "4"
+      PG_POOL_MAX: "${PG_POOL_MAX:-4}"
       # Default catalog / schema / branch for the SQL server.
       # CHA-171's `penca-bootstrap` binary seeds a `public` catalog so
       # unbound Flight SQL connections land on a real `catalog_store`
