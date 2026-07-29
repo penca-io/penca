@@ -24,7 +24,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .integration_helpers import make_client
+from .integration_helpers import (
+    demo_catalog_names,
+    make_client,
+    reaped_demo_catalogs,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_PATH = _REPO_ROOT / "examples" / "oltp_demo.py"
@@ -62,19 +66,10 @@ _WATERMARKS = ("persisted_at", "snapshotted_at", "purged_at")
 _WATERMARK_VALUE = re.compile(rf"({'|'.join(_WATERMARKS)})=(\S+)")
 
 
-def _demo_catalogs(client) -> set[str]:
-    return {
-        catalog.catalog_name
-        for catalog in client.list_catalogs()
-        if catalog.catalog_name.startswith("demo_")
-    }
-
-
 def test_oltp_demo_seeks_one_row_on_both_paths_against_cold_columnar():
     client = make_client()
-    before = _demo_catalogs(client)
 
-    try:
+    with reaped_demo_catalogs(client) as before:
         result = subprocess.run(
             [
                 sys.executable,
@@ -95,28 +90,13 @@ def test_oltp_demo_seeks_one_row_on_both_paths_against_cold_columnar():
         )
         _assert_walkthrough(result)
 
-        # Inside the try, so it pins the demo's cleanup without gating the reap:
-        # if the demo stranded a catalog, the finally still takes it out.
-        assert _demo_catalogs(client) == before, (
+        # Inside the context, so it pins the demo's own cleanup without gating
+        # the reap: if the demo stranded a catalog, the exit still takes it out.
+        assert demo_catalog_names(client) == before, (
             "oltp_demo.py must delete the catalog it created — it is pure "
             "scaffolding once the numbers are printed, and every leaked catalog "
             "sits on a stack the rest of the suite shares"
         )
-    finally:
-        # finally, and reaping whatever appeared rather than gating on a count:
-        # the demo creates its catalog before printing anything, so every red run
-        # strands one, which is precisely what this reap exists to prevent.
-        try:
-            leaked = _demo_catalogs(client) - before
-        except Exception as exc:  # noqa: BLE001 - must not mask a real failure
-            print(f"(could not list catalogs to reap: {exc})")
-            leaked = set()
-
-        for catalog_name in leaked:
-            try:
-                client.delete_catalog(catalog_name=catalog_name)
-            except Exception as exc:  # noqa: BLE001 - must not mask a real failure
-                print(f"(could not delete catalog {catalog_name}: {exc})")
 
 
 def _assert_walkthrough(result) -> None:

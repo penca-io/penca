@@ -698,3 +698,42 @@ def count_stmts_referencing(driver: DbDriver, needle: str) -> int:
         (needle,),
     )
     return int(rows[0][0])
+
+
+def demo_catalog_names(client) -> set[str]:
+    return {
+        catalog.catalog_name
+        for catalog in client.list_catalogs()
+        if catalog.catalog_name.startswith("demo_")
+    }
+
+
+@contextmanager
+def reaped_demo_catalogs(client):
+    """Reap any ``demo_``-prefixed catalog an ``examples/`` script leaves behind.
+
+    Every demo smoke test runs its script as a subprocess against a stack the
+    rest of the suite shares, and each script creates its catalog before it
+    prints anything — so a red run strands one unless something takes it out.
+    Yields the pre-existing set so a caller can additionally assert the script
+    cleaned up after itself.
+
+    Best-effort by construction: a failure to list or delete is printed, never
+    raised, because this runs on the unwind path where the exception already in
+    flight is the one worth propagating.
+    """
+    before = demo_catalog_names(client)
+    try:
+        yield before
+    finally:
+        try:
+            leaked = demo_catalog_names(client) - before
+        except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+            print(f"(could not list catalogs to reap: {exc})")
+            leaked = set()
+
+        for catalog_name in leaked:
+            try:
+                client.delete_catalog(catalog_name=catalog_name)
+            except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+                print(f"(could not delete catalog {catalog_name}: {exc})")

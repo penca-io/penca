@@ -19,18 +19,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .integration_helpers import make_client
+from .integration_helpers import demo_catalog_names, make_client, reaped_demo_catalogs
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_PATH = _REPO_ROOT / "examples" / "audit_demo.py"
-
-
-def _demo_catalogs(client) -> set[str]:
-    return {
-        catalog.catalog_name
-        for catalog in client.list_catalogs()
-        if catalog.catalog_name.startswith("demo_")
-    }
 
 
 def test_audit_demo_runs_the_documented_walkthrough():
@@ -39,9 +31,8 @@ def test_audit_demo_runs_the_documented_walkthrough():
     # only way to reap it, and without that the suite leaks one per run onto a
     # stack every other test shares.
     client = make_client()
-    before = _demo_catalogs(client)
 
-    try:
+    with reaped_demo_catalogs(client) as before:
         result = subprocess.run(
             [sys.executable, str(_DEMO_PATH)],
             cwd=_REPO_ROOT,
@@ -52,25 +43,10 @@ def test_audit_demo_runs_the_documented_walkthrough():
         )
         _assert_walkthrough(result)
 
-        # Inside the try, so it pins the demo's behaviour without gating cleanup:
-        # if more than one catalog appeared, the finally still reaps all of them.
-        created = _demo_catalogs(client) - before
+        # Inside the context, so it pins the demo's behaviour without gating
+        # cleanup: if more than one catalog appeared, the exit still reaps them.
+        created = demo_catalog_names(client) - before
         assert len(created) == 1, f"expected one new demo_ catalog, saw {created}"
-    finally:
-        # finally, and reaping whatever appeared rather than gating on the count:
-        # audit_demo.py creates its catalog before printing anything, so every red
-        # run strands one — which is precisely what this reap exists to prevent.
-        try:
-            leaked = _demo_catalogs(client) - before
-        except Exception as exc:  # noqa: BLE001 - must not mask a real failure
-            print(f"(could not list catalogs to reap: {exc})")
-            leaked = set()
-
-        for catalog_name in leaked:
-            try:
-                client.delete_catalog(catalog_name=catalog_name)
-            except Exception as exc:  # noqa: BLE001 - must not mask a real failure
-                print(f"(could not delete catalog {catalog_name}: {exc})")
 
 
 def _assert_walkthrough(result) -> None:
