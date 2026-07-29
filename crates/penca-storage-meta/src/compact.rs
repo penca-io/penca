@@ -263,11 +263,19 @@ impl LifecycleManager {
     /// are auto-commit; failed-snapshot cleanup is best-effort
     /// in-process): until a snapshot-orphan reaper exists
     /// (TODO(CHA-435)), a hard crash mid-snapshot permanently pins
-    /// every shared URI its orphan rows reference. CHA-531 widened that
-    /// blast radius from branch-scoped to catalog-scoped — orphan rows
-    /// on one branch now pin files written by any branch in the
-    /// catalog, so the reaper is a stronger requirement than it was
-    /// when the gate only saw one branch. A still-referenced
+    /// every shared URI its orphan rows reference.
+    ///
+    /// CHA-531 widened that blast radius, but along a different axis
+    /// than the file set. The URIs an orphan can pin are unchanged —
+    /// still only what that snapshot touched, i.e. the branch's own
+    /// new files plus the ones it carried from its parent. What
+    /// changed is WHOSE queue those orphans block: because the arms no
+    /// longer filter on `branch_uuid`, and every branch that carried a
+    /// URI gets its own branch-keyed delete-set row on retirement, one
+    /// branch's orphans now stall the sweep of every OTHER branch
+    /// holding a queue row for the same URI. Before, an orphan could
+    /// only ever block its own branch's rows. The reaper is therefore
+    /// a stronger requirement than it was. A still-referenced
     /// row stays queued; the retirement that drops the last reference
     /// re-enqueues the URI and refreshes its grace clock (see
     /// [`Self::insert_segment_delete_set_rows`]). Persist-compaction

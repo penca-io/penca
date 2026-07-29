@@ -328,10 +328,17 @@ now the rule lives here.
   when the last referencing snapshot retires), and crash-orphaned
   uncommitted snapshot rows (unbounded until TODO(CHA-435) lands a
   reaper). The live-lock CHA-435 addresses is therefore now
-  **catalog-scoped**: orphans on one branch pin files written by any
-  branch in the catalog. `sweep_segments`' `eligible`/`deleted` pair
-  is the triage signal — a persistent `eligible = 0` against a
-  growing delete set reads as "everything still referenced".
+  **catalog-scoped** — but along the queue axis, not the file axis. An
+  orphan still pins only the URIs its own snapshot touched (that
+  branch's new files plus what it carried from its parent, which under
+  the CHA-515 main-only guard is always `main`). What widened is whose
+  sweep those orphans stall: `segment_delete_uuid` is branch-keyed, so
+  every branch that carried a URI gets its own queue row for it on
+  retirement, and one branch's orphans now block all of them. Before,
+  an orphan could only block its own branch's rows.
+  `sweep_segments`' `eligible`/`deleted` pair is the triage signal — a
+  persistent `eligible = 0` against a growing delete set reads as
+  "everything still referenced".
 * **The grace arm assumes a uniform `query_timeout`.** The
   cross-branch max compares `written_at_micros` across branches
   against a *single* `query_timeout` — the one belonging to the
