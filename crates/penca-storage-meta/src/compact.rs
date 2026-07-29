@@ -263,7 +263,11 @@ impl LifecycleManager {
     /// are auto-commit; failed-snapshot cleanup is best-effort
     /// in-process): until a snapshot-orphan reaper exists
     /// (TODO(CHA-435)), a hard crash mid-snapshot permanently pins
-    /// every shared URI its orphan rows reference. A still-referenced
+    /// every shared URI its orphan rows reference. CHA-531 widened that
+    /// blast radius from branch-scoped to catalog-scoped — orphan rows
+    /// on one branch now pin files written by any branch in the
+    /// catalog, so the reaper is a stronger requirement than it was
+    /// when the gate only saw one branch. A still-referenced
     /// row stays queued; the retirement that drops the last reference
     /// re-enqueues the URI and refreshes its grace clock (see
     /// [`Self::insert_segment_delete_set_rows`]). Persist-compaction
@@ -287,9 +291,10 @@ impl LifecycleManager {
     /// are re-scanned by every sweep — a standing blocked set now
     /// costs O(blocked_rows x branches) per sweep per branch. ADR
     /// 0019's "`segment_delete_set` itself is small" premise no longer
-    /// bounds the work on its own; the triage signal at
-    /// `sweep.rs`'s standing-blocked warning should be read against
-    /// that baseline.
+    /// bounds the work on its own; the triage signal is
+    /// `sweep_segments`' `eligible`/`deleted` pair (penca-api's
+    /// `lifecycle::sweep`), which should be read against that
+    /// baseline.
     ///
     /// 1 SQL query.
     pub async fn eligible_segment_delete_set_rows(

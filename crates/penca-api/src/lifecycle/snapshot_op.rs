@@ -268,6 +268,11 @@ impl LifecycleManager {
     /// produces the snapshot baseline: persist segments in
     /// `(prev_snap_watermark + 1, snapshotted_at_micros + 1)` plus the
     /// prior snapshot (if any) as the cold baseline.
+    ///
+    /// `fork_edge` is the caller's already-resolved lineage, passed in rather
+    /// than re-read here: both are gated on `prev_snap_watermark.is_none()`, so
+    /// re-deriving it would cost a second `branch_store` round-trip on every
+    /// table's first snapshot — forked or not (CHA-531).
     #[allow(clippy::too_many_arguments)]
     async fn assemble_cold_only_plan(
         &self,
@@ -278,6 +283,7 @@ impl LifecycleManager {
         snapshotted_at_micros: i64,
         prev_snap_watermark: Option<i64>,
         snapshot_segments: Vec<SnapshotSegment>,
+        fork_edge: Option<(&str, i64)>,
     ) -> Result<Plan, ApiError> {
         let from_micros = prev_snap_watermark.map(|s| s.saturating_add(1));
         let to_micros = Some(snapshotted_at_micros.saturating_add(1));
@@ -340,17 +346,13 @@ impl LifecycleManager {
         let base_cold_storage = if prev_snap_watermark.is_some() {
             None
         } else {
-            match self
-                .query_manager
-                .read_branch_lineage(pool, catalog_str, branch_str)
-                .await?
-            {
+            match fork_edge {
                 Some((parent_branch_uuid, fork_commit_seq_num)) => {
                     self.query_manager
                         .enumerate_base_cold_source(
                             pool,
                             catalog_str,
-                            &parent_branch_uuid,
+                            parent_branch_uuid,
                             table_str,
                             snapshotted_at_micros,
                             fork_commit_seq_num,
@@ -397,6 +399,11 @@ impl LifecycleManager {
     /// the newer one, and every parent row committed between the two watermarks
     /// would belong to neither the carried baseline nor this tail — silently
     /// dropped. Deriving both from one read makes that unrepresentable.
+    ///
+    /// TODO(CHA-509): one hop only — this folds a single parent's tail and
+    /// applies that parent's tail deletes. Under a fork chain the tail spans
+    /// every hop between the nearest baked ancestor and this branch, folded in
+    /// shadow order (nearer shadows farther).
     async fn assemble_fork_tail_base_cold(
         &self,
         pool: &PgDriver,
@@ -629,6 +636,26 @@ impl LifecycleManager {
         // the new watermark bases at the PARENT's W_snap. Basing at the child's
         // own (`None` → genesis) would stamp a watermark below the seq of rows
         // the snapshot actually materializes.
+        //
+        // It can still UNDERSTATE on that first snapshot. `segment_seq_max` is
+        // windowed over `branch_str` — the CHILD's persist log — so the parent
+        // tail folded in between the parent's W_snap and `fork_commit_seq_num`
+        // contributes no seq. A fork whose child has committed nothing of its
+        // own therefore stamps W_snap at the parent's W_snap, below
+        // `fork_commit_seq_num`, even though the snapshot materializes the
+        // parent through the fork point.
+        //
+        // Left as-is deliberately: understating W_snap is the safe direction —
+        // readers re-resolve the persist log over the ungoverned range instead
+        // of trusting the snapshot, and cross-tier dedup keeps the result
+        // correct. The visible cost is plan shape, not answers: `meta_plan`'s
+        // base-cold gate (`child_snapshot_seq < fork_commit_seq_num`) stays
+        // open, so such a fork keeps paying for the parent's base source until
+        // its own first commit lands. Seeding the fold with
+        // `fork_commit_seq_num` would close both, but it ADVANCES a watermark —
+        // the unsafe direction if any fork path fails to materialize the parent
+        // through the fork point (the parent-has-no-snapshot fallback is the
+        // one to prove out first).
         let snapshot_commit_seq_num = compute_snapshot_seq_watermark(
             baseline_commit_seq_num,
             &segment_seq_max.into_iter().collect::<Vec<i64>>(),
@@ -905,6 +932,9 @@ impl LifecycleManager {
                     snapshotted_at_micros,
                     prev_snap_watermark,
                     snapshot_segments,
+                    fork_edge
+                        .as_ref()
+                        .map(|(parent, seq)| (parent.as_str(), *seq)),
                 )
                 .await?;
             let parts = penca_merge::stream_all_cold_parts(penca_merge::MergeReadRequest {

@@ -316,6 +316,33 @@ now the rule lives here.
   `segment_delete_set` itself is small (one row per compacted-away
   file, deleted on sweep) and partitioned by `branch_uuid` to match
   the rest of the lifecycle tables.
+
+  *Amended by CHA-531.* "Small" no longer holds unconditionally. A
+  row whose file is still referenced across a fork edge is **not**
+  deleted on sweep — it stays queued in the expired range and is
+  re-scanned by every subsequent sweep on its branch. Since the
+  probes are catalog-wide, each such row costs one index probe per
+  branch leaf, so a standing blocked set costs
+  O(blocked_rows x branches) per sweep. Two things make a set stand:
+  a legitimately long-lived carried reference (bounded — it clears
+  when the last referencing snapshot retires), and crash-orphaned
+  uncommitted snapshot rows (unbounded until TODO(CHA-435) lands a
+  reaper). The live-lock CHA-435 addresses is therefore now
+  **catalog-scoped**: orphans on one branch pin files written by any
+  branch in the catalog. `sweep_segments`' `eligible`/`deleted` pair
+  is the triage signal — a persistent `eligible = 0` against a
+  growing delete set reads as "everything still referenced".
+* **The grace arm assumes a uniform `query_timeout`.** The
+  cross-branch max compares `written_at_micros` across branches
+  against a *single* `query_timeout` — the one belonging to the
+  sweeping process (`QUERY_TIMEOUT_SECONDS`, passed down as
+  `LifecycleManager::query_timeout_micros`), not one per row. Deploy
+  a shorter timeout on one branch's lifecycle process and it can
+  expire a sibling branch's row early, reopening the TOCTOU window
+  that pillar 3 closes. Uniform deployment across a catalog is
+  currently an operational convention, not an enforced invariant;
+  making the knob genuinely per-branch would require the probe to
+  compare each row against its own branch's timeout.
 * **Long-running analytical queries hit a hard cap.** Queries that
   exceeded the default 15 min previously completed silently;
   under this ADR they get a `RESOURCE_EXHAUSTED` cancellation.
