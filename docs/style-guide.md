@@ -157,6 +157,38 @@ A failure surfaced on the request that triggered it is better UX than
 a half-success that fails opaquely two requests later — trust the
 client to retry.
 
+### Wire-shape validation lives in the gRPC validation module
+
+Validation of a typed gRPC request shape (`CreateTableRequest`,
+`CreateSchemaRequest`, `MutateDataRequest`, …) belongs in
+`crates/penca-server-grpc/src/validation/<service>.rs` — the module the
+servicer runs *before* dispatching into penca-api. Not as a per-wire-path
+filter inside penca-sql-server, and not inside a penca-api servicer impl.
+
+The test: **would the same failure mode surface different wording depending
+on whether the caller used Flight SQL or direct gRPC?** Flight SQL issues a
+gRPC call, so both callers send the same typed struct through this one
+layer — that convergence point is where the check belongs. Splitting it
+per-entry-point is how one driver's users get an actionable message and
+another's get an internal DataFusion error for the same mistake.
+
+- **Belongs in the validation module** — anything on the typed wire shape:
+  primary-key list dedup / membership / non-empty, retention-config bounds,
+  version-uuid format, `arrow_schema` field constraints, cross-field
+  references. `validation::write::validate_create_table` is the canonical
+  example; fold new per-field checks into the existing sibling rather than
+  adding a parallel one.
+- **Stays SQL-side** — anything sqlparser-syntactic with no gRPC equivalent:
+  AST-flag rejections (`IF NOT EXISTS`, `OR REPLACE`, `INHERITS`, `STRICT`),
+  `Expr::Identifier` checks in `PRIMARY KEY(...)` (sqlparser yields `Expr`,
+  gRPC takes `Vec<String>`), 3-part name rejection, `DEFAULT`-clause
+  rejection, and SQL-type → Arrow-type translator rejections.
+
+`penca-api::write::validate_create_table_primary_keys` is the legacy
+placement this rule corrects away from — don't copy it for new checks.
+Inventory the candidates before writing a fix; don't reflexively put
+validation where you happen to be editing.
+
 ## Proto messages as canonical types
 
 - Use proto message types directly as function parameters and return types.
