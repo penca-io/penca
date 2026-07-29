@@ -8,7 +8,7 @@ metadata:
   modified: 2026-07-21T22:06:09.704Z
 ---
 
-The `penca-io/penca` working checkout ships with **no git `user.name`/`user.email`** configured (local or global). git then auto-guesses `exe.dev user <exedev@fabricdb-dev-1.exe.xyz>` — the exact dev-VM author identity CHA-150's squash scrubbed (~1,700 commits) to keep off the going-public repo. The squashed "Initial commit" is correctly authored `Nico Bautista Hobin <nico@penca.io>`.
+A fresh `penca-io/penca` checkout ships with **no git `user.name`/`user.email`** configured (local or global), and **nothing in `just bootstrap` / `init-agent-tools` sets it** (verified 2026-07-29 — no `user.email` anywhere in the Justfile or `scripts/`). git then auto-guesses `exe.dev user <exedev@fabricdb-dev-1.exe.xyz>` — the exact dev-VM author identity CHA-150's squash scrubbed (~1,700 commits) to keep off the going-public repo. The squashed "Initial commit" is correctly authored `Nico Bautista Hobin <nico@penca.io>`.
 
 Before committing here, set the repo-LOCAL identity to match:
 
