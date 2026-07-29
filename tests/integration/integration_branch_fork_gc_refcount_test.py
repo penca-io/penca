@@ -31,21 +31,20 @@ import time
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client import Mutation
 from penca_client.naming import (
     SEGMENT_DELETE_SET,
     TABLE_SNAPSHOT_INDEX_METADATA,
     TABLE_SNAPSHOT_METADATA,
     TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
     TABLE_SNAPSHOT_SEGMENT_METADATA,
-    table_snapshot_uuid,
 )
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
     USER_SCHEMA,
     get_pg_driver,
-    make_client,
+    setup_partitioned_table,
+    write_cycle,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -53,57 +52,6 @@ from .integration_helpers import (
 
 def _now_micros():
     return int(time.time() * 1_000_000)
-
-
-def _make_env():
-    client = make_client()
-    catalog_uuid, main_branch_uuid = client.create_catalog(
-        f"fgc_cat_{uuid4().hex[:8]}", "owner"
-    )
-    schema_uuid = client.create_schema(
-        "fgc_schema", catalog_uuid=catalog_uuid, author="test", comment="cha-531"
-    )
-    table_uuid = client.create_table(
-        "fgc_table",
-        USER_SCHEMA,
-        primary_keys=["name"],
-        partition_keys=["name"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        author="test",
-        comment="cha-531",
-    )
-    return client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid
-
-
-def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
-    tx = client.begin_tx(
-        catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, branch_uuid=branch_uuid
-    )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(table_uuid=table_uuid, upserts=upserts),
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
-    client.persist(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-        table_uuid=table_uuid,
-    )
-    response = client.snapshot(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        table_uuid=table_uuid,
-        branch_uuid=branch_uuid,
-    )
-    assert response.HasField("snapshotted_at_micros")
-    return table_snapshot_uuid(
-        catalog_uuid, branch_uuid, table_uuid, response.snapshotted_at_micros
-    )
 
 
 def _column_names(table_name):
@@ -249,8 +197,33 @@ def _insert_delete_set_row(catalog_uuid, branch_uuid, table_uuid, uri, written_a
 
 
 def _drop_snapshot_rows(catalog_uuid, branch_uuid, snapshot_uuid):
-    """Drop a snapshot's segment + parent rows, as retirement would."""
-    for name in (TABLE_SNAPSHOT_SEGMENT_METADATA, TABLE_SNAPSHOT_METADATA):
+    """Drop every row a snapshot owns, as retirement would.
+
+    Must include the CHA-412 index sidecars and their headers, not only
+    the base segments: real retirement drops them too
+    (``delete_segment_index_metadata_for_segments``). A simulation that
+    left the sidecars behind would leave the retiring branch's own row
+    pinning the sidecar's ``object_uri``, so a sidecar-refcount test
+    built on it would pass no matter how the gate is scoped.
+    """
+    child = f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA}"
+    header = f"{catalog_uuid}_{TABLE_SNAPSHOT_INDEX_METADATA}"
+    # Sidecars hang off the header, which is what carries the snapshot,
+    # so they go first and by join.
+    get_pg_driver().execute_no_result(
+        SQL(
+            "DELETE FROM {child} c USING {header} p"
+            " WHERE p.branch_uuid = c.branch_uuid"
+            " AND p.table_snapshot_index_uuid = c.table_snapshot_index_uuid"
+            " AND c.branch_uuid = %s AND p.table_snapshot_uuid = %s"
+        ).format(child=Identifier(child), header=Identifier(header)),
+        (branch_uuid, snapshot_uuid),
+    )
+    for name in (
+        TABLE_SNAPSHOT_INDEX_METADATA,
+        TABLE_SNAPSHOT_SEGMENT_METADATA,
+        TABLE_SNAPSHOT_METADATA,
+    ):
         get_pg_driver().execute_no_result(
             SQL(
                 "DELETE FROM {tbl} WHERE branch_uuid = %s AND table_snapshot_uuid = %s"
@@ -272,9 +245,11 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
     the parent must leave the file alone — its reference count is one,
     not zero, and the count is a CATALOG-wide property.
     """
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fgc")
+    )
 
-    snap_main = _cycle(
+    snap_main = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -380,9 +355,11 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
     catalog-wide turns the test above green while carried sidecar files
     are still deleted out from under the child.
     """
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fgc")
+    )
 
-    snap_main = _cycle(
+    snap_main = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -449,12 +426,34 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
 
     client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
 
+    assert _sidecar_rows(catalog_uuid, main_branch) == [], (
+        "the retirement simulation did not take: the parent still holds its"
+        " own sidecar rows, which would pin the URI through the branch-scoped"
+        " arm and make the assertion below pass no matter how the gate is"
+        " scoped."
+    )
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
     remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
     assert len(remaining) == 1, (
         "sweep deleted a cold INDEX SIDECAR that another branch's snapshot"
         f" still references. {shared_uri} is referenced by branch"
         f" {child_branch} via table_snapshot_segment_index_metadata, so the"
         " sidecar refcount arm must probe catalog-wide, not branch-scoped."
+    )
+
+    # Positive control: drop the child's copied sidecar and the file has
+    # zero references left, so the same sweep drains it.
+    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
+    assert _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri]) == [], (
+        "the delete-set row survived a sweep with zero remaining sidecar"
+        " references, so the survival above proves nothing about the sidecar"
+        " arm. Either the sweep never treated the URI as eligible, or the"
+        " cold-file delete failed and the row was left for retry."
     )
 
 
@@ -468,9 +467,11 @@ def test_parent_sweep_respects_another_branchs_grace_window():
     eligible the instant B drops that reference, deleting the file inside
     the grace window a concurrent reader on B relies on.
     """
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fgc")
+    )
 
-    snap_main = _cycle(
+    snap_main = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -498,8 +499,18 @@ def test_parent_sweep_respects_another_branchs_grace_window():
     _insert_delete_set_row(
         catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
     )
+    # Stamped a minute ahead, not at "now". QUERY_TIMEOUT_SECONDS is 2s in
+    # docker/test.env, and this timestamp comes from the test host's clock
+    # while the threshold comes from Postgres's — gRPC latency plus any
+    # container/host skew would eat a 2s margin and flip the row out of
+    # grace, failing the test for a reason it does not test. Only
+    # `_age_delete_set_rows` below should move it.
     _insert_delete_set_row(
-        catalog_uuid, sibling_branch, table_uuid, shared_uri, _now_micros()
+        catalog_uuid,
+        sibling_branch,
+        table_uuid,
+        shared_uri,
+        _now_micros() + 60_000_000,
     )
 
     client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
