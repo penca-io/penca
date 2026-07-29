@@ -7,12 +7,18 @@ use penca_storage_cold::ColdStorageClient;
 
 use crate::error::ApiError;
 use crate::lifecycle::LifecycleManager;
-use crate::resolve::{parse_resolved_uuid, resolve_branch, resolve_catalog};
+use crate::resolve::{parse_resolved_uuid, resolve_catalog};
 
 impl LifecycleManager {
     /// Physically delete cold segment files queued for removal by past
     /// compact waves (ADR 0019 §"Four-part mechanism" item 3), once
     /// `written_at_micros + query_timeout < now`.
+    ///
+    /// Catalog-scoped, not branch-scoped (CHA-531): carry-forward makes one
+    /// cold file reachable from any branch, so the delete set holds one row
+    /// per file for the whole catalog and the refcount gate has to see every
+    /// branch's references at once. There is nothing left for a branch
+    /// argument to select.
     ///
     /// File-delete-then-row-delete ordering is load-bearing: the row only goes
     /// away once cold has confirmed the file is gone, so a transient
@@ -25,10 +31,7 @@ impl LifecycleManager {
     #[tracing::instrument(
         skip_all,
         level = "debug",
-        fields(
-            catalog_uuid = tracing::field::Empty,
-            branch_uuid = tracing::field::Empty,
-        ),
+        fields(catalog_uuid = tracing::field::Empty),
     )]
     pub async fn sweep_segments<W>(
         &self,
@@ -46,27 +49,16 @@ impl LifecycleManager {
         )
         .await?;
         let catalog_uuid = parse_resolved_uuid(&catalog.catalog_uuid, "catalog_uuid")?;
-        let branch = resolve_branch(
-            pool,
-            &catalog_uuid,
-            request.branch_uuid.as_deref(),
-            request.branch_name.as_deref(),
-        )
-        .await?;
-        let branch_uuid = parse_resolved_uuid(&branch.branch_uuid, "branch_uuid")?;
 
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
-        span.record("branch_uuid", tracing::field::display(&branch_uuid));
 
         let catalog_str = catalog_uuid.to_string();
-        let branch_str = branch_uuid.to_string();
 
         let now_micros = penca_storage_meta::LifecycleManager::now_micros(pool).await?;
         let eligible = penca_storage_meta::LifecycleManager::eligible_segment_delete_set_rows(
             pool,
             &catalog_str,
-            &branch_str,
             now_micros,
             self.query_timeout_micros,
         )
@@ -74,7 +66,7 @@ impl LifecycleManager {
 
         let eligible_count = eligible.len();
         let mut deleted_count = 0usize;
-        for (segment_delete_uuid, object_uri) in eligible {
+        for object_uri in eligible {
             if ColdStorageClient::delete_segment(writer, &object_uri, true)
                 .await
                 .is_ok()
@@ -82,8 +74,7 @@ impl LifecycleManager {
                 penca_storage_meta::LifecycleManager::delete_segment_delete_set_row(
                     pool,
                     &catalog_str,
-                    &branch_str,
-                    &segment_delete_uuid.to_string(),
+                    &object_uri,
                 )
                 .await?;
                 deleted_count += 1;

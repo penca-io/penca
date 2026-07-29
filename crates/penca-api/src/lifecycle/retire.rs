@@ -54,9 +54,8 @@ impl LifecycleManager {
     /// sweep's refcount gate; under carry-forward a retired file still
     /// referenced by a younger snapshot stays queued until the reference
     /// holder's own retirement re-enqueues it, restarting the grace clock at
-    /// the last reference drop (the deterministic `segment_delete_uuid`
-    /// collapses both enqueues onto one row, which is what lets the
-    /// `ON CONFLICT` refresh fire).
+    /// the last reference drop (the set is keyed on `object_uri` alone, so both
+    /// enqueues land on one row and the `ON CONFLICT` refresh fires).
     ///
     /// Errors propagate: the committed snapshot is durable and retirement is
     /// idempotent, so it re-runs on the next pass.
@@ -130,8 +129,6 @@ impl LifecycleManager {
         penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
             &tx,
             &catalog_str,
-            &branch_str,
-            &table_str,
             &distinct_uris,
         )
         .await?;
@@ -159,8 +156,6 @@ impl LifecycleManager {
             penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
                 &tx,
                 &catalog_str,
-                &branch_str,
-                &table_str,
                 &sidecar_uris,
             )
             .await?;

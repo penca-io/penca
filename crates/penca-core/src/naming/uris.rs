@@ -2,15 +2,24 @@
 // `{base_uri}/{catalog_uuid}/{branch_uuid}/{persist|snapshot}/{parent_uuid}/{segment_uuid}/data.{ext}`
 // — catalog/branch isolation is visible at the filesystem layout and
 // the parent_uuid groups segments by their persist/snapshot event.
+//
+// The layout is for humans reading a bucket listing. Nothing parses a
+// stored URI: every consumer (retirement, the `segment_delete_set` sweep,
+// compaction reconciliation) drives off metadata columns and treats the
+// URI as an opaque string.
+//
+// The `branch_uuid` path segment therefore names the branch that WROTE the
+// file, which is not necessarily a branch whose metadata references it —
+// carry-forward gives a child's segment row the parent's URI verbatim.
+// Ownership is the `branch_uuid` COLUMN, never the path.
 
 use uuid::Uuid;
 
-/// `kind` is a closed set: `"persist"` (from [`persist_segment_uri`])
-/// or `"snapshot"` (from [`snapshot_segment_uri`]). Any third
-/// caller must pick from the same set so cold-URI parsers and the
-/// `segment_delete_set` sweep continue to recognize the path-segment
-/// kind. If the set grows past two, lift `kind` into a two-variant
-/// enum.
+/// `kind` is a closed set: `"persist"` (from [`persist_segment_uri`]) or
+/// `"snapshot"` (from [`snapshot_segment_uri`]), which keeps the writers'
+/// prefixes disjoint so an orphan sweep over one kind's prefix cannot
+/// reach the other's. If the set grows past two, lift `kind` into a
+/// two-variant enum.
 fn segment_uri(
     base_uri: &str,
     catalog_uuid: &Uuid,
@@ -60,6 +69,9 @@ pub fn tx_log_persist_segment_uri(
 }
 
 /// URI for a cold snapshot segment file.
+///
+/// `branch_uuid` is the branch WRITING the file; a segment row on another
+/// branch may reference it (carry-forward).
 pub fn snapshot_segment_uri(
     base_uri: &str,
     catalog_uuid: &Uuid,
@@ -84,6 +96,9 @@ pub fn snapshot_segment_uri(
 /// `.../snapshot/{snap}/{segment}/idx_{index_slug}.{ext}`. `index_slug`
 /// distinguishes sidecars on the same segment — `"row_uuid"` for the internal
 /// identity index; CHA-463 passes the user index's uuid.
+///
+/// `branch_uuid` is the branch WRITING the sidecar; an index row on another
+/// branch may reference it (carry-forward).
 pub fn segment_index_uri(
     base_uri: &str,
     catalog_uuid: &Uuid,

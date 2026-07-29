@@ -15,6 +15,7 @@
 - [feedback_autonomous_drain_no_checkins.md](feedback_autonomous_drain_no_checkins.md) — During an autonomous drain, bank task after task; halt only for course-changing issues.
 - [feedback_poll_roborev_after_any_commits.md](feedback_poll_roborev_after_any_commits.md) — roborev fires on EVERY commit; poll to quiet + drain kata findings before declaring done.
 - [reference_roborev_kata_bridge_needs_cha_branch.md](reference_roborev_kata_bridge_needs_cha_branch.md) — The kata bridge only enqueues on `cha-NNN` branches; elsewhere an empty queue is NOT a clean review — read `roborev show` by hand.
+- [reference_roborev_severity_threshold_met_is_clean.md](reference_roborev_severity_threshold_met_is_clean.md) — `SEVERITY_THRESHOLD_MET` means CLEAN; trust `.verdict_bool` (1=clean), not the string.
 - [feedback_discuss_before_implementing.md](feedback_discuss_before_implementing.md) — "should we", "I feel like", "is this right" = discuss; don't start editing.
 - [feedback_simplest_correct_mechanism_no_hedging.md](feedback_simplest_correct_mechanism_no_hedging.md) — Lead with the simplest correct mechanism; don't over-engineer or hedge.
 - [feedback_tickets_are_spirit_not_spec.md](feedback_tickets_are_spirit_not_spec.md) — Tickets = spirit, not spec; derive the best mechanism, surface alternatives at the gate.
@@ -40,6 +41,7 @@
 - [feedback_clippy_not_in_cargo_check.md](feedback_clippy_not_in_cargo_check.md) — `cargo check` skips clippy; run `just cargo-clippy` before pushing after signature changes.
 - [reference_buffer_unordered_send_hrtb.md](reference_buffer_unordered_send_hrtb.md) — Send-for-all-lifetimes cold reads: chunked `try_join_all`, NOT `buffer_unordered`; catch with `cargo check -p penca-server-grpc`.
 - [feedback_worktrees.md](feedback_worktrees.md) — VM-per-ticket uses plain `git checkout -b`; worktrees are the laptop-only fallback.
+- [reference_memory_dir_symlinks_into_repo.md](reference_memory_dir_symlinks_into_repo.md) — the auto-memory dir symlinks into the repo's TRACKED `.claude/memory/`; saving a memory dirties the tree and can leak into a feature PR.
 - [feedback_self_sufficient_resume_comment.md](feedback_self_sufficient_resume_comment.md) — Mid-workflow Linear checkpoints go in ONE self-sufficient comment; edit in place.
 - [feedback_linear_workflow.md](feedback_linear_workflow.md) — Repo TOML + just commands for Linear projects/labels; MCP for ad-hoc issue work.
 - [feedback_read_linear_comments_first.md](feedback_read_linear_comments_first.md) — list_comments before drafting plans; constraints land in comments, not the description.
@@ -51,7 +53,7 @@
 - [feedback_no_background_git_commits.md](feedback_no_background_git_commits.md) — Never background a chain ending in git add/commit while working in the foreground (pre-commit stash race).
 
 ## Tool choices
-- [reference_vm_resource_limits_docker_disk_memory.md](reference_vm_resource_limits_docker_disk_memory.md) — This VM's ceilings: ~10min bg-task kill, ~7GB RAM (OOM reassigns host ports), 50GB disk. Which docker prune is safe when, plus the kept-up-stack test recipe.
+- [reference_vm_resource_limits_docker_disk_memory.md](reference_vm_resource_limits_docker_disk_memory.md) — This VM's ceilings: ~10min bg-task kill, ~7GB RAM (OOM reassigns host ports), 50GB disk. Which docker prune is safe when, the kept-up-stack test recipe, and the detached `just integration-test` survivor that fails every test with NO error text.
 - [feedback_rust_rename_symbol.md](feedback_rust_rename_symbol.md) — Typed Rust renames: prefer rename_symbol, verify sites in session-edited files, kill the server after (~3GB).
 - [reference_linear_attachment_visibility.md](reference_linear_attachment_visibility.md) — Linear file-attachments don't render in the UI; surface assets via a markdown link in a comment.
 - [reference_sccache_s3_build_cache.md](reference_sccache_s3_build_cache.md) — sccache→S3 (`fabric-sccache` — genuinely still that name, don't "fix" it); persistent config error → `sccache --stop-server`.

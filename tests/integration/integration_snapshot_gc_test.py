@@ -175,42 +175,43 @@ def _segment_uris_for_snapshot(catalog_uuid, branch_uuid, snapshot_uuid):
     return sorted(r[0] for r in rows)
 
 
-def _delete_set_rows_for_uris(catalog_uuid, branch_uuid, uris):
+def _delete_set_rows_for_uris(catalog_uuid, uris):
     """``[(object_uri, written_at_micros)]`` delete-set rows whose
     ``object_uri`` is in ``uris``."""
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     return get_pg_driver().execute(
         SQL(
-            "SELECT object_uri, written_at_micros FROM {tbl}"
-            " WHERE branch_uuid = %s AND object_uri = ANY(%s)"
+            "SELECT object_uri, written_at_micros FROM {tbl} WHERE object_uri = ANY(%s)"
         ).format(tbl=Identifier(tbl)),
-        (branch_uuid, list(uris)),
+        (list(uris),),
     )
 
 
-def _insert_delete_set_row(catalog_uuid, branch_uuid, table_uuid, uri, written_at):
-    """Manually enqueue ``uri`` for GC, simulating a retirement enqueue
-    (uuid4 PK is fine — the PK is ``(branch_uuid, segment_delete_uuid)``)."""
+def _enqueue_delete_set_row(catalog_uuid, uri, written_at):
+    """Manually enqueue ``uri`` for GC, simulating a retirement enqueue.
+
+    Mirrors `insert_segment_delete_set_rows`: keyed on ``object_uri``
+    alone, so a second enqueue of the same file refreshes the one row's
+    grace clock rather than adding another.
+    """
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     get_pg_driver().execute_no_result(
         SQL(
-            "INSERT INTO {tbl}"
-            " (segment_delete_uuid, branch_uuid, table_uuid, object_uri,"
-            "  written_at_micros)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            "INSERT INTO {tbl} (object_uri, written_at_micros) VALUES (%s, %s)"
+            " ON CONFLICT (object_uri)"
+            " DO UPDATE SET written_at_micros = EXCLUDED.written_at_micros"
         ).format(tbl=Identifier(tbl)),
-        (str(uuid4()), branch_uuid, table_uuid, uri, written_at),
+        (uri, written_at),
     )
 
 
-def _rewind_delete_set_rows(catalog_uuid, branch_uuid, uris, written_at):
+def _rewind_delete_set_rows(catalog_uuid, uris, written_at):
     tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
     get_pg_driver().execute_no_result(
         SQL(
-            "UPDATE {tbl} SET written_at_micros = %s"
-            " WHERE branch_uuid = %s AND object_uri = ANY(%s)"
+            "UPDATE {tbl} SET written_at_micros = %s WHERE object_uri = ANY(%s)"
         ).format(tbl=Identifier(tbl)),
-        (written_at, branch_uuid, list(uris)),
+        (written_at, list(uris)),
     )
 
 
@@ -279,8 +280,7 @@ class TestSnapshotNoRetirement:
             set(snapshot_uris[watermarks[0]]) | set(snapshot_uris[watermarks[1]])
         )
         enqueued = {
-            row[0]
-            for row in _delete_set_rows_for_uris(catalog_uuid, branch_uuid, prior_uris)
+            row[0] for row in _delete_set_rows_for_uris(catalog_uuid, prior_uris)
         }
         assert not enqueued, (
             "no prior-snapshot file may be enqueued in segment_delete_set when "
@@ -337,17 +337,14 @@ class TestSweepRefcount:
         # Simulate a retirement enqueue, already past the grace window.
         past_grace = _now_micros() - 10_000_000
         for uri in uris:
-            _insert_delete_set_row(
-                catalog_uuid, branch_uuid, table_uuid, uri, past_grace
-            )
+            _enqueue_delete_set_row(catalog_uuid, uri, past_grace)
 
         # Phase 1: the snapshot's live segment rows still reference the
         # uris — sweep must skip them despite the elapsed grace window.
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        remaining = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, uris)
+        remaining = _delete_set_rows_for_uris(catalog_uuid, uris)
         assert len(remaining) == len(uris), (
             "sweep must not delete an object_uri referenced by a live "
             f"table_snapshot_segment_metadata row — {len(uris)} rows enqueued, "
@@ -382,9 +379,8 @@ class TestSweepRefcount:
         )
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        remaining = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, uris)
+        remaining = _delete_set_rows_for_uris(catalog_uuid, uris)
         assert not remaining, (
             "at reference count zero past grace, sweep must delete the file "
             f"and drain the set row; {len(remaining)} rows remain"
@@ -399,9 +395,9 @@ class TestSweepRefcount:
 class TestSharedUriGraceClock:
     """ADR 0024 §4 + ADR 0019 — shared-file retirement end to end. A
     retired-but-still-referenced file survives sweep, and the grace
-    clock restarts at the LAST reference drop: retirement re-enqueues
-    onto the same deterministic ``segment_delete_uuid`` row, refreshing
-    ``written_at_micros``."""
+    clock restarts at the LAST reference drop: the set is keyed on
+    ``object_uri`` alone, so retirement re-enqueues onto the same row and
+    refreshes ``written_at_micros``."""
 
     def test_shared_uri_grace_clock_restarts_at_last_reference_drop(self):
         client = make_client()
@@ -458,7 +454,7 @@ class TestSharedUriGraceClock:
         # Retirement retires A and enqueues its files; the shared file
         # is still referenced by B's carried-b row.
         cycle({"name": ["a"], "value": [10]})
-        enqueued = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, shared_uris)
+        enqueued = _delete_set_rows_for_uris(catalog_uuid, shared_uris)
         assert len(enqueued) == len(shared_uris), (
             "retiring snapshot A must enqueue its files in segment_delete_set "
             f"— expected {len(shared_uris)} rows, got {len(enqueued)}. "
@@ -469,12 +465,11 @@ class TestSharedUriGraceClock:
         # Far-past grace clock: only the refcount gate protects the
         # shared file now.
         long_ago = _now_micros() - 3_600_000_000
-        _rewind_delete_set_rows(catalog_uuid, branch_uuid, shared_uris, long_ago)
+        _rewind_delete_set_rows(catalog_uuid, shared_uris, long_ago)
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        remaining = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, shared_uris)
+        remaining = _delete_set_rows_for_uris(catalog_uuid, shared_uris)
         assert len(remaining) == len(shared_uris), (
             "sweep must skip uris still referenced by snapshot B's carried-b "
             f"row — {len(remaining)} of {len(shared_uris)} remain"
@@ -482,11 +477,11 @@ class TestSharedUriGraceClock:
 
         # Cycle 3: touch ONLY a again -> snapshot C carries b by
         # reference AGAIN. Retirement retires B and RE-enqueues the
-        # shared file onto the SAME deterministic segment_delete_uuid
-        # row, refreshing written_at_micros — the grace clock restarts
-        # at the last reference drop.
+        # shared file onto its SAME object_uri-keyed row, refreshing
+        # written_at_micros — the grace clock restarts at the last
+        # reference drop.
         cycle({"name": ["a"], "value": [11]})
-        refreshed = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, shared_uris)
+        refreshed = _delete_set_rows_for_uris(catalog_uuid, shared_uris)
         assert len(refreshed) == len(shared_uris), (
             "the shared uris must still be enqueued after snapshot B's "
             f"retirement; got {len(refreshed)} of {len(shared_uris)}"
@@ -505,12 +500,11 @@ class TestSharedUriGraceClock:
         # above, so deterministically re-stamp the clock to "now"
         # rather than racing the 2s window against RPC/PG latency since
         # the cycle-3 snapshot stamped it server-side.
-        _rewind_delete_set_rows(catalog_uuid, branch_uuid, shared_uris, _now_micros())
+        _rewind_delete_set_rows(catalog_uuid, shared_uris, _now_micros())
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        remaining = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, shared_uris)
+        remaining = _delete_set_rows_for_uris(catalog_uuid, shared_uris)
         assert len(remaining) == len(shared_uris), (
             "sweep within the refreshed grace window must not delete — "
             f"{len(remaining)} of {len(shared_uris)} remain"
@@ -523,9 +517,8 @@ class TestSharedUriGraceClock:
         time.sleep(GRACE_WAIT_SECONDS)
         client.sweep_segments(
             catalog_uuid=catalog_uuid,
-            branch_uuid=branch_uuid,
         )
-        remaining = _delete_set_rows_for_uris(catalog_uuid, branch_uuid, shared_uris)
+        remaining = _delete_set_rows_for_uris(catalog_uuid, shared_uris)
         assert not remaining, (
             "past grace at reference count zero, sweep must drain the shared "
             f"uris; {len(remaining)} rows remain"
@@ -648,10 +641,7 @@ class TestCarryForwardGc:
         # exercises a SECOND-generation carried reference blocking sweep.
         a_uri_b = (uris_b - {b_uri}).pop()
         enqueued = {
-            row[0]
-            for row in _delete_set_rows_for_uris(
-                catalog_uuid, branch_uuid, [a_uri, b_uri]
-            )
+            row[0] for row in _delete_set_rows_for_uris(catalog_uuid, [a_uri, b_uri])
         }
         assert enqueued == {a_uri, b_uri}, (
             f"retiring A must enqueue both of its files; got {sorted(enqueued)}"
@@ -660,13 +650,10 @@ class TestCarryForwardGc:
         # 3. Far-past grace: only the refcount gate protects b's file.
         #    Sweep deletes the dead a file and keeps the shared b file.
         long_ago = _now_micros() - 3_600_000_000
-        _rewind_delete_set_rows(catalog_uuid, branch_uuid, [a_uri, b_uri], long_ago)
-        client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+        _rewind_delete_set_rows(catalog_uuid, [a_uri, b_uri], long_ago)
+        client.sweep_segments(catalog_uuid=catalog_uuid)
         remaining = {
-            row[0]
-            for row in _delete_set_rows_for_uris(
-                catalog_uuid, branch_uuid, [a_uri, b_uri]
-            )
+            row[0] for row in _delete_set_rows_for_uris(catalog_uuid, [a_uri, b_uri])
         }
         assert remaining == {b_uri}, (
             "sweep must drain the unreferenced a file and keep the b file"
@@ -692,13 +679,10 @@ class TestCarryForwardGc:
         assert a_uri_b in set(
             _segment_uris_for_snapshot(catalog_uuid, branch_uuid, snapshot_c_uuid)
         ), "snapshot C must carry B's a file forward (second-generation reference)"
-        _rewind_delete_set_rows(catalog_uuid, branch_uuid, [b_uri, a_uri_b], long_ago)
-        client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
+        _rewind_delete_set_rows(catalog_uuid, [b_uri, a_uri_b], long_ago)
+        client.sweep_segments(catalog_uuid=catalog_uuid)
         remaining = {
-            row[0]
-            for row in _delete_set_rows_for_uris(
-                catalog_uuid, branch_uuid, [b_uri, a_uri_b]
-            )
+            row[0] for row in _delete_set_rows_for_uris(catalog_uuid, [b_uri, a_uri_b])
         }
         assert remaining == {a_uri_b}, (
             "b_uri's last reference dropped so it must sweep, while B's a"

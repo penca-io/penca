@@ -451,8 +451,11 @@ impl PgDialect {
                     persisted_at_micros       BIGINT NOT NULL,
                     -- CHA-443 (IMPL-1): the persist seq watermark = MAX(commit_seq_num)
                     -- over the committed rows persisted; the seq analog of
-                    -- persisted_at_micros. NULL on the aborts-only branch (no
-                    -- committed rows) so IMPL-4's MAX(commit_seq_num) ignores it.
+                    -- persisted_at_micros. NULLable only vestigially: Persist is
+                    -- committed-only since CHA-444 (aborts are Purge's, ADR 0027)
+                    -- and no-ops without writing a row when nothing committed, so
+                    -- every row written carries a seq. Readers may treat it as
+                    -- present; do not reintroduce a NULL-writing path.
                     commit_seq_num          BIGINT,
                     log_kind                TEXT NOT NULL
                         CHECK (log_kind IN ('upsert_log','delete_log')),
@@ -664,20 +667,23 @@ impl PgDialect {
         // then deletes the row. The sweep discriminates only by `object_uri` —
         // there is deliberately no `kind` column.
         //
-        // Partitioned BY LIST (branch_uuid) so `DeleteBranch` reclaims rows via
-        // DROP PARTITION CASCADE; `branch_uuid` participates in the PK per PG's
-        // partition-key constraint.
+        // Keyed on `object_uri` alone — catalog-wide and unpartitioned since
+        // CHA-531. A row asserts "this file is queued for deletion", which is a
+        // property of the file, not of a branch: carry-forward lets one physical
+        // file be referenced from any branch's leaf, so branch-scoped rows would
+        // give one file N independent grace clocks for the sweep to reconcile.
+        // One row per file makes the enqueue's `ON CONFLICT` refresh compute
+        // that cross-branch maximum directly. Branch teardown needs no partition
+        // to drop: `drop_branch_partitions` removes the branch's segment
+        // metadata, which drops its references, and the refcount gate then lets
+        // the sweep collect the file on its own.
         let segment_delete_set = naming::segment_delete_set_table(catalog_uuid);
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
-                    segment_delete_uuid     UUID NOT NULL,
-                    branch_uuid             UUID NOT NULL,
-                    table_uuid              UUID NOT NULL,
-                    object_uri              TEXT NOT NULL,
-                    written_at_micros       BIGINT NOT NULL DEFAULT {epoch},
-                    PRIMARY KEY (branch_uuid, segment_delete_uuid)
-                ) PARTITION BY LIST (branch_uuid)"#,
+                    object_uri              TEXT PRIMARY KEY,
+                    written_at_micros       BIGINT NOT NULL DEFAULT {epoch}
+                )"#,
                 qi = Self::quote_identifier(&segment_delete_set),
             ))
             .await?;
@@ -871,20 +877,20 @@ impl PgDialect {
             ))
             .await?;
 
-        // `sweep_segments` scans by `written_at_micros < now - query_timeout`
-        // after partition pruning on `branch_uuid`; this index bounds the scan
-        // to grace-expired rows rather than the whole deferred set. Note
-        // grace-expired is NOT the same as deletable under the refcount gate: a
-        // URI queued by an early retirement while later snapshots still
-        // reference it (carry-forward) sits in the expired range until the last
-        // reference drops, so each sweep re-scans that standing subset and pays
-        // one index-served `object_uri` probe per row. Enqueue-at-last-drop is
-        // the structural alternative if the blocked set ever proves large.
+        // `sweep_segments` scans by `written_at_micros < now - query_timeout`;
+        // this index bounds the scan to grace-expired rows rather than the
+        // whole deferred set. Note grace-expired is NOT the same as deletable
+        // under the refcount gate: a URI queued by an early retirement while
+        // later snapshots still reference it (carry-forward) sits in the
+        // expired range until the last reference drops, so each sweep re-scans
+        // that standing subset and pays one index-served `object_uri` probe per
+        // row. Enqueue-at-last-drop is the structural alternative if the
+        // blocked set ever proves large.
         let idx_sds_age = format!("idx_{cat_u}_sds_age");
         driver
             .execute_no_result(&format!(
                 r#"CREATE INDEX IF NOT EXISTS {qi_idx}
-                ON {qi_tbl} (branch_uuid, written_at_micros)"#,
+                ON {qi_tbl} (written_at_micros)"#,
                 qi_idx = Self::quote_identifier(&idx_sds_age),
                 qi_tbl = Self::quote_identifier(&segment_delete_set),
             ))
@@ -893,8 +899,10 @@ impl PgDialect {
         // The sweep's refcount gate anti-joins each eligible
         // `segment_delete_set` row against `table_snapshot_segment_metadata` on
         // `object_uri` (delete only at snapshot reference count zero,
-        // ADR 0024 §4). This index serves that per-candidate probe; partition
-        // pruning on `branch_uuid` happens first, so the URI alone suffices.
+        // ADR 0024 §4). This index serves that per-candidate probe. Since
+        // CHA-531 the probe is catalog-wide — carry-forward crosses fork edges,
+        // so a reference can live in any branch's leaf — making `object_uri`
+        // the whole access path, not a refinement on a `branch_uuid` prune.
         //
         // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
         // at CreateCatalog, so older catalogs lack the index — the gate stays
@@ -929,7 +937,7 @@ impl PgDialect {
         // The GC sweep's refcount gate (`eligible_segment_delete_set_rows`)
         // anti-joins the child sidecar table on `object_uri` to pin shared
         // carried-sidecar files, mirroring the base-segment `idx_..._tssm_uri`
-        // probe.
+        // probe — served across every branch leaf, catalog-wide since CHA-531.
         let idx_tssim_uri = format!("idx_{cat_u}_tssim_uri");
         driver
             .execute_no_result(&format!(
@@ -1299,13 +1307,13 @@ impl PgDialect {
             naming::table_persist_segment_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
             naming::compact_segment_metadata_partition(catalog_uuid, branch_uuid),
-            // DROP CASCADE discards any pending deferred-delete rows along with
-            // the branch; the underlying cold files are reclaimed by the
-            // cold-side branch teardown.
-            naming::segment_delete_set_partition(catalog_uuid, branch_uuid),
             naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
         ];
+        // `segment_delete_set` is deliberately absent: it is catalog-wide and
+        // unpartitioned (CHA-531). Dropping the two snapshot-segment partitions
+        // above removes this branch's references to any queued file, so the
+        // sweep's refcount gate opens on its own and reclaims the cold files.
         Self::drop_tables_if_exist(driver, &tx_partitions).await?;
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(catalog_uuid);
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
@@ -1386,7 +1394,7 @@ impl PgDialect {
         catalog_uuid: &Uuid,
         branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        let partitions: [(String, String); 9] = [
+        let partitions: [(String, String); 8] = [
             (
                 naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_persist_metadata_table(catalog_uuid),
@@ -1410,10 +1418,6 @@ impl PgDialect {
             (
                 naming::compact_segment_metadata_partition(catalog_uuid, branch_uuid),
                 naming::compact_segment_metadata_table(catalog_uuid),
-            ),
-            (
-                naming::segment_delete_set_partition(catalog_uuid, branch_uuid),
-                naming::segment_delete_set_table(catalog_uuid),
             ),
             (
                 naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),

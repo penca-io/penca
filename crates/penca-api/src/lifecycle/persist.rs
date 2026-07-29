@@ -327,9 +327,11 @@ impl LifecycleManager {
             acc
         };
         // The persist SEQ watermark — MAX(commit_seq_num) over the committed
-        // rows being persisted (the seq sibling of max_committed_at; aborts
-        // carry no seq). `None` when there are no committed rows → the parent
-        // row's commit_seq_num is NULL.
+        // rows being persisted (the seq sibling of max_committed_at). The
+        // `None` arm is unreachable by the same caller contract that lets
+        // `max_committed_at` be `expect`ed below: `persist_locked` returns
+        // early without writing a persist row when nothing committed. So no
+        // persist row is ever written with a NULL `commit_seq_num`.
         let max_committed_commit_seq_num: Option<i64> = {
             let mut acc: Option<i64> = None;
             for batch in [upsert_batch, delete_batch] {

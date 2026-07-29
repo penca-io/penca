@@ -257,11 +257,12 @@ impl QueryManager {
 
         // Enumerate the parent's cold tier as a second source for a
         // forked branch, gated on the picked child snapshot NOT already
-        // covering the fork (`child_snapshot_seq < fork_commit_seq_num`). When
-        // a child snapshot covers the fork it has folded the parent's data into
-        // its own baseline (the snapshot writer reads through this same path),
-        // so the base source is redundant and skipped — steady-state forked
-        // reads return to the non-forked plan shape.
+        // covering the fork (`child_snapshot_seq < fork_commit_seq_num`). Once
+        // a child snapshot covers the fork, that snapshot's own segment rows
+        // already account for the parent's data — since CHA-531 by carrying the
+        // parent's `object_uri`s forward by reference rather than by rewriting
+        // them — so enumerating the base source again would double-count.
+        // Steady-state forked reads return to the non-forked plan shape.
         let base_cold_storage = match lineage {
             Some((parent_branch_uuid, fork_commit_seq_num))
                 if child_snapshot_seq < fork_commit_seq_num =>

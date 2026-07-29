@@ -548,44 +548,17 @@ where
     D: Sync,
     L: DlDriver + ?Sized,
 {
-    // The all-cold fail-fast lives in `resolve_log_tiers`.
+    // The all-cold fail-fast lives in `resolve_log_tiers`, as does the
+    // base-cold fold that used to sit here (CHA-531) and the CHA-482 identity
+    // parse whose result comes back on the struct.
     let ResolvedLogTiers {
         resolved,
         exclusion_set,
+        identity_row_uuids: row_uuids,
     } = resolve_log_tiers(&req).await?;
 
-    // Parsed once, reused by the base fold below and the snapshot seeks.
-    let row_uuids = identity_row_uuids(
-        req.seeks.as_deref(),
-        req.filter.is_some_and(|f| !f.is_empty()),
-    )?;
-
-    // Fold the parent (base) cold source in below the child. The all-cold
-    // `resolved` is already projected to the output schema, so the parent's
-    // resolved batch is projected to match before the concat.
-    let (resolved, exclusion_set) = {
-        let user_cols: Vec<&str> = req
-            .user_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
-        let log_schemas = cold_persist_schemas(req.user_schema);
-        fold_base_if_present(
-            req.plan,
-            req.dl,
-            &user_cols,
-            req.user_schema,
-            &log_schemas,
-            req.filter,
-            row_uuids.as_deref(),
-            resolved,
-            exclusion_set,
-            true,
-        )
-        .await?
-    };
-
+    // CHA-485 accelerator entries ride alongside the identity restriction for
+    // the provider seek.
     let seeks = SnapshotSeeks {
         identity: row_uuids,
         accelerators: user_seek_specs(req.seeks.as_deref()),
@@ -885,18 +858,38 @@ pub struct ResolvedLogTiers {
     /// row_uuids folded in — apply to any snapshot-tier scan of the
     /// same plan, whole or subset.
     pub exclusion_set: HashSet<String>,
+    /// The identity restriction parsed off the request's seeks, returned
+    /// so the snapshot-tier caller reuses this parse instead of
+    /// re-deriving it — the parse validates arity and UUID syntax and
+    /// can fail, and doing it twice means a second traversal of the
+    /// seek list on every all-cold read (CHA-531).
+    pub identity_row_uuids: Option<Vec<Uuid>>,
 }
 
 /// Run phases 1 + 2 of an all-cold merge read: probe the cold log
 /// arms, compose the (resolved batch, exclusion set) pair, and project
 /// the resolved rows to the output schema. Records `resolved_rows` on
 /// the current span (the `*_parts` instrument span when called from
-/// [`stream_all_cold_parts`]).
+/// [`stream_all_cold_parts`]). Since CHA-531 that count is measured
+/// AFTER the base-cold fold, so on a forked read it covers the parent's
+/// contribution too and will exceed the child's own log rows — it is
+/// the size of the batch handed downstream, not a per-branch tally.
 ///
 /// Same all-cold contract as [`stream_all_cold_parts`]: a hot plan
 /// fails fast with [`MergeError::InvalidPlan`] — this entry never
 /// probes the hot tier, so accepting one would silently drop hot
 /// upserts and delete-exclusions.
+///
+/// `plan.base_cold_storage`, when set, is folded in underneath (CHA-178,
+/// moved here in CHA-531 so the field is honoured on every plan this
+/// entry accepts). **A split consumer must enumerate the base's delete
+/// segments itself.** The fold runs [`filter_live_rows`] over the base,
+/// so a base tombstone reaches `exclusion_set` but never `resolved` —
+/// which is complete for a full-stream consumer, since the exclusion set
+/// covers the whole snapshot leg, and incomplete for one that streams
+/// only a touched subset. `snapshot_op`'s carry-forward writer is the
+/// latter: it reads `base.cold.persist.delete_segments` directly so the
+/// base's deletes still mark their partitions touched.
 pub async fn resolve_log_tiers<'a, D, L>(
     req: &MergeReadRequest<'a, D, L>,
 ) -> Result<ResolvedLogTiers, MergeError>
@@ -938,10 +931,40 @@ where
     // DataFusion residual after the dedup, before projection.
     let resolved = apply_resolved_residual(&req.dl.derive_session(), req.filter, resolved).await?;
     let resolved = project_resolved(resolved, req.user_schema)?;
+
+    // CHA-178: fold the parent (base) cold source in below the child. The
+    // all-cold `resolved` is already projected to the output schema, so the
+    // parent's resolved batch is projected to match before the concat.
+    //
+    // CHA-531: this fold lives here rather than in each caller so that
+    // `base_cold_storage` means the same thing on every plan this entry
+    // accepts. It used to sit in `stream_all_cold_parts` alone, which made the
+    // field a silent no-op for the snapshot writer's carry-forward delta —
+    // dropping a fork parent's post-snapshot persist tail.
+    //
+    // TODO(CHA-509): one base, one hop. A fork chain folds an ORDERED list of
+    // ancestors here, nearest first, each anti-joined against the ACCUMULATED
+    // exclusion so nearer ancestors shadow farther ones. Generalizing at this
+    // call site — rather than at each caller — is what keeps the snapshot
+    // writer correct for free, since it enters through here too.
+    let (resolved, exclusion_set) = fold_base_if_present(
+        req.plan,
+        req.dl,
+        &user_cols,
+        req.user_schema,
+        &log_schemas,
+        req.filter,
+        row_uuids.as_deref(),
+        resolved,
+        exclusion_set,
+        true,
+    )
+    .await?;
     tracing::Span::current().record("resolved_rows", resolved.num_rows() as i64);
     Ok(ResolvedLogTiers {
         resolved,
         exclusion_set,
+        identity_row_uuids: row_uuids,
     })
 }
 
@@ -2726,6 +2749,90 @@ mod tests {
             matches!(result, Err(MergeError::InvalidPlan(_))),
             "hot plan must be rejected, got {result:?}",
             result = result.as_ref().map(|_| "Ok(MergeReadParts)")
+        );
+    }
+
+    /// CHA-531: the base-cold fold must fire at THIS entry, not only at
+    /// [`stream_all_cold_parts`]. Asserted here rather than on
+    /// `fold_in_base_cold_source` because the bug this pins was exactly a
+    /// correct helper that the entry never called — every other plan-level
+    /// test sets `base_cold_storage: None`, so moving the call back out
+    /// leaves them all green.
+    ///
+    /// The child's cold plan is empty (`persist: None` short-circuits
+    /// `resolve_cold`), so everything in the output came from the base.
+    #[tokio::test]
+    async fn resolve_log_tiers_folds_base_cold_storage() {
+        let schema = test_user_schema();
+        let dl = MockDlDriver::default().with_resolved(make_resolved_batch_flagged(
+            &["u_a", "u_d"],
+            &["a", "d"],
+            &[1, 0],
+            &[100, 200],
+            &[false, true], // u_a live upsert, u_d winning tombstone
+        ));
+        let empty_child = Plan {
+            hot_storage: None,
+            cold_storage: Some(ColdStoragePlan {
+                snapshot: None,
+                persist: None,
+            }),
+            base_cold_storage: None,
+        };
+        let with_base = Plan {
+            base_cold_storage: Some(base_cold(i64::MAX)),
+            ..empty_child.clone()
+        };
+        let snapshot = ReadSnapshot::AsOfMicros(i64::MAX);
+        let driver = MockDriver;
+
+        let without = resolve_log_tiers(&MergeReadRequest {
+            segment_order: SegmentOrder::ByPlan,
+            plan: &empty_child,
+            driver: &driver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &snapshot,
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 4,
+            snapshot_prune_min_segments: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            without.resolved.num_rows(),
+            0,
+            "control: with no base the empty child plan resolves to nothing",
+        );
+        assert!(without.exclusion_set.is_empty());
+
+        let tiers = resolve_log_tiers(&MergeReadRequest {
+            segment_order: SegmentOrder::ByPlan,
+            plan: &with_base,
+            driver: &driver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &snapshot,
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 4,
+            snapshot_prune_min_segments: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            all_row_uuids(std::slice::from_ref(&tiers.resolved)),
+            vec!["u_a".to_string()],
+            "the base's live row must reach `resolved` through this entry",
+        );
+        assert_eq!(
+            tiers.exclusion_set,
+            str_set(&["u_a", "u_d"]),
+            "the base's tombstone shadows the snapshot leg via the exclusion \
+             set even though it is filtered out of `resolved`",
         );
     }
 
