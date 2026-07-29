@@ -3,8 +3,6 @@
 //! [`FormatReader`] defines the interface for reading columnar segment files
 //! from object storage. Implementations handle format-specific logic
 //! (row group navigation for Parquet, Lance file reader, etc.).
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/reader/__init__.py`.
 
 pub mod lance;
 pub mod parquet;

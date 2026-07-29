@@ -2,8 +2,6 @@
 //!
 //! [`FormatWriter`] defines the interface for writing columnar segment files
 //! to object storage. Implementations handle format-specific serialization.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/writer/__init__.py`.
 
 pub mod lance;
 pub mod parquet;

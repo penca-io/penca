@@ -827,7 +827,7 @@ impl PgDialect {
 
         // Load-bearing for read_snapshot_segments_for_table's "latest committed
         // snapshot" sub-select (`ORDER BY snapshotted_at_micros DESC LIMIT 1`)
-        // and `MAX(snapshotted_at_micros)` in `get_table_metadata`. The
+        // and `MAX(snapshotted_at_micros)` in `last_durable_snapshot_at`. The
         // `(table_uuid, commit_micros DESC)` shape acts as a point lookup by
         // `table_uuid` only — neither consumer sorts on `commit_micros`, so the
         // DESC ordering does nothing useful, and `branch_uuid` (in every

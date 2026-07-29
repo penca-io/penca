@@ -50,14 +50,14 @@ pub struct ParsedSegmentStats {
     pub per_column: Vec<ParsedColumnStats>,
 }
 
-// Per-column entries are keyed by **column name**, not by position. The
-// writer's batch schema does not always match the reader's user schema:
+// v0 wire format: per-column entries are keyed by **column name**, not by
+// position. The writer's batch schema does not always match the reader's
+// user schema:
 // snapshot/persist writes go through `snapshot_read_schema(user_schema)`
 // which prepends `row_uuid`, so a positional encoding would offset every
 // user-column lookup by one (and silently degrade to keep-all via
 // PerSegmentBuilders' type-mismatch fallthrough). Keying by name lets the two
 // sides disagree on schema shape and still resolve correctly.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentStatsV0 {
     row_count: u64,

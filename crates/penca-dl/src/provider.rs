@@ -266,8 +266,9 @@ pub(crate) fn build_persist_session<R: FormatReader + 'static>(
     cache: Arc<SegmentCache>,
     schemas: &LogSchemas,
 ) -> Result<SessionContext> {
-    // Derive from the process template rather than `SessionContext::new()`,
-    // which costs ~1.4 ms of registry registration per cold read.
+    // Derive from the process template rather than `SessionContext::new()`:
+    // ~71 µs per cold read against ~128 µs (release). See `session_template`
+    // for why `new()` is not as expensive as the often-quoted ~1.4 ms.
     let ctx = derive_cold_session(template);
 
     let (upsert_segs, delete_segs) = match &plan.persist {

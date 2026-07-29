@@ -15,9 +15,7 @@
 //! If a future query-engine concern emerges (e.g. time-travel `AS OF`
 //! syntax, statistics-driven hints, engine-specific UDF binding),
 //! introduce `DlDialect: Dialect` here, declare the new method on it,
-//! and have `DfDialect` impl it. Mirrors the Python side
-//! (``packages/penca/src/penca/lib/dl/dialect.py``), which makes the
-//! same call.
+//! and have `DfDialect` impl it.
 //!
 //! [`Dialect`]: penca_sql::Dialect
 //! [`DbDialect`]: penca_db::dialect::DbDialect

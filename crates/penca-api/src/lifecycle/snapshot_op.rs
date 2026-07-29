@@ -221,8 +221,8 @@ impl LifecycleManager {
         // structurally excluded by `to_micros = upper + 1`. No
         // surrounding REPEATABLE READ tx required. Snapshot's
         // watermark is derived from raw persist-log inputs (mirrors
-        // Persist's stamping rule) so it is well-defined even in
-        // The empty-merge case.
+        // Persist's stamping rule) so it is well-defined even in the
+        // empty-merge case.
         let snapshot_result = self
             .query_manager
             .read_snapshot_segments_for_table(
@@ -298,9 +298,9 @@ impl LifecycleManager {
             )
             .await?;
 
-        // The PersistPlan carries the new `committed_at` filter from
-        // Consumed per-row by the merge SQL builders
-        // in commit 7); the snapshot baseline (if any) sits underneath.
+        // The PersistPlan carries the `committed_at` filter the merge SQL
+        // builders consume per row; the snapshot baseline (if any) sits
+        // underneath.
         let cold_persist_plan =
             if cold_upsert_segments.is_empty() && cold_delete_segments.is_empty() {
                 None
@@ -1847,8 +1847,8 @@ async fn build_user_index_sidecar<W: FormatWriter>(
 /// Build + write a single cold-index sidecar over `key_cols` for one base
 /// segment slice, then record its NULL-committed child row. The canonical core
 /// shared by every per-segment index — the row_uuid identity index,
-/// user secondary indexes, and the built-in system name index
-///. `slug` distinguishes sidecars on the same segment in both the uri
+/// user secondary indexes, and the built-in system name index. `slug`
+/// distinguishes sidecars on the same segment in both the uri
 /// and the deterministic sidecar id (`"row_uuid"` for the internal identity
 /// index; the `index_uuid` string for a declared index), so a fresh build and a
 /// carry-forward agree on the id and a crash-retry collapses via ON CONFLICT.
@@ -2059,10 +2059,10 @@ fn carry_forward_keys(
     // a PK subset only decides HOW the touched set is attributed (subset →
     // delete-log columns; non-subset → the row_uuid reverse lookup), which
     // is `snapshot_locked`'s concern, not an eligibility question. The
-    // builds a row_uuid sidecar for every snapshot segment, so the non-subset
-    // reverse lookup always has its index (a missing one is an invariant
-    // violation that `reverse_lookup_attributed_labels` fails fast on, not a
-    // full-rewrite fallback).
+    // snapshot build writes a row_uuid sidecar for every segment, so the
+    // non-subset reverse lookup always has its index (a missing one is an
+    // invariant violation that `reverse_lookup_attributed_labels` fails fast
+    // on, not a full-rewrite fallback).
     //
     // (d) every prior segment's typed key must be derivable from its
     // statistics; any underivable segment → warn + full rewrite.
@@ -2089,8 +2089,8 @@ fn carry_forward_keys(
     Ok(Some(keys))
 }
 
-/// Split the prior snapshot's segments by their stats-derived partition
-///: segments whose label is in `touched` go to the rewrite
+/// Split the prior snapshot's segments by their stats-derived partition:
+/// segments whose label is in `touched` go to the rewrite
 /// stream (original order preserved — that order is chunk_idx order =
 /// typed-order runs, the ByPlan contract); the rest become the carried map
 /// (typed [`PartitionOrderKey`] → that partition's prior segment uuids, in

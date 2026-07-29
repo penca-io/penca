@@ -1,7 +1,5 @@
 //! Lance format reader using `lance-file` crate + `object_store`.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/reader/lance_reader.py`.
-//!
 //! Uses `lance_file::reader::FileReader` directly — the same API that
 //! Python's `lance.file.LanceFileReader` wraps via PyO3.
 

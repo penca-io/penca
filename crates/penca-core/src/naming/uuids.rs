@@ -134,8 +134,8 @@ pub fn system_name_index_uuid(system_table_uuid: &Uuid) -> Uuid {
 /// ([`commit_tx_log_partition`] and siblings) use 2 PK values
 /// `[branch, tag]`; [`table_snapshot_uuid`] uses 3;
 /// [`table_persist_uuid`] (this) uses 4. Within arity-2, the
-/// trailing `tag` string is unique per helper (one of 11 distinct
-/// values matching the table-name constant the partition serves), so
+/// trailing `tag` string is unique per helper (it matches the
+/// table-name constant the partition serves), so
 /// the partition family also lives in disjoint hash-input subspaces.
 /// Adding a sibling that reuses an existing arity+tag combo *would*
 /// collide — give it a distinct arity or tag (or chain it off a

@@ -42,7 +42,6 @@ pub fn branch_from_row(catalog_uuid: &str, row: &PgRow) -> Branch {
     }
 }
 
-//
 // stream_merged returns sys-table reads as Arrow RecordBatches. The
 // helpers below extract typed columns at row index `i` so callers
 // don't repeat the downcast boilerplate at every site.

@@ -1375,6 +1375,8 @@ mod tests {
         );
     }
 
+    // Every method returns nothing, so hot resolve stays empty and the tests
+    // below exercise the cold-only arms.
     struct MockDriver;
 
     impl DbDriver for MockDriver {

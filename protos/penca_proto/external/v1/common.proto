@@ -53,13 +53,14 @@ message IntegerRange {
   optional int64 max = 2;
 }
 
-// Retention policy for a table's history. Defined at catalog (required),
-// schema (optional), and table (optional) levels; the effective policy for
-// a table is coalesce(table, schema, catalog), each field resolved
-// independently. Both knobs are coarse, human-set durations in seconds.
+// Retention policy for a table's history. Defined at schema (optional) and
+// table (optional) levels; the effective policy for a table is
+// coalesce(table, schema), each field resolved independently. Schema is the
+// broadest scope — a catalog carries no retention policy. Both knobs are
+// coarse, human-set durations in seconds.
 message RetentionConfig {
   // Retention window span, in seconds — how far back history is kept.
-  // Absent = inherit from parent; at the catalog level, absent = retain
+  // Absent = inherit from the schema; absent at the schema too = retain
   // indefinitely.
   optional int64 retention_duration_seconds = 1;
 

@@ -53,7 +53,8 @@ pub trait DlDriver: Send + Sync {
     /// process-wide session template — a microsecond clone of the function
     /// registry + analyzer/optimizer rules with a fresh, isolated catalog.
     /// Cold-read paths must obtain sessions this way rather than through
-    /// `SessionContext::new()`, which rebuilds the whole registry.
+    /// `SessionContext::new()`, which reassembles the registry map and the
+    /// rule lists on every call.
     fn derive_session(&self) -> SessionContext;
 
     /// Execute `sql` against the cold tier's log tables for this plan.
@@ -770,8 +771,8 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
                 &batch, out_schema,
             )?);
         }
-        // No segments: `concat_batches` needs at least the schema, and
-        // `stream_all_cold` yields an empty out-schema batch here too.
+        // No segments ⇒ an empty out-schema batch, matching what
+        // `stream_all_cold` yields.
         if per_segment.is_empty() {
             return Ok(Some(RecordBatch::new_empty(out_schema.clone())));
         }

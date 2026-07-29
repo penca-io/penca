@@ -33,7 +33,8 @@ pub fn lex_compare_predicate(
     )
 }
 
-/// CTE bodies + tombstone-shadow predicates for the composite tiebreaker. Returned by [`build_composite_merge_resolution`].
+/// CTE bodies + tombstone-shadow predicates for the composite tiebreaker.
+/// Returned by [`build_composite_merge_resolution`].
 ///
 /// Aliases used in the predicates are fixed: `l.` for the latest CTE,
 /// `d.` for the deletes CTE. Callers MUST alias their JOINed CTEs as

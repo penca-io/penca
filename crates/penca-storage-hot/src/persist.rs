@@ -103,9 +103,9 @@ impl HotStorageClient {
     ///
     /// Returns a `RecordBatch` with columns
     /// `(version_uuid, row_uuid, <pk_cols...>, tx_uuid, write_seq_num,
-    ///   commit_micros, began_at_micros, commit_seq_num)`. The trailing
-    /// PK columns interleave between `row_uuid` and `tx_uuid` in
-    /// table-declared order; their types are resolved from `user_schema`.
+    ///   commit_micros, began_at_micros, commit_seq_num)`. PK columns
+    /// interleave between `row_uuid` and `tx_uuid` in table-declared order;
+    /// their types are resolved from `user_schema`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         level = "debug",

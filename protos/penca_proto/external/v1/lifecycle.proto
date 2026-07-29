@@ -375,7 +375,7 @@ service LifecycleService {
 
   // Enumerates `table_uuid`s with a committed `table_persist_metadata` row in
   // a `persisted_at` window — drives the scheduler's per-tick Purge
-  // enumeration (CHA-445).
+  // enumeration.
   rpc ListPersistedTables(ListPersistedTablesRequest) returns (ListPersistedTablesResponse);
 
   // CHA-273: catalog-wide persist/snapshot over every table on a branch,

@@ -1,7 +1,5 @@
 //! Parquet format reader using arrow-rs `parquet` crate + `object_store`.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/reader/parquet_reader.py`.
-//!
 //! Reads go through the async range reader (`ParquetObjectReader` +
 //! `ParquetRecordBatchStreamBuilder`), so column projection and the
 //! `(offset, length)` slice drive selective byte-range fetches against object

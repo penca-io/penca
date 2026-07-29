@@ -1,7 +1,8 @@
 //! Workload-correctness guard for the cold-segment read floor.
 //!
-//! The `cold_segment_read_floor` bench times the two read arms against a Lance/Parquet segment: (a) whole-segment read + client-side
-//! filter, (b) `(offset, length)` range read (the pushdown). A throughput
+//! The `cold_segment_read_floor` bench times the two read arms against a
+//! Lance/Parquet segment: (a) whole-segment read + client-side filter,
+//! (b) `(offset, length)` range read (the pushdown). A throughput
 //! number is only meaningful if both arms actually return the intended row, so
 //! this test locks that: it writes a segment, reads the target row each way,
 //! and asserts the two arms agree.

@@ -26,11 +26,7 @@ if _version_not_supported:
 
 
 class WriteServiceStub(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    WriteService owns every Penca write: catalog/schema/table DDL,
+    """WriteService owns every Penca write: catalog/schema/table DDL,
     branching, transactions, and data mutations. Schema and table DDL
     are transactional via CHA-164 (each accepts an optional `tx_uuid`
     to join an open tx, otherwise auto-commits). Catalog DDL is not
@@ -146,11 +142,7 @@ class WriteServiceStub(object):
 
 
 class WriteServiceServicer(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    WriteService owns every Penca write: catalog/schema/table DDL,
+    """WriteService owns every Penca write: catalog/schema/table DDL,
     branching, transactions, and data mutations. Schema and table DDL
     are transactional via CHA-164 (each accepts an optional `tx_uuid`
     to join an open tx, otherwise auto-commits). Catalog DDL is not
@@ -417,11 +409,7 @@ def add_WriteServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class WriteService(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    WriteService owns every Penca write: catalog/schema/table DDL,
+    """WriteService owns every Penca write: catalog/schema/table DDL,
     branching, transactions, and data mutations. Schema and table DDL
     are transactional via CHA-164 (each accepts an optional `tx_uuid`
     to join an open tx, otherwise auto-commits). Catalog DDL is not
