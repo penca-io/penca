@@ -21,33 +21,16 @@
 //!
 //! ## Failure semantics
 //!
-//! Failure handling has three tiers:
+//! Nothing here retries in-process: recovery is always "the table is still in
+//! its dirty set on a later tick". The **full tier-by-tier breakdown lives in
+//! `docs/services/lifecycle-scheduler.md`, section "Failure handling"** — it is
+//! the operator-facing contract and the single source of truth. Do not restate
+//! it here; this doc and that one drifted repeatedly while both carried it.
 //!
-//! - **Discovery** (`ListCatalogs` / `ListBranches`) — propagates out of `tick`
-//!   with `?`, ending the whole sweep. Nothing else runs that tick.
-//! - **Per-branch** — in the snapshot loop a dirty-set listing error returns
-//!   early from that branch, so its watermarks do NOT advance and the next tick
-//!   re-runs the same window; the sweep continues to the next branch. The
-//!   persist loop holds no watermarks, so its branch-op RPC error is only logged.
-//! - **Per-table** — Purge failures are swallowed in `ops::purge_one`, and the
-//!   branch ops swallow theirs server-side, signalling by withholding the
-//!   watermark. The enclosing sweep's watermark advances regardless.
-//!
-//! `PersistBranch` and `SnapshotBranch` enumerate their dirty sets
-//! **unwindowed** server-side, so a table that fails one of them stays
-//! enumerated and is retried on every subsequent tick regardless of whether it
-//! sees further writes.
-//!
-//! The two **Purge** passes are the windowed ones, and their windows differ in
-//! both bounds: the modified pass runs `[last_modified_tick, now)` while the
-//! aged-persisted pass runs `[last_purge_tick, now - grace)`. A one-off failure
-//! on a table that then goes quiet is **not** retried until it re-enters that
-//! pass's window — a further committed or aborted write for the modified pass, a
-//! further committed persist for the aged-persisted one. Durable per-table retry
-//! queues are deferred past v0.
-//!
-//! Retry interval is per-op: the persist cadence for Persist, the snapshot
-//! cadence for the rest.
+//! The one fact worth having at the code: the branch ops enumerate their dirty
+//! sets **unwindowed** server-side, so a failed table is retried every tick with
+//! no dependence on new traffic, whereas the two Purge passes are windowed and
+//! only retry once a table re-enters their window.
 //!
 //! ## Mechanism contract
 //!

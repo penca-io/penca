@@ -168,45 +168,44 @@ All values are required from environment variables; defaults live in
 
 ## Failure handling
 
-Failure handling has three tiers.
+Failure handling has three tiers. Nothing retries in-process — recovery is
+always "the table is still in its dirty set on a later tick".
 
-A **discovery** failure (`ListCatalogs` / `ListBranches`) propagates out of the
-tick entirely — nothing else runs that tick, in either loop.
+**Discovery.** A `ListCatalogs` / `ListBranches` error propagates out of the tick
+entirely. Nothing else runs that tick, in either loop.
 
-A **branch-level** failure behaves differently per loop. In the snapshot loop a
-dirty-set listing error returns early from that branch, so its watermarks do NOT
-advance and the next tick re-runs the same window. The persist loop holds no
-watermarks, so its branch-op RPC error is simply logged. Either way that loop
-moves on to the next branch.
+**Per-branch.** Two distinct kinds, and they differ:
 
-A **per-table** Purge failure is logged and swallowed inside `ops::purge_one`,
-and the enclosing sweep's watermark advances past it. Errors on a single table within a branch are also
-logged and skipped — the branch ops are continue-on-error, which is
-load-bearing rather than incidental: both dirty sets are enumerated
-oldest-timestamp-first, so a table whose op keeps failing sorts first on
-every subsequent sweep and would starve everything behind it forever if
-the loop aborted on it.
+- A *dirty-set listing* error (`ListModifiedTables` / `ListPersistedTables`, in
+  the snapshot loop only) returns early from that branch, so its enumeration
+  watermarks do not advance and the next tick re-runs the same window.
+- A *branch-op RPC* error (`PersistBranch` / `SnapshotBranch`, in both loops) is
+  logged and the sweep continues. In the snapshot loop that means Purge and
+  tx-log GC still run for that branch and the enumeration watermarks still
+  advance.
 
-A branch op that skipped at least one table signals partial completion by
-withholding its response watermark; the scheduler logs that, and callers
-needing an all-or-nothing flush (CreateBranch) treat it as an error.
+Either way the loop moves on to the next branch.
 
-Every lifecycle op is idempotent, and both branch ops re-enumerate
-**unwindowed** — `list_all_modified_table_uuids` and
-`list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound. So
-a table that fails stays in its dirty set and is retried on every subsequent
-tick, with no dependence on receiving further writes:
+**Per-table.** Purge failures are swallowed inside `ops::purge_one`. The branch
+ops swallow their own per-table failures server-side and report it by leaving
+`BranchOpResponse.watermark` unset — a *different* watermark from the scheduler's
+enumeration watermarks, which advance regardless. The scheduler logs the unset
+response; `CreateBranch` treats it as a hard error.
 
-- a failed Snapshot keeps its committed persist row with no snapshot past it, so
-  it stays in `ListPersistedTables`;
-- a failed Persist keeps its `tx_table_log` rows, which only `PurgeTxLog` clears
-  and which it cannot reach until Purge advances — so it stays in
-  `ListModifiedTables`.
+### What gets retried, and when
 
-The windowed enumerations belong to the scheduler's own **Purge** passes, which
-do carry `[last_tick, now)` bounds. There, a one-off failure on a table that then
-goes idle is not retried until the table re-enters a future window — the v0 gap
-durable per-table retry queues would close.
+The branch ops enumerate **unwindowed** — `list_all_modified_table_uuids` and
+`list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound,
+and neither set is filtered on failure. A table that failed is simply still in
+the set, so it is retried on the next tick with no dependence on new traffic.
+
+The two **Purge** passes are windowed, and their windows differ in both bounds:
+the modified pass runs `[last_modified_tick, now)`, the aged-persisted pass runs
+`[last_purge_tick, now - grace)`. A one-off failure on a table that then goes
+quiet is not retried until it re-enters that pass's window — a further committed
+or aborted write for the modified pass, a further committed persist for the
+aged-persisted one. That is the v0 gap durable per-table retry queues would
+close.
 
 The scheduler does NOT use gRPC retries or backoff. The tick cadence
 (`SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` for Persist,
