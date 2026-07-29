@@ -35,7 +35,11 @@ _INDEX_HEADING = "## Examples"
 # also matches inside "### Examples" — and the README's per-script sections are
 # h3s in exactly this space, so that collision is likely rather than theoretical.
 _INDEX_START = re.compile(rf"^{re.escape(_INDEX_HEADING)}\s*$", re.MULTILINE)
-_NEXT_H2 = re.compile(r"^## ", re.MULTILINE)
+# Ends at the next h2 OR h3. Stopping only at the h2 swallowed every per-script
+# `### examples/<name>.py` deep-dive that sits under this heading, so a script
+# with a section but no index row still matched and the index table itself went
+# unguarded — the exact silent-omission this file exists to catch.
+_SECTION_END = re.compile(r"^#{2,3} ", re.MULTILINE)
 
 # A fenced code block, including the fence lines. Stripped before matching: the
 # README pairs each example with a `uv run python examples/<name>.py` block, so
@@ -55,29 +59,37 @@ _FENCED_BLOCK = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 _EXAMPLE_MENTION = re.compile(r"examples/([\w.-]+\.py)")
 
 
-def _index_section() -> str:
-    """The README's examples-index section, prose only.
+def _read_readme() -> str:
+    return _README.read_text(encoding="utf-8")
+
+
+def _index_section(readme: str) -> str:
+    """The README's index section — the entries themselves, prose only.
 
     Scoped to the section rather than searched over the whole README: a script
     named in some unrelated paragraph (the Quick start's run command, say) would
     otherwise satisfy the index assertion without the index listing it at all.
+    And scoped to stop at the first per-script `###`, so that a script's own
+    deep-dive section cannot stand in for an index entry.
+
+    Takes the text rather than reading the file, so the scoping itself is
+    testable — see ``test_index_section_stops_before_the_per_script_sections``.
     """
-    # Fences come out of the WHOLE file first, before anything else reads it.
+    # Fences come out of the WHOLE text first, before anything else reads it.
     # Stripping them last leaves two ordering hazards: a `## Examples` line
     # inside an earlier fenced block would anchor the search in the wrong place,
     # and a `## ` inside a fence within the section would cut it mid-block,
     # stranding an unbalanced fence that can no longer be stripped.
-    readme = _FENCED_BLOCK.sub("", _README.read_text(encoding="utf-8"))
-    start = _INDEX_START.search(readme)
+    stripped = _FENCED_BLOCK.sub("", readme)
+    start = _INDEX_START.search(stripped)
     assert start is not None, (
         f"README.md has no examples index section. Expected a line that is "
         f"exactly {_INDEX_HEADING!r}, with nothing after it. It is the entry "
         f"point for the examples family — see CHA-527."
     )
 
-    # End at the next h2 so per-script `###` subsections stay inside the section.
-    tail = readme[start.end() :]
-    end = _NEXT_H2.search(tail)
+    tail = stripped[start.end() :]
+    end = _SECTION_END.search(tail)
 
     return tail[: end.start()] if end else tail
 
@@ -110,7 +122,35 @@ def _indexed_examples() -> set[str]:
     pointing at an `examples/_helpers.py` that does not exist could never be
     reported. The private-module skip belongs on the *required* side only.
     """
-    return set(_EXAMPLE_MENTION.findall(_index_section()))
+    return set(_EXAMPLE_MENTION.findall(_index_section(_read_readme())))
+
+
+def test_index_section_stops_before_the_per_script_sections():
+    """A script with a deep-dive section but no index row is NOT indexed.
+
+    The index table is the thing under guard. Scoping the section to the next
+    h2 swallowed every per-script `### examples/<name>.py` heading that lives
+    under this one, so a script could satisfy the containment check on the
+    strength of its own section alone — which is exactly the silent omission
+    the module docstring says this file exists to prevent.
+
+    Synthetic rather than the real README on purpose: the failure needs a
+    script that is sectioned but unlisted, and the README must never actually
+    be in that state.
+    """
+    readme = (
+        "## Examples\n\n"
+        "| Script | Shows |\n|---|---|\n"
+        "| `examples/listed.py` | named in the index |\n\n"
+        "### `examples/sectioned.py` — a section, but no index row\n\n"
+        "Prose that mentions examples/sectioned.py the way a deep-dive would.\n\n"
+        "## Architecture\n"
+    )
+    named = set(_EXAMPLE_MENTION.findall(_index_section(readme)))
+    assert named == {"listed.py"}, (
+        f"the index section must stop before the per-script sections, so a "
+        f"sectioned-but-unlisted script does not count as indexed; saw {named}"
+    )
 
 
 def test_examples_dir_is_not_empty():
