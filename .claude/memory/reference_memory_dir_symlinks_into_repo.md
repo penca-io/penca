@@ -12,7 +12,7 @@ metadata:
 
 Two consequences:
 
-1. **It can void a gate.** The pre-PR gate records `GATE_START_DIRTY` and requires it empty (see [[feedback_full_integration_suite_fresh_stack_pre_pr]]). Saving a memory mid-gate dirties the tree. A markdown-only diff has no bearing on Rust/Python behavior, so the *result* still holds — but say so explicitly rather than letting a non-empty `DIRTY` line silently discredit a green run.
+1. **It can void a gate.** The pre-PR gate records `GATE_START_DIRTY` and requires it empty (see [[feedback_integration_suite_full_fresh_before_pr]]). Saving a memory mid-gate dirties the tree. A markdown-only diff has no bearing on Rust/Python behavior, so the *result* still holds — but say so explicitly rather than letting a non-empty `DIRTY` line silently discredit a green run.
 2. **It can leak into the wrong PR.** `git add -A` / `git commit -a` on a feature branch will sweep memory edits into that PR's diff. Stage memory files deliberately, in their own commit, or leave them uncommitted until the feature branch is out of the way.
 
 Verify with `readlink -f <memory-dir>` — do not assume the memory dir is outside the project.

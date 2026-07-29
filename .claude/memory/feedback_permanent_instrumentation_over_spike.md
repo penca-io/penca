@@ -17,4 +17,4 @@ When instrumentation built for a one-off investigation is reusable for future de
 - Write the comment as rationale, not "SPIKE (revert)".
 - It becomes a real deliverable — decide whether it rides in the feature PR or its own small observability change.
 
-Related: [[feedback_capture_test_output_once]].
+Related: [[feedback_slow_commands_capture_and_wait]].

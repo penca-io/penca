@@ -14,4 +14,4 @@ The authoritative field is `roborev show <job> --json | jq .verdict_bool` — **
 
 So: an empty `kata list --label cha-NNN` alongside a `SEVERITY_THRESHOLD_MET` job is consistent, not a dropped finding. Don't go hunting for the suppressed text — check `verdict_bool` and move on.
 
-Related: [[feedback_poll_roborev_after_any_commits]], [[feedback_kata_list_label_intersect_broken]].
+Related: [[feedback_poll_roborev_after_any_commits]], and [[reference_roborev_kata_bridge_needs_cha_branch]] for the other direction — an empty queue is *not* evidence of a clean review when the bridge never ran at all.

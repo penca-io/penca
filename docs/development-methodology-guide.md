@@ -76,6 +76,56 @@ thing it's supposed to do?" Do not write tests that add no value (e.g.,
 testing that constants equal themselves, testing trivial getters, or testing
 implementation details that aren't meaningful behavior).
 
+**Don't test upstream libraries.** Before adding a test, decompose what it
+actually asserts and label each link in the chain as Penca-owned or upstream.
+If most of the chain is "library X does what its docs say," it isn't a test —
+it's expensive boilerplate. A proposed integration test that read
+`docker logs` for every servicer and grepped for a startup line turned out to
+assert five things, of which four were someone else's job (compose env
+presence — a `rg` away; every binary calling `init_tracing()` — also `rg`;
+`tracing-subscriber` writing to stdout; docker capturing stdout) and only one
+was ours. Pin the Penca-owned subset with the cheapest tool that covers it:
+`rg` for one-time structural guarantees ("every binary calls X"), unit tests
+for pure-function logic, and integration tests only for behavior that
+genuinely needs the live stack — cross-service RPC ordering, real Postgres or
+S3 interaction.
+
+**Don't build test harnesses for local dev tooling.** Production and engine
+paths earn tests; a convenience `just` recipe, a one-off script, or anything
+whose failure is immediately visible to the person running it generally does
+not. Restructuring a Justfile recipe into a script so a stub can drive it is
+the specific thing to avoid — fix the bug, verify by hand, record the
+verification in the commit message, and move on. Weigh the guard against the
+failure it prevents, not against how embarrassing the bug was: "I got this
+wrong twice" argues for care, not infrastructure. The questions that matter
+are blast radius (a recipe that runs once per ticket on a disposable VM and
+leaves a few stale rows behind is cheap to get wrong) and whether the failure
+is *silent* — a hang announces itself the moment you Ctrl-C it, while exiting
+0 having skipped every item past a list cap does not. Only silent *and* costly
+earns machinery.
+
+Cheap **structural** checks are a different thing and are already the repo
+norm: `static_perf_framework_wiring_test.py` greps recipe bodies for the
+symbols they must invoke, at near-zero cost and no restructuring. Add those
+freely — just don't mistake them for behavioral coverage. A grep confirms a
+guard is *present*, not that it is *correct*.
+
+**Timestamp and watermark helpers are the exception — they earn exhaustive
+coverage.** Helpers that compute a cutoff, eligibility watermark, snapshot
+upper bound, or clamp from system state are load-bearing correctness
+primitives, and a single missed input combination can silently break the
+live-query safety chain. Give them unit tests over every *reachable* cross
+product of input states, not happy-path examples. This constrains the
+signature: the helper must take plain primitives or small structs and return
+a typed output — no DB connection, no SQL inside it — so the tests need no
+fixtures. Enumerate the cross product as a table (`dimension | values to
+cover`) while scoping the work, not as prose. It stays small once structural
+constraints apply: most dimensions collapse to `<` / `==` / `>` relative to
+another input, or `0` vs positive, or empty vs single vs multiple. Cover the
+empty-input branch explicitly (it usually has sentinel behavior), and add
+permutation-invariance tests wherever an input is a set or map, so the output
+can't depend on iteration order.
+
 ### Development tests are not committed
 
 TDD tests are a development tool — they help you build changes verifiably and

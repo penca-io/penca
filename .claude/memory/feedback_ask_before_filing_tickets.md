@@ -17,4 +17,4 @@ metadata:
 
 **How to apply:** outside those cases, report the finding and end with "want me to file it?". If the answer is no, the finding still belongs in the report — the user can act on it without a ticket existing.
 
-Related: [[feedback_evaluate_ticket_necessity_first_principles]] (whether the work should exist at all), [[feedback_no_harness_for_local_dev_tooling]] (the proportionality correction from the same review).
+Related: [[feedback_evaluate_ticket_necessity_first_principles]] (whether the work should exist at all), the "Don't build test harnesses for local dev tooling" rule in `docs/development-methodology-guide.md` (the proportionality correction from the same review).

@@ -119,6 +119,8 @@ Lightweight architecture checks (greppable patterns):
 - Imports at top of file, not inside functions.
 - **Purge-state consumers read the stored watermark, not a derivation.** Code that needs "the Purge watermark for table T" (tx_log GC, segment GC, cleanup-pass cutoffs) reads `table_purge_metadata.purged_at_micros(T)` directly — flag any `MAX(persisted_at_micros) ... WHERE now - committed_at > grace` expression standing in for it, even when functionally close. "Use `purged_at`, not `persisted_at`" is categorical.
 - **`stream_merged` row filters qualify columns with `l.`.** When a `stream_merged` / `resolve_table_metadata` caller passes a `row_filter`, columns must be `l.`-qualified (e.g. `l.row_uuid = '...'`). All three SQL paths (hot, cold, snapshot) expose the same `l` alias; an unqualified column is ambiguous on the join and any other prefix breaks exactly one path. Canonical pattern: `crates/penca-storage-meta/src/table.rs::resolve_table_metadata`.
+- **Cold DataFusion reads derive their session from the driver template, never `SessionContext::new()`.** A cold read that builds a `SessionContext` must derive it via `penca_dl::derive_cold_session(&template)` from the driver's `session_template` (`Arc<SessionState>`, held by `QueryManager`). The template carries the shared function registry plus the analyzer/optimizer rules; a fresh `SessionContext::new()` silently diverges from every other cold read. Derive once per read call and pass `&SessionContext` down into the penca-merge helper (mirrors `output.rs`'s `session: &SessionContext` param). Flag any bare `SessionContext::new()` on a cold path — this is a recurring review finding, most recently `penca_merge::cold_audit_batches` on the `audit_data` path.
+- **penca-api names DataFusion types only through penca-dl re-exports.** penca-api does not depend on the `datafusion` crate — penca-merge owns DataFusion — so `use datafusion::prelude::SessionContext` in penca-api is an `E0433 unlinked crate` error, not a style nit. Use `penca_dl::{SessionState, SessionContext}` / `penca_dl::derive_cold_session`; if a needed type isn't re-exported, add the `pub use` to `crates/penca-dl/src/lib.rs` rather than taking a direct dependency.
 
 For cross-bounded-context architecture concerns — bounded-context boundaries, microservice ownership, ADR alignment, CQRS-shaped splits — invoke `/software-architect`. It applies a Fowler-principled checklist (single bounded context per service, CQS vs CQRS, TolerantReader, StranglerFig, DesignStaminaHypothesis) against the diff and returns structured findings.
 
@@ -159,11 +161,13 @@ The `event` field controls the review type:
 - `"COMMENT"` — suggestions only, no blocking
 - `"APPROVE"` — no critical or important issues
 
+**Reviewing a PR this account authored → `event` MUST be `"COMMENT"`.** GitHub rejects `APPROVE` and `REQUEST_CHANGES` on your own pull request ("Can not approve/request-changes your own pull request"), and the `/do-issue` `orch:spawn-review` path always hits this: the review subagent shares the author's `gh` credentials, so reviewer and author are the same account regardless of the subagent being fresh-context. Convey severity in the review body and inline comments instead — "**Critical**: …" in the comment text, not in the review verdict. The finding mechanics are unaffected: inline comments, `cha-NNN review-pr` kata tasks, and round-2 thread resolution via the GraphQL `resolveReviewThread` mutation all work normally. Only reach for `APPROVE`/`REQUEST_CHANGES` when reviewing someone else's PR.
+
 ```bash
 gh api repos/{owner}/{repo}/pulls/{number}/reviews \
   --method POST \
   --field commit_id="<SHA>" \
-  --field event="REQUEST_CHANGES" \
+  --field event="COMMENT" \
   --field body="## Penca PR Review Summary
 
 <high-level summary of findings>" \

@@ -26,4 +26,4 @@ records the *previous* commit's SHA against the task. Hit this twice on CHA-423
 3. THEN `kata close <ref> --done --commit <verified-sha>` as its own command.
 
 Relates to [[feedback_just_check_gate_trust]] (only trust a gate when it truly
-passed) and [[feedback_commit_scope_allowlist]] (commit-msg hook rules).
+passed) and the commit-message rules in the `/do-issue` skill's Step-4 commit guidance (types, and scopes sourced from `linear/labels.toml`).
