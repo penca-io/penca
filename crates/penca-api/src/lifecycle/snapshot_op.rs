@@ -29,6 +29,7 @@ use penca_db::driver::pg::PgDriver;
 use penca_dl::driver::DlDriver;
 use penca_format::reader::FormatReader;
 use penca_format::writer::FormatWriter;
+use penca_proto::external::v1::create_branch_request::ForkPoint;
 use penca_proto::external::v1::{Index, SnapshotRequest, SnapshotResponse};
 use penca_storage_cold::ColdStorageClient;
 use penca_storage_meta::watermarks::compute_snapshot_seq_watermark;
@@ -637,7 +638,7 @@ impl LifecycleManager {
         // own (`None` → genesis) would stamp a watermark below the seq of rows
         // the snapshot actually materializes.
         //
-        // `fork_commit_seq_num` joins the fold for the same reason.
+        // The parent's contribution joins the fold for the same reason.
         // `segment_seq_max` is windowed over `branch_str` — the CHILD's persist
         // log — so the parent tail this snapshot folds in between the parent's
         // W_snap and the fork point contributes no seq of its own. The child's
@@ -645,21 +646,48 @@ impl LifecycleManager {
         // drag the fold above the fork point anyway; what defeats that is an
         // `as_of` snapshot whose micros window closes before the child's persist
         // but after the parent's tail, leaving the fold empty while the snapshot
-        // still materializes the parent through the fork edge. Both plan paths
-        // below materialize it through exactly that ceiling — carry-forward via
-        // `assemble_fork_tail_base_cold`, full rewrite via
-        // `enumerate_base_cold_source` — so the seq is covered by construction
-        // on either, and there is no third path: `fork_edge` is what selects
-        // them.
+        // still materializes parent rows.
         //
-        // Understating here is not merely conservative. `meta_plan`'s base-cold
-        // gate is `child_snapshot_seq < fork_commit_seq_num`, so a watermark
-        // short of the fork point leaves that gate open forever and every read
-        // of the fork re-enumerates and re-folds the parent's base to dedup it
-        // against data the child's own snapshot already holds.
+        // Understating is not merely conservative. `meta_plan`'s base-cold gate
+        // is `child_snapshot_seq < fork_commit_seq_num`, so a watermark short of
+        // the fork point leaves that gate open forever and every read of the
+        // fork re-enumerates and re-folds the parent's base to dedup it against
+        // data the child's own snapshot already holds.
+        //
+        // But the fork edge is the wrong number to claim outright, because both
+        // plan paths clamp the parent on the MICROS axis as well as the seq one:
+        // carry-forward via `assemble_fork_tail_base_cold`'s `max_micros`, full
+        // rewrite via `enumerate_base_cold_source`'s. An `as_of` pin below a
+        // parent commit that still sits under the fork edge strands that commit
+        // — it is filtered out of what this snapshot materializes — and claiming
+        // the edge anyway would close the base-cold gate over it, losing those
+        // rows on the child for the life of the branch (no later snapshot
+        // re-folds the parent: `fork_edge` is gated on `prev_snap_watermark`).
+        //
+        // On the parent's own log seq order and micros order agree, so the
+        // parent's latest committed seq at or before the pin IS the ceiling this
+        // snapshot materializes. Claim the lesser of that and the fork edge. In
+        // the common no-`as_of` case the pin sits past the fork and the two
+        // coincide, so the plan-shape win is preserved. `resolve_committed_tx`
+        // waterfalls hot `commit_tx_log` → cold `tx_log`, so a PurgeTxLog'd
+        // position still resolves.
         let mut fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
-        if let Some((_, fork_commit_seq_num)) = &fork_edge {
-            fold_seqs.push(*fork_commit_seq_num);
+        if let Some((parent_branch_uuid, fork_commit_seq_num)) = &fork_edge {
+            let parent_uuid = Uuid::parse_str(parent_branch_uuid)
+                .map_err(|e| ApiError::Internal(format!("invalid parent branch uuid: {e}")))?;
+            if let Some(pinned) = self
+                .query_manager
+                .resolve_committed_tx(
+                    pool,
+                    readers,
+                    &catalog_uuid,
+                    &parent_uuid,
+                    Some(&ForkPoint::CommitMicros(snapshotted_at_micros)),
+                )
+                .await?
+            {
+                fold_seqs.push((*fork_commit_seq_num).min(pinned.commit_seq_num));
+            }
         }
         let snapshot_commit_seq_num =
             compute_snapshot_seq_watermark(baseline_commit_seq_num, &fold_seqs);
