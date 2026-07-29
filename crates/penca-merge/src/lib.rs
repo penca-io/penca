@@ -548,19 +548,14 @@ where
     D: Sync,
     L: DlDriver + ?Sized,
 {
-    // The all-cold fail-fast lives in `resolve_log_tiers`.
+    // The all-cold fail-fast lives in `resolve_log_tiers`, as does the
+    // base-cold fold that used to sit here (CHA-531) and the CHA-482 identity
+    // parse whose result comes back on the struct.
     let ResolvedLogTiers {
         resolved,
         exclusion_set,
+        identity_row_uuids: row_uuids,
     } = resolve_log_tiers(&req).await?;
-
-    // CHA-482: identity restriction for the snapshot seeks. The base-cold fold
-    // that used to sit here moved into `resolve_log_tiers` (CHA-531), which
-    // parses its own copy.
-    let row_uuids = identity_row_uuids(
-        req.seeks.as_deref(),
-        req.filter.is_some_and(|f| !f.is_empty()),
-    )?;
 
     // CHA-485 accelerator entries ride alongside the identity restriction for
     // the provider seek.
@@ -863,13 +858,22 @@ pub struct ResolvedLogTiers {
     /// row_uuids folded in — apply to any snapshot-tier scan of the
     /// same plan, whole or subset.
     pub exclusion_set: HashSet<String>,
+    /// The identity restriction parsed off the request's seeks, returned
+    /// so the snapshot-tier caller reuses this parse instead of
+    /// re-deriving it — the parse validates arity and UUID syntax and
+    /// can fail, and doing it twice means a second traversal of the
+    /// seek list on every all-cold read (CHA-531).
+    pub identity_row_uuids: Option<Vec<Uuid>>,
 }
 
 /// Run phases 1 + 2 of an all-cold merge read: probe the cold log
 /// arms, compose the (resolved batch, exclusion set) pair, and project
 /// the resolved rows to the output schema. Records `resolved_rows` on
 /// the current span (the `*_parts` instrument span when called from
-/// [`stream_all_cold_parts`]).
+/// [`stream_all_cold_parts`]). Since CHA-531 that count is measured
+/// AFTER the base-cold fold, so on a forked read it covers the parent's
+/// contribution too and will exceed the child's own log rows — it is
+/// the size of the batch handed downstream, not a per-branch tally.
 ///
 /// Same all-cold contract as [`stream_all_cold_parts`]: a hot plan
 /// fails fast with [`MergeError::InvalidPlan`] — this entry never
@@ -937,6 +941,12 @@ where
     // accepts. It used to sit in `stream_all_cold_parts` alone, which made the
     // field a silent no-op for the snapshot writer's carry-forward delta —
     // dropping a fork parent's post-snapshot persist tail.
+    //
+    // TODO(CHA-509): one base, one hop. A fork chain folds an ORDERED list of
+    // ancestors here, nearest first, each anti-joined against the ACCUMULATED
+    // exclusion so nearer ancestors shadow farther ones. Generalizing at this
+    // call site — rather than at each caller — is what keeps the snapshot
+    // writer correct for free, since it enters through here too.
     let (resolved, exclusion_set) = fold_base_if_present(
         req.plan,
         req.dl,
@@ -954,6 +964,7 @@ where
     Ok(ResolvedLogTiers {
         resolved,
         exclusion_set,
+        identity_row_uuids: row_uuids,
     })
 }
 
