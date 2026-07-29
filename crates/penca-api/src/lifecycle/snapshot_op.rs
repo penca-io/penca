@@ -637,29 +637,32 @@ impl LifecycleManager {
         // own (`None` → genesis) would stamp a watermark below the seq of rows
         // the snapshot actually materializes.
         //
-        // It can still UNDERSTATE on that first snapshot. `segment_seq_max` is
-        // windowed over `branch_str` — the CHILD's persist log — so the parent
-        // tail folded in between the parent's W_snap and `fork_commit_seq_num`
-        // contributes no seq. A fork whose child has committed nothing of its
-        // own therefore stamps W_snap at the parent's W_snap, below
-        // `fork_commit_seq_num`, even though the snapshot materializes the
-        // parent through the fork point.
+        // `fork_commit_seq_num` joins the fold for the same reason.
+        // `segment_seq_max` is windowed over `branch_str` — the CHILD's persist
+        // log — so the parent tail this snapshot folds in between the parent's
+        // W_snap and the fork point contributes no seq of its own. The child's
+        // seqs are seeded one past the fork edge, so its own segments normally
+        // drag the fold above the fork point anyway; what defeats that is an
+        // `as_of` snapshot whose micros window closes before the child's persist
+        // but after the parent's tail, leaving the fold empty while the snapshot
+        // still materializes the parent through the fork edge. Both plan paths
+        // below materialize it through exactly that ceiling — carry-forward via
+        // `assemble_fork_tail_base_cold`, full rewrite via
+        // `enumerate_base_cold_source` — so the seq is covered by construction
+        // on either, and there is no third path: `fork_edge` is what selects
+        // them.
         //
-        // Left as-is deliberately: understating W_snap is the safe direction —
-        // readers re-resolve the persist log over the ungoverned range instead
-        // of trusting the snapshot, and cross-tier dedup keeps the result
-        // correct. The visible cost is plan shape, not answers: `meta_plan`'s
-        // base-cold gate (`child_snapshot_seq < fork_commit_seq_num`) stays
-        // open, so such a fork keeps paying for the parent's base source until
-        // its own first commit lands. Seeding the fold with
-        // `fork_commit_seq_num` would close both, but it ADVANCES a watermark —
-        // the unsafe direction if any fork path fails to materialize the parent
-        // through the fork point (the parent-has-no-snapshot fallback is the
-        // one to prove out first).
-        let snapshot_commit_seq_num = compute_snapshot_seq_watermark(
-            baseline_commit_seq_num,
-            &segment_seq_max.into_iter().collect::<Vec<i64>>(),
-        );
+        // Understating here is not merely conservative. `meta_plan`'s base-cold
+        // gate is `child_snapshot_seq < fork_commit_seq_num`, so a watermark
+        // short of the fork point leaves that gate open forever and every read
+        // of the fork re-enumerates and re-folds the parent's base to dedup it
+        // against data the child's own snapshot already holds.
+        let mut fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
+        if let Some((_, fork_commit_seq_num)) = &fork_edge {
+            fold_seqs.push(*fork_commit_seq_num);
+        }
+        let snapshot_commit_seq_num =
+            compute_snapshot_seq_watermark(baseline_commit_seq_num, &fold_seqs);
 
         let snap_uuid = table_snapshot_uuid(
             &catalog_uuid,

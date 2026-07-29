@@ -27,8 +27,12 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
+from penca_client._time import micros_to_datetime
 from penca_client.naming import (
+    TABLE_PERSIST_METADATA,
+    TABLE_SNAPSHOT_METADATA,
     TABLE_SNAPSHOT_SEGMENT_METADATA,
+    table_snapshot_uuid,
 )
 from psycopg.sql import SQL, Identifier
 
@@ -88,6 +92,47 @@ def _segment_row_count(catalog_uuid, branch_uuid, snapshot_uuid):
             "   AND commit_micros IS NOT NULL"
         ).format(seg=Identifier(seg_parent)),
         (branch_uuid, snapshot_uuid),
+    )
+    return int(rows[0][0])
+
+
+def _snapshot_seq_watermark(catalog_uuid, branch_uuid, snapshot_uuid):
+    """``W_snap`` — the snapshot's ``commit_seq_num``, i.e. the seq up to
+    which the snapshot claims to describe the table.
+
+    The read planner's base-cold gate for a fork is
+    ``child_snapshot_seq < fork_commit_seq_num``, so this column is what
+    decides whether a fork ever stops folding its parent's cold tier.
+    """
+    snap_parent = f"{catalog_uuid}_{TABLE_SNAPSHOT_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT commit_seq_num FROM {snap}"
+            " WHERE branch_uuid = %s AND table_snapshot_uuid = %s"
+            "   AND commit_micros IS NOT NULL"
+        ).format(snap=Identifier(snap_parent)),
+        (branch_uuid, snapshot_uuid),
+    )
+    assert len(rows) == 1, f"expected one committed snapshot row, got {rows}"
+    return int(rows[0][0])
+
+
+def _persist_watermark(catalog_uuid, branch_uuid, table_uuid):
+    """Latest committed ``persisted_at_micros`` for one branch's table —
+    the same value ``compute_snapshot_window`` bounds a snapshot by.
+
+    Used as a SERVER-clock anchor for an ``as_of`` snapshot: comparing a
+    client-side ``datetime.now()`` against server-stamped watermarks
+    would make the window bound race the two clocks.
+    """
+    persist_parent = f"{catalog_uuid}_{TABLE_PERSIST_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT max(persisted_at_micros) FROM {tpm}"
+            " WHERE branch_uuid = %s AND table_uuid = %s"
+            "   AND commit_micros IS NOT NULL"
+        ).format(tpm=Identifier(persist_parent)),
+        (branch_uuid, table_uuid),
     )
     return int(rows[0][0])
 
@@ -422,3 +467,119 @@ def test_fork_first_snapshot_applies_parents_tail_delete():
         table_uuid=table_uuid,
         branch_uuid=main_branch,
     ) == [("alice", 1), ("carol", 3)]
+
+
+def test_fork_first_snapshot_watermark_covers_the_fork_point():
+    """A fork's first snapshot materializes the parent through the fork
+    edge, so its ``W_snap`` must be at least ``fork_commit_seq_num`` —
+    even when the child's own persist log contributes no seq to the fold.
+
+    ``W_snap`` folds the previous baseline with the max seq of the persist
+    segments this snapshot consumes, and that max is windowed over the
+    CHILD's log. The parent's carried baseline and folded tail both sit
+    at or below the fork edge on a seq axis the child's log never covers,
+    so with nothing of the child's own in the window the fold bases at the
+    parent's (older) watermark and the snapshot understates what it holds.
+
+    The child's commit seqs are seeded one past the fork edge, so the
+    usual write-then-snapshot ordering hides this: the child's own segment
+    always drags the fold above the fork point. Snapshotting ``as_of`` a
+    micros bound BEFORE the child's persist is what isolates it — the
+    child's segment leaves the window while the parent's baseline and tail
+    stay in it. That is a real point-in-time snapshot, not a contrivance:
+    the resulting snapshot genuinely holds the parent's table as of the
+    fork.
+
+    Understating is not merely conservative. ``meta_plan``'s base-cold
+    gate is ``child_snapshot_seq < fork_commit_seq_num``, so a watermark
+    short of the fork edge leaves that gate open for the life of the
+    branch and every read re-enumerates and re-folds the parent's cold
+    tier to dedup it against rows the child's own snapshot already holds.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fcf")
+    )
+
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    # The tail: persisted on the parent, never snapshotted, so the child's
+    # first snapshot has real parent rows to fold in above the carried
+    # baseline. Without it the snapshot would be a pure carry and the
+    # watermark claim would be vacuous.
+    write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table({"name": ["dave"], "value": [4]}, schema=USER_SCHEMA),
+    )
+    as_of = _persist_watermark(catalog_uuid, main_branch, table_uuid)
+
+    branch = client.create_branch(
+        f"fcf_wm_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-531",
+    )
+    child_branch = branch.branch_uuid
+
+    write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+        upserts=pa.table({"name": ["alice"], "value": [99]}, schema=USER_SCHEMA),
+    )
+    assert _persist_watermark(catalog_uuid, child_branch, table_uuid) > as_of, (
+        "the child's persist must land strictly after `as_of` or the snapshot"
+        " window still covers the child's own segment and the fold is dragged"
+        " above the fork edge for the wrong reason"
+    )
+
+    response = client.snapshot(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+        snapshot_at=micros_to_datetime(as_of),
+    )
+    assert response.HasField("snapshotted_at_micros")
+    assert response.snapshotted_at_micros == as_of, (
+        "the snapshot window must clamp to `as_of`, not to the child's later"
+        " persist watermark, or the isolating precondition is gone"
+    )
+    snap_child = table_snapshot_uuid(
+        catalog_uuid, child_branch, table_uuid, response.snapshotted_at_micros
+    )
+
+    assert (
+        _snapshot_seq_watermark(catalog_uuid, child_branch, snap_child)
+        >= branch.fork_commit_seq_num
+    ), (
+        "the child's first snapshot holds the parent's table as of the fork"
+        " edge — carried baseline plus folded tail — so its W_snap must cover"
+        f" fork_commit_seq_num={branch.fork_commit_seq_num}. Stamping the"
+        " parent's older watermark leaves meta_plan's base-cold gate open"
+        " forever."
+    )
+
+    # The snapshot is as-of the fork, so the child's own later write is
+    # still served from its persist log on top of it.
+    assert _read_pairs(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+    ) == [("alice", 99), ("bob", 2), ("carol", 3), ("dave", 4)]
