@@ -80,28 +80,36 @@ def _called_names(node: ast.AST) -> set[str]:
 
 
 def _is_serial_mark(node: ast.AST) -> bool:
-    """True only for the ``pytest.mark.serial`` dotted path.
-
-    Matching any attribute named ``serial`` would accept an unrelated mention
-    inside another decorator's arguments — ``@pytest.mark.parametrize("mode",
-    [Mode.serial])`` on a scraping test would satisfy the check and mask a
-    genuinely missing mark. This file's whole job is to be the thing that
-    cannot be fooled, so it requires the ``.mark.`` parent too.
-    """
+    """True only for the full ``pytest.mark.serial`` dotted path."""
     return (
         isinstance(node, ast.Attribute)
         and node.attr == "serial"
         and isinstance(node.value, ast.Attribute)
         and node.value.attr == "mark"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "pytest"
     )
 
 
-def _has_serial_mark(node: ast.AST) -> bool:
-    for decorator in getattr(node, "decorator_list", []):
-        if any(_is_serial_mark(n) for n in ast.walk(decorator)):
-            return True
+def _decorator_head(decorator: ast.expr) -> ast.expr:
+    """The decorator itself, unwrapping a call: ``@f(x)`` -> ``f``."""
+    return decorator.func if isinstance(decorator, ast.Call) else decorator
 
-    return False
+
+def _has_serial_mark(node: ast.AST) -> bool:
+    """True when a decorator IS ``pytest.mark.serial``.
+
+    Tests the decorator head rather than walking the decorator, because a
+    mark nested in another decorator's arguments does not mark the test:
+    ``@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.serial)])``
+    is ordinary pytest that serializes ONE parameter, while the rest still run
+    under ``-n auto``. Walking would have read that as the whole test being
+    marked — the direction that hides a real gap.
+    """
+    return any(
+        _is_serial_mark(_decorator_head(decorator))
+        for decorator in getattr(node, "decorator_list", [])
+    )
 
 
 def _body_sets_serial_pytestmark(body: list[ast.stmt]) -> bool:

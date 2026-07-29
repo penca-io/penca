@@ -785,8 +785,11 @@ fetch-jdbc-driver:
 #   just integration-test lifecycle query
 # Set the parallel phase's worker count. Unset means `auto`, capped by
 # PENCA_TEST_JOBS_MAX (default 4); an explicit value is used as-is, uncapped,
-# so a 2-core box can reproduce CI's 4-worker contention:
+# so a box with fewer cores than CI can still reproduce its worker count:
 #   PENCA_TEST_JOBS=4 just integration-test
+# Note that oversubscribing cores this way slows the servicers, which is what
+# the pinned 2s QUERY_TIMEOUT_SECONDS measures against — so timeouts seen this
+# way may be the oversubscription rather than a real defect.
 # Note a named subset now runs its non-serial tests under xdist too, so it is
 # representative of CI — but that means output is captured and breakpoint()/pdb
 # won't attach. For an interactive debug loop, call pytest directly.
@@ -874,15 +877,30 @@ integration-test *services:
             return 1
         fi
 
-        grep -c '::' "$collect_out" || true
+        # Anchored: a collected node id is the whole line and starts with the
+        # file path. pytest's reporter writes its warnings-summary and
+        # deselection text to stdout as well, so an unanchored "::" would
+        # count that noise as tests.
+        grep -cE '^[^ ]+::' "$collect_out" || true
     }
-    total_n=$(count_tests "${files[@]}") || exit 1
-    serial_n=$(count_tests "${files[@]}" -m "serial") || exit 1
-    parallel_n=$(count_tests "${files[@]}" -m "not serial") || exit 1
+    # One definition of each selector, shared by the counts below and by the
+    # phase invocations. Previously the literals appeared in five places and
+    # the guard compared only its own two, so a typo in a PHASE (-m "not
+    # seriall") passed the guard untouched and ran every serial test under
+    # -n auto, exiting 0 — the same one-sided-typo class the guard exists for,
+    # failing in the direction that hides.
+    SERIAL_SELECTOR='serial'
+    PARALLEL_SELECTOR='not serial'
 
-    # Selecting nothing at all is never right — a mistyped service name lands
-    # here — and without this both phases would exit 5, both tolerances would
-    # fire, and the recipe would report success having run no tests.
+    total_n=$(count_tests "${files[@]}") || exit 1
+    serial_n=$(count_tests "${files[@]}" -m "$SERIAL_SELECTOR") || exit 1
+    parallel_n=$(count_tests "${files[@]}" -m "$PARALLEL_SELECTOR") || exit 1
+
+    # Selecting nothing at all is never right: without this both phases would
+    # exit 5, both tolerances would fire, and the recipe would report success
+    # having run no tests. Reached when the selected files collect cleanly but
+    # hold no tests — a mistyped service name does NOT land here, since that is
+    # a pytest usage error caught by count_tests above.
     if [ "$total_n" -eq 0 ]; then
         echo "selection matched no tests" >&2
         exit 1
@@ -903,7 +921,7 @@ integration-test *services:
     # ~11m for the same files' work back when the suite was fully serial. The
     # gap is buffer cost, not what these tests inherently take.
     serial_rc=0
-    uv run pytest "${files[@]}" -m "serial" -s || serial_rc=$?
+    uv run pytest "${files[@]}" -m "$SERIAL_SELECTOR" -s || serial_rc=$?
 
     # No `-s`: N workers interleave into noise, and nothing here needs it — the
     # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
@@ -914,16 +932,16 @@ integration-test *services:
     # workers against the default pool of 4, 28 tests failed, every one with
     # "pool timed out while waiting for an open connection" and nothing else —
     # but docker/test.env now raises PG_POOL_MAX for the test profile, so that
-    # is no longer what binds. If that override is ever dropped, lower this cap
-    # to match or the parallel phase goes red again.
+    # is no longer what binds. If that override is ever dropped, this cap must
+    # come down to the pool depth — 4 workers against a pool of 4 is the
+    # configuration that produced those 28 failures.
     #
     # What binds now is CPU against the deliberately small
-    # QUERY_TIMEOUT_SECONDS=2. At 4 workers on a 2-core box, two heavy
-    # compaction tests time out:
-    # test_cascade_seal_when_active_full_and_next_uncompacted_breaches and
-    # test_persist_chunked_segments_compact_normally. They pass at 1 worker per
-    # core, which is CI's ratio, so they are not marked — but if the queue ever
-    # flakes on those two, marking them `serial` is the remedy.
+    # QUERY_TIMEOUT_SECONDS=2: at 4 workers on a 2-core box, two heavy
+    # compaction tests timed out. Both are now marked `serial` (reason (b)), so
+    # they no longer run in this phase — but the shape is worth remembering,
+    # since a server-side deadline that small is sensitive to how much CPU the
+    # servicers get, not just to how many workers there are.
     #
     # PENCA_TEST_JOBS sets `-n` directly so it can raise as well as lower —
     # without that, a 2-core box could never reach CI's 4 workers and the queue
@@ -932,10 +950,10 @@ integration-test *services:
     # so passing both would silently cap a deliberate request.
     parallel_rc=0
     if [ -n "${PENCA_TEST_JOBS:-}" ]; then
-        uv run pytest "${files[@]}" -m "not serial" \
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" \
             -n "$PENCA_TEST_JOBS" || parallel_rc=$?
     else
-        uv run pytest "${files[@]}" -m "not serial" \
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" \
             -n auto --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
     fi
 
