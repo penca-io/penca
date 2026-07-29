@@ -18,7 +18,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::new_null_array;
+use arrow::array::{BooleanArray, Int64Array, new_null_array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -193,6 +193,33 @@ impl<R: FormatReader + 'static> TableProvider for PersistTableProvider<R> {
     }
 }
 
+/// Clamp a persist segment's batch to its own `max_commit_seq_num` ceiling.
+///
+/// A no-op for every ordinarily-written segment — the recorded maximum IS the
+/// file's largest `commit_seq_num` — and for the tx_log carriers, which set no
+/// ceiling. It bites only on a row that deliberately claims less than its file
+/// holds: a fork's inherited persist references, clamped to the fork position
+/// (CHA-539).
+fn apply_segment_seq_ceiling(
+    batch: &RecordBatch,
+    segment: &PersistSegment,
+) -> Result<RecordBatch, ArrowError> {
+    let Some(ceiling) = segment.max_commit_seq_num else {
+        return Ok(batch.clone());
+    };
+    let Ok(idx) = batch.schema().index_of("commit_seq_num") else {
+        return Ok(batch.clone());
+    };
+    let seqs = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| ArrowError::SchemaError("commit_seq_num is not Int64".into()))?;
+    let keep: BooleanArray = seqs.iter().map(|v| Some(v.is_some_and(|s| s <= ceiling))).collect();
+
+    arrow::compute::filter_record_batch(batch, &keep)
+}
+
 struct PersistPartitionStream<R: FormatReader + 'static> {
     segments: Arc<Vec<PersistSegment>>,
     readers: Arc<HashMap<i32, R>>,
@@ -238,7 +265,13 @@ impl<R: FormatReader + 'static> PartitionStream for PersistPartitionStream<R> {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let projected = project_batch_to_schema(&batch, &output_schema)
+                // Apply the segment's own ceiling BEFORE projecting: the
+                // projection may drop `commit_seq_num` (see `scan`'s
+                // output_ordering), and filtering after it would silently skip
+                // the ceiling on exactly the queries that project it away.
+                let bounded = apply_segment_seq_ceiling(&batch, segment)
+                    .map_err(DataFusionError::from)?;
+                let projected = project_batch_to_schema(&bounded, &output_schema)
                     .map_err(DataFusionError::from)?;
                 if projected.num_rows() > 0 {
                     yield projected;
@@ -668,6 +701,73 @@ mod tests {
     use penca_core::{Format, PersistPlan};
     use penca_format::reader::{AnyFormatReader, FormatError};
 
+    /// The ceiling is prescriptive: a row claiming less than its file holds must
+    /// emit only the rows at or below it. Covers the three reachable shapes —
+    /// clamped (below content), inert (at content), and unbounded (`None`, the
+    /// tx_log carriers) — plus the projected-away case, which is why the filter
+    /// runs on the full schema.
+    #[test]
+    fn segment_seq_ceiling_clamps_only_when_it_claims_less() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("commit_seq_num", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let seg = |ceiling| PersistSegment {
+            max_commit_seq_num: ceiling,
+            ..PersistSegment::default()
+        };
+
+        // Clamped below the file's content: only rows at or below survive.
+        let clamped = apply_segment_seq_ceiling(&batch, &seg(Some(20))).unwrap();
+        assert_eq!(clamped.num_rows(), 2, "ceiling 20 must drop the seq-30 row");
+
+        // Inert: the recorded max IS the file's max, the ordinary case.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(Some(30)))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+
+        // Unbounded — the tx_log carriers, built via `..default()`.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(None))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+
+        // Below every row: an empty batch, not an error.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(Some(0)))
+                .unwrap()
+                .num_rows(),
+            0,
+        );
+
+        // A batch without the column cannot be filtered on it; pass it through
+        // rather than erroring, since the ceiling is unenforceable there.
+        let no_seq = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("row_uuid", DataType::Utf8, false)])),
+            vec![Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        assert_eq!(
+            apply_segment_seq_ceiling(&no_seq, &seg(Some(0)))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+    }
+
     fn user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("row_uuid", DataType::Utf8, false),
@@ -807,6 +907,7 @@ mod tests {
             statistics: stats,
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 

@@ -1188,6 +1188,7 @@ impl QueryManager {
                     seg.row_count, seg.format, \
                     seg.min_tx_commit_micros, \
                     seg.max_tx_commit_micros, \
+                    seg.max_commit_seq_num, \
                     seg.size_bytes, seg.metadata, seg.statistics \
              FROM {seg} seg \
              INNER JOIN {tfm} tfm \
@@ -1256,6 +1257,10 @@ impl QueryManager {
                 statistics: statistics.unwrap_or_default(),
                 offset,
                 length,
+                // Always set, even where it is inert: for an ordinarily-written
+                // segment this equals the file's true maximum, so the ceiling
+                // costs a no-op filter and needs no per-row special case.
+                max_commit_seq_num: Some(row.get("max_commit_seq_num")),
             };
 
             match log_kind {

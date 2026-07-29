@@ -138,6 +138,10 @@ impl<'a> PersistScope<'a> {
             statistics: Vec::new(),
             offset,
             length,
+            // Carried through the merge rather than dropped: a compact input
+            // whose row claims less than its file holds must not have that
+            // ceiling widened by being repacked.
+            max_commit_seq_num: Some(row.get("max_commit_seq_num")),
         })
     }
 }

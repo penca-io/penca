@@ -77,6 +77,25 @@ pub struct PersistSegment {
     /// Number of rows from `offset` (set by `compact_persist_segments`;
     /// unset ⇒ to end-of-file).
     pub length: Option<i64>,
+    /// Inclusive per-row `commit_seq_num` ceiling: this segment contributes
+    /// rows at or below it and nothing above. `None` ⇒ unbounded.
+    ///
+    /// **Prescriptive, not descriptive** (CHA-539). For any segment an ordinary
+    /// Persist wrote the recorded value already IS the largest `commit_seq_num`
+    /// in the file, so applying it is a no-op — which is what lets one uniform
+    /// rule cover both cases with no "is this a copied row" branch. It bites
+    /// only where a row deliberately claims less than its file holds: a fork
+    /// materializes the parent's persist segments as its own reference rows,
+    /// clamped to the fork position, because a fork point is an arbitrary
+    /// commit-order position and the parent's segments routinely straddle it.
+    ///
+    /// Distinct from `PersistPlan.commit_seq.max_seq`, which is the plan-wide
+    /// as-of / tier fence. The effective ceiling is the `min` of the two.
+    ///
+    /// `None` is load-bearing for the tx_log carriers built via
+    /// `..PersistSegment::default()`: a cold `tx_log` segment reuses this type
+    /// but holds commit metadata, not data rows, and has no ceiling.
+    pub max_commit_seq_num: Option<i64>,
 }
 
 /// The internal `row_uuid` index sidecar attached to a snapshot segment — the
@@ -269,6 +288,7 @@ impl Default for PersistSegment {
             statistics: Vec::new(),
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 }
