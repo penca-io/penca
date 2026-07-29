@@ -113,6 +113,11 @@ TABLE_PERSIST_SEGMENT_METADATA = "table_persist_segment_metadata"
 TABLE_PURGE_METADATA = "table_purge_metadata"
 TABLE_SNAPSHOT_METADATA = "table_snapshot_metadata"
 TABLE_SNAPSHOT_SEGMENT_METADATA = "table_snapshot_segment_metadata"
+# CHA-412 cold-index sidecars: a per-snapshot header plus one row per
+# sidecar file. A sidecar is a cold file in its own right, so it has its
+# own two-phase commit and `segment_delete_set` GC participation.
+TABLE_SNAPSHOT_INDEX_METADATA = "table_snapshot_index_metadata"
+TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA = "table_snapshot_segment_index_metadata"
 # CHA-202: in-flight compact merged-file tracking (scoped by
 # (branch_uuid, table_uuid)).
 COMPACT_SEGMENT_METADATA = "compact_segment_metadata"

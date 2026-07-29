@@ -7,6 +7,14 @@ delete_set_rows`` probes both of its ``NOT EXISTS`` refcount arms with
 ``branch_uuid = $1``, so the parent's sweep cannot see the child's
 reference and deletes a file the child still reads.
 
+One test per arm the gate has to get right: the base-segment refcount,
+the index-sidecar refcount (a carried sidecar shares its file the same
+way), and the grace clock (branch-keyed delete-set rows mean the
+retirement that drops the last reference refreshes only its own branch's
+row). Each pairs its survival assertion with a positive control, because
+"the row is still there" is also what a sweep that never considered the
+URI eligible looks like.
+
 The cross-branch reference is synthesized with direct SQL rather than
 produced by a real fork snapshot: this pins the GC gate on its own,
 independent of the carry-forward writer landing. Retirement itself is
@@ -26,7 +34,9 @@ import pyarrow as pa
 from penca_client import Mutation
 from penca_client.naming import (
     SEGMENT_DELETE_SET,
+    TABLE_SNAPSHOT_INDEX_METADATA,
     TABLE_SNAPSHOT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
     TABLE_SNAPSHOT_SEGMENT_METADATA,
     table_snapshot_uuid,
 )
@@ -159,6 +169,53 @@ def _segment_rows(catalog_uuid, branch_uuid, snapshot_uuid):
         (branch_uuid, snapshot_uuid),
     )
     return [(r[0], r[1]) for r in rows]
+
+
+def _sidecar_rows(catalog_uuid, branch_uuid, snapshot_uuid=None):
+    """``[(segment_index_uuid, object_uri), ...]``.
+
+    ``snapshot_uuid`` narrows to one snapshot's sidecars; omit it to list
+    every sidecar on the branch (the child's copied row hangs off a
+    synthesized index header, not off a snapshot the writer produced).
+    A sidecar row carries no snapshot of its own — it hangs off an index
+    header — so narrowing joins through ``table_snapshot_index_metadata``.
+    """
+    child = f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA}"
+    parent = f"{catalog_uuid}_{TABLE_SNAPSHOT_INDEX_METADATA}"
+    if snapshot_uuid is None:
+        rows = get_pg_driver().execute(
+            SQL(
+                "SELECT segment_index_uuid::text, object_uri FROM {child}"
+                " WHERE branch_uuid = %s ORDER BY object_uri"
+            ).format(child=Identifier(child)),
+            (branch_uuid,),
+        )
+    else:
+        rows = get_pg_driver().execute(
+            SQL(
+                "SELECT c.segment_index_uuid::text, c.object_uri"
+                " FROM {child} c JOIN {parent} p"
+                " ON p.branch_uuid = c.branch_uuid"
+                " AND p.table_snapshot_index_uuid = c.table_snapshot_index_uuid"
+                " WHERE c.branch_uuid = %s AND p.table_snapshot_uuid = %s"
+                " ORDER BY c.object_uri"
+            ).format(child=Identifier(child), parent=Identifier(parent)),
+            (branch_uuid, snapshot_uuid),
+        )
+
+    return [(r[0], r[1]) for r in rows]
+
+
+def _age_delete_set_rows(catalog_uuid, branch_uuid, uri):
+    """Push a branch's delete-set rows for ``uri`` past the grace window."""
+    tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
+    get_pg_driver().execute_no_result(
+        SQL(
+            "UPDATE {tbl} SET written_at_micros = %s"
+            " WHERE branch_uuid = %s AND object_uri = %s"
+        ).format(tbl=Identifier(tbl)),
+        (_now_micros() - 10_000_000, branch_uuid, uri),
+    )
 
 
 def _segment_uris(catalog_uuid, branch_uuid, snapshot_uuid):
@@ -294,12 +351,177 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
     # pinning the file: if the row drains now, the sweep was live and
     # willing to delete this URI all along.
     _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+    assert _segment_uris(catalog_uuid, child_branch, child_snap) == [], (
+        "the control's setup did not take: the child's synthesized segment"
+        " rows are still present, so a surviving delete-set row below would"
+        " mean nothing."
+    )
 
     client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
 
     drained = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
     assert drained == [], (
         "the delete-set row survived a sweep with zero remaining references,"
-        " so phase 1's survival proves nothing about the refcount gate — the"
-        f" sweep never treated {shared_uri} as eligible in the first place."
+        " so phase 1's survival proves nothing about the refcount gate."
+        f" Either the sweep never treated {shared_uri} as eligible, or the"
+        " cold-file delete failed and the row was left for retry (sweep.rs"
+        " only drains a row after a successful delete)."
+    )
+
+
+def test_parent_sweep_spares_a_sidecar_another_branch_references():
+    """The same cross-branch refcount contract for the SIDECAR arm.
+
+    ``eligible_segment_delete_set_rows`` has a second ``NOT EXISTS`` arm
+    against ``table_snapshot_segment_index_metadata``: a carried cold
+    index sidecar (CHA-412) copies the prior file's ``object_uri`` by
+    reference exactly as its base segment does, so it has the identical
+    cross-branch exposure. A fix that makes only the base-segment arm
+    catalog-wide turns the test above green while carried sidecar files
+    are still deleted out from under the child.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+
+    snap_main = _cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    sidecar_rows = _sidecar_rows(catalog_uuid, main_branch, snap_main)
+    assert sidecar_rows, (
+        "the parent snapshot must have written at least one row_uuid index"
+        " sidecar (CHA-412) for this test to mean anything"
+    )
+    shared_sidecar_uuid, shared_uri = sidecar_rows[0]
+
+    child_branch = client.create_branch(
+        f"fgc_sidecar_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-531",
+    ).branch_uuid
+
+    # A carried sidecar reference: same object_uri, fresh identity, under
+    # the child's branch_uuid — with its parent header row, since the
+    # sidecar row is keyed by table_snapshot_index_uuid.
+    child_snap = str(uuid4())
+    child_index = str(uuid4())
+    _copy_row_to_branch(
+        f"{catalog_uuid}_{TABLE_SNAPSHOT_METADATA}",
+        where="branch_uuid = %s AND table_snapshot_uuid = %s",
+        params=(main_branch, snap_main),
+        overrides={"branch_uuid": child_branch, "table_snapshot_uuid": child_snap},
+    )
+    _copy_row_to_branch(
+        f"{catalog_uuid}_{TABLE_SNAPSHOT_INDEX_METADATA}",
+        where="branch_uuid = %s AND table_snapshot_uuid = %s",
+        params=(main_branch, snap_main),
+        overrides={
+            "branch_uuid": child_branch,
+            "table_snapshot_uuid": child_snap,
+            "table_snapshot_index_uuid": child_index,
+        },
+    )
+    _copy_row_to_branch(
+        f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA}",
+        where="branch_uuid = %s AND segment_index_uuid = %s",
+        params=(main_branch, shared_sidecar_uuid),
+        overrides={
+            "branch_uuid": child_branch,
+            "table_snapshot_index_uuid": child_index,
+            "segment_index_uuid": str(uuid4()),
+        },
+    )
+    assert shared_uri in {
+        uri for _u, uri in _sidecar_rows(catalog_uuid, child_branch)
+    }, "setup failed: the child must hold a reference to the parent's sidecar"
+
+    _insert_delete_set_row(
+        catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
+    )
+    _drop_snapshot_rows(catalog_uuid, main_branch, snap_main)
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
+    remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    assert len(remaining) == 1, (
+        "sweep deleted a cold INDEX SIDECAR that another branch's snapshot"
+        f" still references. {shared_uri} is referenced by branch"
+        f" {child_branch} via table_snapshot_segment_index_metadata, so the"
+        " sidecar refcount arm must probe catalog-wide, not branch-scoped."
+    )
+
+
+def test_parent_sweep_respects_another_branchs_grace_window():
+    """The grace clock is cross-branch too.
+
+    ``naming::segment_delete_uuid`` is branch-keyed, so when a retirement
+    on branch B drops the last reference to a file the parent enqueued
+    long ago, only B's delete-set row gets a fresh ``written_at_micros``.
+    Without a self-join arm the parent's own already-expired row goes
+    eligible the instant B drops that reference, deleting the file inside
+    the grace window a concurrent reader on B relies on.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+
+    snap_main = _cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    parent_rows = _segment_rows(catalog_uuid, main_branch, snap_main)
+    assert parent_rows
+    _shared_seg_uuid, shared_uri = parent_rows[0]
+
+    sibling_branch = client.create_branch(
+        f"fgc_grace_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-531",
+    ).branch_uuid
+
+    # Zero live references, but two delete-set rows for the same file: the
+    # parent's is long expired, the sibling's was just written.
+    _drop_snapshot_rows(catalog_uuid, main_branch, snap_main)
+    _insert_delete_set_row(
+        catalog_uuid, main_branch, table_uuid, shared_uri, _now_micros() - 10_000_000
+    )
+    _insert_delete_set_row(
+        catalog_uuid, sibling_branch, table_uuid, shared_uri, _now_micros()
+    )
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
+    remaining = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    assert len(remaining) == 1, (
+        f"sweep deleted {shared_uri} while branch {sibling_branch} still held"
+        " a within-grace delete-set row for it. The grace gate must be"
+        " cross-branch: the retirement that dropped the last reference"
+        " refreshed only the retiring branch's row."
+    )
+
+    # Positive control: age the sibling's row out of grace and the same
+    # sweep drains the file, proving the grace arm — not some unrelated
+    # ineligibility — was what spared it above.
+    _age_delete_set_rows(catalog_uuid, sibling_branch, shared_uri)
+
+    client.sweep_segments(catalog_uuid=catalog_uuid, branch_uuid=main_branch)
+
+    drained = _delete_set_rows_for_uris(catalog_uuid, main_branch, [shared_uri])
+    assert drained == [], (
+        "with every delete-set row for this file past grace and zero live"
+        f" references, the sweep must drain {shared_uri}; it did not, so the"
+        " assertion above proves nothing about the grace arm."
     )
