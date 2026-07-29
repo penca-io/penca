@@ -927,6 +927,13 @@ integration-test *services:
     # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
     # Runs even if phase 1 failed, so one invocation reports both.
     #
+    # `--dist loadgroup` honours `xdist_group`, which pins mutually-conflicting
+    # tests to ONE worker while leaving them parallel with everything else.
+    # Ungrouped tests distribute exactly as under the default `load`. Note this
+    # is not a substitute for the serial phase: loadgroup still runs the group
+    # concurrently with other tests, which is fine for tests that conflict only
+    # with each other and useless for ones that need the stack quiet.
+    #
     # The cap is 4 because that is what CI has, not because of a measured
     # ceiling. Worker count WAS bounded by the servicers' PG pools — at 4
     # workers against the default pool of 4, 28 tests failed, every one with
@@ -950,10 +957,10 @@ integration-test *services:
     # so passing both would silently cap a deliberate request.
     parallel_rc=0
     if [ -n "${PENCA_TEST_JOBS:-}" ]; then
-        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" \
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" --dist loadgroup \
             -n "$PENCA_TEST_JOBS" || parallel_rc=$?
     else
-        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" \
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" --dist loadgroup \
             -n auto --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
     fi
 
