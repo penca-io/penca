@@ -333,7 +333,7 @@ For the claimed `<ref>`, read its labels via `kata show <ref> --json | jq -r '.l
 4. Commit: `test(scope): add acceptance tests for <ticket title>`, footer `CHA-XX`.
 5. `kata close <ref> --done --commit <sha> --message "<≥40 chars: scope + verification>"`. Implementation tasks blocked-by this red-test unblock.
 
-If self-verification fails (test errored instead of failing for the right reason, or didn't fail at all), `kata claim --force <ref>` release is **not** the answer — leave the task claimed, post a brief diagnostic to the task body via `kata edit <ref> --comment "<what failed>"`, and exit the tick. The user surfaces it via `kata tui` or in the next session.
+If self-verification fails (test errored instead of failing for the right reason, or didn't fail at all), `kata claim --force <ref>` release is **not** the answer — leave the task claimed, post a brief diagnostic via `kata comment <ref> --body "<what failed>"`, and exit the tick. The user surfaces it via `kata tui` or in the next session.
 
 **`impl`** — implement, commit, close:
 1. Read the task body's symbols/files + invocation list.
@@ -432,7 +432,7 @@ Findings are **input to your judgment, not a work queue to execute**. Every comm
 
 The `--wontfix` message is a review response, not a dismissal — state the reasoning a reviewer would need to disagree with you. "Not worth it" is not a justification; "disambiguates two callers, only one of which has a production caller, and the previous round asked for this text to be unified" is.
 
-**Halt and surface instead of deciding** when a finding overturns an approved-plan non-goal or a stated design decision. That is a course-changing issue, and the user owns it — do not silently expand scope, and do not silently ship the flaw either. Mechanically: leave the task claimed, record the verdict and what it contradicts via `kata comment <ref> "<verdict>"` — **not** `kata edit --body`, which replaces rather than appends and would destroy the finding text the human needs to read, and not `kata edit --comment`, which is a post-mutation hook that is rejected without a mutation flag — then `ScheduleWakeup` with `stop: true` to end the drain, and surface the decision with a recommendation. Do NOT release the claim — an unclaimed blocked finding looks like available work to the next tick.
+**Halt and surface instead of deciding** when a finding overturns an approved-plan non-goal or a stated design decision. That is a course-changing issue, and the user owns it — do not silently expand scope, and do not silently ship the flaw either. Mechanically: leave the task claimed, record the verdict and what it contradicts via `kata comment <ref> --body "<verdict>"` — the body goes in the flag, since `comment` takes the ref as its only positional. **Not** `kata edit --body` (replaces rather than appends, destroying the finding text the human needs to read) and **not** `kata edit --comment` (a post-mutation hook, rejected without a mutation flag) — then `ScheduleWakeup` with `stop: true` to end the drain, and surface the decision with a recommendation. Do NOT release the claim — an unclaimed blocked finding looks like available work to the next tick.
 
 ### Doc-only tickets
 

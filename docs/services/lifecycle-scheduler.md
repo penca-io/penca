@@ -168,14 +168,19 @@ All values are required from environment variables; defaults live in
 
 ## Failure handling
 
-A **branch-level** failure behaves differently in each loop. In the snapshot
-loop a listing RPC error propagates out of the sweep, so the per-branch step
-returns early and that branch's watermarks do NOT advance — the next tick re-runs
-the same window. The persist loop holds no watermarks, so its per-branch RPC
-error is simply logged. Either way the loop moves on to the next branch.
+Failure handling has three tiers.
 
-A **per-table** Purge failure is logged and swallowed, and the watermark advances
-past it. Errors on a single table within a branch are also
+A **discovery** failure (`ListCatalogs` / `ListBranches`) propagates out of the
+tick entirely — nothing else runs that tick, in either loop.
+
+A **branch-level** failure behaves differently per loop. In the snapshot loop a
+dirty-set listing error returns early from that branch, so its watermarks do NOT
+advance and the next tick re-runs the same window. The persist loop holds no
+watermarks, so its branch-op RPC error is simply logged. Either way that loop
+moves on to the next branch.
+
+A **per-table** Purge failure is logged and swallowed inside `ops::purge_one`,
+and the enclosing sweep's watermark advances past it. Errors on a single table within a branch are also
 logged and skipped — the branch ops are continue-on-error, which is
 load-bearing rather than incidental: both dirty sets are enumerated
 oldest-timestamp-first, so a table whose op keeps failing sorts first on

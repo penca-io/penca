@@ -21,23 +21,30 @@
 //!
 //! ## Failure semantics
 //!
-//! A branch-level error (a listing RPC failing) propagates out of the snapshot
-//! loop's per-branch step, so its watermarks do NOT advance and the next tick
-//! re-runs the same window. The persist loop carries no watermarks, so its
-//! per-branch RPC error is only logged. Either way the sweep continues to the
-//! next branch.
+//! Failure handling has three tiers:
+//!
+//! - **Discovery** (`ListCatalogs` / `ListBranches`) — propagates out of `tick`
+//!   with `?`, ending the whole sweep. Nothing else runs that tick.
+//! - **Per-branch** — in the snapshot loop a dirty-set listing error returns
+//!   early from that branch, so its watermarks do NOT advance and the next tick
+//!   re-runs the same window; the sweep continues to the next branch. The
+//!   persist loop holds no watermarks, so its branch-op RPC error is only logged.
+//! - **Per-table** — Purge failures are swallowed in `ops::purge_one`, and the
+//!   branch ops swallow theirs server-side, signalling by withholding the
+//!   watermark. The enclosing sweep's watermark advances regardless.
 //!
 //! `PersistBranch` and `SnapshotBranch` enumerate their dirty sets
 //! **unwindowed** server-side, so a table that fails one of them stays
 //! enumerated and is retried on every subsequent tick regardless of whether it
 //! sees further writes.
 //!
-//! The two **Purge** passes are the windowed ones: they re-enumerate only tables
-//! falling in the next `[last_tick, now)` window, so a one-off failure on a
-//! table that then goes quiet is **not** retried until it re-enters a window —
-//! a further committed or aborted write for the modified pass, a further
-//! committed persist for the aged-persisted one. Durable per-table retry queues
-//! are deferred past v0.
+//! The two **Purge** passes are the windowed ones, and their windows differ in
+//! both bounds: the modified pass runs `[last_modified_tick, now)` while the
+//! aged-persisted pass runs `[last_purge_tick, now - grace)`. A one-off failure
+//! on a table that then goes quiet is **not** retried until it re-enters that
+//! pass's window — a further committed or aborted write for the modified pass, a
+//! further committed persist for the aged-persisted one. Durable per-table retry
+//! queues are deferred past v0.
 //!
 //! Retry interval is per-op: the persist cadence for Persist, the snapshot
 //! cadence for the rest.
