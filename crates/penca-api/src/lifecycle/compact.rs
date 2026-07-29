@@ -3,8 +3,7 @@
 //! [`compact_one_scope`] is the active+sealed merge loop used by
 //! `LifecycleManager::compact_persist_segments`; [`PersistScope`]
 //! (per-`LogKind`: delete-log vs upsert-log) carries the per-scope
-//! state. Snapshot segments are immutable and never compact (ADR
-//! 0024, CHA-407).
+//! state. Snapshot segments are immutable and never compact (ADR 0024).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,8 +34,6 @@ use crate::lifecycle::compact_plan::{CompactInputMeta, plan_wave};
 pub(super) struct PersistScope<'a> {
     pub log_kind: LogKind,
     pub snapshot: &'a ReadSnapshot,
-    /// CHA-472: the rehomed by-branch reads ([`QueryManager::get_table_arrow_schema_by_branch`])
-    /// are `QueryManager` methods now; the scope carries the manager handle.
     pub query_manager: &'a crate::query::QueryManager,
 }
 
@@ -96,8 +93,8 @@ impl<'a> PersistScope<'a> {
                     })
                     .transpose()
             }
-            // CHA-185: cold delete schema carries PK columns; compact
-            // reads the same shape persist wrote.
+            // The cold delete schema carries PK columns — compact must read
+            // the same shape persist wrote.
             LogKind::DeleteLog => {
                 let meta = self
                     .query_manager
@@ -145,12 +142,8 @@ impl<'a> PersistScope<'a> {
     }
 }
 
-/// Per-scope active+sealed compaction algorithm.
-///
-/// The scope (`PersistScope`) supplies the per-scope state; this
-/// function holds the algorithm — plan-wave invariants, the
-/// `pool.begin()` / `tx.commit()` shape, the orphan-tracking
-/// auto-commit phase, and the CHA-233 deferred-delete enqueue.
+/// Per-scope active+sealed compaction algorithm. Returns the new merged URI,
+/// or `None` when the wave produced no new file.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_one_scope<L, R, W>(
     scope: &PersistScope<'_>,
@@ -200,9 +193,8 @@ where
         None => return Ok(None),
     };
 
-    // Seal-only wave: no new merged file, just bulk-seal and commit. The
-    // cold files behind the sealed rows stay on disk (those rows keep
-    // pointing at them) so nothing to delete.
+    // Seal-only wave. The sealed rows keep pointing at their cold files, so
+    // there is nothing to enqueue for deletion.
     if plan.input_indices.is_empty() {
         let seal_uuid_strs: Vec<String> = plan
             .seal_indices
@@ -255,9 +247,8 @@ where
             .await
             .map_err(ApiError::ColdStorage)?;
     let merged = concat_batches(&segment_schema, &batches).map_err(ApiError::Arrow)?;
-    // CHA-82: compute merged-file segment statistics once; replayed onto
-    // every input row's metadata via repoint below. Whole-merged-file
-    // stats are applied uniformly (per-slice sharper stats deferred).
+    // Computed once and replayed onto every input row via the repoint below:
+    // whole-merged-file stats apply uniformly, with no per-slice sharpening.
     let merged_stats = penca_dl::stats::compute_segment_statistics(&merged);
 
     let merged_file_uuid = Uuid::new_v4();
@@ -271,8 +262,8 @@ where
         storage_format_text,
     );
 
-    // Phase 1: orphan-tracking INSERT (auto-commit) → write file.
-    // CHA-218: the orphan row's `table_uuid` is always the user table_uuid.
+    // Phase 1: orphan-tracking INSERT (auto-commit) → write file. The orphan
+    // row's `table_uuid` is always the user table_uuid.
     LifecycleManager::insert_compact_segment(
         pool,
         &catalog_str,
@@ -283,17 +274,14 @@ where
     .await?;
 
     ColdStorageClient::write_table_persist_segment(writer, &merged_uri, &merged).await?;
-    // CHA-347: the re-pointed `size_bytes` must be the in-memory Arrow
-    // footprint (the unit `compact_plan` folds against), not the on-disk
-    // merged-file size. Compute it from the merged batch; the split
-    // below distributes it proportionally by row_count.
+    // The re-pointed `size_bytes` MUST be the in-memory Arrow footprint — the
+    // unit `compact_plan` folds against — not the on-disk merged-file size.
+    // The loop below splits it across inputs proportionally by row_count.
     let merged_size_bytes: i64 = batch_in_memory_bytes(&merged)?;
 
-    // Phase 2 (still inside `tx`): repoint the new active's inputs to the
-    // new merged URI in canonical input order; if this is a seal-and-start-
-    // new wave, bulk-seal the prior active's rows (NOT in `input_meta` —
-    // they stay at the prior URI, just flip `is_sealed`); flip the orphan-
-    // tracking row's `commit_micros`.
+    // Phase 2, still inside `tx`. A seal-and-start-new wave's prior active is
+    // NOT in `input_meta`: those rows stay at the prior URI and only flip
+    // `is_sealed`.
     let total_rows: i64 = input_meta.iter().map(|m| m.row_count).sum();
     let mut cumulative: i64 = 0;
     let mut uris_to_defer_delete: HashSet<String> = HashSet::new();
@@ -319,13 +307,9 @@ where
         .await?;
         cumulative += meta.row_count;
         if meta.old_uri != merged_uri {
-            // The row no longer references its old file. In extend mode
-            // `old_uri` is either an uncompacted segment's fresh URI or
-            // the prior active's URI (rewritten under a new URI by this
-            // wave); in seal mode it's always a fresh uncompacted URI.
-            // The prior active's URI in seal mode is NOT in `input_meta`
-            // — its rows stay sealed-and-pointing at it, so the file
-            // persists.
+            // This row no longer references its old file. Reachable only for
+            // rows in `input_meta`, so a seal-mode prior active — whose rows
+            // stay sealed-and-pointing at their file — is never enqueued.
             uris_to_defer_delete.insert(meta.old_uri.clone());
         }
     }
@@ -349,15 +333,11 @@ where
     }
     LifecycleManager::commit_compact_segment(&tx, &catalog_str, &branch_str, &merged_uri).await?;
 
-    // CHA-233 / ADR 0019 §"Four-part mechanism" item 3: enqueue each
-    // replaced URI in `segment_delete_set` inside the merge tx, so the
-    // deferred-delete row commits atomically with the URI swap. The cold
-    // file itself is removed later by `sweep_segments` once past the
-    // grace window — any concurrent plan that captured the old URI
-    // finishes within `query_timeout` and so still finds the file in
-    // cold. The snapshot side shares the single `segment_delete_set`
-    // table; `sweep_segments` doesn't discriminate by kind, only by
-    // `object_uri`.
+    // Must happen inside the merge tx (ADR 0019 §"Four-part mechanism" item
+    // 3) so the deferred-delete row commits atomically with the URI swap.
+    // `sweep_segments` removes the file only once past the grace window, by
+    // which time any concurrent plan holding the old URI has finished within
+    // `query_timeout` and still found the file.
     if !uris_to_defer_delete.is_empty() {
         let defer_uris: Vec<String> = uris_to_defer_delete.into_iter().collect();
         LifecycleManager::insert_segment_delete_set_rows(

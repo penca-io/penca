@@ -1,9 +1,9 @@
-//! Snapshot: cold-tier-only point-in-time materialization (CHA-228).
+//! Snapshot: cold-tier-only point-in-time materialization.
 //!
 //! [`LifecycleManager::snapshot`] is the public entry; `snapshot_locked`
 //! runs the orchestration inside the per-table advisory lock. Two step
 //! helpers split the planning: `compute_snapshot_window` and
-//! `assemble_cold_only_plan`. The write itself is the CHA-404 packed
+//! `assemble_cold_only_plan`. The write itself is the packed
 //! streaming pipeline — `penca_merge::stream_all_cold_parts` (delta once +
 //! plan-ordered prior-snapshot stream) into
 //! `packer::pack_merged_partition_stream`, each flushed file persisted
@@ -51,8 +51,8 @@ use crate::lifecycle::packer::{PackStep, SegmentPacker, pack_merged_partition_st
 
 /// The keys that govern a snapshot's intra-partition sort:
 /// `clustering_keys` when the table declares them, else the primary
-/// keys (CHA-404). One home for the rule — the recorded parent-row
-/// keys and the actual segment sort must agree (CHA-406's key-change
+/// keys. One home for the rule — the recorded parent-row
+/// keys and the actual segment sort must agree (carry-forward's key-change
 /// detection reads the recorded value), so callers must never apply a
 /// different default. Note this means tables without clustering keys
 /// get PK-sorted snapshot segments (prunable min/max stats) where they
@@ -68,7 +68,7 @@ fn effective_clustering_keys(
     }
 }
 
-/// CHA-228: the empty-merge placeholder (all rows tombstoned by new
+/// The empty-merge placeholder (all rows tombstoned by new
 /// persist) — one zero-row segment at `chunk_idx = 0` so the watermark
 /// gets committed to `table_snapshot_metadata`. Without it the next
 /// Snapshot(T) would redo the same merge-read forever.
@@ -212,7 +212,7 @@ impl LifecycleManager {
         table_str: &str,
         as_of_micros: Option<i64>,
     ) -> Result<Option<(i64, SnapshotResult)>, ApiError> {
-        // CHA-227: plan-time atomicity is via explicit threading.
+        // Plan-time atomicity is via explicit threading.
         // `persisted_at` (read first) bounds `upper`, and `upper + 1`
         // bounds the persist segment fetch's upper. A concurrent
         // Persist committing between the watermark read and the
@@ -222,7 +222,7 @@ impl LifecycleManager {
         // surrounding REPEATABLE READ tx required. Snapshot's
         // watermark is derived from raw persist-log inputs (mirrors
         // Persist's stamping rule) so it is well-defined even in
-        // CHA-228's empty-merge case.
+        // The empty-merge case.
         let snapshot_result = self
             .query_manager
             .read_snapshot_segments_for_table(
@@ -231,10 +231,10 @@ impl LifecycleManager {
                 branch_str,
                 table_str,
                 None,
-                // CHA-443: snapshot construction picks the latest baseline to carry
+                // Snapshot construction picks the latest baseline to carry
                 // forward; no seq-axis read cutoff applies here.
                 None,
-                // CHA-492: the snapshot writer picks (no pinned identity).
+                // The snapshot writer picks (no pinned identity).
                 None,
             )
             .await?;
@@ -291,15 +291,15 @@ impl LifecycleManager {
                 from_micros,
                 to_micros,
                 // Snapshot materializes the full committed_at window; no
-                // seq-axis read cutoff applies at construction (CHA-429 #4).
+                // seq-axis read cutoff applies at construction.
                 // The seq-aware baseline picker for AsOfSeq *reads* is
-                // tracked separately in CHA-457.
+                // tracked separately.
                 None,
             )
             .await?;
 
         // The PersistPlan carries the new `committed_at` filter from
-        // CHA-227 commit 1 (consumed per-row by the merge SQL builders
+        // Consumed per-row by the merge SQL builders
         // in commit 7); the snapshot baseline (if any) sits underneath.
         let cold_persist_plan =
             if cold_upsert_segments.is_empty() && cold_delete_segments.is_empty() {
@@ -312,7 +312,7 @@ impl LifecycleManager {
                         min_micros: from_micros,
                         max_micros: to_micros,
                     }),
-                    // CHA-443: snapshot-write read uses the committed-at window
+                    // Snapshot-write read uses the committed-at window
                     // `[from, to)` (no hot tier to fence against); the seq fence
                     // is a read-plan concern, so `commit_seq` stays unset and the
                     // merge builder keeps the committed_at bounds.
@@ -322,11 +322,11 @@ impl LifecycleManager {
         let cold_snapshot_plan = prev_snap_watermark.map(|ts| SnapshotPlan {
             segments: snapshot_segments,
             snapshotted_at_micros: ts,
-            // CHA-443: write-path baseline plan; W_snap is a read-plan concern,
+            // Write-path baseline plan; W_snap is a read-plan concern,
             // not consulted on the snapshot-write merge.
             ..Default::default()
         });
-        // CHA-178: on a forked branch's FIRST snapshot, fold the parent's cold
+        // On a forked branch's FIRST snapshot, fold the parent's cold
         // tier into the delta so the new baseline materializes
         // parent-as-of-fork ∪ the branch's own writes — the mechanism that lets
         // steady-state forked reads skip the base source (the read gate).
@@ -395,7 +395,7 @@ impl LifecycleManager {
         // FOLLOWUP-A dropped `primary_keys` from `stream_merged`'s shape;
         // snapshot needs `partition_keys` (partition split) and the
         // effective clustering keys (in-segment sort) — `clustering_keys`
-        // defaulting to `primary_keys` when unset (CHA-404).
+        // defaulting to `primary_keys` when unset.
         let (arrow_schema_bytes, partition_keys, clustering_keys, primary_keys) = self
             .query_manager
             .get_table_schema_and_layout_keys(
@@ -416,7 +416,7 @@ impl LifecycleManager {
         let user_schema: SchemaRef =
             Arc::new(try_schema_from_ipc_buffer(&arrow_schema_bytes).map_err(ApiError::Arrow)?);
 
-        // CHA-483: the live user secondary-index definitions for this table at
+        // The live user secondary-index definitions for this table at
         // the snapshot's pin. Each is re-derived into a parent header + per-
         // segment sidecars below (materialize-on-next-snapshot); a dropped index
         // simply isn't listed here next cycle, so it stops being re-declared.
@@ -450,7 +450,7 @@ impl LifecycleManager {
             }
         };
         let SnapshotResult {
-            // CHA-485: planner-only field; the snapshot writer re-derives defs
+            // Planner-only field; the snapshot writer re-derives defs
             // from live index_metadata itself.
             indexes: _,
             snapshotted_at_micros: prev_snap_watermark,
@@ -460,7 +460,7 @@ impl LifecycleManager {
             clustering_keys: recorded_clustering_keys,
         } = snapshot_result;
 
-        // CHA-483: prior committed segments keyed by uuid, so the write tail can
+        // Prior committed segments keyed by uuid, so the write tail can
         // read a CARRIED segment's base file to materialize a newly-active user
         // index's missing sidecar (materialize-on-next-snapshot). Built by
         // borrow before `snapshot_segments` is consumed by the paths below.
@@ -475,7 +475,7 @@ impl LifecycleManager {
                 .collect()
         };
 
-        // CHA-443 (IMPL-2): the new snapshot's seq watermark W_snap =
+        // The new snapshot's seq watermark W_snap =
         // max(prev snapshot's W_snap, MAX(persist seg max_commit_seq_num) over the
         // segments this snapshot folds in — the (prev_snap_watermark,
         // snapshotted_at] committed-at window). Carry-forward-only (no new
@@ -506,7 +506,7 @@ impl LifecycleManager {
         let snap_str = snap_uuid.to_string();
         let storage_format_text = self.storage_format.extension();
 
-        // CHA-432: decide the durable retention rung once, here at creation.
+        // Decide the durable retention rung once, here at creation.
         // Resolve the effective snapshot density (table → schema → catalog),
         // read the last durable rung's watermark, and apply the pure kernel.
         // Snapshot is a cold background op under the snapshot advisory lock, so
@@ -566,18 +566,18 @@ impl LifecycleManager {
             user_indexes: &user_indexes,
         };
 
-        // CHA-459: one typed PartitionOrdering for the whole snapshot
+        // One typed PartitionOrdering for the whole snapshot
         // cycle — the ordering authority threaded into carry-forward key
         // derivation and both pack paths, so every leg merges partitions in
         // typed partition order rather than stringified-label order.
         let ordering = PartitionOrdering::new(&user_schema, &partition_keys)?;
 
-        // CHA-406 carry-forward eligibility (ADR 0024 §3): engage iff a
+        // Carry-forward eligibility (ADR 0024 §3): engage iff a
         // prior committed snapshot exists with non-placeholder segments,
         // its recorded layout keys equal the current ones, the table is
         // partitioned with partition ⊆ PK, and every prior segment's
         // typed key is derivable from its statistics. Any failure → the
-        // CHA-404 full-rewrite path, used verbatim.
+        // full-rewrite path, used verbatim.
         let prior_keys = carry_forward_keys(
             &ordering,
             &snapshot_segments,
@@ -636,11 +636,11 @@ impl LifecycleManager {
                     .await?,
                 );
             } else {
-                // CHA-448 v2: the partition column is outside the PK, so it is
+                // The partition column is outside the PK, so it is
                 // absent from the cold delete-log AND a partition-key move
                 // keeps the same row_uuid (upsert only, no delete). Reverse-
                 // look up the PRIOR partition of every window-touched row_uuid
-                // — upserts ∪ deletes — via the CHA-412 row_uuid sidecars; the
+                // — upserts ∪ deletes — via the row_uuid sidecars; the
                 // eligibility gate guaranteed every prior segment has one.
                 let mut touched_row_uuids = touched_row_uuids_from_delta(&delta_groups)?;
                 touched_row_uuids.extend(
@@ -685,14 +685,14 @@ impl LifecycleManager {
                 ..Default::default()
             };
             // Prior stream over the touched subset only, with the same
-            // global exclusion set the delta resolve produced (CHA-142).
+            // global exclusion set the delta resolve produced.
             let prior_stream = penca_merge::snapshot_segment_stream(
                 &touched_plan,
                 dl_driver,
                 &user_schema,
                 &user_schema,
                 None,
-                // CHA-485: the writer path seeks nothing.
+                // The writer path seeks nothing.
                 penca_merge::SnapshotSeeks::default(),
                 exclusion_set,
                 penca_merge::SnapshotStreamTuning {
@@ -721,7 +721,7 @@ impl LifecycleManager {
             )
             .await
         } else {
-            // CHA-404 full-rewrite path
+            // Full-rewrite path.
             // The whole prior snapshot is the merge baseline; its
             // survivors stream in plan order (= label-sorted runs) with
             // the exclusion applied per batch inside the all-cold entry
@@ -798,7 +798,7 @@ impl LifecycleManager {
     }
 
     /// Resolve the carry-forward window's persist rows into the
-    /// label-grouped delta plus the global exclusion set (CHA-406 phase
+    /// label-grouped delta plus the global exclusion set (carry-forward phase
     /// A). Builds a persist-only `Plan` (no snapshot baseline —
     /// the prior snapshot is carried/rewritten, not merged) for the
     /// `(prev_watermark + 1, snap + 1]` window and runs
@@ -841,7 +841,7 @@ impl LifecycleManager {
                 from_micros,
                 to_micros,
                 // Carry-forward materializes the full committed_at window; no
-                // seq-axis read cutoff applies (CHA-429 #4; CHA-457 tracks the
+                // seq-axis read cutoff applies (tracked separately for the
                 // seq-aware baseline picker for AsOfSeq reads).
                 None,
             )
@@ -856,7 +856,7 @@ impl LifecycleManager {
                     min_micros: from_micros,
                     max_micros: to_micros,
                 }),
-                // CHA-443: carry-forward delta read over the committed-at window;
+                // Carry-forward delta read over the committed-at window;
                 // no tier fence, so `commit_seq` stays unset (see the sibling
                 // write-path plan above).
                 commit_seq: None,
@@ -890,7 +890,7 @@ impl LifecycleManager {
     }
 
     /// Distinct partition labels a window's cold delete-log attributes
-    /// to (CHA-406 delete attribution). The delete segments carry the
+    /// to (carry-forward delete attribution). The delete segments carry the
     /// table's PK columns (`cold_delete_schema`), and partition ⊆ PK by
     /// the eligibility gate, so the partition label is derivable from
     /// each delete row. Reads the segment FILES — `Plan` only lists
@@ -911,7 +911,7 @@ impl LifecycleManager {
         // Decode only the partition-key columns, and fold one batch at a
         // time rather than collecting the whole windowed delete log
         // resident — labels are all we need, and the delete window can be
-        // large (CHA-406 keeps the streaming memory bound throughout).
+        // large (carry-forward keeps the streaming memory bound throughout).
         let projection: Vec<&str> = partition_keys.iter().map(String::as_str).collect();
         let mut stream = ColdStorageClient::read_persist_segments(
             readers,
@@ -945,12 +945,12 @@ impl LifecycleManager {
     }
 
     /// The `row_uuid` of every row in a window's cold delete-log — the delete
-    /// identities the CHA-448 reverse-lookup attributes to their prior
+    /// identities the reverse-lookup attributes to their prior
     /// partition. Sibling to [`Self::delete_attributed_labels`], which projects
     /// the partition columns (present only when partition ⊆ PK); this projects
     /// `row_uuid`, which `cold_delete_schema` always carries, so it works when
     /// the partition column is outside the PK. Folds one batch at a time to
-    /// keep the streaming memory bound (CHA-406).
+    /// keep the streaming memory bound.
     async fn delete_row_uuids<R: FormatReader>(
         readers: &HashMap<i32, R>,
         delete_segments: &[PersistSegment],
@@ -993,21 +993,21 @@ impl LifecycleManager {
     }
 
     /// Distinct PRIOR-snapshot partition labels the window's touched row_uuids
-    /// (upserts ∪ deletes) lived in — the CHA-448 v2 attribution frontier for
+    /// (upserts ∪ deletes) lived in — the attribution frontier for
     /// partition ⊄ PK. For each prior segment whose label is not already
-    /// touched, read its internal row_uuid sidecar (CHA-412) and binary-search
+    /// touched, read its internal row_uuid sidecar and binary-search
     /// it for any touched row_uuid (`seek_row_offsets`); a hit adds that
     /// segment's label, so the partition is rewritten (not carried) and its
     /// stale copy is dropped by the global exclusion set during the rewrite —
     /// attribution, not dedup. `prior_keys` is aligned 1:1 with
     /// `snapshot_segments` (the `carry_forward_keys` output). Over-inclusion is
-    /// byte-correct. CHA-412 builds a row_uuid sidecar for every snapshot
+    /// byte-correct. A row_uuid sidecar is built for every snapshot
     /// segment, so a probed segment without one is an invariant violation this
     /// fn fails fast on (not a full-rewrite fallback — the PK-agnostic gate no
     /// longer guards it).
     ///
     /// Cost: O(not-yet-touched prior segments) sidecar reads per cycle — a
-    /// random row_uuid is a uniform hash with no partition locality (CHA-412),
+    /// random row_uuid is a uniform hash with no partition locality,
     /// so partition-stat pruning can't bound the candidate set and every such
     /// segment's sidecar must be probed. The probes run concurrently, bounded
     /// by `segment_read_concurrency` (the shared cold-read budget) like the
@@ -1080,7 +1080,7 @@ impl LifecycleManager {
     /// Probe one prior segment's row_uuid sidecar for any `probe_keys`,
     /// returning that segment's partition label if it contains one — a single
     /// concurrent unit of [`Self::reverse_lookup_attributed_labels`]. Fails
-    /// fast if the segment has no sidecar (CHA-412 builds one for every
+    /// fast if the segment has no sidecar (one is built for every
     /// snapshot segment, so absence is an invariant violation).
     async fn probe_segment_for_label<R: FormatReader>(
         readers: &HashMap<i32, R>,
@@ -1099,7 +1099,7 @@ impl LifecycleManager {
         let sidecar = ColdStorageClient::read_segment_index(readers, sidecar_meta, sidecar_schema)
             .await
             .map_err(ApiError::ColdStorage)?;
-        // CHA-480: the seek kernel takes composite tuple probes; the row_uuid
+        // The seek kernel takes composite tuple probes; the row_uuid
         // index is single-column, so wrap each probe key as a 1-tuple.
         let probe_tuples: Vec<&[&str]> = probe_keys.iter().map(std::slice::from_ref).collect();
         let hit = !penca_format::index::seek_row_offsets(&sidecar, &probe_tuples)?.is_empty();
@@ -1115,7 +1115,7 @@ impl LifecycleManager {
     /// durable writer's group rollback, a ROW-ONLY carried delete (the
     /// shared prior files must never be deleted here), and the
     /// uncommitted parent delete.
-    /// CHA-483: materialize user secondary indexes for carried-forward segments
+    /// Materialize user secondary indexes for carried-forward segments
     /// (materialize-on-next-snapshot). A carried segment the prior snapshot
     /// already indexed carries its sidecar forward by reference; a newly-active
     /// index has the carried base file read back and the missing sidecar built.
@@ -1318,7 +1318,7 @@ impl LifecycleManager {
         // gate, so until it runs every row below the still-NULL parent
         // is unreachable regardless of its own commit state.
         let mut carried_specs: Vec<CarriedSegmentSpec> = Vec::new();
-        // CHA-412: auto-build the internal `row_uuid` identity index for every
+        // Auto-build the internal `row_uuid` identity index for every
         // snapshot — a parent header + per-segment sidecars riding the same
         // two-phase gate (the phase-2 parent snapshot commit below). The index
         // is format-agnostic: the sidecar follows the table's storage format
@@ -1326,7 +1326,7 @@ impl LifecycleManager {
         // base segments. `parent_index_uuid` is the deterministic header id both
         // the per-segment children and the carry-forward JOIN reference.
         let parent_index_uuid = table_snapshot_index_uuid(ctx.snap_uuid, None).to_string();
-        // CHA-481: the three __penca_system__ tables (schemas/tables/indexes)
+        // The three __penca_system__ tables (schemas/tables/indexes)
         // ALSO carry a built-in composite name index, declared + materialized
         // alongside the row_uuid index on every snapshot. The classifier returns
         // None for every other table, so this is a no-op for user tables. Its
@@ -1364,7 +1364,7 @@ impl LifecycleManager {
                 None,
             )
             .await?;
-            // CHA-483: re-declare a parent header per live user index
+            // Re-declare a parent header per live user index
             // (`index_uuid` non-NULL). Inserted uncommitted alongside the
             // internal header; the single branch+snapshot-scoped commit below
             // commits them all. Re-deriving from `index_metadata` each snapshot
@@ -1379,14 +1379,14 @@ impl LifecycleManager {
                     &user_parent,
                     ctx.snap_str,
                     Some(&index.index_uuid),
-                    // CHA-485: stamp the declared key columns onto the
+                    // Stamp the declared key columns onto the
                     // snapshot-scoped header — the planner's covering-index
                     // source (it never reads `index_metadata`, ADR 0026 §5).
                     Some(&index.columns),
                 )
                 .await?;
             }
-            // CHA-481: declare the built-in name-index parent (non-NULL
+            // Declare the built-in name-index parent (non-NULL
             // index_uuid) for the system tables before the shared commit below,
             // so it commits alongside the row_uuid + user-index parents.
             if let Some(name) = &name_index {
@@ -1397,7 +1397,7 @@ impl LifecycleManager {
                     &name.parent_index_uuid,
                     ctx.snap_str,
                     Some(&name.slug),
-                    // Not planner-selectable: the metadata fast-path (CHA-484)
+                    // Not planner-selectable: the metadata fast-path
                     // hardcodes its index and never consults key_columns.
                     None,
                 )
@@ -1462,11 +1462,11 @@ impl LifecycleManager {
                     &uuids,
                 )
                 .await?;
-                // CHA-455: a carried base segment carries its cold-index
+                // A carried base segment carries its cold-index
                 // sidecars forward by reference. Insert NULL-committed,
                 // then commit them in this SAME phase-2 (keyed by the new
                 // segment uuids) so a sidecar never becomes visible out of
-                // step with its base segment. No-op until CHA-412 emits
+                // step with its base segment. No-op until the build emits
                 // sidecars.
                 let carry_pairs: Vec<(String, String)> = carried_specs
                     .iter()
@@ -1486,16 +1486,16 @@ impl LifecycleManager {
                     &carry_pairs,
                 )
                 .await?;
-                // CHA-484: the built-in system-table NAME index (CHA-481) is
+                // The built-in system-table NAME index is
                 // deliberately absent from this carry branch — it relies on
                 // the three `__penca_system__` tables being carry-INELIGIBLE
                 // (registered with empty partition/clustering keys, so the
-                // CHA-406 gate never engages). If system tables ever become
+                // carry-forward gate never engages). If system tables ever become
                 // carry-eligible, carry the name sidecar here too, or every
-                // carried segment planless-degrades the CHA-484 by-name fast
+                // carried segment planless-degrades the by-name fast
                 // path to the merge fallback (its entry absent from the
                 // segment's keyed `index_sidecars`).
-                // CHA-483: user secondary indexes on carried segments — carry
+                // User secondary indexes on carried segments — carry
                 // already-indexed sidecars forward by reference; build the
                 // missing ones for newly-active indexes by reading the carried
                 // base files (materialize-on-next-snapshot). Keyed by carried
@@ -1520,7 +1520,7 @@ impl LifecycleManager {
             }
             // A carried-only snapshot commits its watermark through its
             // carried rows; the placeholder is only for a genuinely empty
-            // merge (CHA-228).
+            // merge.
             if !wrote_any && carried_specs.is_empty() {
                 let placeholder = empty_merge_placeholder_step(
                     ctx.snap_uuid,
@@ -1535,7 +1535,7 @@ impl LifecycleManager {
                     .write_segment_group(pool, writer, &placeholder)
                     .await?;
             }
-            // CHA-412: commit the snapshot's built index sidecars (the parent
+            // Commit the snapshot's built index sidecars (the parent
             // header was already committed up front). Still invisible until the
             // phase-2 snapshot commit below, so an index never becomes visible
             // out of step with its snapshot.
@@ -1563,7 +1563,7 @@ impl LifecycleManager {
                 &carried_uuids,
             )
             .await;
-            // CHA-455: clean up any uncommitted carried sidecars too
+            // Clean up any uncommitted carried sidecars too
             // (keyed by the new carried segment uuids).
             let _ = penca_storage_meta::LifecycleManager::delete_uncommitted_segment_index_for_segments(
                 pool,
@@ -1579,7 +1579,7 @@ impl LifecycleManager {
                 ctx.snap_str,
             )
             .await;
-            // CHA-412: roll back the built index sidecars (files + uncommitted
+            // Roll back the built index sidecars (files + uncommitted
             // child rows) and the uncommitted parent header.
             for uri in &built_index_uris {
                 let _ = ColdStorageClient::delete_segment(writer, uri, true).await;
@@ -1610,7 +1610,7 @@ impl LifecycleManager {
         )
         .await?;
 
-        // CHA-468: Snapshot only materialises + commits the baseline.
+        // Snapshot only materialises + commits the baseline.
         // Retirement of prior snapshots is a separate, disabled-by-default op
         // (`LifecycleManager::retire_snapshots`) — decoupled here so a newer
         // snapshot no longer strands an open (RYOW) tx's baseline and forces a
@@ -1627,7 +1627,7 @@ impl LifecycleManager {
 struct SnapshotWriteCtx<'a> {
     catalog_uuid: &'a Uuid,
     branch_uuid: &'a Uuid,
-    // CHA-481: the snapshot target's table_uuid — classifies whether this is a
+    // The snapshot target's table_uuid — classifies whether this is a
     // __penca_system__ table that also carries a built-in composite name index.
     table_uuid: &'a Uuid,
     catalog_str: &'a str,
@@ -1637,19 +1637,19 @@ struct SnapshotWriteCtx<'a> {
     snap_str: &'a str,
     snapshotted_at_micros: i64,
     commit_seq_num: i64,
-    /// CHA-432: whether this snapshot is a durable retention rung. Decided once,
+    /// Whether this snapshot is a durable retention rung. Decided once,
     /// here at creation, from the last durable rung and the effective density.
     durable: bool,
     user_schema: &'a SchemaRef,
     storage_format_text: &'a str,
     partition_keys: &'a [String],
     clustering_keys: &'a [String],
-    /// CHA-483: the table's live user secondary-index definitions, re-derived
+    /// The table's live user secondary-index definitions, re-derived
     /// each snapshot into per-index parent headers + per-segment sidecars.
     user_indexes: &'a [Index],
 }
 
-/// CHA-481: the built-in composite name index to materialize on a
+/// The built-in composite name index to materialize on a
 /// `__penca_system__` table's snapshot, alongside the row_uuid index. `spec`
 /// names the key columns the per-segment sidecar sorts on; `parent_index_uuid`
 /// is the committed (non-NULL `index_uuid`) name-index parent header; `slug`
@@ -1662,11 +1662,11 @@ struct NameIndexBuild<'a> {
 }
 
 /// Build + write the per-segment cold-index sidecars for one packed snapshot
-/// file. Every segment gets CHA-412's strictly-internal `row_uuid` identity
-/// sidecar; each of the table's live user secondary indexes (CHA-483) and, for a
-/// `__penca_system__` table, the built-in composite name index (CHA-481) add
+/// file. Every segment gets the strictly-internal `row_uuid` identity
+/// sidecar; each of the table's live user secondary indexes and, for a
+/// `__penca_system__` table, the built-in composite name index add
 /// their own composite sidecar over the same in-memory slice. Each sidecar is a
-/// sorted `(key…, row_offset)` artifact (the CHA-480 kernel; the CHA-454 seek
+/// sorted `(key…, row_offset)` artifact (the same kernel the seek
 /// reads it); every one goes through [`build_one_segment_sidecar`]. Child rows
 /// reference their parent header and are NULL-committed (committed in the
 /// snapshot's phase-2 gate, keyed by segment uuid). Accumulates one built
@@ -1706,7 +1706,7 @@ async fn build_file_segment_indexes<W: FormatWriter>(
         let seg_uuid = Uuid::parse_str(&row.seg_uuid_str)
             .map_err(|e| ApiError::Internal(format!("invalid segment uuid: {e}")))?;
 
-        // CHA-412: the strictly-internal row_uuid identity index (every segment).
+        // The strictly-internal row_uuid identity index (every segment).
         let row_uuid_col = slice.column_by_name("row_uuid").ok_or_else(|| {
             ApiError::Internal("snapshot batch missing row_uuid column".to_string())
         })?;
@@ -1725,7 +1725,7 @@ async fn build_file_segment_indexes<W: FormatWriter>(
         )
         .await?;
 
-        // CHA-483: one composite sidecar per live user secondary index, from the
+        // One composite sidecar per live user secondary index, from the
         // same in-memory slice.
         for index in ctx.user_indexes {
             let user_parent = user_parent_index_uuid(ctx.snap_uuid, index)?;
@@ -1745,7 +1745,7 @@ async fn build_file_segment_indexes<W: FormatWriter>(
             .await?;
         }
 
-        // CHA-481: the built-in composite name index (system tables only). Its
+        // The built-in composite name index (system tables only). Its
         // key columns are the system table's user columns (all Utf8); a missing
         // column is a fail-fast bug, not a degraded path.
         if let Some(name) = name_index {
@@ -1781,13 +1781,13 @@ async fn build_file_segment_indexes<W: FormatWriter>(
         built_seg_uuids.push(row.seg_uuid_str.clone());
     }
     // `sidecars_built` counts written sidecars, not segments: beyond the row_uuid
-    // sidecar, each user index (CHA-483) and the system name index (CHA-481) add
+    // sidecar, each user index and the system name index add
     // one per segment, so this exceeds the segment count when either is present.
     tracing::Span::current().record("sidecars_built", built_uris.len() - n_uris_before);
     Ok(())
 }
 
-/// CHA-483: the deterministic per-`(snapshot, index)` parent-header id for a
+/// The deterministic per-`(snapshot, index)` parent-header id for a
 /// user secondary index — the value declared as the parent row and referenced
 /// by every sidecar built or carried for that index this snapshot. Centralizes
 /// the `index_uuid` parse + its error so the four call sites can't drift.
@@ -1797,7 +1797,7 @@ fn user_parent_index_uuid(snap_uuid: &Uuid, index: &Index) -> Result<String, Api
     Ok(table_snapshot_index_uuid(snap_uuid, Some(&index_uuid)).to_string())
 }
 
-/// CHA-483: build + write one user secondary-index sidecar for a single base
+/// Build + write one user secondary-index sidecar for a single base
 /// segment from its in-memory rows. Derives the index's key columns from the
 /// segment batch (a missing indexed column is a fail-fast bug) and delegates the
 /// artifact build + child-row insert to [`build_one_segment_sidecar`], slugged by
@@ -1846,9 +1846,9 @@ async fn build_user_index_sidecar<W: FormatWriter>(
 
 /// Build + write a single cold-index sidecar over `key_cols` for one base
 /// segment slice, then record its NULL-committed child row. The canonical core
-/// shared by every per-segment index — the row_uuid identity index (CHA-412),
-/// user secondary indexes (CHA-483), and the built-in system name index
-/// (CHA-481). `slug` distinguishes sidecars on the same segment in both the uri
+/// shared by every per-segment index — the row_uuid identity index,
+/// user secondary indexes, and the built-in system name index
+///. `slug` distinguishes sidecars on the same segment in both the uri
 /// and the deterministic sidecar id (`"row_uuid"` for the internal identity
 /// index; the `index_uuid` string for a declared index), so a fresh build and a
 /// carry-forward agree on the id and a crash-retry collapses via ON CONFLICT.
@@ -1903,7 +1903,7 @@ async fn build_one_segment_sidecar<W: FormatWriter>(
     Ok(())
 }
 
-/// CHA-483: read one carried base segment's rows back into memory so a
+/// Read one carried base segment's rows back into memory so a
 /// newly-active user index's missing sidecar can be built (materialize-on-next-
 /// snapshot). The base file stays carried-by-reference — only this read + the
 /// new small sidecar are added, never a base rewrite. The returned batch is in
@@ -1960,7 +1960,7 @@ async fn read_carried_base_segment<R: FormatReader>(
 }
 
 /// True when every partition-key column is also a primary-key column (the v1
-/// carry-forward shape). When false (CHA-448 v2), delete attribution can't read
+/// carry-forward shape). When false, delete attribution can't read
 /// the partition column from the cold delete-log and a partition-key move keeps
 /// the same row_uuid, so the touched set is completed by the row_uuid
 /// reverse-lookup instead of `delete_attributed_labels`.
@@ -1968,7 +1968,7 @@ fn partition_subset_of_pk(partition_keys: &[String], primary_keys: &[String]) ->
     partition_keys.iter().all(|key| primary_keys.contains(key))
 }
 
-/// CHA-432: decide whether the snapshot being created is a `durable` retention
+/// Decide whether the snapshot being created is a `durable` retention
 /// rung — the pure kernel of sticky durable assignment (ADR 0025 §2). Decided
 /// once, at creation, from the last durable rung's watermark and the effective
 /// density; the caller persists the result so the floor stays monotonic.
@@ -1976,8 +1976,7 @@ fn partition_subset_of_pk(partition_keys: &[String], primary_keys: &[String]) ->
 /// Durable iff any of:
 /// - there is no prior durable rung (`last_durable_at_micros` is `None`) — the
 ///   first snapshot always anchors the ladder;
-/// - density is unset (`None`) — keep-all-in-window, every snapshot durable
-///   (CHA-55);
+/// - density is unset (`None`) — keep-all-in-window, every snapshot durable;
 /// - the gap since the last durable is at least one density window
 ///   (`snapshotted_at_micros - last >= snapshot_density_seconds * 1_000_000`;
 ///   seconds→micros converted at the comparison).
@@ -1996,7 +1995,7 @@ fn decide_durable(
 }
 
 /// Collect the `row_uuid` of every resolved delta row (the window's upsert
-/// identities) across the partition groups. CHA-448 probes these against the
+/// identities) across the partition groups. The reverse lookup probes these against the
 /// prior snapshot's row_uuid sidecars to attribute each row's PRIOR partition —
 /// the upsert half of the touched set, which catches a partition-key move
 /// (same row_uuid, no delete). Pure over its input.
@@ -2021,12 +2020,12 @@ fn touched_row_uuids_from_delta(
     Ok(row_uuids)
 }
 
-/// CHA-406 carry-forward eligibility gate (ADR 0024 §3). Returns
+/// Carry-forward eligibility gate (ADR 0024 §3). Returns
 /// `Some(per-segment keys)` when carry-forward applies — the typed
 /// [`PartitionOrderKey`]s (one per prior segment, in segment/chunk_idx
 /// order) double as the touched/carried split key (via `.label()`) and the
-/// carried map's typed ordering key (CHA-459) — or `None` to fall back to
-/// the CHA-404 full rewrite. Pure over its inputs.
+/// carried map's typed ordering key — or `None` to fall back to
+/// the full rewrite. Pure over its inputs.
 #[allow(clippy::too_many_arguments)]
 fn carry_forward_keys(
     ordering: &PartitionOrdering,
@@ -2048,7 +2047,7 @@ fn carry_forward_keys(
         return Ok(None);
     }
     // (b) recorded layout keys present AND equal to the current ones.
-    // `None` = a pre-CHA-404 parent row (unknown keys) → full rewrite;
+    // `None` = a parent row with unknown keys → full rewrite;
     // any key change is the ADR 0024 layout-key invariant → full
     // rewrite.
     if recorded_partition_keys != Some(partition_keys)
@@ -2058,8 +2057,8 @@ fn carry_forward_keys(
     }
     // The gate is partition-key/PK-agnostic: whether the partition columns are
     // a PK subset only decides HOW the touched set is attributed (subset →
-    // delete-log columns; non-subset → CHA-448 row_uuid reverse lookup), which
-    // is `snapshot_locked`'s concern, not an eligibility question. CHA-412
+    // delete-log columns; non-subset → the row_uuid reverse lookup), which
+    // is `snapshot_locked`'s concern, not an eligibility question. The
     // builds a row_uuid sidecar for every snapshot segment, so the non-subset
     // reverse lookup always has its index (a missing one is an invariant
     // violation that `reverse_lookup_attributed_labels` fails fast on, not a
@@ -2091,14 +2090,14 @@ fn carry_forward_keys(
 }
 
 /// Split the prior snapshot's segments by their stats-derived partition
-/// (CHA-406): segments whose label is in `touched` go to the rewrite
+///: segments whose label is in `touched` go to the rewrite
 /// stream (original order preserved — that order is chunk_idx order =
 /// typed-order runs, the ByPlan contract); the rest become the carried map
 /// (typed [`PartitionOrderKey`] → that partition's prior segment uuids, in
 /// prior chunk_idx order). `prior_keys` is aligned with `snapshot_segments`
 /// 1:1 (the `carry_forward_keys` output), so the zip pairs each segment
 /// with its key. Touched membership is by label identity (`.label()`); the
-/// carried map orders by the typed key (CHA-459).
+/// carried map orders by the typed key.
 fn split_prior_segments_by_touch(
     prior_keys: Vec<PartitionOrderKey>,
     snapshot_segments: Vec<SnapshotSegment>,
@@ -2122,7 +2121,7 @@ fn split_prior_segments_by_touch(
     (touched_segments, carried)
 }
 
-/// Shared fixtures for the CHA-404 red-test modules below.
+/// Shared fixtures for the packing test modules below.
 #[cfg(test)]
 mod rt_fixtures {
     use std::sync::Arc;
@@ -2190,7 +2189,7 @@ mod rt_fixtures {
     }
 
     /// The typed `PartitionOrdering` for the `rt_schema` single Utf8 `pk`
-    /// partition key (CHA-459) — what `pack_merged_partition_stream` now
+    /// partition key — what `pack_merged_partition_stream` now
     /// takes in place of a bare `partition_keys` vec.
     pub(super) fn rt_ordering() -> PartitionOrdering {
         PartitionOrdering::new(&rt_schema(), &["pk".to_string()]).unwrap()
@@ -2206,7 +2205,7 @@ mod rt_fixtures {
     }
 }
 
-/// CHA-404 red tests — acceptance criterion 1: peak memory is bounded by
+/// Acceptance criterion 1: peak memory is bounded by
 /// the packing buffer + one in-flight partition, never the whole table.
 ///
 /// These tests are this ticket's outer TDD loop and are committed RED:
@@ -2415,7 +2414,7 @@ mod streaming_red_tests {
     }
 
     /// Finishing an empty packer emits nothing — the zero-row
-    /// empty-merge placeholder (CHA-228) is the orchestration's job,
+    /// empty-merge placeholder is the orchestration's job,
     /// not the packer's.
     #[test]
     fn packer_empty_finish_emits_nothing() {
@@ -2498,9 +2497,9 @@ mod streaming_red_tests {
     }
 }
 
-/// CHA-406 red tests — the carry-forward streaming contracts.
+/// The carry-forward streaming contracts.
 ///
-/// Committed RED like the CHA-404 modules above (planned-seam
+/// Committed RED like the modules above (planned-seam
 /// precedent): `oversized_partition_streams_before_prior_exhausted`
 /// is assertion-red until the two-cursor streaming sorted-merge lands
 /// (today `complete_partition` buffers the whole run before pushing);
@@ -2764,7 +2763,7 @@ mod cf_streaming_red_tests {
     }
 }
 
-/// CHA-404 red tests — acceptance criterion 2: the packed streaming
+/// Acceptance criterion 2: the packed streaming
 /// write produces the same row content per partition as today's
 /// whole-table merge (`build_segments_to_write` as the reference
 /// oracle), plus the packing invariants the new layout introduces.
@@ -2778,7 +2777,7 @@ mod cf_streaming_red_tests {
 /// Exclusion-set scope note: the partition-key-move case is pinned at
 /// THIS seam by modeling the upstream anti-join (the moved row's stale
 /// copy never reaches the stream — that behavior is penca-merge's,
-/// covered by its CHA-411 tests and `just integration-test lifecycle`).
+/// covered by its own tests and `just integration-test lifecycle`).
 #[cfg(test)]
 mod content_equivalence_red_tests {
     use std::collections::BTreeMap;
@@ -2803,11 +2802,11 @@ mod content_equivalence_red_tests {
     use penca_core::naming::{snapshot_segment_uri, table_snapshot_segment_uuid};
 
     /// The LEGACY whole-table planner, preserved verbatim as this
-    /// module's reference oracle after CHA-404 removed it from the
+    /// module's reference oracle, no longer part of the
     /// production path (the packed streaming write replaced it).
     /// One per-segment write step planned by
     /// [`LifecycleManager::build_segments_to_write`]. `size_bytes` is the
-    /// chunk's standalone in-memory footprint (CHA-347), carried from the
+    /// chunk's standalone in-memory footprint, carried from the
     /// chunker to be recorded. A named struct (not a positional tuple) to
     /// avoid field-transposition hazards and mirror [`SnapshotSegmentStep`].
     // Verbatim legacy copy — fields the oracle comparisons don't read
@@ -2834,7 +2833,7 @@ mod content_equivalence_red_tests {
     /// distinct (it's the only uniquifier in
     /// `table_snapshot_segment_uuid`).
     ///
-    /// CHA-228: empty-merge case (all rows tombstoned by new persist) —
+    /// Empty-merge case (all rows tombstoned by new persist) —
     /// emit one zero-row placeholder segment at `chunk_idx = 0` so the
     /// watermark gets committed to `table_snapshot_metadata`. Without
     /// the placeholder, the next Snapshot(T) would re-derive
@@ -2858,7 +2857,7 @@ mod content_equivalence_red_tests {
     ) -> Result<Vec<SnapshotSegmentWriteStep>, ApiError> {
         let partitions = partition_record_batch(merged, partition_keys)?;
 
-        // CHA-215: chunk each partition's batch so no emitted snapshot
+        // Chunk each partition's batch so no emitted snapshot
         // segment exceeds `max_segment_bytes`.
         let mut segments_to_write: Vec<SnapshotSegmentWriteStep> = Vec::new();
         let mut chunk_idx: u32 = 0;
@@ -3008,7 +3007,7 @@ mod content_equivalence_red_tests {
 
     /// The oracle's cross-partition emission order — the run of distinct
     /// `partition_value`s (consecutive-deduped) the whole-table oracle
-    /// emits, skipping the zero-row placeholder. CHA-459: this is typed
+    /// emits, skipping the zero-row placeholder. This is typed
     /// partition order (both paths share `partition_record_batch`), so the
     /// streaming packer must match it exactly — the type-correct successor
     /// to the old stringified-label sort.
@@ -3062,7 +3061,7 @@ mod content_equivalence_red_tests {
     /// Walk the emitted file steps asserting every packing invariant,
     /// and return per-partition row content (in emission order).
     /// `expected_label_order` is the oracle's typed partition emission
-    /// order (CHA-459): the streaming packer must flush partitions in that
+    /// order: the streaming packer must flush partitions in that
     /// exact order.
     fn checked_new_path_partitions(
         steps: &[SnapshotFileStep],
@@ -3222,7 +3221,7 @@ mod content_equivalence_red_tests {
         .await;
     }
 
-    /// CHA-459: a non-string (`Int64`) partition key. The streaming packer
+    /// A non-string (`Int64`) partition key. The streaming packer
     /// and the whole-table oracle must agree per partition AND emit in
     /// typed order (`[2, 9, 10, 100]`, not the lexicographic
     /// `[10, 100, 2, 9]`) — the content-equivalence proof that the typed
@@ -3259,7 +3258,7 @@ mod content_equivalence_red_tests {
         assert_equivalent(&delta, prior, &keys(PK), &keys(&["v"]), 1 << 20).await;
     }
 
-    /// CHA-406 matrix extension: one partition's prior rows span THREE
+    /// Matrix extension: one partition's prior rows span THREE
     /// stream batches (even sort keys, clustering-sorted within and
     /// across batches — the ByPlan contract), with delta rows
     /// interleaving odds AND colliding with prior on keys 8 and 16 —
@@ -3402,7 +3401,7 @@ mod content_equivalence_red_tests {
     }
 
     /// Empty inputs emit no file steps — the zero-row placeholder
-    /// (CHA-228 watermark commit) is the orchestration's job, pinned by
+    /// (the watermark commit) is the orchestration's job, pinned by
     /// the integration suite, not the packer's.
     #[tokio::test]
     async fn empty_inputs_emit_no_steps() {
@@ -3450,7 +3449,7 @@ mod effective_clustering_keys_tests {
     }
 }
 
-/// CHA-448: the pure upsert-identity collector behind the non-subset
+/// The pure upsert-identity collector behind the non-subset
 /// reverse-lookup. The async sidecar-reading helpers (`delete_row_uuids`,
 /// `reverse_lookup_attributed_labels`) are covered end-to-end by the
 /// `test_non_subset_*` integration tests; this pins the one pure helper whose
@@ -3491,7 +3490,7 @@ mod touched_row_uuids_tests {
     }
 }
 
-/// CHA-432 durable-rung decision matrix. `decide_durable` is the pure kernel
+/// Durable-rung decision matrix. `decide_durable` is the pure kernel
 /// behind sticky durable assignment: a snapshot becomes a durable retention
 /// rung iff there is no prior durable rung, or density is unset (every snapshot
 /// durable), or it is at least `snapshot_density_seconds` past the last durable.
@@ -3512,7 +3511,7 @@ mod decide_durable_tests {
 
     #[test]
     fn unset_density_makes_every_snapshot_durable() {
-        // Density unset ⇒ keep-all-in-window (CHA-55): every snapshot a rung,
+        // Density unset ⇒ keep-all-in-window: every snapshot a rung,
         // even one micro after the last durable.
         assert!(decide_durable(Some(1_000 * SEC), 1_000 * SEC + 1, None));
     }
@@ -3536,9 +3535,9 @@ mod decide_durable_tests {
     }
 }
 
-/// CHA-406 / CHA-448 eligibility gate matrix — each reject branch plus the
+/// Eligibility gate matrix — each reject branch plus the
 /// accept cases, including the NULL (`None`) vs empty (`Some(vec![])`)
-/// recorded-key distinction the gate hinges on and the CHA-448 non-subset
+/// recorded-key distinction the gate hinges on and the non-subset
 /// with/without-sidecar split. The gate is correctness-critical (a wrong accept
 /// risks data loss; a wrong reject is a silent perf regression), and it is a
 /// cheap pure function, so it gets a spelled-out matrix.
@@ -3667,7 +3666,7 @@ mod carry_forward_keys_tests {
         assert!(out.is_none());
     }
 
-    /// SQL NULL recorded keys (pre-CHA-404 parent) decode to `None` —
+    /// SQL NULL recorded keys decode to `None` —
     /// distinct from `Some(vec![])` — and must reject.
     #[test]
     fn reject_null_recorded_keys() {
@@ -3721,7 +3720,7 @@ mod carry_forward_keys_tests {
         assert!(out.is_none());
     }
 
-    /// CHA-448 v2: the gate is PK-agnostic, so partition ⊄ PK is eligible on
+    /// The gate is PK-agnostic, so partition ⊄ PK is eligible on
     /// the same terms as the subset case — the subset-vs-reverse-lookup choice
     /// is `snapshot_locked`'s, not the gate's. The label is derived from the
     /// `value` partition column, so the ordering must match it.
@@ -3808,7 +3807,7 @@ mod carry_forward_keys_tests {
     }
 }
 
-/// CHA-459 Part A: the snapshot writer's cross-partition emit order — the
+/// The snapshot writer's cross-partition emit order — the
 /// order baked into `chunk_idx`, which `read_snapshot_segments_for_table`
 /// replays via `ORDER BY seg.chunk_idx` — must be *typed* partition-column
 /// order for a non-string key. `pack_merged_partition_stream` over an

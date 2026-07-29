@@ -3,9 +3,8 @@
 //! [`ResolvedScope`] bundles the `(catalog_uuid, branch_uuid,
 //! schema_uuid, table_uuid, snapshot)` clump that opens every
 //! `read_data` / `write_data` handler — one demand-driven
-//! resolve+validate pass shared verbatim by both paths (CHA-475).
-//! Reads route through `QueryManager`'s cached resolver (CHA-472).
-//! Two constructors:
+//! resolve+validate pass shared verbatim by both paths, routed through
+//! `QueryManager`'s cached resolver. Two constructors:
 //!
 //! - [`ResolvedScope::resolve_schema`] for handlers that need at
 //!   most a schema (`get_schema`, `list_schemas`, `list_tables`).
@@ -15,13 +14,12 @@
 //!   schema and table (`get_table`, `read_data`, `plan_audit`).
 //!
 //! The snapshot derivation reads from `open_tx_uuid` + `as_of_micros` +
-//! `as_of_seq` (CHA-443); `WriteDataRequest` maps its write-side `tx_uuid`
-//! onto the `open_tx_uuid` arm (RYOW), and the trait gives `AuditDataRequest`
-//! a place to substitute `committed_at.max_micros` for `as_of_micros`
-//! (CHA-236). Catalog + branch resolve snapshot-blind
-//! (never time-traveled); identifier resolution pins on whichever axis the
-//! request time-traveled (micros / seq), defaulting to the per-branch seq
-//! frontier — the same axis as the data read.
+//! `as_of_seq`; `WriteDataRequest` maps its write-side `tx_uuid` onto the
+//! `open_tx_uuid` arm (RYOW), and the trait gives `AuditDataRequest` a place
+//! to substitute `committed_at.max_micros` for `as_of_micros`. Catalog +
+//! branch resolve snapshot-blind (never time-traveled); identifier resolution
+//! pins on whichever axis the request time-traveled (micros / seq), defaulting
+//! to the per-branch seq frontier — the same axis as the data read.
 
 use crate::query::QueryManager;
 use penca_db::driver::DbDriver;
@@ -50,20 +48,15 @@ pub(crate) struct ResolvedScope {
     pub(crate) catalog_uuid: Uuid,
     pub(crate) branch_uuid: Uuid,
     pub(crate) schema_uuid: Option<Uuid>,
-    /// The `__penca_system__.schemas` row captured during schema
-    /// resolution. `resolve_schema` populates it on both identifier paths,
-    /// so the `get_schema` handler reuses it directly (CHA-365 + CHA-381).
-    /// `None` only when no schema row is resolved — the `list_schemas` flow
-    /// and the by-uuid `resolve_table` flow (which derives the schema from
-    /// the resolved table row instead).
+    /// The `__penca_system__.schemas` row captured during schema resolution,
+    /// so `get_schema` reuses it directly. `None` only when no schema row is
+    /// resolved — the `list_schemas` flow and the by-uuid `resolve_table`
+    /// flow (which derives the schema from the resolved table row instead).
     pub(crate) schema_row: Option<Schema>,
-    /// The `__penca_system__.tables` row captured during table resolution.
-    /// `resolve_table` always populates it now (CHA-381): the by-uuid path
-    /// reads it catalog-wide, the by-name path schema-scoped. `read_data`
-    /// reuses its Arrow schema instead of a second identical merge (CHA-352)
-    /// and the `get_table` handler reuses the whole row (CHA-365). `None`
-    /// only on the `resolve_schema` flow (`get_schema` / `list_schemas` /
-    /// `list_tables`), which resolves no table.
+    /// The `__penca_system__.tables` row captured during table resolution, so
+    /// `read_data` reuses its Arrow schema instead of a second identical merge
+    /// and `get_table` reuses the whole row. `None` only on the
+    /// `resolve_schema` flow, which resolves no table.
     pub(crate) table_row: Option<Table>,
     pub(crate) snapshot: ReadSnapshot,
 }
@@ -73,8 +66,7 @@ pub(crate) struct ResolvedScope {
 ///
 /// `open_tx_uuid` / `as_of_micros` are the read-side snapshot inputs
 /// — `AuditDataRequest` overrides `as_of_micros` to read from
-/// `committed_at.max_micros` (CHA-236) and leaves `open_tx_uuid` at
-/// the default `None`.
+/// `committed_at.max_micros` and leaves `open_tx_uuid` at the default `None`.
 pub(crate) trait RequestIdents {
     fn catalog_uuid(&self) -> Option<&str>;
     fn catalog_name(&self) -> Option<&str>;
@@ -86,14 +78,12 @@ pub(crate) trait RequestIdents {
     fn as_of_micros(&self) -> Option<i64> {
         None
     }
-    /// CHA-443 (IMPL-6) / CHA-460: the seq-axis time-travel arm. `Some(N)` makes
-    /// identifier resolution pin `AsOfSeq(N)` — the same axis as a seq data
-    /// read — so a renamed table resolves at its historical name.
-    /// `ReadDataRequest` carries it via its `as_of` oneof; the metadata read
-    /// requests (`GetSchema`/`ListSchemas`/`GetTable`/`ListTables`) via their
-    /// plain `as_of_seq` field (CHA-460, the seq sibling of `as_of_micros`). The
-    /// index reads and `AuditData` have no seq consumer and take the `None`
-    /// default.
+    /// The seq-axis time-travel arm. `Some(N)` makes identifier resolution pin
+    /// `AsOfSeq(N)` — the same axis as a seq data read — so a renamed table
+    /// resolves at its historical name. `ReadDataRequest` carries it via its
+    /// `as_of` oneof; the metadata read requests via their plain `as_of_seq`
+    /// field. The index reads and `AuditData` have no seq consumer and take
+    /// the `None` default.
     fn as_of_seq(&self) -> Option<i64> {
         None
     }
@@ -139,10 +129,8 @@ macro_rules! impl_snapshot_idents {
     };
 }
 
-// CHA-460: the snapshot-ident accessors plus the `as_of_seq` arm, for the
-// metadata read requests that carry a seq axis (GetSchema / ListSchemas /
-// GetTable / ListTables). Index reads stay on `impl_snapshot_idents!` (micros
-// only) — no consumer pins them on seq.
+// For the metadata read requests that carry a seq axis. Index reads stay on
+// `impl_snapshot_idents!` (micros only) — no consumer pins them on seq.
 macro_rules! impl_snapshot_idents_with_seq {
     () => {
         impl_snapshot_idents!();
@@ -174,10 +162,10 @@ macro_rules! impl_table_idents {
     };
 }
 
-// CHA-479: the data + DDL write requests map their write-side `tx_uuid` onto the
-// `open_tx_uuid` (RYOW) arm so name resolution sees the open tx's own uncommitted
-// writes. Writes never wall-clock/seq time-travel, so the `as_of_*` arms stay at
-// the trait default `None`.
+// The data + DDL write requests map their write-side `tx_uuid` onto the
+// `open_tx_uuid` (RYOW) arm so name resolution sees the open tx's own
+// uncommitted writes. Writes never wall-clock/seq time-travel, so the
+// `as_of_*` arms stay at the trait default `None`.
 macro_rules! impl_write_tx_idents {
     () => {
         fn open_tx_uuid(&self) -> Option<&str> {
@@ -210,8 +198,6 @@ impl RequestIdents for ListTablesRequest {
     impl_schema_idents!();
 }
 
-// CHA-455: index reads resolve the owning table (schema + table idents)
-// and time-travel via the same open_tx_uuid / as_of_micros pin pair.
 impl RequestIdents for GetIndexRequest {
     impl_catalog_branch_idents!();
     impl_snapshot_idents!();
@@ -233,17 +219,12 @@ impl RequestIdents for ReadDataRequest {
     fn open_tx_uuid(&self) -> Option<&str> {
         self.open_tx_uuid.as_deref()
     }
-    // CHA-429 / CHA-443: the `as_of` oneof carries either commit axis.
-    // Identifier resolution pins on the SAME axis as the data read — the
-    // micros arm here, the seq arm via `as_of_seq` below — so a renamed
-    // table resolves at its historical name on whichever axis the caller
-    // time-traveled. The two arms are mutually exclusive (oneof), so at
-    // most one is `Some`.
+    // Identifier resolution pins on the SAME axis as the data read, so a
+    // renamed table resolves at its historical name on whichever axis the
+    // caller time-traveled. The two arms are a oneof, so at most one is `Some`.
     fn as_of_micros(&self) -> Option<i64> {
         read_data_as_of_axes(&self.as_of).0
     }
-    // CHA-443 (IMPL-6): the seq arm of the `as_of` oneof drives seq-axis
-    // identifier resolution (`AsOfSeq(N)`), matching the seq data pin.
     fn as_of_seq(&self) -> Option<i64> {
         read_data_as_of_axes(&self.as_of).1
     }
@@ -253,25 +234,17 @@ impl RequestIdents for AuditDataRequest {
     impl_catalog_branch_idents!();
     impl_schema_idents!();
     impl_table_idents!();
-    // CHA-236: AuditData reuses the `committed` window's micros upper
-    // bound as the `as_of_micros` snapshot for name resolution so a
-    // renamed table resolves at its historical name across the audit
-    // window. Honors only the `commit_micros` arm; a seq-axis window
-    // resolves names at the default snapshot (no seq→micros resolution).
-    // Falls back to a `pg_now`-pinned `AsOfMicros` (via the resolver's
-    // self-capture) when no upper bound is set. AuditDataRequest carries
-    // no `open_tx_uuid`; the default `None` applies.
+    // Reuse the `committed` window's micros upper bound as the name-resolution
+    // snapshot, so a renamed table resolves at its historical name across the
+    // audit window. Only the `commit_micros` arm is honored — a seq-axis
+    // window resolves names at the default snapshot (there is no seq→micros
+    // resolution). No upper bound falls back to a `pg_now`-pinned
+    // `AsOfMicros` via the resolver's self-capture.
     fn as_of_micros(&self) -> Option<i64> {
         audit_committed_axes(&self.committed).0.and_then(|r| r.max)
     }
 }
 
-// CHA-475: the write data path resolves the same `(base + target table)` scope
-// as `read_data`, through the same cached `QueryManager` resolver (CHA-472). A
-// write never wall-clock / seq time-travels, so the as_of arms stay at their
-// `None` default; its `tx_uuid` maps onto the `open_tx_uuid` arm so name
-// resolution sees the open tx's own (uncommitted) writes — read-your-own-write,
-// exactly as the read path's `open_tx_uuid` does.
 impl RequestIdents for WriteDataRequest {
     impl_catalog_branch_idents!();
     impl_schema_idents!();
@@ -279,10 +252,6 @@ impl RequestIdents for WriteDataRequest {
     impl_write_tx_idents!();
 }
 
-// CHA-479: the DDL write handlers resolve their identifiers through the same
-// shared `ResolvedScope` as `read_data` / `write_data` (collapsing the former
-// `WriteRequestScope`). Each request exposes the standard identifier surface it
-// carries; `tx_uuid` maps onto `open_tx_uuid` (RYOW) via `impl_write_tx_idents!`.
 // CreateSchema mints its own uuid, so it carries no schema ident (base-only).
 impl RequestIdents for CreateSchemaRequest {
     impl_catalog_branch_idents!();
@@ -321,8 +290,6 @@ impl RequestIdents for DeleteTableRequest {
     impl_write_tx_idents!();
 }
 
-// CHA-455: index DDL targets a user table (schema + table idents) — same
-// resolve_table flow as update_table / delete_table.
 impl RequestIdents for CreateIndexRequest {
     impl_catalog_branch_idents!();
     impl_schema_idents!();
@@ -344,12 +311,12 @@ impl RequestIdents for DeleteIndexRequest {
     impl_write_tx_idents!();
 }
 
-/// CHA-429: the single canonical decode of the ReadData `as_of` oneof into
-/// its two mutually exclusive commit-axis bounds `(commit_micros,
-/// commit_seq_num)`. `read_data` reads both arms for the read snapshot;
-/// [`RequestIdents::as_of_micros`] for `ReadDataRequest` reads only
-/// `.0` for identifier resolution. Routing both through here is what keeps
-/// the two arms from drifting (roborev finding on the I3 commit).
+/// The single canonical decode of the ReadData `as_of` oneof into its two
+/// mutually exclusive commit-axis bounds `(commit_micros, commit_seq_num)`.
+/// `read_data` reads both arms for the read snapshot;
+/// [`RequestIdents::as_of_micros`] for `ReadDataRequest` reads only `.0` for
+/// identifier resolution. Routing both through here keeps the two from
+/// drifting.
 pub(crate) fn read_data_as_of_axes(
     as_of: &Option<read_data_request::AsOf>,
 ) -> (Option<i64>, Option<i64>) {
@@ -360,7 +327,7 @@ pub(crate) fn read_data_as_of_axes(
     }
 }
 
-/// CHA-429: the single canonical decode of the AuditData `committed` oneof
+/// The single canonical decode of the AuditData `committed` oneof
 /// into its two mutually exclusive commit-axis windows `(micros_window,
 /// seq_window)`. `plan_audit` reads both windows (the micros window feeds
 /// `timestamp_bounds`, the seq window the `(seq_from, seq_to)` pair);
@@ -444,7 +411,7 @@ impl ResolvedScope {
             resolve_base(driver, request, default_frontier).await?;
         let branch_str = branch_uuid.to_string();
 
-        // CHA-381 (Design X): dispatch on the table identifier.
+        // Dispatch on the table identifier:
         // - table_uuid present → catalog-wide resolve; no schema needed, and
         //   the schema is derived from the resolved row (true residency).
         // - else → schema parent is required to scope the name lookup.
@@ -522,9 +489,9 @@ where
     )
     .await?;
     let branch_uuid = parse_resolved_uuid(&branch.branch_uuid, "branch_uuid")?;
-    // CHA-443 (IMPL-6): catalog + branch resolve snapshot-blind (they are
-    // never time-traveled — see the module header); then the read snapshot
-    // pins on the request's axis (micros / seq / open-tx) or, by default, the
+    // Catalog + branch resolved snapshot-blind above (they are never
+    // time-traveled — see the module header); the read snapshot then pins on
+    // the request's axis (micros / seq / open-tx) or, by default, the
     // per-branch seq frontier captured here (or threaded as `default_frontier`).
     let snapshot = QueryManager::resolve_read_snapshot(
         driver,

@@ -4,12 +4,11 @@
 //! and table data. The `read_data` method orchestrates the full merge-on-read
 //! path via `penca_merge::stream_merged`.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/api/query.py`.
+//! The metadata reads live on `QueryManager` (ADR 0028) so its caches serve
+//! the query AND write read paths through one eligibility gate: `meta_plan`
+//! holds the read-plan assembly, `meta_resolve` the system-table resolves +
+//! metadata getters.
 
-// CHA-472: metadata read methods rehomed off `penca_storage_meta::LifecycleManager`
-// onto `QueryManager` so its caches serve the query AND write read paths
-// through one eligibility gate (ADR 0028). `meta_plan` holds the read-plan
-// assembly; `meta_resolve` holds the system-table resolves + metadata getters.
 mod cold_read;
 mod index_select;
 mod meta_plan;
@@ -81,8 +80,8 @@ pub struct AuditPlan {
     branch_uuid: uuid::Uuid,
     table_uuid: uuid::Uuid,
     user_schema: SchemaRef,
-    /// CHA-185: table's declared primary keys, needed to construct the
-    /// widened cold delete schema for `cold_delete_audit_batches`.
+    /// The table's declared primary keys, needed to construct the widened
+    /// cold delete schema for `cold_delete_audit_batches`.
     primary_keys: Vec<String>,
     /// Combined cold-side committed_at window as half-open `[from, to)`
     /// micros scalars. Both `None` pre-Purge: the cold tier contributes
@@ -100,7 +99,7 @@ pub struct AuditPlan {
     /// already in cold post-Purge.
     hot_from: Option<i64>,
     hot_to: Option<i64>,
-    /// CHA-429: half-open `commit_seq_num` window for a seq-axis `committed`
+    /// Half-open `commit_seq_num` window for a seq-axis `committed`
     /// audit (both `None` for the micros axis). Applied as a per-row drop
     /// on the cold scan and a `t.commit_seq_num` predicate on the hot stream;
     /// the committed_at tier fence above still partitions hot vs cold.
@@ -111,31 +110,30 @@ pub struct AuditPlan {
     seq_to: Option<i64>,
     cold_upsert_segments: Vec<PersistSegment>,
     cold_delete_segments: Vec<PersistSegment>,
-    /// CHA-507: when set, `audit_data` reattaches per-tx `author`/`comment` by
-    /// joining the cold `tx_log`; when unset those columns are omitted.
+    /// When set, `audit_data` reattaches per-tx `author`/`comment` by joining
+    /// the cold `tx_log`; when unset those columns are omitted.
     include_tx_metadata: bool,
-    /// CHA-507: the branch's committed cold `tx_log` segments (the commit map),
-    /// read once here and joined by the cold audit builders on `commit_seq_num`
+    /// The branch's committed cold `tx_log` segments (the commit map), read
+    /// once here and joined by the cold audit builders on `commit_seq_num`
     /// when `include_tx_metadata` is set. Empty when the flag is off.
     tx_log_segments: Vec<PersistSegment>,
-    /// CHA-178: the parent branch's persist segments, for a forked branch's
+    /// The parent branch's persist segments, for a forked branch's
     /// audit — so `audit_data` surfaces the inherited history. Empty for a
     /// non-forked branch. Streamed after the branch's own cold segments,
     /// capped per-row at `base_seq_to` so the child never audits the parent's
     /// post-fork rows.
     base_cold_upsert_segments: Vec<PersistSegment>,
     base_cold_delete_segments: Vec<PersistSegment>,
-    /// CHA-507 × CHA-178: the parent branch's committed cold `tx_log` segments,
-    /// joined onto the inherited base rows to reattach their `author`/`comment`
-    /// when `include_tx_metadata` is set (the parent's pre-fork commits live in
-    /// the parent's tx_log, not the child's). Empty for a non-forked branch or
+    /// The parent branch's committed cold `tx_log` segments, joined onto the
+    /// inherited base rows to reattach their `author`/`comment` when
+    /// `include_tx_metadata` is set — the parent's pre-fork commits live in
+    /// the parent's tx_log, not the child's. Empty for a non-forked branch or
     /// when the flag is off.
     base_tx_log_segments: Vec<PersistSegment>,
-    /// CHA-178: exclusive per-row `commit_seq_num` upper bound for the base
-    /// (parent) segments = `min(seq_to, fork_seed + 1)`. `None` for a
-    /// non-forked branch.
+    /// Exclusive per-row `commit_seq_num` upper bound for the base (parent)
+    /// segments = `min(seq_to, fork_seed + 1)`. `None` for a non-forked branch.
     base_seq_to: Option<i64>,
-    /// CHA-398: ids point-lookup restriction, decoded once here so both
+    /// ids point-lookup restriction, decoded once here so both
     /// stream halves (upserts + deletes) share one derivation.
     row_uuids: Option<Vec<uuid::Uuid>>,
     /// ADR 0019 §"Four-part mechanism" item 4 — wall-clock deadline
@@ -155,15 +153,12 @@ pub struct QueryManager {
     pub default_page_size: i64,
     pub default_stream_batch_size: u32,
     /// Max in-flight segment reads during stream_merged's snapshot phase.
-    /// Memory-safety knob — each read materializes a segment. See
-    /// [`docs/style-guide.md`] on threading memory/concurrency knobs
-    /// through service config.
+    /// Memory-safety knob — each read materializes a whole segment.
     pub segment_read_concurrency: usize,
-    /// CHA-353: skip snapshot segment pruning unless the planned segment
-    /// count exceeds this (from `QUERY_SNAPSHOT_PRUNE_MIN_SEGMENTS`). Threaded
-    /// into each data-read `MergeReadRequest`.
+    /// Skip snapshot segment pruning unless the planned segment count exceeds
+    /// this (from `QUERY_SNAPSHOT_PRUNE_MIN_SEGMENTS`).
     pub snapshot_prune_min_segments: usize,
-    /// CHA-485: cap on the cartesian product of per-column IN-list bindings
+    /// Cap on the cartesian product of per-column IN-list bindings
     /// when the planner selects a covering user index (from
     /// `QUERY_INDEX_SEEK_MAX_PROBE_TUPLES`). Over the cap the index is
     /// skipped — a correctness-preserving optimization cutoff (the read
@@ -176,36 +171,33 @@ pub struct QueryManager {
     /// `commit_micros` / `persisted_at_micros` stays in the same
     /// unit as every other timestamp in the system.
     pub query_timeout_micros: i64,
-    /// Process-lifetime cache of decoded snapshot segments (CHA-252),
-    /// shared (behind `Arc`) into every per-query `DatafusionDlDriver`.
-    /// Budget is env-configured by the hosting service.
+    /// Process-lifetime cache of decoded snapshot segments, shared (behind
+    /// `Arc`) into every per-query `DatafusionDlDriver`. Budget is
+    /// env-configured by the hosting service.
     pub snapshot_cache: Arc<SegmentCache>,
-    /// Process-lifetime cache of snapshot segment *lists* (CHA-441) — the
-    /// immutable `(segments, W_snap)` baseline keyed `(catalog, branch, table)`.
-    /// Consulted on the latest-snapshot read path so a warm current-time read
-    /// skips the per-read Postgres snapshot-list round-trip; time-travel reads
-    /// bypass it. TTL + entry cap are env-configured (TTL `<=` the GC grace).
+    /// Process-lifetime cache of snapshot segment *lists* — the immutable
+    /// `(segments, W_snap)` baseline keyed `(catalog, branch, table, W_snap)`,
+    /// so a warm read skips the per-read Postgres snapshot-list round-trip.
+    /// TTL + entry cap are env-configured, TTL `<=` the GC grace.
     pub snapshot_list_cache: Arc<SnapshotListCache>,
-    /// Process-wide cold-session template (CHA-421): the default function
-    /// registry + analyzer/optimizer rules, built once at service startup and
-    /// injected into every per-query `DatafusionDlDriver` so cold reads clone it
-    /// (~71 µs) instead of the warm `SessionContext::new()` cost (~128 µs/call
-    /// in release). Held opaquely (built by the binary via
-    /// `penca_dl::build_cold_session_template`).
+    /// Process-wide cold-session template: the default function registry +
+    /// analyzer/optimizer rules, built once at service startup and injected
+    /// into every per-query `DatafusionDlDriver` so cold reads clone it
+    /// (~71 µs) instead of paying the warm `SessionContext::new()` cost
+    /// (~128 µs/call in release). Held opaquely, built by the binary via
+    /// `penca_dl::build_cold_session_template`.
     pub session_template: Arc<SessionState>,
 }
 
 impl QueryManager {
-    /// CHA-472: build a metadata-reader `QueryManager` for the write and
-    /// lifecycle services. The read methods rehomed onto `QueryManager`
-    /// (ADR 0028) need a receiver; the caller supplies the caches so the write
-    /// service can share the query path's caches (IMPL-3 — the hot point-write
-    /// resolve then hits the snapshot-list cache) while the lifecycle service
-    /// passes disabled caches (it always reads fresh). The remaining
-    /// page-size / concurrency / timeout knobs are inert for this role — the
-    /// relocated resolves/getters hardcode their own `stream_merged`
+    /// Build a metadata-reader `QueryManager` for the write and lifecycle
+    /// services. The caller supplies the caches: the write service shares the
+    /// query path's, so its hot point-write resolve hits the snapshot-list
+    /// cache, while the lifecycle service passes disabled ones (it always
+    /// reads fresh). The page-size / concurrency / timeout knobs are inert for
+    /// this role — the resolves/getters hardcode their own `stream_merged`
     /// concurrency, never paginate, and never wrap a read in the query-timeout
-    /// deadline — so they carry concrete in-unit defaults.
+    /// deadline.
     pub fn for_metadata_reads(
         session_template: Arc<SessionState>,
         snapshot_cache: Arc<SegmentCache>,
@@ -279,7 +271,7 @@ where
     }
 }
 
-/// CHA-180: derive the user-visible `SchemaRef` for `read_data` from
+/// Derive the user-visible `SchemaRef` for `read_data` from
 /// the table's full schema and the request's optional projection.
 /// Three states:
 ///   - `None` (field unset): all user columns.
@@ -318,17 +310,15 @@ fn apply_projection(
     }
 }
 
-/// CHA-236: derive the read's visibility snapshot from `open_tx_uuid`
-/// (RYOW) / `as_of_micros` (explicit point-in-time) / `as_of_seq` (explicit
-/// seq travel) / neither (CHA-443: pinned to the per-branch seq frontier).
-/// The request axes are mutually exclusive — see `ReadDataRequest`
-/// proto comments. When `open_tx_uuid` is supplied, validates the
-/// format, looks up the tx on the request's branch leaf partitions
-/// (so a tx on a different branch surfaces as `NotFound`), and rejects
-/// expired / aborted / committed states with `FailedPrecondition`.
-// CHA-429 split the single `as_of` arg into the mutually exclusive
-// `request_commit_micros` / `request_commit_seq_num` axes; the snapshot
-// derivation inputs are irreducible here.
+/// Derive the read's visibility snapshot from `open_tx_uuid` (RYOW) /
+/// `as_of_micros` (explicit point-in-time) / `as_of_seq` (explicit seq travel)
+/// / neither (pinned to the per-branch seq frontier). The request axes are
+/// mutually exclusive — see `ReadDataRequest` proto comments. When
+/// `open_tx_uuid` is supplied, validates the format, looks up the tx on the
+/// request's branch leaf partitions (so a tx on a different branch surfaces as
+/// `NotFound`), and rejects expired / aborted / committed states with
+/// `FailedPrecondition`.
+// The snapshot derivation inputs are irreducible.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_query_snapshot<D>(
     driver: &D,
@@ -418,20 +408,19 @@ where
             }
         }
     } else if let Some(seq) = request_commit_seq_num {
-        // CHA-429: explicit seq-axis pin — exact, no resolution.
+        // Explicit seq-axis pin — exact, no resolution.
         Ok(ReadSnapshot::AsOfSeq(seq))
     } else if let Some(ts) = request_commit_micros {
         Ok(ReadSnapshot::AsOfMicros(ts))
     } else {
-        // CHA-443 (IMPL-6): a read with neither an open tx nor an explicit
-        // as_of pins a bounded snapshot at the per-branch seq frontier
-        // (counter - 1) rather than pg_now — so "read latest" composes with
-        // the seq tier-fence and resolves names on the same axis as data.
-        // `read_data` threads the frontier it captured for identifier
-        // resolution as `default_frontier` so the whole RPC shares ONE pin;
-        // a single-shot caller passes None and self-captures here. (CHA-86's
-        // "no unbounded read" invariant still holds — the frontier is a
-        // bounded upper.)
+        // A read with neither an open tx nor an explicit as_of pins a bounded
+        // snapshot at the per-branch seq frontier (counter - 1) rather than
+        // pg_now, so "read latest" composes with the seq tier-fence and
+        // resolves names on the same axis as data. `read_data` threads the
+        // frontier it captured for identifier resolution as
+        // `default_frontier` so the whole RPC shares ONE pin; a single-shot
+        // caller passes None and self-captures here. Still never an unbounded
+        // read — the frontier is a bounded upper.
         let frontier = match default_frontier {
             Some(seq) => seq,
             None => {
@@ -454,8 +443,6 @@ impl QueryManager {
     fn deadline_now(&self) -> tokio::time::Instant {
         tokio::time::Instant::now() + Duration::from_micros(self.query_timeout_micros as u64)
     }
-
-    // -- Catalog (read-only) ----------------------------------------------
 
     #[tracing::instrument(
         skip_all,
@@ -483,13 +470,11 @@ impl QueryManager {
         }
     }
 
-    /// CHA-460: a branch's max committed `commit_seq_num` (the inclusive seq
-    /// frontier). The SQL server's `GetFlightInfo` captures this once to pin an
-    /// auto-commit statement's reads on the seq axis — the seq-axis pin source
-    /// that replaced the removed `pg_now` micros clock. Thin wrapper over the
-    /// same [`QueryManager::branch_seq_frontier`] (`commit_tx_log_seq_num` counter −
-    /// 1; genesis `-1`) the `read_data` default path uses, so the SQL pin and
-    /// the gRPC default share one max-committed source.
+    /// A branch's max committed `commit_seq_num` (the inclusive seq frontier).
+    /// The SQL server's `GetFlightInfo` captures this once to pin an
+    /// auto-commit statement's reads on the seq axis. Thin wrapper over the
+    /// same [`QueryManager::branch_seq_frontier`] the `read_data` default path
+    /// uses, so the SQL pin and the gRPC default share one max-committed source.
     #[tracing::instrument(skip_all, level = "debug")]
     pub async fn get_max_commit_seq_num(
         &self,
@@ -522,8 +507,6 @@ impl QueryManager {
         })
     }
 
-    // -- Branch (read-only) -----------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -544,7 +527,7 @@ impl QueryManager {
         )
         .await?;
         let catalog_uuid = parse_resolved_uuid(&catalog.catalog_uuid, "catalog_uuid")?;
-        // CHA-381: resolve_branch returns the whole Branch, so reuse it as the
+        // resolve_branch returns the whole Branch, so it is reused as the
         // response instead of re-reading branch_store.
         let branch = resolve_branch(
             driver,
@@ -600,8 +583,6 @@ impl QueryManager {
         })
     }
 
-    // -- Schema (read-only) -----------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -626,7 +607,7 @@ impl QueryManager {
         })?;
         span.record("schema_uuid", tracing::field::display(&schema_uuid));
 
-        // CHA-381: resolve_schema populates schema_row whenever a schema
+        // resolve_schema populates schema_row whenever a schema
         // identifier is present (required above), so reuse the carried row
         // directly instead of re-resolving it by uuid.
         let schema = scope.schema_row.ok_or_else(|| {
@@ -682,8 +663,6 @@ impl QueryManager {
         })
     }
 
-    // -- Table (read-only) ------------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -711,7 +690,7 @@ impl QueryManager {
         span.record("schema_uuid", tracing::field::display(&schema_uuid));
         let schema_str = schema_uuid.to_string();
 
-        // CHA-381: resolve_table always carries the resolved
+        // resolve_table always carries the resolved
         // `__penca_system__.tables` row now (by-uuid reads it catalog-wide,
         // by-name schema-scoped), so reuse it instead of re-fetching by uuid.
         let mut table = scope
@@ -803,8 +782,6 @@ impl QueryManager {
         })
     }
 
-    // -- Index metadata reads (CHA-455) -----------------------------------
-
     /// Get one index definition by uuid or `(table, name)`, time-travelled
     /// by the request's `open_tx_uuid` / `as_of_micros` pin. NOT_FOUND when
     /// no index resolves at that snapshot.
@@ -890,8 +867,6 @@ impl QueryManager {
         Ok(ListIndexesResponse { indexes })
     }
 
-    // -- Data reads -------------------------------------------------------
-
     /// Execute the full merge-on-read path for a single table.
     ///
     /// Resolves identifiers → fetches arrow schema → calls
@@ -909,8 +884,7 @@ impl QueryManager {
     /// **Span lifetime caveat:** `#[instrument]` here brackets the
     /// plan-phase future only — the span ends when the boxed stream is
     /// returned to the caller, not when the stream is exhausted. The
-    /// stream-phase timing is the gRPC layer's request span's job
-    /// (CHA-315).
+    /// stream-phase timing is the gRPC layer's request span's job.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -936,31 +910,26 @@ impl QueryManager {
         // before any await so the deadline binds the full RPC, including
         // the metadata round-trips below and the stream phase.
         let deadline = self.deadline_now();
-        // CHA-168: metadata reads on `__penca_system__.tables` go
-        // through stream_merged (hot+cold), so they need a DlDriver. The
-        // same driver flows into the stream_merged for the user data
-        // below — share one instance.
+        // Metadata reads on `__penca_system__.tables` go through
+        // stream_merged (hot+cold), so they need a DlDriver; the same driver
+        // flows into the user-data stream_merged below, so share one instance.
         let dl = DatafusionDlDriver::new(
             readers.clone(),
             self.snapshot_cache.clone(),
             self.session_template.clone(),
         );
-        // CHA-429: ReadData `as_of` is a oneof over the two commit axes —
-        // split into the (mutually exclusive) micros / seq arms. CHA-443: the
-        // default path (no as_of, no open_tx) and the seq arm both pin the
-        // commit_seq_num axis; the merge probes run as independent statements and
-        // must share ONE bounded pin, captured once below (the seq frontier
-        // for a default read, or the request's explicit axis otherwise).
+        // The default path (no as_of, no open_tx) and the seq arm both pin the
+        // commit_seq_num axis. The merge probes run as independent statements
+        // and must share ONE bounded pin, captured once below — the seq
+        // frontier for a default read, the request's explicit axis otherwise.
         let (request_commit_micros, request_commit_seq_num) =
             crate::scope::read_data_as_of_axes(&request.as_of);
-        // CHA-236 / CHA-443: resolve the identifier-stage snapshot from the
-        // request's as_of (micros / seq) / open_tx so a renamed table/schema
-        // is findable at its historical name on the SAME axis as the data.
-        // On the default path resolve_table self-captures the per-branch seq
-        // frontier (resolve_read_snapshot's default arm) — passing `None`
-        // here — and we reuse THAT frontier for the data read below so the
-        // whole RPC shares ONE pin (the CHA-86 single-capture property, now
-        // on the seq axis). The micros/seq/open_tx arms ignore it.
+        // Resolve the identifier-stage snapshot from the request's as_of /
+        // open_tx so a renamed table/schema is findable at its historical name
+        // on the SAME axis as the data. On the default path resolve_table
+        // self-captures the per-branch seq frontier — hence the `None` — and
+        // that same frontier is reused for the data read below so the whole
+        // RPC shares one pin. The micros/seq/open_tx arms ignore it.
         let scope = ResolvedScope::resolve_table(self, driver, &dl, request, None).await?;
         let catalog_uuid = scope.catalog_uuid;
         let branch_uuid = scope.branch_uuid;
@@ -987,9 +956,8 @@ impl QueryManager {
             ApiError::Internal("resolve_table did not populate schema_uuid".into())
         })?;
         span.record("schema_uuid", tracing::field::display(&schema_uuid));
-        // CHA-381: resolve_table carries the resolved `__penca_system__.tables`
-        // row, so reuse its table_uuid + Arrow schema here and drop the old
-        // schema-scoped arrow-schema refetch fallback.
+        // resolve_table already carries the resolved `__penca_system__.tables`
+        // row, so its table_uuid + Arrow schema are reused instead of refetched.
         let table = scope
             .table_row
             .ok_or_else(|| ApiError::Internal("resolve_table did not populate table_row".into()))?;
@@ -1002,16 +970,12 @@ impl QueryManager {
         let branch_uuid_str = branch_uuid.to_string();
         let catalog_uuid_str = catalog_uuid.to_string();
 
-        // CHA-433: resolve the effective retention duration (table -> schema;
-        // scope-B made retention schema-broadest) to drive the folded floor.
         // A by-NAME resolve (the SQL server's hot path) already carries the
-        // schema in `scope.schema_row`, so it stays zero-roundtrip; a by-UUID
-        // resolve doesn't populate it, so read the schema's retention directly
-        // (one metadata read, off the SQL hot path). For a current read
-        // (as_of = frontier) these are current; the write-time monotonicity
-        // guard keeps a time-travel read's historical policy >= current, so the
-        // folded floor never wrongly rejects a valid read (CHA-511 tightens the
-        // lenient side).
+        // schema in `scope.schema_row`, so this stays zero-roundtrip; a
+        // by-UUID resolve doesn't populate it and pays one metadata read, off
+        // the SQL hot path. The write-time monotonicity guard keeps a
+        // time-travel read's historical policy >= current, so the folded floor
+        // never wrongly rejects a valid read.
         let retention_duration_seconds = crate::retention::effective_retention_duration(
             self,
             driver,
@@ -1023,7 +987,6 @@ impl QueryManager {
         )
         .await?;
 
-        // Empty stored bytes still map to NotFound (the pre-CHA-365 edge).
         if table.arrow_schema.is_empty() {
             return Err(ApiError::NotFound(format!(
                 "table arrow schema not found: {table_uuid_str}"
@@ -1035,20 +998,18 @@ impl QueryManager {
             try_schema_from_ipc_buffer(&arrow_schema_bytes).map_err(ApiError::Arrow)?;
         let full_schema: SchemaRef = Arc::new(arrow_schema);
 
-        // CHA-398: decode the ids point-lookup restriction once, deriving
-        // row_uuids server-side via the shared PK-batch kernel. Validation
-        // runs against the FULL (unprojected) schema + declared
+        // Validation runs against the FULL (unprojected) schema + declared
         // primary_keys, so a column projection never changes what a valid
-        // ids batch looks like. Empty bytes = no restriction.
+        // ids batch looks like.
         let row_uuids = crate::pk_batch::optional_row_uuids(
             &request.ids,
             &table_uuid,
             &full_schema,
             &table.primary_keys,
         )?;
-        // CHA-398 observability: count only — PK values are PII-gated out
-        // of spans (same gate as `filter`). 0 = unrestricted (the kernel
-        // rejects 0-row batches, so 0 is unambiguous).
+        // Count only — PK values are PII-gated out of spans, same as `filter`.
+        // 0 = unrestricted; the kernel rejects 0-row batches, so 0 is
+        // unambiguous.
         span.record("ids_rows", row_uuids.as_ref().map_or(0, Vec::len) as u64);
 
         // Apply columns pushdown here (once, up-front) so every tier's
@@ -1057,7 +1018,7 @@ impl QueryManager {
         // `stream_merged` derives its SELECT list from `user_schema.fields()`.
         // Clone first: `full_schema` is retained and handed to `stream_merged` so
         // the snapshot-segment cache decodes the whole (unprojected) segment
-        // once and serves every projection from it (CHA-252).
+        // once and serves every projection from it.
         let schema_ref = apply_projection(full_schema.clone(), request.projection.as_ref())?;
 
         let snapshot = resolve_query_snapshot(
@@ -1078,14 +1039,14 @@ impl QueryManager {
         // `< began_at` is mapped to inclusive `began_at - 1`); see
         // its doc-comment in `penca_merge` for the full rule.
         let plan_as_of_micros = snapshot.plan_as_of_micros();
-        // CHA-429 #4: on a seq-axis read, let the planner skip whole cold
-        // segments past the seq cutoff (`min_commit_seq_num > N`) — `None` for
-        // the micros / OpenTx axes, where committed_at selection stands.
+        // On a seq-axis read this lets the planner skip whole cold segments
+        // past the seq cutoff (`min_commit_seq_num > N`); `None` for the
+        // micros / OpenTx axes, where committed_at selection stands.
         let plan_commit_seq_upper = snapshot.plan_commit_seq_upper();
-        // CHA-492 (Q1): decode + validate the structured `indexes` seek BEFORE
-        // plan(). Only when the caller sent one (most reads skip the
-        // defined-index resolve). An `indexes` naming columns that are not a
-        // DEFINED index is rejected here, pre-plan — fail-fast at the boundary.
+        // Decode + validate the structured `indexes` seek BEFORE plan(), and
+        // only when the caller sent one, so most reads skip the defined-index
+        // resolve. An `indexes` naming columns that are not a DEFINED index is
+        // rejected here — fail-fast at the boundary.
         let index_seek = if request.indexes.is_empty() {
             None
         } else {
@@ -1109,10 +1070,10 @@ impl QueryManager {
             Some(seek) => (Some(seek.bindings), Some(seek.residual)),
             None => (None, None),
         };
-        // CHA-492 (Q3): the exact-cover signal is the ORIGINAL request filter
-        // being empty — the SQL producer pushes no residual when the structured
-        // seek fully covers (the SQL-server FilterExec is the Inexact net).
-        // Captured BEFORE the index residual folds into the effective filter.
+        // The exact-cover signal is the ORIGINAL request filter being empty —
+        // the SQL producer pushes no residual when the structured seek fully
+        // covers (the SQL-server FilterExec is the Inexact net). MUST be
+        // captured BEFORE the index residual folds into the effective filter.
         let exact_selection = request.filter.is_none();
         // The effective merge filter ANDs the request filter with the index
         // seek's residual, so a defined-but-unmaterialized index (no seek entry)
@@ -1120,8 +1081,8 @@ impl QueryManager {
         // ignores this filter (the seek is the exact selection).
         let filter = combine_filters(request.filter.clone(), index_residual.as_deref());
         let snapshot_cache = self.snapshot_cache.clone();
-        // CHA-492: the snapshot-list cache is keyed on the resolved snapshot's
-        // W_snap, so it is safe for every read; a disabled cache
+        // The snapshot-list cache is keyed on the resolved snapshot's W_snap,
+        // so it is safe for every read; a disabled cache
         // (`SnapshotListCache::disabled`) is the per-service opt-out, not a
         // per-snapshot gate. The Arc is cloned for the `'a` stream.
         let snapshot_list_cache = self.snapshot_list_cache.clone();
@@ -1131,12 +1092,11 @@ impl QueryManager {
         let snapshot_prune_min_segments = self.snapshot_prune_min_segments;
         let index_seek_max_probe_tuples = self.index_seek_max_probe_tuples;
         let inner: BatchStream<'a> = Box::pin(async_stream::try_stream! {
-            // CHA-227: plan-time atomicity is via explicit threading
-            // inside `QueryManager::plan` — `hot_min` bounds both the
-            // snapshot picker and the persist segment fetch, so
-            // concurrent Persist+Purge commits between reads can't
-            // shift the hot/cold cutoff seen by this plan. No
-            // surrounding REPEATABLE READ tx required.
+            // Plan-time atomicity comes from explicit threading inside
+            // `QueryManager::plan` — `hot_min` bounds both the snapshot picker
+            // and the persist segment fetch, so concurrent Persist+Purge
+            // commits between reads can't shift this plan's hot/cold cutoff.
+            // No surrounding REPEATABLE READ tx required.
             let (plan, retention_floor) = self.plan(
                 driver,
                 &catalog_uuid_str,
@@ -1145,14 +1105,12 @@ impl QueryManager {
                 plan_as_of_micros,
                 plan_commit_seq_upper,
                 retention_duration_seconds,
-                // CHA-492: W_snap-keyed snapshot-list cache — safe for any read.
                 Some(snapshot_list_cache.as_ref()),
             )
             .await?;
 
-            // CHA-433: reject a read whose as_of falls below the retention floor
-            // (per-axis, strict `<`) with FAILED_PRECONDITION — an error, not a
-            // clamp: a clamped answer is data at a different instant than asked.
+            // Below-floor reads are an ERROR, never a clamp: a clamped answer
+            // is data at a different instant than the caller asked for.
             // Surfaces as the stream's first item, like other plan errors.
             if let Some(floor) = retention_floor
                 && meta_plan::retention_floor_below(
@@ -1174,26 +1132,17 @@ impl QueryManager {
             // nothing.
             yield RecordBatch::new_empty(schema_ref.clone());
 
-            // Three-way dispatch on plan shape. All-hot (CHA-142 fast
-            // path): no cold tier at all — skip the merge pipeline and
-            // stream the resolved hot SQL directly, eliminating the
-            // per-segment exclusion-set machinery and the row_uuid/dedup
-            // pass. All-cold: no hot tier — compose only the cold arms
-            // via `stream_all_cold` (no hot probes in the flow).
-            // Mixed: the full `stream_merged` pipeline. `is_all_hot` is
-            // checked first so a truly empty plan (no hot, no cold)
-            // stays on `stream_all_hot`'s empty-stream arm.
+            // Three-way dispatch on plan shape. All-hot: no cold tier at all —
+            // skip the merge pipeline and stream the resolved hot SQL
+            // directly, eliminating the per-segment exclusion-set machinery
+            // and the row_uuid/dedup pass. All-cold: no hot tier — compose
+            // only the cold arms via `stream_all_cold`, no hot probes in the
+            // flow. Mixed: the full `stream_merged` pipeline. `is_all_hot` is
+            // checked FIRST so a truly empty plan (no hot, no cold) stays on
+            // `stream_all_hot`'s empty-stream arm.
             //
-            // CHA-441: the hot existence gate now makes `QueryManager::plan`
-            // emit `hot_storage = None` whenever no hot row exists past the
-            // fence, so the all-cold arm engages for fully-cold user reads
-            // (snapshot-only = `is_all_cold` with no persist band; cold-only =
-            // with one). The lifecycle snapshot writer still reaches it
-            // cold-only by construction.
-            //
-            // CHA-441 (34mf): record the dispatched tier shape — the
-            // observability seam the snapshot-only / merged acceptance tests
-            // scrape. Dormant unless `penca=debug`.
+            // The tier_shape event is the observability seam the
+            // snapshot-only / merged acceptance tests scrape.
             tracing::debug!(tier_shape = tier_shape(&plan), "read_data tier dispatch");
 
             if is_all_hot(&plan) {
@@ -1211,45 +1160,36 @@ impl QueryManager {
                     yield next?;
                 }
             } else {
-                // CHA-482: the cold read (DataFusion-free snapshot-only seek
-                // bypass, else the merge pipeline) is the shared `stream_cold_read`
-                // helper — callable by both this path and (CHA-484) the by-name
-                // metadata resolves. Cold-tier DataFusion driver is Arc-clones
-                // only; never constructed on the hot path above.
+                // Arc-clones only, and deliberately never constructed on the
+                // all-hot path above.
                 let dl = DatafusionDlDriver::new(
                     readers.clone(),
                     snapshot_cache.clone(),
                     session_template.clone(),
                 );
-                // Subsume the CHA-398 row_uuid restriction as the single identity
-                // seek entry; the covering user-index entries follow it.
                 let mut seeks = IndexSeek::identity_seeks(row_uuids.as_deref());
-                // CHA-492: the covering user-index seek is driven by the WIRE
-                // `indexes` tuples (decoded + validated pre-plan), matched
-                // against the snapshot's MATERIALIZED indexes. Materialized -> a
-                // seek entry (rides the bypass when it is the single covering
-                // seek, else the merge as a scan accelerator the residual
-                // re-filters); defined-but-unmaterialized -> no entry, served by
-                // the residual `filter`. Identity stays FIRST: it is the only
-                // entry that restricts the exclusion set (CHA-473/CHA-482).
+                // The covering user-index seek is driven by the WIRE `indexes`
+                // tuples (decoded + validated pre-plan), matched against the
+                // snapshot's MATERIALIZED indexes. Materialized → a seek entry
+                // (rides the bypass when it is the single covering seek, else
+                // the merge as a scan accelerator the residual re-filters);
+                // defined-but-unmaterialized → no entry, served by the
+                // residual `filter`. Identity MUST stay FIRST: it is the only
+                // entry that restricts the exclusion set.
                 if let Some(bindings) = index_bindings.as_ref()
                     && let Some(snapshot_plan) =
                         plan.cold_storage.as_ref().and_then(|cold| cold.snapshot.as_ref())
                     && !snapshot_plan.indexes.is_empty()
                 {
-                    // CHA-492 wire path: the SQL provider sent structured
-                    // `indexes` tuples; match them against the snapshot's
-                    // materialized indexes.
                     let user_entries = index_select::select_from_bindings(
                         bindings,
                         snapshot_plan,
                         index_seek_max_probe_tuples,
                     );
                     if !user_entries.is_empty() {
-                        // The acceptance marker the integration suite scrapes
-                        // (integration_user_index_seek_test.py): one event per
-                        // read that selected covering indexes, entry count as a
-                        // bare-int field.
+                        // Scraped by
+                        // tests/integration/integration_user_index_seek_test.py
+                        // — the field names are a test contract.
                         tracing::debug!(
                             index_seek = true,
                             index_seek_entries = user_entries.len(),
@@ -1264,8 +1204,8 @@ impl QueryManager {
                         plan.cold_storage.as_ref().and_then(|cold| cold.snapshot.as_ref())
                     && !snapshot_plan.indexes.is_empty()
                 {
-                    // CHA-485 filter re-parse path: a gRPC caller sent a `filter`
-                    // but no structured `indexes` (e.g. an ids-restricted read
+                    // Filter re-parse path: a gRPC caller sent a `filter` but
+                    // no structured `indexes` (e.g. an ids-restricted read
                     // with a covering filter — the SQL path always sends wire
                     // tuples). `select_index_seeks` emits its own index_seek
                     // marker.
@@ -1310,7 +1250,7 @@ impl QueryManager {
     /// of every row, annotated with transaction metadata, across both
     /// tiers.
     ///
-    /// CHA-218: cold rows carry the four tx metadata columns inline, so
+    /// Cold rows carry the four tx metadata columns inline, so
     /// the cold tail is a pure scan — no JOIN. The audit horizon is the
     /// underlying cold persist segments (not the snapshot baseline), so
     /// `QueryManager::read_persist_segments_for_window` is used to fetch every
@@ -1349,8 +1289,8 @@ impl QueryManager {
 
         let include_tx_metadata = plan.include_tx_metadata;
         let audit_schema = audit_upsert_schema(&schema_ref, include_tx_metadata);
-        // CHA-421: cold audit joins run on a session derived from the driver's
-        // template (shared function registry + optimizer rules), not a fresh
+        // Cold audit joins MUST run on a session derived from the driver's
+        // template (shared function registry + optimizer rules), never a fresh
         // SessionContext::new().
         let cold_session = penca_dl::derive_cold_session(&self.session_template);
         let cold_batches = cold_upsert_audit_batches(
@@ -1368,8 +1308,8 @@ impl QueryManager {
             plan.row_uuids.as_deref(),
         )
         .await?;
-        // CHA-178: the parent branch's inherited upsert history (forked branch),
-        // capped per-row at the fork seq (`base_seq_to`).
+        // The parent branch's inherited upsert history, capped per-row at the
+        // fork seq (`base_seq_to`).
         let base_cold_batches = if plan.base_cold_upsert_segments.is_empty() {
             Vec::new()
         } else {
@@ -1398,15 +1338,14 @@ impl QueryManager {
             // `Table::from_batches`, even when the stream is empty.
             yield RecordBatch::new_empty(audit_schema.clone());
 
-            // CHA-218 / CHA-217: stream cold then hot. The post-purge
-            // persist watermark guarantees only the *boundary* invariant
-            // `max(cold.committed_at) < min(hot.committed_at)`; neither
-            // tier is internally sorted by `commit_micros`, so
-            // `audit_data` does not promise a sorted stream.
+            // Cold then hot. The post-purge persist watermark guarantees only
+            // the *boundary* invariant `max(cold.committed_at) <
+            // min(hot.committed_at)`; neither tier is internally sorted by
+            // `commit_micros`, so `audit_data` does not promise a sorted stream.
             for batch in cold_batches {
                 yield batch;
             }
-            // CHA-178: inherited parent history follows the branch's own cold.
+            // Inherited parent history follows the branch's own cold.
             for batch in base_cold_batches {
                 yield batch;
             }
@@ -1448,9 +1387,9 @@ impl QueryManager {
     /// of the cold persist delete segments. Emits `row_uuid` plus tx
     /// columns; user data columns are absent.
     ///
-    /// CHA-218: cold delete rows carry the four tx metadata columns
-    /// inline; the cold tail is a pure scan over the per-segment audit
-    /// horizon (no snapshot filter — see `read_persist_segments_for_window`).
+    /// Cold delete rows carry the four tx metadata columns inline, so the
+    /// cold tail is a pure scan over the per-segment audit horizon — no
+    /// snapshot filter, see `read_persist_segments_for_window`.
     ///
     /// **Span lifetime caveat:** plan-phase only — see `read_data`'s
     /// doc-comment.
@@ -1482,7 +1421,7 @@ impl QueryManager {
         let batch_size = self.default_stream_batch_size as usize;
 
         let include_tx_metadata = plan.include_tx_metadata;
-        // CHA-421: derive the cold audit session from the driver's template.
+        // Derive the cold audit session from the driver's template.
         let cold_session = penca_dl::derive_cold_session(&self.session_template);
         let cold_batches = cold_delete_audit_batches(
             &cold_session,
@@ -1499,8 +1438,8 @@ impl QueryManager {
             plan.row_uuids.as_deref(),
         )
         .await?;
-        // CHA-178: the parent branch's inherited delete history (forked branch),
-        // capped per-row at the fork seq (`base_seq_to`).
+        // The parent branch's inherited delete history, capped per-row at the
+        // fork seq (`base_seq_to`).
         let base_cold_batches = if plan.base_cold_delete_segments.is_empty() {
             Vec::new()
         } else {
@@ -1536,7 +1475,7 @@ impl QueryManager {
             for batch in cold_batches {
                 yield batch;
             }
-            // CHA-178: inherited parent delete history follows the branch's own.
+            // Inherited parent delete history follows the branch's own.
             for batch in base_cold_batches {
                 yield batch;
             }
@@ -1612,31 +1551,27 @@ impl QueryManager {
         // audit_deletes (via AuditPlan.deadline) so the two stream
         // halves share one bound from the original plan call.
         let deadline = self.deadline_now();
-        // CHA-168: the __penca_system__.tables metadata read goes through
-        // stream_merged; needs a DlDriver for cold-segment access.
+        // The __penca_system__.tables metadata read goes through
+        // stream_merged, so it needs a DlDriver for cold-segment access.
         let dl = DatafusionDlDriver::new(
             readers,
             self.snapshot_cache.clone(),
             self.session_template.clone(),
         );
-        // CHA-236: AuditData reuses `committed_at.max` as the
-        // `as_of_micros` snapshot for name resolution so a renamed
-        // table resolves at its historical name across the audit
-        // window. Falls back to a self-captured `pg_now` (`AsOfMicros`)
-        // if no upper bound is set (CHA-86 — no unbounded reads).
-        // The `AuditDataRequest` impl of `RequestIdents`
-        // substitutes that value for `as_of_micros`.
+        // AuditData reuses `committed_at.max` as the `as_of_micros` snapshot
+        // for name resolution (via its `RequestIdents` impl), so a renamed
+        // table resolves at its historical name across the audit window. With
+        // no upper bound it falls back to a self-captured `pg_now` — never an
+        // unbounded read.
         let scope = ResolvedScope::resolve_table(self, pool, &dl, request, None).await?;
         let catalog_uuid = scope.catalog_uuid;
         let branch_uuid = scope.branch_uuid;
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
         span.record("branch_uuid", tracing::field::display(&branch_uuid));
-        // CHA-381: resolve_table already read this table's
-        // `__penca_system__.tables` row at `scope.snapshot` — catalog-wide on
-        // the by-uuid path, schema-scoped on the by-name path, the same row
-        // either way — and it carries arrow_schema + primary_keys. Reuse it
-        // instead of a second identical stream_merged.
+        // resolve_table already read this table's `__penca_system__.tables`
+        // row at `scope.snapshot`, carrying arrow_schema + primary_keys — so
+        // reuse it rather than issuing a second identical stream_merged.
         let table = scope
             .table_row
             .ok_or_else(|| ApiError::Internal("resolve_table did not populate table_row".into()))?;
@@ -1644,9 +1579,6 @@ impl QueryManager {
         span.record("table_uuid", tracing::field::display(&table_uuid));
         let branch_uuid_str = branch_uuid.to_string();
 
-        // CHA-177: per-branch data tables derive deterministically from
-        // `(table_uuid, branch_uuid)`; callers pass the identity pair
-        // directly to the hot-table helpers.
         let catalog_uuid_str = catalog_uuid.to_string();
         let table_uuid_str = table_uuid.to_string();
         if table.arrow_schema.is_empty() {
@@ -1659,7 +1591,7 @@ impl QueryManager {
             try_schema_from_ipc_buffer(&table.arrow_schema).map_err(ApiError::Arrow)?;
         let user_schema: SchemaRef = Arc::new(arrow_schema);
 
-        // CHA-398: decode the ids restriction once for both stream halves.
+        // Decoded once here so both stream halves share one derivation.
         let row_uuids = crate::pk_batch::optional_row_uuids(
             &request.ids,
             &table_uuid,
@@ -1668,14 +1600,12 @@ impl QueryManager {
         )?;
         // Count only — PK values are PII-gated; 0 = unrestricted.
         span.record("ids_rows", row_uuids.as_ref().map_or(0, Vec::len) as u64);
-        // CHA-429: AuditData `committed` is a oneof over the two commit
-        // axes. The micros arm bounds cold-segment SELECTION + the
-        // committed_at per-row/hot filters (today's behavior); the seq arm
-        // is applied as a per-row drop on cold + a hot SQL predicate, while
-        // cold-segment selection falls back to the committed_at tier fence
-        // (the micros window is None for a seq audit, so cold = everything
-        // below hot_min). seq segment-skip on min/max_commit_seq_num is a later
-        // optimization, not correctness.
+        // The micros arm bounds cold-segment SELECTION plus the committed_at
+        // per-row/hot filters. The seq arm is applied as a per-row drop on
+        // cold plus a hot SQL predicate, with cold-segment selection falling
+        // back to the committed_at tier fence (the micros window is None for a
+        // seq audit, so cold = everything below hot_min). A seq segment-skip
+        // on min/max_commit_seq_num would be an optimization, not correctness.
         let (committed_micros_window, committed_seq_window) =
             crate::scope::audit_committed_axes(&request.committed);
         let (mut user_from, user_to) = timestamp_bounds(committed_micros_window);
@@ -1683,26 +1613,20 @@ impl QueryManager {
             Some(r) => (r.min, r.max),
             None => (None, None),
         };
-        // ADR 0019 / CHA-233: bound the cold segment fetch by the same
-        // `hot_min = max(persisted_at) + 1` cutoff that the hot read at
-        // execute time keys off. Between Persist's commit and Purge's
-        // grace-bounded hot delete, the same rows live physically in
-        // both tiers but the plan filter excludes the cold-side rows
-        // from the hot side — `audit_data` has no merge dedup, so the
-        // partition must be strict.
+        // The cold segment fetch below is bounded by the same
+        // `hot_min = max(persisted_at) + 1` cutoff the hot read keys off at
+        // execute time (ADR 0019). Between Persist's commit and Purge's
+        // grace-bounded hot delete the same rows live physically in both
+        // tiers, and `audit_data` has no merge dedup, so the partition must be
+        // strict. Pinning `cold_to = min(user_to, hot_min)` to THIS read's
+        // `hot_min` is what stops a concurrent Persist between the two
+        // round-trips from shifting the cold segment set — no surrounding
+        // REPEATABLE READ tx required.
         //
-        // CHA-227: plan-time atomicity is via explicit threading — the
-        // segment fetch's `cold_to = min(user_to, hot_min)` upper bound
-        // is pinned to this read's `hot_min`, so a concurrent Persist
-        // committing between the two round-trips can't shift the cold
-        // segment set. No surrounding REPEATABLE READ tx required.
+        // Pre-Persist (hot_min == 0) the cold tier contributes nothing at all,
+        // so the segment fetch is short-circuited away entirely.
         //
-        // Pre-Persist (hot_min == 0) the cold tier contributes nothing
-        // at all — hot owns every audit row. Short-circuit the segment
-        // fetch so it's invisible at the SQL level.
-        // CHA-433: resolve the effective retention duration (table -> schema;
-        // from scope.schema_row on the by-name path, else a schema fetch) and
-        // fold the floor onto the hot_min round trip.
+        // The retention floor rides the same hot_min round trip.
         let schema_uuid = scope.schema_uuid.ok_or_else(|| {
             ApiError::Internal("resolve_table did not populate schema_uuid".into())
         })?;
@@ -1727,11 +1651,10 @@ impl QueryManager {
             ),
         )
         .await?;
-        // CHA-433: enforce the floor on the present audit axis (strict <). An
-        // explicit lower bound below the floor is rejected with
-        // FAILED_PRECONDITION; an unset lower bound means "all retained history"
-        // and clamps up to the floor (the axis follows the present window; a
-        // fully-unbounded audit defaults to the micros axis).
+        // Enforce the floor on the present audit axis, strict `<`. An explicit
+        // lower bound below the floor is REJECTED; an unset one means "all
+        // retained history" and clamps up to the floor. A fully-unbounded audit
+        // defaults to the micros axis.
         if let Some(floor) = retention_floor {
             if committed_seq_window.is_some() {
                 match seq_from {
@@ -1776,8 +1699,8 @@ impl QueryManager {
                     user_from,
                     cold_to,
                     // Audit selects segments on the committed_at window; the
-                    // seq-axis `committed` cursor (CHA-429 I6) prunes per row,
-                    // not per segment, so no segment seq skip here.
+                    // seq-axis `committed` cursor prunes per row, not per
+                    // segment, so no segment seq skip here.
                     None,
                 ),
             )
@@ -1804,9 +1727,8 @@ impl QueryManager {
         };
         let hot_to = user_to;
 
-        // CHA-507: when the caller wants tx metadata and there is cold work,
-        // read the branch's committed cold tx_log segments so the cold audit
-        // builders can reattach author/comment via a commit_seq_num join.
+        // The cold audit builders reattach author/comment via a
+        // commit_seq_num join against these.
         let include_tx_metadata = request.include_tx_metadata;
         let tx_log_segments = if include_tx_metadata && hot_min != 0 {
             tx_log_persist_segments(
@@ -1823,14 +1745,14 @@ impl QueryManager {
             Vec::new()
         };
 
-        // CHA-178: for a forked branch, enumerate the parent's persist segments
-        // so `audit_data` surfaces the inherited history. Capped at the fork
-        // seq at the segment level here and per-row via `base_seq_to` below, so
-        // the child never audits the parent's post-fork rows. Fetched
-        // unconditionally (independent of the child's `hot_min == 0` skip — the
-        // parent's history lives entirely in its cold tier). CHA-507: when tx
-        // metadata is requested, also read the parent's tx_log so the inherited
-        // rows reattach author/comment from the parent's own commit map.
+        // For a forked branch, enumerate the parent's persist segments so
+        // `audit_data` surfaces the inherited history. Capped at the fork seq
+        // at the segment level here and per-row via `base_seq_to` below, so the
+        // child never audits the parent's post-fork rows. Fetched
+        // unconditionally, independent of the child's `hot_min == 0` skip — the
+        // parent's history lives entirely in its cold tier. Its tx_log is read
+        // too so the inherited rows reattach author/comment from the parent's
+        // own commit map, not the child's.
         let (
             base_cold_upsert_segments,
             base_cold_delete_segments,
@@ -1918,7 +1840,7 @@ impl QueryManager {
     /// an unset position resolves the branch head. `Ok(None)` when the position
     /// names no committed tx on the branch in either tier.
     ///
-    /// CHA-507: the hot `commit_tx_log` row may be GC'd by PurgeTxLog while the
+    /// The hot `commit_tx_log` row may be GC'd by PurgeTxLog while the
     /// position is still durably committed in cold, so a hot miss is not
     /// authoritative — hence the waterfall. This is a read, so it (and its cold
     /// half) live on `QueryManager`; the write path reaches it through its
@@ -2103,9 +2025,9 @@ fn seek_committed_tx_in_batches(
 
 /// True when the plan has no cold tier work to do — both the cold log and
 /// the snapshot are absent. The merge-on-read pipeline reduces to a single
-/// hot-tier query in that case (CHA-142 fast path).
+/// hot-tier query in that case.
 fn is_all_hot(plan: &Plan) -> bool {
-    // CHA-178: a forked branch's base cold source is folded only in the merge
+    // A forked branch's base cold source is folded only in the merge
     // pipeline (stream_merged / stream_all_cold), so a plan carrying one is
     // never all-hot — routing it to stream_all_hot would silently drop the
     // inherited parent data.
@@ -2119,7 +2041,7 @@ fn is_all_hot(plan: &Plan) -> bool {
 }
 
 /// True when the plan has no hot tier — the read composes only the cold
-/// arms via `stream_all_cold` (CHA-427). Checked after `is_all_hot`, so
+/// arms via `stream_all_cold`. Checked after `is_all_hot`, so
 /// a truly empty plan never reaches this predicate's dispatch arm.
 ///
 /// Staged: `QueryManager::plan` currently emits a hot plan for every
@@ -2129,7 +2051,7 @@ fn is_all_cold(plan: &Plan) -> bool {
     plan.hot_storage.is_none()
 }
 
-/// CHA-441: true when the read is served entirely from the immutable snapshot
+/// True when the read is served entirely from the immutable snapshot
 /// baseline — no hot tier (the existence gate dropped it) AND a cold snapshot
 /// with no persist band past it (`Pu <= W_snap`, the minimum-latency fast
 /// path). Distinguished from a *cold-only* read (snapshot + a persist band) so
@@ -2142,24 +2064,23 @@ fn is_snapshot_only(plan: &Plan) -> bool {
             .is_some_and(|cold| cold.snapshot.is_some() && cold.persist.is_none())
 }
 
-/// CHA-476/492/501 gate: a read may be served by the DataFusion-free snapshot
-/// seek when its plan is snapshot-only and its selection is *exact*
-/// (`exact_selection`: the seek IS the complete answer — no residual filter to
-/// re-apply, ADR 0023/0029). The gate is **axis-independent** — it admits
-/// `LatestSeq`, `AsOfSeq`, `AsOfMicros`, AND `OpenTx` alike (CHA-501 dropped the
-/// former `LatestSeq`/`AsOfSeq`-only axis restriction).
+/// A read may be served by the DataFusion-free snapshot seek when its plan is
+/// snapshot-only and its selection is *exact* (`exact_selection`: the seek IS
+/// the complete answer — no residual filter to re-apply, ADR 0023/0029). The
+/// gate is deliberately **axis-independent**: it admits `LatestSeq`,
+/// `AsOfSeq`, `AsOfMicros`, AND `OpenTx` alike.
 ///
 /// Soundness is carried entirely by `is_snapshot_only`, so no axis check is
 /// needed:
-/// - A snapshot-only plan has NO hot tier. The CHA-473 loose existence gate
+/// - A snapshot-only plan has NO hot tier. The loose existence gate
 ///   (`phase_one_fence_and_existence`: a table-scoped `EXISTS(upsert) OR
 ///   EXISTS(delete)` with no as_of/fence predicate) reports `hot_present = true`
 ///   whenever *either* hot log holds any row, so `hot_present = false` means both
 ///   are empty — provably no hot overlay for ANY reader. That includes an open
 ///   tx's own uncommitted RMW writes (those ARE log rows, so the bare EXISTS
 ///   subsumes them): a tx that wrote the key keeps `hot_present = true` → not
-///   snapshot-only → this gate is false → the seek does not fire (the CHA-471
-///   open-tx RYOW guard).
+///   snapshot-only → this gate is false → the seek does not fire, which is
+///   what keeps open-tx RYOW correct.
 /// - The planner already resolves the snapshot bounded by the read's axis
 ///   frontier (`hot_min_and_snapshot_pick`: `commit_seq <= began_at_seq_num - 1`
 ///   for `OpenTx`, `<= as_of` for time-travel), so every row in that snapshot is
@@ -2176,9 +2097,8 @@ fn is_direct_seek_eligible(plan: &Plan, exact_selection: bool) -> bool {
 }
 
 /// AND-compose an optional base filter with an optional extra fragment, each
-/// parenthesized so precedence is preserved (CHA-492: the effective merge
-/// filter is the request filter ANDed with a structured `indexes` seek's
-/// residual). Mirrors [`schema_scoped_filter`]'s composition for user reads.
+/// parenthesized so precedence is preserved. The effective merge filter is the
+/// request filter ANDed with a structured `indexes` seek's residual.
 fn combine_filters(base: Option<String>, extra: Option<&str>) -> Option<String> {
     match (base, extra) {
         (Some(b), Some(e)) => Some(format!("({b}) AND ({e})")),
@@ -2188,7 +2108,7 @@ fn combine_filters(base: Option<String>, extra: Option<&str>) -> Option<String> 
     }
 }
 
-/// CHA-441 (34mf): the dispatched tier shape, for the `tier_shape` observability
+/// The dispatched tier shape, for the `tier_shape` observability
 /// event. `is_all_hot` is checked first (a truly-empty plan rides the all-hot
 /// empty-stream arm), matching the dispatch order in `read_data`.
 fn tier_shape(plan: &Plan) -> &'static str {
@@ -2211,15 +2131,14 @@ fn tier_shape(plan: &Plan) -> &'static str {
 ///
 /// When `plan.hot_storage` is also `None` (truly empty plan), yields no
 /// batches.
-// CHA-368 (IMPL-4): the all-hot read path. `build_merge_resolved` no longer
-// splices the user `WHERE` (DataFusion is the single filter engine) and now
-// emits a two-arm resolve — visible upserts (`is_delete = false`) UNION winning
-// tombstones (`is_delete = true`) — so this fn drops the tombstone arm in PG
-// (`WHERE NOT m.is_delete`) and applies the user predicate as a DataFusion
-// residual per batch, through the same `full_plan_predicate` the snapshot tier
-// evaluates inside its scan. It thus takes the cold-session `template` to derive
-// one residual `SessionContext` per filtered read (CHA-421). The extra params
-// (template) push it just over the arg-lint threshold; the set is irreducible.
+// `build_merge_resolved` does not splice the user `WHERE` — DataFusion is the
+// single filter engine — and emits a two-arm resolve (visible upserts
+// `is_delete = false` UNION winning tombstones `is_delete = true`), so this fn
+// drops the tombstone arm in PG (`WHERE NOT m.is_delete`) and applies the user
+// predicate as a DataFusion residual per batch, through the same
+// `full_plan_predicate` the snapshot tier evaluates inside its scan. Hence the
+// cold-session `template` param, used to derive one residual `SessionContext`
+// per filtered read. The arg set is irreducible.
 #[allow(clippy::too_many_arguments)]
 fn stream_all_hot<'a, D>(
     driver: &'a D,
@@ -2244,13 +2163,12 @@ where
         .map(|f| f.name().as_str())
         .collect();
     let hot_max = hot_plan.committed_at.as_ref().and_then(|f| f.max_micros);
-    // CHA-443 (IMPL-5): the hot↔cold tier fence is the seq lower
-    // `commit_seq_num > W_persist` on `commit_seq.min_seq` (replaces the old
-    // `committed_at > hot_min`). `None` pre-Persist (hot owns every row).
+    // The hot↔cold tier fence is the seq lower `commit_seq_num > W_persist` on
+    // `commit_seq.min_seq`. `None` pre-Persist, where hot owns every row.
     let tier_seq_lower = hot_plan.commit_seq.and_then(|c| c.min_seq);
     let snapshot = snapshot.tighten_for_hot(hot_max);
 
-    // CHA-368: unfiltered resolve — the user predicate is applied by DataFusion
+    // Unfiltered resolve — the user predicate is applied by DataFusion
     // (residual below), never spliced here. The resolve carries an `is_delete`
     // flag per row (visible upsert vs winning tombstone).
     let inner_sql = build_merge_resolved::<PgDialect>(
@@ -2265,12 +2183,12 @@ where
 
     let has_filter = filter.is_some_and(|f| !f.is_empty());
 
-    // CHA-180 + CHA-368: 0-col projection (DataFusion planning `SELECT COUNT(*)`
-    // is the canonical trigger) — the caller consumes only `num_rows`. Push the
-    // aggregation into Postgres, but ONLY when there's no user filter: CHA-368
-    // moved the predicate into a DataFusion residual that needs the filter's
-    // columns, and a 0-col projection has none, so PG can no longer count
-    // *filtered* rows. Under DataFusion's Inexact filter pushdown a COUNT with a
+    // 0-col projection (DataFusion planning `SELECT COUNT(*)` is the canonical
+    // trigger) — the caller consumes only `num_rows`. Push the aggregation into
+    // Postgres, but ONLY when there's no user filter: the predicate is a
+    // DataFusion residual that needs the filter's columns, and a 0-col
+    // projection has none, so PG cannot count *filtered* rows. Under
+    // DataFusion's Inexact filter pushdown a COUNT with a
     // `WHERE` always projects the filter's columns, so a 0-col read never
     // carries a filter — the `!has_filter` guard makes that structural, routing
     // any stray filtered 0-col read to the streaming residual path below (which
@@ -2318,7 +2236,7 @@ where
         });
     }
 
-    // Invariant guard (CHA-368 review): reaching here with no user columns
+    // Invariant guard: reaching here with no user columns
     // means `has_filter` (the no-filter 0-col case took the COUNT fast path
     // above). Under DataFusion's Inexact filter pushdown a filtered read always
     // projects the filter's columns, so a 0-col projection never carries a
@@ -2349,7 +2267,7 @@ where
         return Box::pin(base.map(|item| item.map_err(ApiError::from)));
     }
 
-    // Filtered read (CHA-368): apply the user predicate as a DataFusion residual —
+    // Filtered read: apply the user predicate as a DataFusion residual —
     // the same `full_plan_predicate` the snapshot tier and the merged path use, so
     // every tier filters through one engine. The residual may reference `row_uuid`
     // (identity / RYOW / system-table reads filter by it), so — like the merged
@@ -2369,7 +2287,7 @@ where
     // The predicate is compiled ONCE per read (planning registers a throwaway
     // table `l` on the session; per-batch would re-register `l` and error on the
     // second batch), then evaluated per batch. Session derived once from the
-    // shared cold-session template (CHA-421); filter owned for the stream's life.
+    // shared cold-session template; filter owned for the stream's life.
     // row_uuid is column 0; the user cols follow — project them back out after the
     // residual so the yielded schema matches the caller's user-cols projection.
     let session = penca_dl::derive_cold_session(session_template);
@@ -2393,20 +2311,18 @@ where
             // Drop row_uuid → the user-cols output schema the caller expects.
             yield filtered.project(&user_col_indices)?;
         }
-        // CHA-368 observability: residual selectivity — rows_in = PG's full
-        // projected delta, rows_out = survivors. The signal the moved-out PG WHERE
-        // used to make visible via PG's returned-row count. Counts only; the filter
-        // fragment stays PII-gated. A stream cancelled mid-flight emits no event.
+        // Residual selectivity: rows_in = PG's full projected delta, rows_out =
+        // survivors. Counts only — the filter fragment stays PII-gated. A
+        // stream cancelled mid-flight emits no event.
         tracing::debug!(rows_in, rows_out, "stream_all_hot residual applied");
     })
 }
 
-/// CHA-507: read the cold upsert persist segments (author/comment no longer
+/// Read the cold upsert persist segments (which do NOT carry author/comment
 /// inline) and hand them to [`penca_merge::cold_audit_batches`], which filters
 /// on the committed_at / commit_seq_num windows + the `ids` restriction,
 /// reattaches `author`/`comment` from the cold tx_log via a `commit_seq_num`
-/// join when `include_tx_metadata`, and projects to the audit schema — all on
-/// DataFusion (replaces the former hand-rolled Arrow scan).
+/// join when `include_tx_metadata`, and projects to the audit schema.
 #[allow(clippy::too_many_arguments)]
 async fn cold_upsert_audit_batches<R: FormatReader + 'static>(
     ctx: &SessionContext,
@@ -2470,7 +2386,7 @@ async fn read_tx_log_batches<R: FormatReader + 'static>(
     Ok((batches, schema))
 }
 
-/// CHA-507: half-open overlap test for pruning cold tx_log segments to an audit
+/// Half-open overlap test for pruning cold tx_log segments to an audit
 /// window before reading files — a segment `[min, max]` overlaps `[from, to)`
 /// iff `max >= from` and `min < to` on each set axis; an unset bound is no
 /// constraint. Pure, so the prune's boundary behavior is unit-tested.
@@ -2488,7 +2404,7 @@ fn tx_log_segment_in_window(
     micros_overlaps && seq_overlaps
 }
 
-/// CHA-507: read the branch's committed cold tx_log segment metadata and shape
+/// Read the branch's committed cold tx_log segment metadata and shape
 /// it as `PersistSegment`s the audit builders can read + join on
 /// `commit_seq_num`.
 async fn tx_log_persist_segments(
@@ -2530,10 +2446,10 @@ async fn tx_log_persist_segments(
     Ok(out)
 }
 
-/// CHA-507: mirror of [`cold_upsert_audit_batches`] for the delete log. Cold
-/// delete row shape (CHA-185, CHA-431, CHA-430; CHA-507 dropped author/comment):
-/// `(row_uuid, <pk_cols>, write_seq_num, commit_micros, began_at_micros,
-/// commit_seq_num)`. [`penca_merge::cold_audit_batches`] filters, joins the
+/// Mirror of [`cold_upsert_audit_batches`] for the delete log. Cold delete row
+/// shape is `(row_uuid, <pk_cols>, write_seq_num, commit_micros,
+/// began_at_micros, commit_seq_num)` — no author/comment.
+/// [`penca_merge::cold_audit_batches`] filters, joins the
 /// cold tx_log for author/comment when requested, and projects to the audit
 /// schema.
 #[allow(clippy::too_many_arguments)]
@@ -2581,7 +2497,7 @@ async fn cold_delete_audit_batches<R: FormatReader + 'static>(
     .map_err(ApiError::Merge)
 }
 
-/// CHA-178: exclusive per-row `commit_seq_num` upper bound for a forked
+/// Exclusive per-row `commit_seq_num` upper bound for a forked
 /// branch's parent (base) audit segments. Parent rows must be `<= fork_seed`
 /// (exclusive bound `fork_seed + 1`), tightened by any audit seq-window upper
 /// so the base never exceeds the audit request's own window.
@@ -2655,7 +2571,7 @@ mod tests {
         ));
     }
 
-    /// CHA-507: the cold fork-point seek — exact seq, as-of micros (latest
+    /// The cold fork-point seek — exact seq, as-of micros (latest
     /// `<= T` by max seq), out-of-range → None, and head (max seq).
     #[test]
     fn seek_committed_tx_in_batches_covers_seq_micros_and_head() {
@@ -2704,7 +2620,7 @@ mod tests {
 
     #[test]
     fn combine_filters_composes_all_four_shapes() {
-        // CHA-492: the effective merge filter ANDs the request filter with the
+        // The effective merge filter ANDs the request filter with the
         // index-seek residual, each parenthesized so precedence is preserved.
         assert_eq!(combine_filters(None, None), None);
         assert_eq!(
@@ -2769,13 +2685,10 @@ mod tests {
         tokio::time::Instant::now() + Duration::from_secs(60)
     }
 
-    // CHA-443 (IMPL-6): a read with neither `open_tx_uuid` nor an explicit
-    // `as_of` pins the "read latest" snapshot on the SEQ axis (`AsOfSeq`
-    // frontier), not committed_at micros, so it composes with the seq
-    // tier-fence and resolves names on the same axis as data. (Supersedes the
-    // CHA-86 `AsOfMicros(pg_now)` default; there is still no unbounded read
-    // variant.) `read_data` threads the frontier it captured for identifier
-    // resolution as `default_frontier`; here we supply it directly.
+    // A read with neither `open_tx_uuid` nor an explicit `as_of` pins the
+    // "read latest" snapshot on the SEQ axis, not committed_at micros, so it
+    // composes with the seq tier-fence and resolves names on the same axis as
+    // data.
     #[tokio::test]
     async fn resolve_query_snapshot_no_tx_no_as_of_pins_snapshot() {
         let catalog = uuid::Uuid::nil();
@@ -2794,13 +2707,12 @@ mod tests {
         .expect("resolution must not error on the no-tx / no-as_of path");
 
         // The default "read latest" path pins the SEQ frontier as `LatestSeq`
-        // (CHA-472: the cache-eligible marker) — not committed_at micros — and a
-        // threaded default_frontier pins exactly that value.
+        // — the cache-eligible marker, not committed_at micros — and a threaded
+        // default_frontier pins exactly that value.
         assert_eq!(snapshot, ReadSnapshot::LatestSeq(2_468_135));
     }
 
-    // Regression guard: an explicit `as_of_micros` still maps to
-    // `AsOfMicros(ts)` verbatim (passes before and after the fix).
+    // An explicit `as_of_micros` maps to `AsOfMicros(ts)` verbatim.
     #[tokio::test]
     async fn resolve_query_snapshot_explicit_as_of_unchanged() {
         let catalog = uuid::Uuid::nil();
@@ -2821,7 +2733,7 @@ mod tests {
         assert_eq!(snapshot, ReadSnapshot::AsOfMicros(1_234_567));
     }
 
-    // CHA-429: an explicit `commit_seq_num` maps to `AsOfSeq(n)` verbatim —
+    // An explicit `commit_seq_num` maps to `AsOfSeq(n)` verbatim —
     // exact, no resolution, no DB round-trip.
     #[tokio::test]
     async fn resolve_query_snapshot_explicit_commit_seq_num_maps_to_as_of_seq() {
@@ -2842,8 +2754,6 @@ mod tests {
 
         assert_eq!(snapshot, ReadSnapshot::AsOfSeq(42));
     }
-
-    // CHA-427: read_data dispatch predicates
 
     /// Pins the three-way dispatch contract over the four plan shapes,
     /// including the precedence property the dispatch comment leans on:
@@ -2911,7 +2821,7 @@ mod tests {
         assert!(!is_all_hot(&mixed));
         assert!(!is_all_cold(&mixed));
 
-        // CHA-178: a forked branch's base cold source is folded only in the
+        // A forked branch's base cold source is folded only in the
         // merge pipeline, so a plan carrying one is never all-hot even with no
         // own cold tier — otherwise a fresh forked read would take the
         // fold-free stream_all_hot path and read empty.
@@ -2936,7 +2846,7 @@ mod tests {
         assert!(is_all_cold(&forked_cold));
     }
 
-    /// CHA-476: the direct point-read arm gates on `is_snapshot_only`, true only
+    /// The direct point-read arm gates on `is_snapshot_only`, true only
     /// for a cold snapshot leg with NO persist band and NO hot tier. A persist
     /// band (a write after the snapshot) or any hot tier structurally excludes
     /// the arm — pinning the gate's exclusions.

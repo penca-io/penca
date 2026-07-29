@@ -1,4 +1,4 @@
-//! CHA-404: whole-partition packing of snapshot segment files.
+//! Whole-partition packing of snapshot segment files.
 //!
 //! [`SegmentPacker`] accumulates clustered partition batches and flushes
 //! one packed segment FILE whenever the next partition would exceed
@@ -13,7 +13,7 @@
 //! partition label) and the prior-snapshot survivor stream (exclusion
 //! already applied in-scan, arriving as label-sorted runs).
 //!
-//! CHA-406: a touched prior partition is merged with its delta by a
+//! A touched prior partition is merged with its delta by a
 //! two-cursor streaming sorted-merge ([`PartitionMerger`]) instead of a
 //! whole-partition `concat + sort`, and the packer accumulates a
 //! partition's merged output sub-partition at a time — flushing
@@ -42,7 +42,7 @@ use crate::lifecycle::batch_util::{
 use crate::lifecycle::chunker::{batch_in_memory_bytes, chunk_row_ranges};
 use crate::lifecycle::durable_writer::{SnapshotFileStep, SnapshotSegmentRowSpec};
 
-/// One step out of [`pack_merged_partition_stream`] (CHA-406): either a
+/// One step out of [`pack_merged_partition_stream`]: either a
 /// freshly packed file for a rewritten/delta partition, or a batch of
 /// carried-forward segment specs for an untouched partition referenced
 /// by its prior file. Carried specs carry no `file_batch` — the
@@ -84,7 +84,7 @@ pub(super) struct SegmentPacker {
     buffered: Vec<(Option<String>, RecordBatch)>,
     buffered_bytes: i64,
     chunk_idx: u32,
-    /// CHA-406: the partition currently being streamed in sub-partition
+    /// The partition currently being streamed in sub-partition
     /// chunks. `None` between partitions and for the whole-partition
     /// `push_partition` path (delta-only labels).
     open: Option<OpenPartition>,
@@ -159,7 +159,7 @@ impl SegmentPacker {
         Ok(out)
     }
 
-    /// CHA-406: stream one sub-partition of merged output into the open
+    /// Stream one sub-partition of merged output into the open
     /// partition `label`. Accumulates rows, and once the accumulation
     /// crosses `max_segment_bytes` flushes the pending multi-partition
     /// buffer (so its chunk_idx stays below this oversized partition's)
@@ -228,7 +228,7 @@ impl SegmentPacker {
         Ok(out)
     }
 
-    /// CHA-406: complete the open partition. An under-cap partition that
+    /// Complete the open partition. An under-cap partition that
     /// never flushed folds into the multi-partition buffer (so small
     /// partitions still share one file); an oversized partition flushes
     /// its retained tail as its own file (the deliberate under-cap-tail
@@ -258,7 +258,7 @@ impl SegmentPacker {
     }
 
     /// Flush whatever is buffered. The packer is consumed — the
-    /// zero-row empty-merge placeholder (CHA-228) is the caller's job.
+    /// zero-row empty-merge placeholder is the caller's job.
     pub(super) fn finish(mut self) -> Result<Vec<SnapshotFileStep>, ApiError> {
         debug_assert!(
             self.open.is_none(),
@@ -370,7 +370,7 @@ impl SegmentPacker {
     }
 }
 
-/// CHA-406 two-cursor streaming sorted-merge of one partition's prior
+/// Two-cursor streaming sorted-merge of one partition's prior
 /// snapshot rows (arriving as a sorted stream of slices) with its delta
 /// (resolved once, sorted once). Replaces the whole-partition
 /// `concat + sort`: peak residency is the delta plus one prior slice,
@@ -388,7 +388,7 @@ impl SegmentPacker {
 /// (a stable merge of two sorted runs), so it matches the content
 /// oracle in `snapshot_op.rs`.
 struct PartitionMerger {
-    /// Typed ordering key (CHA-459) carrying the partition's identity label
+    /// Typed ordering key carrying the partition's identity label
     /// (`key.label()`, used for `partition_value`) and its typed sort row.
     key: PartitionOrderKey,
     /// Delta sorted once by the effective sort keys; `None` for a
@@ -548,19 +548,19 @@ fn interleave_two(
 /// `delta_groups` is the windowed cold resolve grouped by partition label
 /// (`partition_record_batch` output). The `snapshot_stream` must yield
 /// prior-snapshot survivor batches in plan order, which is
-/// typed-partition-order run order (CHA-459). That contract is provided
-/// end-to-end by the snapshot wiring (CHA-404): `ORDER BY seg.chunk_idx`
+/// typed-partition-order run order. That contract is provided
+/// end-to-end by the snapshot wiring: `ORDER BY seg.chunk_idx`
 /// in `read_snapshot_segments_for_table` plus the ordered (`ByPlan`)
 /// segment scan — the writer emits partitions in typed partition order, so
 /// chunk_idx order IS typed partition order.
 ///
-/// `ordering` is the typed [`PartitionOrdering`] (CHA-459): it carries the
+/// `ordering` is the typed [`PartitionOrdering`]: it carries the
 /// partition-key names and the `RowConverter` that mints the
 /// [`PartitionOrderKey`]s the `delta` / `carried` maps and the order check
 /// are keyed by, so every leg merges in typed partition order rather than
 /// stringified-label order (an `Int` key would otherwise sort `"10" < "2"`).
 ///
-/// CHA-406: each touched prior partition is merged with its delta by a
+/// Each touched prior partition is merged with its delta by a
 /// [`PartitionMerger`] and streamed sub-partition at a time into the
 /// packer; delta-only partitions interleave at their order position via
 /// the whole-partition `push_partition` path. Untouched partitions are
@@ -571,7 +571,7 @@ fn interleave_two(
 /// `ORDER BY seg.chunk_idx` still yields typed-order runs for the next
 /// cycle. `carried` is disjoint from the stream and delta partitions by
 /// construction (carried = untouched, stream/delta = touched); empty for
-/// the CHA-404 full-rewrite path. Out-of-(typed-)order prior partitions
+/// the full-rewrite path. Out-of-(typed-)order prior partitions
 /// are an invariant violation (fail fast).
 pub(super) fn pack_merged_partition_stream<'a>(
     delta_groups: Vec<(Option<String>, RecordBatch)>,
@@ -584,7 +584,7 @@ pub(super) fn pack_merged_partition_stream<'a>(
     mut packer: SegmentPacker,
 ) -> Pin<Box<dyn Stream<Item = Result<PackStep, ApiError>> + Send + 'a>> {
     Box::pin(async_stream::try_stream! {
-        // Re-key delta groups by their typed PartitionOrderKey (CHA-459):
+        // Re-key delta groups by their typed PartitionOrderKey:
         // the BTreeMap then drains in typed partition order, not the
         // stringified-label order an Option<String> key would impose.
         let mut delta: BTreeMap<PartitionOrderKey, RecordBatch> = BTreeMap::new();
@@ -740,14 +740,14 @@ fn batch_order_key(
     ordering.order_key_at(&cols, 0, label)
 }
 
-/// Enforce typed-order arrival of prior-stream partitions (CHA-459): a
+/// Enforce typed-order arrival of prior-stream partitions: a
 /// partition out of typed order (or resurfacing after a later one) breaks
 /// the `ORDER BY seg.chunk_idx` contract — a mis-packing hazard, not a
 /// degraded mode.
 ///
 /// Cross-version note: this typed-arrival invariant assumes the prior
-/// snapshot was written by post-CHA-459 code. A prior snapshot written by
-/// pre-fix code over a *non-string* partition key laid its segments out in
+/// snapshot was written by code that already orders typed. A prior snapshot
+/// written before that over a *non-string* partition key laid its segments in
 /// stringified-label order (e.g. an Int key `[10, 100, 2, 9]`), which is
 /// not typed-ascending, so its stream trips this check's loud fail-fast
 /// (not silent corruption). Pre-release there is no such live data; the fix
@@ -790,7 +790,7 @@ fn close_partition(
 }
 
 /// Drain pending carried + delta-only partitions in merged typed order
-/// (CHA-459) up to `bound` (`Some(key)` → strictly below it; `None` → all
+/// up to `bound` (`Some(key)` → strictly below it; `None` → all
 /// remaining). Carried and delta partitions are disjoint by construction,
 /// so the two `BTreeMap` heads never tie. A carried partition flushes the
 /// pending multi-partition buffer first (chunk_idx is flush-assigned, so
@@ -886,7 +886,7 @@ fn push_delta_only(
         return Ok(Vec::new());
     }
     let clustered = sort_record_batch_by_keys(&batch, sort_keys)?;
-    // Permanent off-by-default residency observability (CHA-404):
+    // Permanent off-by-default residency observability:
     // per-partition row counts under `penca_api=trace`.
     tracing::trace!(
         target: "penca_api::snapshot_streaming",
