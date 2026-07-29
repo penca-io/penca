@@ -606,38 +606,13 @@ where
         exclusion_set,
     } = resolve_log_tiers(&req).await?;
 
-    // CHA-482: identity restriction parsed once, reused by the base fold below
-    // and the snapshot seeks.
+    // CHA-482: identity restriction for the snapshot seeks. The base-cold fold
+    // that used to sit here moved into `resolve_log_tiers` (CHA-531), which
+    // parses its own copy.
     let row_uuids = identity_row_uuids(
         req.seeks.as_deref(),
         req.filter.is_some_and(|f| !f.is_empty()),
     )?;
-
-    // CHA-178: fold the parent (base) cold source in below the child. The
-    // all-cold `resolved` is already projected to the output schema, so the
-    // parent's resolved batch is projected to match before the concat.
-    let (resolved, exclusion_set) = {
-        let user_cols: Vec<&str> = req
-            .user_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
-        let log_schemas = cold_persist_schemas(req.user_schema);
-        fold_base_if_present(
-            req.plan,
-            req.dl,
-            &user_cols,
-            req.user_schema,
-            &log_schemas,
-            req.filter,
-            row_uuids.as_deref(),
-            resolved,
-            exclusion_set,
-            true,
-        )
-        .await?
-    };
 
     // CHA-485 accelerator entries ride alongside the identity restriction for
     // the provider seek.
@@ -1001,6 +976,29 @@ where
     // projection. No-op when `filter` is None (e.g. the snapshot-writer caller).
     let resolved = apply_resolved_residual(&req.dl.derive_session(), req.filter, resolved).await?;
     let resolved = project_resolved(resolved, req.user_schema)?;
+
+    // CHA-178: fold the parent (base) cold source in below the child. The
+    // all-cold `resolved` is already projected to the output schema, so the
+    // parent's resolved batch is projected to match before the concat.
+    //
+    // CHA-531: this fold lives here rather than in each caller so that
+    // `base_cold_storage` means the same thing on every plan this entry
+    // accepts. It used to sit in `stream_all_cold_parts` alone, which made the
+    // field a silent no-op for the snapshot writer's carry-forward delta —
+    // dropping a fork parent's post-snapshot persist tail.
+    let (resolved, exclusion_set) = fold_base_if_present(
+        req.plan,
+        req.dl,
+        &user_cols,
+        req.user_schema,
+        &log_schemas,
+        req.filter,
+        row_uuids.as_deref(),
+        resolved,
+        exclusion_set,
+        true,
+    )
+    .await?;
     tracing::Span::current().record("resolved_rows", resolved.num_rows() as i64);
     Ok(ResolvedLogTiers {
         resolved,
