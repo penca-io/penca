@@ -451,8 +451,11 @@ impl PgDialect {
                     persisted_at_micros       BIGINT NOT NULL,
                     -- CHA-443 (IMPL-1): the persist seq watermark = MAX(commit_seq_num)
                     -- over the committed rows persisted; the seq analog of
-                    -- persisted_at_micros. NULL on the aborts-only branch (no
-                    -- committed rows) so IMPL-4's MAX(commit_seq_num) ignores it.
+                    -- persisted_at_micros. NULLable only vestigially: Persist is
+                    -- committed-only since CHA-444 (aborts are Purge's, ADR 0027)
+                    -- and no-ops without writing a row when nothing committed, so
+                    -- every row written carries a seq. Readers may treat it as
+                    -- present; do not reintroduce a NULL-writing path.
                     commit_seq_num          BIGINT,
                     log_kind                TEXT NOT NULL
                         CHECK (log_kind IN ('upsert_log','delete_log')),
