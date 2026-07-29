@@ -1,16 +1,16 @@
-//! Workload-correctness guard for the hot+cold merge fan-in floor (CHA-415 #3).
+//! Workload-correctness guard for the hot+cold merge fan-in floor.
 //!
-//! The `merge_fanin_floor` bench (I3) times the real `scan_snapshot` (CHA-411
-//! `SnapshotTableProvider`) exclusion anti-join over a fixed in-memory cold base
+//! The `merge_fanin_floor` bench times the real `scan_snapshot`
+//! (`SnapshotTableProvider`) exclusion anti-join over a fixed in-memory cold base
 //! as hot churn (the exclusion-set size) grows. A throughput number is only
 //! meaningful if the exclusion is actually applied to the *intended* rows, so
 //! this guard pins both count and content: scanning a base of N rows with H
 //! excluded row_uuids returns exactly the N − H *non-excluded* rows (the
 //! excluded ones absent, the rest present), and an empty exclusion keeps all N.
 //!
-//! Characterization guard — `scan_snapshot` is existing correct production code
-//! (its semantics are owned by penca-dl's own tests); this just confirms the
-//! bench measures a real anti-join over the right rows, not a passthrough.
+//! `scan_snapshot`'s own semantics are owned by penca-dl's tests; this just
+//! confirms the bench measures a real anti-join over the right rows, not a
+//! passthrough.
 
 #[path = "../benches/floor_support.rs"]
 mod floor_support;

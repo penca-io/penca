@@ -16,10 +16,6 @@ use crate::{CarriedSegmentSpec, LifecycleManager, MetadataError, Result};
 impl LifecycleManager {
     /// Insert a snapshot metadata row (phase 1).
     ///
-    /// CHA-198: writes to the per-catalog parent
-    /// `{catalog_uuid}_table_snapshot_metadata`; populates structured
-    /// `branch_uuid` + `table_uuid` columns.
-    ///
     /// 1 SQL query.
     pub async fn insert_snapshot_metadata(
         driver: &impl DbDriver<Row = PgRow>,
@@ -30,29 +26,26 @@ impl LifecycleManager {
         snapshotted_at_micros: i64,
         partition_keys: &[String],
         clustering_keys: &[String],
-        // CHA-443 (IMPL-2): the snapshot seq watermark W_snap (the seq analog of
-        // snapshotted_at_micros; -1 for an empty/genesis baseline).
+        // The snapshot seq watermark W_snap; -1 for an empty/genesis baseline.
         commit_seq_num: i64,
-        // CHA-432: whether this snapshot is a durable retention rung. Decided
-        // once by the caller (`decide_durable`) at creation and sticky.
+        // Whether this snapshot is a durable retention rung. Decided once by
+        // the caller (`decide_durable`) at creation and sticky thereafter.
         durable: bool,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let table = naming::table_snapshot_metadata_table(&catalog);
-        // CHA-203: deterministic `table_snapshot_uuid` from
-        // `(catalog, branch, table, snapshotted_at)`; retries collapse
-        // via `DO UPDATE`.
+        // `table_snapshot_uuid` is deterministic from
+        // `(catalog, branch, table, snapshotted_at)`, so retries collapse via
+        // `DO UPDATE`.
         //
-        // CHA-404: `partition_keys` / `clustering_keys` record the
-        // write-time layout keys (clustering already resolved to its
-        // primary-key default by the caller). Parent-level because a
-        // key change between snapshots forces a full rewrite (ADR
-        // 0024), so one key set covers every segment in the snapshot.
+        // `partition_keys` / `clustering_keys` are parent-level because a key
+        // change between snapshots forces a full rewrite (ADR 0024), so one key
+        // set covers every segment in the snapshot.
         //
-        // CHA-432: `durable` is deliberately omitted from the `DO UPDATE` set —
-        // it is decided once at creation and must stay sticky so the retention
-        // floor is monotonic; a crash-retry re-inserts the identical row but
-        // never flips an already-recorded flag.
+        // `durable` is deliberately omitted from the `DO UPDATE` set — it is
+        // decided once at creation and must stay sticky so the retention floor
+        // is monotonic. A crash-retry re-inserts the identical row but never
+        // flips an already-recorded flag.
         let sql = format!(
             "INSERT INTO {table} \
              (table_snapshot_uuid, branch_uuid, table_uuid, \
@@ -83,7 +76,7 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// CHA-432: the `snapshotted_at_micros` of the most recent **committed**
+    /// The `snapshotted_at_micros` of the most recent **committed**
     /// durable snapshot for `(branch, table)`, or `None` when none is durable
     /// yet. The sticky durable-assignment decision reads this once at snapshot
     /// creation to gate the next rung by the density cadence.
@@ -120,11 +113,9 @@ impl LifecycleManager {
 
     /// Insert a snapshot segment with NULL `commit_micros`.
     ///
-    /// `offset`/`length` are the segment's row range within its file
-    /// (CHA-404: multiple segments — one per partition — can share one
-    /// `object_uri`); a single-segment file is the whole-file range
-    /// `(0, row_count)`, never NULL (CHA-407 made the columns NOT
-    /// NULL).
+    /// `offset`/`length` are the segment's row range within its file — multiple
+    /// segments, one per partition, can share one `object_uri`. A
+    /// single-segment file is the whole-file range `(0, row_count)`, never NULL.
     ///
     /// 1 SQL query.
     #[allow(clippy::too_many_arguments)]
@@ -374,16 +365,15 @@ impl LifecycleManager {
     /// COMMITTED snapshot of a table except the single latest (by
     /// `snapshotted_at_micros`).
     ///
-    /// The retirement input (ADR 0024 §4 / CHA-405): snapshots are a
-    /// read-optimization cache, so when a new snapshot commits, every
-    /// older one is retired — only the latest serves reads. Bounded
-    /// time-travel history is persist-log retention's job (CHA-425).
-    /// Uncommitted parents are excluded on both sides: an in-flight
-    /// snapshot is neither retire-able nor the retirement pivot.
+    /// The retirement input (ADR 0024 §4): snapshots are a read-optimization
+    /// cache, so when a new snapshot commits every older one is retired and
+    /// only the latest serves reads. Bounded time-travel history is persist-log
+    /// retention's job. Uncommitted parents are excluded on both sides: an
+    /// in-flight snapshot is neither retire-able nor the retirement pivot.
     ///
-    /// Deliberate sibling of [`Self::get_snapshot_segments_for_table`]
-    /// (the all-snapshots enumeration `DeleteBranch` uses) — a ranked
-    /// filter, not a boolean knob on the full enumeration.
+    /// A deliberate sibling of [`Self::get_snapshot_segments_for_table`] (the
+    /// all-snapshots enumeration `DeleteBranch` uses) — a ranked filter, not a
+    /// boolean knob on the full enumeration.
     ///
     /// 1 SQL query.
     pub async fn get_retired_snapshot_segments(
@@ -435,8 +425,8 @@ impl LifecycleManager {
 
     /// Delete snapshot segments by UUID list.
     ///
-    /// Used by retirement (ADR 0024 §4 / CHA-405). Branch-deletion uses
-    /// DROP PARTITION CASCADE instead.
+    /// Used by retirement (ADR 0024 §4). Branch-deletion uses DROP PARTITION
+    /// CASCADE instead.
     ///
     /// 1 SQL query.
     pub async fn delete_snapshot_segments_by_uuids(
@@ -465,7 +455,7 @@ impl LifecycleManager {
     }
 
     /// Carry forward untouched prior-snapshot segments by reference
-    /// (CHA-406, ADR 0024 §3): one new `table_snapshot_segment_uuid` per
+    /// (ADR 0024 §3): one new `table_snapshot_segment_uuid` per
     /// spec under the NEW snapshot, copying the prior row's storage
     /// columns (`object_uri`, `offset`, `length`, `row_count`,
     /// `size_bytes`, `format`, `metadata`, `statistics`) server-side —
@@ -585,9 +575,9 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// Commit a batch of snapshot segments by UUID (phase 2, bulk form
-    /// of [`Self::commit_snapshot_segment`]). Used by CHA-406 to commit
-    /// carried rows alongside the written ones.
+    /// Commit a batch of snapshot segments by UUID (phase 2, bulk form of
+    /// [`Self::commit_snapshot_segment`]). Commits carried rows alongside the
+    /// written ones.
     ///
     /// 1 SQL query (no-op on empty input).
     pub async fn commit_snapshot_segments_by_uuids(
@@ -660,10 +650,8 @@ impl LifecycleManager {
 
     /// Delete snapshot metadata rows that have no remaining segments.
     ///
-    /// Used by retirement (ADR 0024 §4 / CHA-405) after segment delete
-    /// to sweep parent rows orphaned by the segment cleanup. CHA-203:
-    /// keyed on `(branch_uuid, table_uuid)` after the schema dropped
-    /// `data_log_prefix_uuid`.
+    /// Used by retirement (ADR 0024 §4) after segment delete to sweep parent
+    /// rows orphaned by the segment cleanup.
     ///
     /// 1 SQL query.
     pub async fn delete_orphaned_snapshot_metadata(
@@ -704,7 +692,7 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// CHA-432: retention floor — the newest `durable` snapshot at/before the
+    /// Retention floor — the newest `durable` snapshot at/before the
     /// retention window start (`now_micros − retention_duration_seconds ×
     /// 1_000_000`). Returns the floor row's `(commit_seq_num,
     /// snapshotted_at_micros)` so consumers compare on the axis their
@@ -714,9 +702,9 @@ impl LifecycleManager {
     /// no query issued) or when no durable snapshot precedes the window (table
     /// younger than the window); downstream retention ops then no-op.
     ///
-    /// Reusable substrate: the persist prune (CHA-434) and snapshot retirement
-    /// (CHA-55) call this directly; CHA-433 folds the same predicate onto the
-    /// plan-time `hot_min` round trip. 0 SQL queries when disabled, else 1.
+    /// The persist prune and snapshot retirement call this directly; the
+    /// read path folds the same predicate onto the plan-time `hot_min` round
+    /// trip. 0 SQL queries when disabled, else 1.
     pub async fn retention_floor(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -756,7 +744,7 @@ impl LifecycleManager {
 /// `(commit_seq_num, snapshotted_at_micros)`.
 ///
 /// Shared by [`LifecycleManager::retention_floor`] (window start bound as a
-/// parameter) and CHA-433's plan-time fold onto the `hot_min` round trip (window
+/// parameter) and the plan-time fold onto the `hot_min` round trip (window
 /// start computed from the DB clock), so the durable/committed predicate lives
 /// in exactly one place. `snapshot_table_sql` is the already-quoted snapshot
 /// metadata table; `branch_param`/`table_param` are the `$N` placeholders;
@@ -778,7 +766,7 @@ pub fn retention_floor_select(
     )
 }
 
-/// The retention floor (CHA-433): the newest `durable` snapshot at/before the
+/// The retention floor: the newest `durable` snapshot at/before the
 /// window start. Both coordinates are carried so each consumer compares on the
 /// axis its `as_of`/`from` arrives on — a named pair (not a positional
 /// `(i64, i64)`) so the seq and micros axes can't be transposed at a call site.

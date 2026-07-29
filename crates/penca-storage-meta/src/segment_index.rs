@@ -1,4 +1,4 @@
-//! Cold-index *materialization* metadata helpers (CHA-412 / ADR 0026 §5),
+//! Cold-index *materialization* metadata helpers (ADR 0026 §5),
 //! split into a snapshot parent/child pair mirroring `table_snapshot_metadata`
 //! → `table_snapshot_segment_metadata`:
 //!
@@ -7,25 +7,23 @@
 //!   snapshot's two-phase commit and retired with it.
 //! * `table_snapshot_segment_index_metadata` (CHILD) — one row per `(segment,
 //!   index)` sidecar; a cold file with its own `(written_at, committed_at)`
-//!   two-phase commit, carried forward with its base segment (CHA-406) and GC'd
-//!   via `segment_delete_set` (CHA-405) when the base segment retires.
+//!   two-phase commit, carried forward with its base segment and GC'd via
+//!   `segment_delete_set` when the base segment retires.
 //!
 //! The role discriminator `index_uuid IS NULL` ⇒ the strictly-internal
 //! `row_uuid` identity index; non-NULL ⇒ a *declared* index — either a built-in
-//! system-table name index (CHA-481, a deterministic
-//! [`naming::system_name_index_uuid`] that is itself never a
-//! `__penca_system__.indexes` row) or a user secondary index (CHA-463). The
-//! built-in name index is deliberately non-NULL so the `row_uuid` read plan's
-//! `index_uuid IS NULL` filter excludes it. It lives on the PARENT only; the
-//! child references the parent via `table_snapshot_index_uuid` and does not
-//! duplicate it. Every id
-//! here is the system's xxh3-in-Rust identity ([`naming::row_uuid_for_pk`] /
-//! [`naming::table_snapshot_index_uuid`]) — there are no SQL-side hashes. A
-//! carried child reuses the new snapshot's parent id (passed by the caller, the
-//! same value the build inserted) plus its own deterministic sidecar id, so
-//! build and carry agree and nothing can drift cross-language. The GC-enqueue
-//! reuses [`LifecycleManager::insert_segment_delete_set_rows`] (the canonical
-//! CHA-233 helper). The artifact BUILD that writes new-segment rows is CHA-412.
+//! system-table name index (a deterministic [`naming::system_name_index_uuid`]
+//! that is itself never a `__penca_system__.indexes` row) or a user secondary
+//! index. The built-in name index is deliberately non-NULL so the `row_uuid`
+//! read plan's `index_uuid IS NULL` filter excludes it. It lives on the PARENT
+//! only; the child references the parent via `table_snapshot_index_uuid`.
+//!
+//! Every id here is the system's xxh3-in-Rust identity
+//! ([`naming::row_uuid_for_pk`] / [`naming::table_snapshot_index_uuid`]) —
+//! there are no SQL-side hashes. A carried child reuses the new snapshot's
+//! parent id (passed by the caller, the same value the build inserted) plus its
+//! own deterministic sidecar id, so build and carry agree and nothing can drift
+//! cross-language.
 
 use penca_core::naming;
 use penca_db::driver::{DbDriver, SqlType, SqlValue, format_sql_uuid_array};
@@ -37,11 +35,9 @@ use crate::helpers::{epoch, parse_uuid, qi};
 use crate::{LifecycleManager, Result, SegmentIndexMetadata, TableSnapshotIndexMetadata};
 
 impl LifecycleManager {
-    // -- Parent: table_snapshot_index_metadata --------------------------------
-
     /// Insert a parent index row with NULL `commit_micros` (phase 1) —
     /// the snapshot "has" this index. `index_uuid` is `None` for the internal
-    /// `row_uuid` index. `key_columns` (CHA-485) is the USER index's declared
+    /// `row_uuid` index. `key_columns` is the USER index's declared
     /// key columns, denormalized onto the snapshot-scoped header for planner
     /// covering-index selection (planning reads only snapshot-index metadata,
     /// ADR 0026 §5); `None` for the internal identity index and the built-in
@@ -193,8 +189,8 @@ impl LifecycleManager {
     }
 
     /// List committed parent index rows for a snapshot — the planning-read API
-    /// CHA-454 consults ("does snapshot S have index X?"). The internal index is
-    /// the row with `index_uuid` NULL.
+    /// answering "does snapshot S have index X?". The internal index is the row
+    /// with `index_uuid` NULL.
     ///
     /// 1 SQL query.
     pub async fn list_table_snapshot_index(
@@ -234,8 +230,6 @@ impl LifecycleManager {
             })
             .collect())
     }
-
-    // -- Child: table_snapshot_segment_index_metadata -------------------------
 
     /// Insert a child sidecar row with NULL `commit_micros` (phase 1).
     /// `table_snapshot_index_uuid` references the parent, which carries the
@@ -388,10 +382,9 @@ impl LifecycleManager {
     }
 
     /// List committed child sidecar rows for a set of base segments. The
-    /// planning-read API CHA-454 consumes (group by `segment_uuid`, probe the
-    /// matching index); the lifecycle also uses it to collect a retiring
-    /// segment's sidecar `object_uri`s before enqueuing them in
-    /// `segment_delete_set`.
+    /// planning-read API (group by `segment_uuid`, probe the matching index);
+    /// the lifecycle also uses it to collect a retiring segment's sidecar
+    /// `object_uri`s before enqueuing them in `segment_delete_set`.
     ///
     /// 1 SQL query (no-op on empty input).
     pub async fn list_segment_index_metadata(

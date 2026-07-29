@@ -136,9 +136,6 @@ def _timed_query(stmt_secs: dict[str, float], key: str, client, sql: str):
     return result
 
 
-# --- Shared TPC-B transaction parameters -----------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class _TpcbTxn:
     """One TPC-B transaction's parameters, drawn once and replayed by both
@@ -169,9 +166,6 @@ def _next_tpcb_txn(rng: random.Random, scale: int, i: int) -> _TpcbTxn:
         hid=i + 1,
         mtime=_BASE_MTIME + i,
     )
-
-
-# --- Penca schema setup + bulk load --------------------------------------
 
 
 def setup_pgbench_schema(client, scale: int) -> dict:
@@ -325,9 +319,6 @@ def snapshot_pgbench_tables(
         client.execute_query(f"SELECT * FROM {_fqn(context, table_name)}")
 
 
-# --- Penca TPC-B workload over Flight SQL ---------------------------------
-
-
 def _fqn(context: dict, table_name: str) -> str:
     return f"{context['catalog_name']}.{context['schema_name']}.{table_name}"
 
@@ -478,9 +469,6 @@ def print_stmt_breakdown(stmt_mean_ms: dict[str, float]) -> None:
     print(f"| **transaction total** | **{sum(stmt_mean_ms.values()):.1f} ms** |")
 
 
-# --- Hand-rolled Postgres baseline ----------------------------------------
-
-
 def create_pgbench_baseline_schema(conn) -> None:
     """Create the equivalent four pgbench tables in the Postgres baseline.
 
@@ -585,8 +573,6 @@ def run_pgbench_baseline_txns(conn, scale: int, n_transactions: int, seed: int) 
         cur.execute("SELECT COUNT(*) FROM pgbench_history")
         return cur.fetchone()[0]
 
-
-# --- OLAP / HTAP query ------------------------------------------------------
 
 # An analytical query: a per-account history count + the per-branch average of
 # that count, filtered + top-N — the scan/join/aggregate shape a columnar,

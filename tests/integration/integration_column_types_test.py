@@ -171,9 +171,6 @@ def _assert_field_types_preserved(out: pa.Table, expected: pa.Schema) -> None:
     assert got == want, f"type drift (collapse?): got {got}, want {want}"
 
 
-# ── R1 — the declarable-but-un-round-trippable gap ─────────────────────
-
-
 @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
 class TestColumnTypeGapReproduction:
     """CHA-386 baseline: the four types the DDL gate already admits must
@@ -228,9 +225,6 @@ class TestColumnTypeGapReproduction:
         assert row["d"] is not None and "2024-01-15" in str(row["d"])
         assert row["dec"] is not None and "123.45" in str(row["dec"])
         assert row["ts"] is not None and "2024-01-15" in str(row["ts"])
-
-
-# ── R2 — the widened core set ──────────────────────────────────────────
 
 
 class TestWidenedTypeRoundTrip:
@@ -393,9 +387,6 @@ class TestWidenedTypeRoundTrip:
         assert rows[0]["ts"] is not None and "2024-01-15" in str(rows[0]["ts"])
 
 
-# ── Phase 3 — cold-tier round-trip of the widened set ──────────────────
-
-
 class TestWidenedColdRoundTrip:
     """The widened set survives a flush to cold (Parquet/Lance writers)
     and reads back identically. ``persist`` + ``purge`` force the read to
@@ -450,9 +441,6 @@ class TestWidenedColdRoundTrip:
         assert out.column("d64")[0].as_py() == datetime.date(2024, 1, 15)
         assert out.column("ts")[0].as_py() == datetime.datetime(2024, 1, 15, 12, 30, 0)
         assert out.column("lst")[0].as_py() == [1, 2, 3]
-
-
-# ── R3 — single-gate rejection of unsupported types ────────────────────
 
 
 class TestUnsupportedTypeRejection:

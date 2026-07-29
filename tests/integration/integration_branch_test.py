@@ -37,10 +37,6 @@ from .integration_helpers import (
     make_client,
 )
 
-# ---------------------------------------------------------------------------
-# Setup helpers
-# ---------------------------------------------------------------------------
-
 
 def _qi(name: str) -> str:
     return Identifier(name).as_string(None)
@@ -144,11 +140,6 @@ def _persist_seg_count(catalog_uuid, branch_uuid, table_uuid) -> int:
     return rows[0][0]
 
 
-# ---------------------------------------------------------------------------
-# CreateBranch — multi-schema materialization
-# ---------------------------------------------------------------------------
-
-
 class TestCreateBranchAllSchemas:
     def test_multi_schema_create_branch_materializes_every_schemas_tables(self):
         """CreateBranch on a catalog with 2 user schemas materializes
@@ -163,7 +154,6 @@ class TestCreateBranchAllSchemas:
             _main_branch_uuid,
         ) = _setup_two_schema_catalog(client)
 
-        # CreateBranch — catalog-wide.
         client.create_branch(
             "child",
             "test",
@@ -301,7 +291,6 @@ class TestCreateBranchEnablesWritesPerSchema:
         )
         child_branch_uuid = child_branch.branch_uuid
 
-        # Write into s1.t1 on child.
         _write_rows(
             client,
             catalog_uuid=catalog_uuid,
@@ -311,7 +300,6 @@ class TestCreateBranchEnablesWritesPerSchema:
             rows={"name": ["alice"], "value": [10]},
         )
 
-        # Write into s2.t2 on child.
         _write_rows(
             client,
             catalog_uuid=catalog_uuid,
@@ -321,7 +309,6 @@ class TestCreateBranchEnablesWritesPerSchema:
             rows={"name": ["bob"], "value": [20]},
         )
 
-        # Reads on child return the new rows.
         child_t1 = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=s1_uuid,
@@ -352,11 +339,6 @@ class TestCreateBranchEnablesWritesPerSchema:
             branch_uuid=main_branch_uuid,
         )
         assert main_t2.num_rows == 0
-
-
-# ---------------------------------------------------------------------------
-# MergeBranch — multi-schema fan-out
-# ---------------------------------------------------------------------------
 
 
 class TestMergeBranchAllSchemas:
@@ -410,7 +392,6 @@ class TestMergeBranchAllSchemas:
             catalog_uuid=catalog_uuid,
         )
 
-        # Reads of s1.t1 on main return the row written on child.
         main_t1 = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=s1_uuid,
@@ -419,7 +400,6 @@ class TestMergeBranchAllSchemas:
         )
         assert main_t1.column("name").to_pylist() == ["alice"]
 
-        # Reads of s2.t2 on main return the row written on child.
         main_t2 = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=s2_uuid,
@@ -454,11 +434,6 @@ class TestMergeBranchAllSchemas:
         assert t2_uuid in observed, (
             f"merge_tx tx_table_log missing t2_uuid; got {observed}"
         )
-
-
-# ---------------------------------------------------------------------------
-# DeleteBranch — multi-schema cold cleanup
-# ---------------------------------------------------------------------------
 
 
 class TestDeleteBranchAllSchemas:
@@ -535,35 +510,19 @@ class TestDeleteBranchAllSchemas:
         assert _seg_count(t1_uuid) > 0
         assert _seg_count(t2_uuid) > 0
 
-        # Delete child branch — catalog-wide.
         client.delete_branch(
             catalog_uuid=catalog_uuid,
             branch_uuid=child_branch_uuid,
         )
 
-        # Cold segment metadata for s1.t1 and s2.t2 is gone.
         assert _seg_count(t1_uuid) == 0
         assert _seg_count(t2_uuid) == 0
 
-        # Operations against the deleted branch raise NOT_FOUND.
         with pytest.raises(NotFoundError):
             client.get_branch(
                 catalog_uuid=catalog_uuid,
                 branch_uuid=child_branch_uuid,
             )
-
-
-# ---------------------------------------------------------------------------
-# (Original test 6 — "commit_tx_log purge watermark spans all schemas" — dropped.)
-# ---------------------------------------------------------------------------
-#
-# The original CHA-184 plan included a test asserting that persisting
-# `s1.t1` alone does not purge `commit_tx_log` rows still referenced by an
-# unpersisted `s2.t2`. CHA-168 removed `LifecycleManager::try_purge_tx_log`
-# outright and folded hot commit_tx_log purge into the per-branch persist
-# commit — one watermark per branch, monotonically advancing. The
-# per-schema list-walk this test was meant to catch no longer exists,
-# so the test is dropped (not deferred) per CHA-184 plan rev 3.
 
 
 class TestHotLogIndexPerBranch:
@@ -630,11 +589,6 @@ class TestHotLogIndexPerBranch:
         )
 
 
-# ---------------------------------------------------------------------------
-# CHA-515: main-only branching guard (interim, removed by CHA-509)
-# ---------------------------------------------------------------------------
-
-
 class TestCreateBranchMainOnlyGuard:
     """Forks are main-only until CHA-509 lands multi-level inheritance.
 
@@ -648,7 +602,6 @@ class TestCreateBranchMainOnlyGuard:
         client = make_client()
         catalog_uuid, _s1, _s2, _t1, _t2, _main = _setup_two_schema_catalog(client)
 
-        # Fork off main → succeeds (unchanged).
         client.create_branch(
             "child", "test", "create_branch", catalog_uuid=catalog_uuid
         )

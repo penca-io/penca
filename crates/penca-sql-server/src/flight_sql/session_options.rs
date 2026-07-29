@@ -143,9 +143,9 @@ pub(crate) fn handle_set_session_options(
         }
     }
 
-    // Phase 2: apply every planned mutation. `apply_plan` is
-    // infallible — `WriteSchema` is the only mutation now that
-    // catalog binding is handshake-only (CHA-253).
+    // Phase 2: apply every planned mutation. `apply_plan` is infallible —
+    // `WriteSchema` is the only mutation, because catalog binding is
+    // handshake-only.
     for plan in plans {
         apply_plan(ctx, plan);
     }

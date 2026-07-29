@@ -345,7 +345,6 @@ impl PartitionStream for PencaPartitionStream {
                     continue;
                 }
 
-                // Decode Arrow IPC stream format bytes into RecordBatch(es).
                 let cursor = std::io::Cursor::new(resp.data);
                 let reader = StreamReader::try_new(cursor, None)
                     .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;

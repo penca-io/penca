@@ -1,20 +1,19 @@
-//! Cold-tier index artifact build kernel (CHA-412 / ADR 0026 §2).
+//! Cold-tier index artifact build kernel (ADR 0026 §2).
 //!
 //! The per-segment index artifact is the indexed column(s) **sorted**, paired
 //! with each base row's **segment-relative** physical position — a flat sorted
 //! `(key_0, …, key_{n-1}, row_offset)`, one entry per base row. Duplicate
 //! composite keys form a contiguous run; a lookup binary-searches to the first
-//! match and scans the equal-tuple run (the seek is CHA-454). `row_offset` is
-//! the row's ordinal *within its segment* (`0..len`); the segment's own file
-//! `offset` maps it to a file-physical row at read time.
+//! match and scans the equal-tuple run. `row_offset` is the row's ordinal
+//! *within its segment* (`0..len`); the segment's own file `offset` maps it to
+//! a file-physical row at read time.
 //!
-//! The kernel is **index-agnostic** — it sorts ANY key columns. CHA-412 feeds it
-//! the single `row_uuid` column; CHA-480 generalizes it to **N-column composite
-//! keys** (the sorted `(key…, row_offset)` layout is the contract the build
-//! chunks CHA-481/483 and the seek chunk CHA-482 meet at). It is the canonical
-//! *binary-searchable* form: CHA-454 loads the artifact through the shared
-//! snapshot-segment cache (CHA-252) and binary-searches the sorted composite
-//! key — there is no HashMap.
+//! The kernel is **index-agnostic** — it sorts ANY key columns, from the single
+//! `row_uuid` identity column to N-column composite keys. The sorted
+//! `(key…, row_offset)` layout is the contract the build and seek sides meet
+//! at, and it is the canonical *binary-searchable* form: the reader loads the
+//! artifact through the shared snapshot-segment cache and binary-searches the
+//! sorted composite key — there is no HashMap.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -46,9 +45,9 @@ fn index_key_col(idx: usize) -> String {
 /// Schema of a per-segment index artifact: `(key_0, …, key_{n-1}, row_offset:
 /// Int64)`. `key_types` are the indexed columns' datatypes (one per key column,
 /// in sort-priority order); each `key_i` field is **nullable** so the kernel's
-/// nulls-last sort stays honest for the generic (CHA-463 user-column) reuse —
-/// for CHA-412's non-null `row_uuid` no nulls are present, but the schema must
-/// not claim non-null for an arbitrary column. `row_offset` is non-nullable.
+/// nulls-last sort stays honest for arbitrary user columns — the non-null
+/// `row_uuid` identity index has no nulls, but the schema must not claim
+/// non-null for an arbitrary column. `row_offset` is non-nullable.
 pub fn segment_index_schema(key_types: &[DataType]) -> SchemaRef {
     let mut fields: Vec<Field> = key_types
         .iter()
@@ -117,7 +116,7 @@ pub fn build_segment_index(key_cols: &[ArrayRef]) -> Result<RecordBatch, FormatE
 /// segment-relative `row_offset`s. Each tuple's arity must be in
 /// `1..=num_keys` (= `num_columns - 1`): a full-arity tuple is an exact
 /// composite-key seek, and a SHORTER tuple is a leading-PREFIX seek that
-/// matches every row whose leading key columns equal the probe (CHA-499). An
+/// matches every row whose leading key columns equal the probe. An
 /// over-arity tuple, or tuples of differing arity within one call, is a
 /// fail-fast error. Binary-searches the lexicographically-sorted composite key
 /// to the first match of each tuple, then scans the contiguous
@@ -130,7 +129,7 @@ pub fn build_segment_index(key_cols: &[ArrayRef]) -> Result<RecordBatch, FormatE
 /// leading-column-first sort, which makes every row sharing a leading-key
 /// prefix contiguous (pinned by `build_composite_leading_column_contiguity`).
 ///
-/// Contract note (CHA-499): "a short probe is a prefix seek" is deliberate and
+/// Contract note: "a short probe is a prefix seek" is deliberate and
 /// general — this shared primitive does NOT re-guard exact-arity intent. That
 /// is safe because every internal seek caller fixes its probe arity at its own
 /// resolve boundary from a declared key schema (`resolve_name_seek` enforces
@@ -144,7 +143,7 @@ pub fn build_segment_index(key_cols: &[ArrayRef]) -> Result<RecordBatch, FormatE
 /// lets a future user-query partial-key seek (a `WHERE a = v` over a composite
 /// `(a, b)` user index) reuse this exact primitive without a second entry point.
 ///
-/// Keys are compared in the key columns' NATIVE types (CHA-485): each probe
+/// Keys are compared in the key columns' NATIVE types: each probe
 /// element is cast from its string form to the corresponding key column's
 /// `DataType` once per call (strict cast — an unrepresentable probe is a
 /// fail-fast error, never a silently-never-matching NULL), then the sorted
@@ -156,8 +155,8 @@ pub fn build_segment_index(key_cols: &[ArrayRef]) -> Result<RecordBatch, FormatE
 /// Probe-string contract: each element must be in Arrow's Utf8→`DataType`
 /// cast grammar for its key column (plain decimal integers, `true`/`false`
 /// booleans, RFC3339 timestamps, …). Callers own that formatting — the
-/// CHA-485 planner pass restricts covering-index selection to a type
-/// allowlist whose literal renderings round-trip this grammar.
+/// planner's covering-index selection is restricted to a type allowlist
+/// whose literal renderings round-trip this grammar.
 pub fn seek_row_offsets(
     sidecar: &RecordBatch,
     probe_tuples: &[&[&str]],
@@ -170,8 +169,8 @@ pub fn seek_row_offsets(
         ))
     })?;
     // Validate probe arity at the boundary, before any data access, so a
-    // mis-shaped caller is rejected even against a zero-row sidecar. CHA-499:
-    // a probe SHORTER than `num_keys` is a leading-PREFIX seek (it matches
+    // mis-shaped caller is rejected even against a zero-row sidecar.
+    // A probe SHORTER than `num_keys` is a leading-PREFIX seek (it matches
     // every row whose leading key columns equal the probe); only an OVER-arity
     // probe or a ragged batch (tuples of differing arity — one comparator set
     // is built for the whole batch, so `probe_arity` must be uniform) is a
@@ -400,7 +399,7 @@ mod tests {
 
     #[test]
     fn non_utf8_int_key_is_supported() {
-        // Shared-kernel genericity (CHA-463): an Int key column sorts the same.
+        // Shared-kernel genericity: an Int key column sorts the same.
         let key: ArrayRef = Arc::new(Int32Array::from(vec![30, 10, 20]));
         let batch = build_segment_index(&[key]).unwrap();
         assert_eq!(batch.schema(), segment_index_schema(&[DataType::Int32]));
@@ -417,8 +416,6 @@ mod tests {
         );
         assert_eq!(offsets(&batch), vec![1, 2, 0]);
     }
-
-    // ----- CHA-454 R1: seek_row_offsets (the read/seek side) --------------
 
     fn sorted(mut v: Vec<i64>) -> Vec<i64> {
         v.sort_unstable();
@@ -482,10 +479,9 @@ mod tests {
         );
     }
 
-    // ----- CHA-480: composite multi-column keys (build + seek) ------------
     // The sorted `(key_0 … key_{n-1}, row_offset)` layout is the interface
-    // contract the build chunks (CHA-481/483) and the seek chunk (CHA-482)
-    // meet at. These cases lock it for N = 1, 2, 3 columns.
+    // contract the build and seek sides meet at. These cases lock it for
+    // N = 1, 2, 3 columns.
 
     #[test]
     fn build_composite_2col_lexicographic_sort() {
@@ -603,8 +599,8 @@ mod tests {
         let batch =
             build_segment_index(&[utf8(&["s2", "s1", "s1"]), utf8(&["t1", "t2", "t1"])]).unwrap();
         // 2-column sidecar: an OVER-arity (3) probe tuple is fail-fast Err.
-        // (A 1-arity probe is now a valid leading-prefix seek — CHA-499, covered
-        // by the seek_prefix_* tests.)
+        // (A 1-arity probe is a valid leading-prefix seek, covered by the
+        // seek_prefix_* tests.)
         let too_long: &[&[&str]] = &[&["s1", "t1", "x"]];
         assert!(seek_row_offsets(&batch, too_long).is_err());
     }
@@ -677,7 +673,6 @@ mod tests {
         assert!(seek_row_offsets(&empty, prefix).unwrap().is_empty());
     }
 
-    // ----- CHA-499: leading-prefix seek (short probe = prefix) -------------
     // A probe SHORTER than the sidecar's key arity is a leading-prefix seek:
     // it matches every row whose leading key columns equal the probe and
     // returns the full contiguous run. Correctness rests entirely on
@@ -776,7 +771,6 @@ mod tests {
         }
     }
 
-    // ----- CHA-485: typed (non-Utf8) key seek ------------------------------
     // The build already sorts any key type; these pin that the SEEK compares
     // in the column's native type via the cast-probe + typed-comparator path.
 

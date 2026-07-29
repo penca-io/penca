@@ -31,6 +31,7 @@
 - [feedback_followup_tickets_before_impl_todo_pointers.md](feedback_followup_tickets_before_impl_todo_pointers.md) — Mint deferred-scope follow-ups at plan approval; TODO(CHA-NNN)↔ticket pointers are bidirectional.
 
 ## Workflow / tool habits
+- [reference_proto_comment_edits_regen_py_stubs.md](reference_proto_comment_edits_regen_py_stubs.md) — Editing a .proto COMMENT requires `just compile-protos-py`; the tracked `*_pb2_grpc.py` stubs embed proto comments as docstrings and no CI job checks their freshness.
 - [feedback_full_integration_suite_fresh_stack_pre_pr.md](feedback_full_integration_suite_fresh_stack_pre_pr.md) — Pre-PR gate = FULL integration suite on a FRESH stack, never a subset (subsets miss contract-change fallout).
 - [feedback_just_check_gate_trust.md](feedback_just_check_gate_trust.md) — Trust `just check` only when it truly passed; mid-pipeline "All checks passed!" lies.
 - [feedback_full_integration_suite_before_push.md](feedback_full_integration_suite_before_push.md) — Branch PR CI SKIPS the Rust integration job (merge-queue only); after a cross-cutting change grep ALL usages + run the full suite locally.

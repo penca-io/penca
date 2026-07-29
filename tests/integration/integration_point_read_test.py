@@ -162,11 +162,6 @@ def _setup_composite_table(client) -> tuple[str, str, str, str]:
     return schema_uuid, table_uuid, catalog_uuid, main_branch_uuid
 
 
-# ---------------------------------------------------------------------------
-# ReadData ids — acceptance
-# ---------------------------------------------------------------------------
-
-
 class TestReadDataIds:
     def test_ids_returns_exactly_named_row_and_latest_version(self):
         client = make_client()
@@ -456,11 +451,6 @@ class TestReadDataIds:
         assert result.column("value").to_pylist() == [3]
 
 
-# ---------------------------------------------------------------------------
-# ReadData ids — validation
-# ---------------------------------------------------------------------------
-
-
 def _raw_read(ctx, ids_bytes: bytes) -> None:
     """Issue a raw-stub ReadData with hand-built ids bytes and drain the
     stream (errors surface on iteration)."""
@@ -598,11 +588,6 @@ class TestReadDataIdsValidation:
         _assert_invalid_argument(excinfo)
 
 
-# ---------------------------------------------------------------------------
-# AuditData ids
-# ---------------------------------------------------------------------------
-
-
 class TestAuditDataIds:
     def _seed_history(self, client, ctx):
         """alice: v1, v2, delete. bob: one version (noise)."""
@@ -691,11 +676,6 @@ class TestAuditDataIds:
         assert deletes.num_rows == 1
 
 
-# ---------------------------------------------------------------------------
-# Hot-log point-read index (white-box)
-# ---------------------------------------------------------------------------
-
-
 class TestHotLogRowUuidIndex:
     def test_row_uuid_leading_index_on_both_hot_logs(self):
         """The ids pushdown probes the hot logs by ``row_uuid`` below
@@ -728,7 +708,6 @@ class TestHotLogRowUuidIndex:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-426 — SQL point lookups must populate ``ReadDataRequest.ids``.
 #
 # CHA-398 added the ``ids`` PK-batch restriction but only for callers who
@@ -746,7 +725,6 @@ class TestHotLogRowUuidIndex:
 #
 # RED before the CHA-426 wiring: the SQL path always sent empty ``ids``,
 # so every ``read_data`` close line carried ``ids_rows=0``.
-# ---------------------------------------------------------------------------
 
 # Anchored INSIDE the read_data span's brace group so a future span
 # that carries its own ids_rows under a read_data parent cannot satisfy
@@ -820,6 +798,9 @@ def _assert_ids_pushdown(since: int, context: str) -> None:
     )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestSqlPointLookupIdsPushdown:
     """CHA-426: point SQL statements restrict the read via the ids PK batch."""
 

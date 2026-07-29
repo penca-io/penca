@@ -44,8 +44,6 @@ from psycopg.pq import Format
 from psycopg.sql import Composable
 from psycopg_pool import ConnectionPool
 
-# ── Postgres driver (white-box test access) ───────────────────────────
-
 
 class DbDriver(ABC):
     """Executes queries against a transactional database."""
@@ -325,9 +323,6 @@ class _PsycopgTxDriver(DbDriver):
         pass
 
 
-# ── Test helpers ──────────────────────────────────────────────────────
-
-# Common test schema
 USER_SCHEMA = pa.schema(
     [
         pa.field("name", pa.utf8()),
@@ -704,6 +699,8 @@ def poll_log_for(
     lands once. Absence assertions must NOT use an unpolled window; use the
     flush-barrier + exact-count pattern (see
     ``integration_direct_point_read_test.py``).
+
+    Callers MUST be marked ``@pytest.mark.serial`` — see ``container_log``.
     """
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
@@ -733,8 +730,19 @@ def container_log(service: str) -> str:
     two streams would let bytes insert before the offset and fold in an
     earlier test's event.)
 
-    pytest runs serially in this suite (no xdist), so a stdout-offset
-    snapshot taken right before a query isolates that query's log window.
+    The offset window is only sound because every caller is marked
+    ``@pytest.mark.serial`` and so runs outside the ``-n auto`` phase. The
+    suite itself is no longer serial: a concurrent worker driving the same
+    service interleaves its lines into this container's stdout, and they land
+    *after* the offset, inside the window. So calling this obligates the
+    marker — CHA-519 removes both, replacing the scrape with a structured
+    per-request seam.
+
+    ``tests/static/static_serial_marker_test.py`` is what keeps that true, by
+    walking the call graph. It resolves callees by name within one module, so
+    a plain call reaching here is covered; a call through an alias or a
+    dynamic attribute, or a helper that shells out to ``docker logs`` itself,
+    is not — add those to that test's root set by hand.
     """
     project = os.environ["COMPOSE_PROJECT_NAME"]
     container = f"{project}-{service}-1"
@@ -759,8 +767,6 @@ def lookup_data_log_prefix_uuid(branch_uuid: str, table_uuid: str) -> str:
     return row_uuid_for_pk(table_uuid, [branch_uuid])
 
 
-# ── pg_stat_statements white-box counters (CHA-365) ───────────────────
-#
 # The metadata-resolution amplification CHA-365 fixes is invisible at the
 # gRPC wire (responses are byte-identical) — the only observable is how
 # many ``__penca_system__.{tables,schemas}`` merge SELECTs a single RPC
@@ -801,3 +807,42 @@ def count_stmts_referencing(driver: DbDriver, needle: str) -> int:
         (needle,),
     )
     return int(rows[0][0])
+
+
+def demo_catalog_names(client) -> set[str]:
+    return {
+        catalog.catalog_name
+        for catalog in client.list_catalogs()
+        if catalog.catalog_name.startswith("demo_")
+    }
+
+
+@contextmanager
+def reaped_demo_catalogs(client):
+    """Reap any ``demo_``-prefixed catalog an ``examples/`` script leaves behind.
+
+    Every demo smoke test runs its script as a subprocess against a stack the
+    rest of the suite shares, and each script creates its catalog before it
+    prints anything — so a red run strands one unless something takes it out.
+    Yields the pre-existing set so a caller can additionally assert the script
+    cleaned up after itself.
+
+    Best-effort by construction: a failure to list or delete is printed, never
+    raised, because this runs on the unwind path where the exception already in
+    flight is the one worth propagating.
+    """
+    before = demo_catalog_names(client)
+    try:
+        yield before
+    finally:
+        try:
+            leaked = demo_catalog_names(client) - before
+        except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+            print(f"(could not list catalogs to reap: {exc})")
+            leaked = set()
+
+        for catalog_name in leaked:
+            try:
+                client.delete_catalog(catalog_name=catalog_name)
+            except Exception as exc:  # noqa: BLE001 - must not mask a real failure
+                print(f"(could not delete catalog {catalog_name}: {exc})")

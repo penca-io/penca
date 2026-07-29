@@ -5,7 +5,7 @@
 /// merge-on-read visibility predicate (the upper bound on the commit axis
 /// and the optional OR'd own-writes clause), not on-disk materialization.
 ///
-/// CHA-429: the read pins a point on EITHER commit axis — wall-clock
+/// The read pins a point on EITHER commit axis — wall-clock
 /// (`AsOfMicros`) or the gapless commit-order serial (`AsOfSeq`) — and the
 /// merge always *orders* internally by `commit_seq_num` (the authoritative
 /// total order; `commit_micros` can tie under concurrency). The
@@ -15,19 +15,19 @@
 pub enum ReadSnapshot {
     /// Point-in-time on the commit-timestamp axis: `commit_micros
     /// <= ts`. The default read path pins this to a captured `pg_now`
-    /// (CHA-86) — there is no unbounded read variant.
+    /// — there is no unbounded read variant.
     AsOfMicros(i64),
-    /// Point-in-time on the commit-order axis (CHA-429): `commit_seq_num <=
+    /// Point-in-time on the commit-order axis: `commit_seq_num <=
     /// seq`. Exact — unlike `commit_micros`, the serial never ties.
     AsOfSeq(i64),
-    /// CHA-472: like [`ReadSnapshot::AsOfSeq`] for *planning* (an exact
+    /// Like [`ReadSnapshot::AsOfSeq`] for *planning* (an exact
     /// `commit_seq_num <= seq` pin on the per-branch commit frontier), but flagged
     /// as the DEFAULT "read latest" resolution rather than an explicit seq
-    /// time-travel. CHA-492: the snapshot-list cache is keyed on the resolved
-    /// snapshot's `W_snap`, so every read shape (this, explicit `AsOfSeq` /
-    /// `AsOfMicros` time-travel) shares one content-addressed entry per snapshot
-    /// version — the flag no longer gates cache eligibility. The immutable cold
-    /// baseline is all the cache holds; the hot change-log is always read fresh.
+    /// time-travel. The snapshot-list cache is keyed on the resolved snapshot's
+    /// `W_snap`, so every read shape shares one content-addressed entry per
+    /// snapshot version — this flag does not gate cache eligibility. The
+    /// immutable cold baseline is all the cache holds; the hot change-log is
+    /// always read fresh.
     LatestSeq(i64),
     /// Snapshot isolation for an open tx at `began_at_seq_num` plus
     /// read-your-own-writes for `tx_uuid`. Visibility predicate:
@@ -38,7 +38,7 @@ pub enum ReadSnapshot {
     ///
     /// The strict `<` excludes txs that committed at/after this tx's BEGIN
     /// frontier (snapshot isolation). `began_at_seq_num` is the
-    /// `commit_tx_log_seq_num` counter value captured at BEGIN (CHA-429) — the
+    /// `commit_tx_log_seq_num` counter value captured at BEGIN — the
     /// next-to-allocate frontier, so `< began_at_seq_num` is exactly
     /// "committed before this tx began". The OR clause picks up this tx's
     /// own uncommitted writes from the upsert/delete logs (where
@@ -50,7 +50,7 @@ pub enum ReadSnapshot {
 }
 
 impl ReadSnapshot {
-    /// CHA-441: the open tx's uuid on an [`ReadSnapshot::OpenTx`] read, else
+    /// The open tx's uuid on an [`ReadSnapshot::OpenTx`] read, else
     /// `None`. Callers thread it into `QueryManager::plan` so the phase-1 hot
     /// existence gate includes the tx's own RYOW writes — derive it from the
     /// snapshot rather than assuming a read is non-open-tx.
@@ -75,11 +75,9 @@ impl ReadSnapshot {
     ///   segment below the fence and the per-row `commit_seq_num` predicate in
     ///   the cold merge SQL does the visibility (`plan_commit_seq_upper` —
     ///   `began_at_seq_num - 1` for OpenTx). (Pruning these segments on
-    ///   `min/max_commit_seq_num` is a later optimization, not correctness —
-    ///   CHA-429 deliverable #4.)
+    ///   `min/max_commit_seq_num` is a later optimization, not correctness.)
     ///
-    /// Always a concrete bound since CHA-86 removed the unbounded variant
-    /// (CHA-361).
+    /// Always a concrete bound — there is no unbounded read variant.
     pub fn plan_as_of_micros(&self) -> i64 {
         match self {
             ReadSnapshot::AsOfMicros(ts) => *ts,
@@ -90,7 +88,7 @@ impl ReadSnapshot {
     }
 
     /// Inclusive `commit_seq_num` upper bound for cold-segment SELECTION on
-    /// the commit-order axis (CHA-429 deliverable #4) — the seq sibling
+    /// the commit-order axis — the seq sibling
     /// of [`ReadSnapshot::plan_as_of_micros`].
     ///
     /// - [`ReadSnapshot::AsOfSeq`] → `Some(n)`: `plan` skips cold segments
@@ -101,12 +99,9 @@ impl ReadSnapshot {
     /// - [`ReadSnapshot::OpenTx`] → `Some(began_at_seq_num - 1)`: snapshot
     ///   isolation on the seq axis — cold serves only `commit_seq_num <
     ///   began_at_seq_num`, matching the hot path's predicate
-    ///   (`read_snapshot_clause`). CHA-444 dropped Persist's
-    ///   `oldest_open_began_at` write-time clamp (which used to freeze every
-    ///   cold row below the open tx's frontier), so the OpenTx visibility bound
-    ///   moves here, to the read side. Without it cold would serve rows
-    ///   committed *after* the tx began once they reach cold — an isolation
-    ///   violation the write-time clamp used to prevent.
+    ///   (`read_snapshot_clause`). This read-side bound is the ONLY thing
+    ///   enforcing OpenTx isolation against cold: without it, cold would serve
+    ///   rows committed *after* the tx began once they reach cold.
     pub fn plan_commit_seq_upper(&self) -> Option<i64> {
         match self {
             ReadSnapshot::AsOfSeq(n) | ReadSnapshot::LatestSeq(n) => Some(*n),
@@ -149,9 +144,9 @@ mod tests {
         }
     }
 
-    // CHA-441: the gate threads `open_tx_uuid` from the snapshot,
-    // so the accessor must return the tx uuid ONLY for OpenTx — a regression to
-    // `None` here re-opens the cold-DDL RYOW gap on the system-table axis.
+    // The hot existence gate threads `open_tx_uuid` from the snapshot, so the
+    // accessor must return the tx uuid ONLY for OpenTx — a regression to `None`
+    // here re-opens the cold-DDL RYOW gap on the system-table axis.
     #[test]
     fn open_tx_uuid_some_only_for_open_tx() {
         let tx = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
@@ -167,11 +162,10 @@ mod tests {
         assert!(ReadSnapshot::AsOfSeq(7).open_tx_uuid().is_none());
     }
 
-    // CHA-444: the cold read's seq upper per snapshot variant. OpenTx is the
-    // load-bearing case — it carries `began_at_seq_num - 1` so cold serves only
-    // `commit_seq_num < began_at_seq_num` (snapshot isolation), replacing the
-    // removed write-time `oldest_open_began_at` clamp. The hot path already
-    // applies the same `< began_at_seq_num` predicate (`read_snapshot_clause`).
+    // OpenTx is the load-bearing case — it carries `began_at_seq_num - 1` so
+    // cold serves only `commit_seq_num < began_at_seq_num` (snapshot isolation).
+    // The hot path applies the same `< began_at_seq_num` predicate
+    // (`read_snapshot_clause`).
     #[test]
     fn plan_commit_seq_upper_open_tx_is_began_minus_one() {
         assert_eq!(open_tx(100).plan_commit_seq_upper(), Some(99));

@@ -48,10 +48,6 @@ _requires_rust = pytest.mark.skipif(
     reason="Flight SQL requires --backend rust",
 )
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.usefixtures("query_setup")
 class TestQueryPerformance:

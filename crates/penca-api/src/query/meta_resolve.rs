@@ -1,16 +1,15 @@
-//! CHA-472: metadata read methods rehomed off `penca_storage_meta::LifecycleManager`
-//! onto [`QueryManager`] (ADR 0028) — the system-table resolves
+//! [`QueryManager`]'s metadata reads (ADR 0028) — the system-table resolves
 //! (`resolve_{table,schema,index}_metadata`), the metadata getters, the
 //! `(open_tx, as_of)` snapshot resolver, and the by-branch lifecycle reads.
-//! CHA-472 IMPL-2 / CHA-492: the three system-table resolves pass the
-//! W_snap-keyed snapshot-list cache unconditionally — the key is
-//! content-addressed by snapshot version, so every resolve (current-time or
-//! time-travel) hits its own immutable entry with no staleness to gate on; the
-//! by-branch lifecycle reads stay `cache = None` (they always read fresh).
+//!
+//! The three system-table resolves pass the W_snap-keyed snapshot-list cache
+//! unconditionally: the key is content-addressed by snapshot version, so every
+//! resolve (current-time or time-travel) hits its own immutable entry with no
+//! staleness to gate on. The by-branch lifecycle reads stay `cache = None` —
+//! they must always read fresh.
 
-// CHA-472: faithfully preserve the source crate's crate-wide
-// `#![allow(clippy::too_many_arguments)]` posture — the relocated SQL readers
-// carry many positional args and the new `&self` receiver tips several over.
+// The SQL readers here carry many positional args and the `&self` receiver
+// tips several over the threshold.
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
@@ -44,54 +43,50 @@ use super::cold_read::stream_cold_read;
 /// (`seq_num = 0`) both yield `SNAPSHOT_SEQ_GENESIS` (`-1`) — `AsOfSeq(-1)`
 /// sees nothing committed. Split out from [`QueryManager::branch_seq_frontier`]
 /// so the offset + genesis edge are unit-testable without a row-returning
-/// driver (sqlx `PgRow` is not constructible in a unit test). CHA-443 (IMPL-6).
+/// driver (sqlx `PgRow` is not constructible in a unit test).
 fn seq_frontier_from_counter(counter_seq_num: Option<i64>) -> i64 {
     counter_seq_num.unwrap_or(0) - 1
 }
 
 /// Parse a UUID string into a [`Uuid`], mapping a malformed value to a typed
 /// `MetadataError::Db` protocol error attributed to `field` (e.g.
-/// `"table_uuid"`) rather than injecting the raw string into SQL. Collapses
-/// the by-uuid metadata getters' parse-or-error blocks (CHA-473); the
-/// plan-side `table_uuid` parse (CHA-484) shares it.
+/// `"table_uuid"`) rather than injecting the raw string into SQL.
 pub(crate) fn parse_meta_uuid(s: &str, field: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
         MetadataError::Db(sqlx::Error::Protocol(format!("invalid {field} '{s}': {e}")))
     })
 }
 
-/// How a system-table read selects rows (CHA-484).
+/// How a system-table read selects rows.
 pub(crate) enum SystemSelection {
     /// Full scan or plain residual filter (list reads, FK lists,
     /// schema-scoped shapes) — merge path only.
     Scan { filter: Option<String> },
-    /// CHA-473 identity restriction: seek + restricted exclusion via the
-    /// merge; bypass-eligible iff `filter` is `None` (the CHA-476 gate,
-    /// unchanged semantics).
+    /// Identity restriction: seek + restricted exclusion via the merge;
+    /// bypass-eligible iff `filter` is `None`.
     IdentitySeek {
         row_uuids: Vec<Uuid>,
         filter: Option<String>,
     },
-    /// CHA-484 unique composite name-key selection. The seek IS the complete
-    /// answer (exact selection, ADR 0023/0029) → bypass when eligible; else
-    /// the read derives the equivalent SQL residual from the same key/values
-    /// and rides `stream_merged` (the seek entry itself never reaches the
-    /// merge — penca-merge's name-entry fail-fast stays as the guard).
+    /// Unique composite name-key selection. The seek IS the complete answer
+    /// (exact selection, ADR 0023/0029) → bypass when eligible; else the read
+    /// derives the equivalent SQL residual from the same key/values and rides
+    /// `stream_merged` (the seek entry itself never reaches the merge —
+    /// penca-merge's name-entry fail-fast stays as the guard).
     NameSeek { tuples: Vec<Vec<String>> },
-    /// CHA-499 leading-prefix selection: `table_uuid`-only (arity-1) probes on
-    /// the composite `(table_uuid, index_name)` name sidecar — the seek returns
+    /// Leading-prefix selection: `table_uuid`-only (arity-1) probes on the
+    /// composite `(table_uuid, index_name)` name sidecar — the seek returns
     /// every index row of each listed table. Exact (the seek IS the complete
     /// answer for the `table_uuid IN (…)` predicate) → bypass when eligible;
-    /// else the derived `l.table_uuid IN (…)` residual rides `stream_merged`
-    /// (the CHA-496 filtered scan), so the seek is built on top of the scan.
+    /// else the derived `l.table_uuid IN (…)` residual rides `stream_merged`,
+    /// so the seek is built on top of the scan.
     PrefixSeek { table_uuids: Vec<String> },
 }
 
 /// A resolved system-table seek: the internal seek entry plus its SQL residual
 /// fallback, derived from one source (the spec's key columns + the probe
-/// values) so the two can't drift. Shared by the composite name seek
-/// ([`resolve_name_seek`], CHA-484) and the leading-prefix seek
-/// ([`resolve_prefix_seek`], CHA-499).
+/// values) so the two can't drift. Shared by [`resolve_name_seek`] and
+/// [`resolve_prefix_seek`].
 struct ResolvedSystemSeek {
     seek: IndexSeek,
     residual: String,
@@ -152,8 +147,8 @@ fn resolve_name_seek(
     Ok(ResolvedSystemSeek {
         seek: IndexSeek {
             index_uuid: Some(spec.index_uuid),
-            // CHA-485: the seek carries its key columns so the snapshot seek
-            // decodes the composite name sidecar against its typed key schema.
+            // Carried so the snapshot seek decodes the composite name sidecar
+            // against its typed key schema.
             key_columns: spec.key_columns.iter().map(|c| c.to_string()).collect(),
             tuples,
         },
@@ -161,17 +156,17 @@ fn resolve_name_seek(
     })
 }
 
-/// Resolve a `table_uuid` leading-PREFIX seek (CHA-499) against the same
-/// CHA-481 name-index spec `resolve_name_seek` uses. The composite name sidecar
-/// is `(table_uuid, index_name)`, so an arity-1 `table_uuid` probe seeks the
-/// leading key column and returns every index row of each listed table.
+/// Resolve a `table_uuid` leading-PREFIX seek against the same name-index spec
+/// `resolve_name_seek` uses. The composite name sidecar is `(table_uuid,
+/// index_name)`, so an arity-1 `table_uuid` probe seeks the leading key column
+/// and returns every index row of each listed table.
 ///
 /// Fail fast (never a silent scan): errors if the target has no built-in name
 /// index, if the spec's LEADING key column is not `table_uuid` (a re-key that
 /// moved it off the lead would make an arity-1 probe silently over-select — pin
 /// the coupling here, at the resolve boundary), or on an empty probe set. The
 /// seek carries the FULL key columns (so the sidecar decodes at full arity)
-/// with arity-1 `table_uuid` tuples; the residual is the CHA-496
+/// with arity-1 `table_uuid` tuples; the residual is the
 /// `l.table_uuid IN (…)` scan, derived from the same values so the two can't
 /// drift.
 fn resolve_prefix_seek(
@@ -202,7 +197,7 @@ fn resolve_prefix_seek(
         seek: IndexSeek {
             index_uuid: Some(spec.index_uuid),
             // FULL composite key columns so the sidecar decodes at full arity;
-            // the arity-1 tuples below make it a leading-prefix probe (CHA-499).
+            // the arity-1 tuples below make it a leading-prefix probe.
             key_columns: spec.key_columns.iter().map(|c| c.to_string()).collect(),
             tuples: table_uuids
                 .into_iter()
@@ -214,7 +209,7 @@ fn resolve_prefix_seek(
 }
 
 /// Compose the optional `__penca_system__.tables` schema scope
-/// (`l.schema_uuid = '<uuid>'`, CHA-184/CHA-177 — TEXT column, no cast) with an
+/// (`l.schema_uuid = '<uuid>'` — a TEXT column, so no cast) with an
 /// optional residual filter into the outer-SELECT WHERE fragment. `l.` is the
 /// latest-CTE alias `stream_merged` projects on. `None` schema scope returns
 /// every schema's tables on the branch (the catalog-wide read shape).
@@ -241,10 +236,8 @@ fn system_table_label(catalog: &Uuid, table_uuid: &Uuid) -> &'static str {
 }
 
 /// Demux the rows of a filterless `__penca_system__.indexes` scan into
-/// per-table index groups keyed by `table_uuid` (CHA-496). `index_from_record_batch`
-/// already decodes `Index.table_uuid`, so the group key reads off the decoded
-/// row — this is the batched replacement for `meta_list_tables`'s per-table
-/// `resolve_table_indexes` N+1.
+/// per-table index groups keyed by `table_uuid` — the batched alternative to a
+/// per-table `resolve_table_indexes` N+1 in `meta_list_tables`.
 fn demux_indexes_by_table(index_batches: &[RecordBatch]) -> HashMap<String, Vec<Index>> {
     let mut indexes_by_table: HashMap<String, Vec<Index>> = HashMap::new();
     for batch in index_batches {
@@ -261,23 +254,16 @@ fn demux_indexes_by_table(index_batches: &[RecordBatch]) -> HashMap<String, Vec<
 }
 
 /// Build the `l.table_uuid IN ('u1','u2',…)` residual scoping a batched
-/// `__penca_system__.indexes` read to a specific set of tables (CHA-496). `l.`
-/// is the latest-CTE alias `stream_merged` projects; `table_uuid` is a text
-/// column (matches the single-table `resolve_table_indexes`
-/// `l.table_uuid = '…'` shape — no `::uuid` cast).
+/// `__penca_system__.indexes` read to a specific set of tables. `l.` is the
+/// latest-CTE alias `stream_merged` projects; `table_uuid` is a text column,
+/// so no `::uuid` cast.
 ///
-/// The values are `table_uuid`s just read off the `__penca_system__.tables`
-/// `table_uuid` column (CHA-380; formerly the overloaded `row_uuid`) —
-/// already-validated, system-generated stored values — inlined directly.
-/// Unlike the single-table `resolve_table_indexes` path (which takes a
-/// caller-supplied `table_uuid: &str` and runs it through `parse_meta_uuid`
-/// for fail-fast validation + normalization), this batched path intentionally
-/// skips that guard: its inputs are trusted DB rows, not caller input, so a
-/// parse would be a wasted round-trip. A corrupt stored `table_uuid` would splice
-/// a broken query rather than surface a typed error — acceptable given the
-/// source.
+/// The values are inlined without a `parse_meta_uuid` guard, unlike the
+/// single-table `resolve_table_indexes` path: these are stored DB rows, not
+/// caller input, so a parse would be a wasted round-trip. A corrupt stored
+/// `table_uuid` splices a broken query rather than surfacing a typed error.
 ///
-/// Plain `IN (...)` — not Postgres-only `= ANY(ARRAY[…]::text[])` — so it is
+/// Plain `IN (...)` — NOT Postgres-only `= ANY(ARRAY[…]::text[])` — so it is
 /// valid in both the hot (Postgres) and cold (DataFusion) legs `stream_merged`
 /// unions. Callers must guard the empty-slice case (an empty `IN ()` is a SQL
 /// error); `meta_list_tables` skips the read entirely when no tables are listed.
@@ -291,20 +277,15 @@ fn table_uuid_in_filter(table_uuids: &[String]) -> String {
 }
 
 impl QueryManager {
-    /// One plan+dispatch entry for every system-table read (CHA-484): build
-    /// the plan through the shared CHA-472 cache gate, then hand off to the
-    /// shared [`stream_cold_read`] kernel (DataFusion-free snapshot seek when
+    /// One plan+dispatch entry for every system-table read: build the plan
+    /// through the shared cache gate, then hand off to the shared
+    /// [`stream_cold_read`] kernel (DataFusion-free snapshot seek when
     /// eligible, else the `stream_all_cold` / `stream_merged` pipeline).
     ///
-    /// CHA-380 collapsed this fully onto `stream_cold_read` — no
-    /// metadata-specific parameter survives. The old divergences dissolved once
-    /// the system rows exposed first-class entity-uuid columns: metadata drops
-    /// `row_uuid` at the projection like `read_data` (`*_from_record_batch` and
-    /// the uuid-list reads now read those columns, not `row_uuid`), and its
-    /// name/prefix seeks ride the merge fallback as accelerators like a user
-    /// covering index. All that stays metadata-specific is the
-    /// `SystemSelection -> (seek, residual, exact)` resolution below; the
-    /// `Vec<RecordBatch>` collect is a thin boundary wrapper.
+    /// Nothing metadata-specific survives past the `SystemSelection -> (seek,
+    /// residual, exact)` resolution below — the kernel is byte-identical to
+    /// `read_data`'s. The `Vec<RecordBatch>` collect is a boundary wrapper for
+    /// metadata callers that want a bounded result, NOT a `collect: bool` knob.
     pub(crate) async fn read_system_table<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -324,7 +305,7 @@ impl QueryManager {
         // (seek entry, merge residual, exactness). A name/prefix entry rides
         // the merge fallback as a selection accelerator like a user covering
         // index — penca-merge accepts any non-identity seek that carries its
-        // residual `filter` (CHA-380).
+        // residual `filter`.
         let (seek, filter, exact) = match selection {
             SystemSelection::Scan { filter } => (None, filter, false),
             SystemSelection::IdentitySeek { row_uuids, filter } => {
@@ -349,26 +330,15 @@ impl QueryManager {
                 branch_uuid,
                 snapshot.plan_as_of_micros(),
                 snapshot.plan_commit_seq_upper(),
-                // CHA-433: system-table (metadata) reads are never retention-
-                // governed — pass None so no floor is read or enforced.
+                // Metadata reads are never retention-governed, so no floor is
+                // read or enforced.
                 None,
-                // CHA-492: W_snap-keyed snapshot-list cache — safe for any
-                // resolve; a disabled cache is the per-service opt-out.
+                // W_snap-keyed, so safe for any resolve; a disabled cache is
+                // the per-service opt-out.
                 Some(self.snapshot_list_cache.as_ref()),
             )
             .await?;
 
-        // CHA-380: the metadata read path is now a thin wrapper over the shared
-        // `stream_cold_read` kernel (bypass seek, else `stream_all_cold` /
-        // `stream_merged`, projected to the user columns) — identical to
-        // `read_data`. The old divergences dissolved once the system rows
-        // exposed first-class entity-uuid columns: metadata drops `row_uuid`
-        // like `read_data` (`*_from_record_batch` + the uuid-list reads now read
-        // the real columns), and its name/prefix seeks ride the merge like a
-        // user covering index. All that stays metadata-specific is the
-        // `SystemSelection -> (seek, residual, exact)` resolution above; the
-        // collect is a boundary wrapper (metadata callers want a bounded
-        // `Vec<RecordBatch>`, not a stream), NOT a `collect: bool` knob.
         let seeks = seek.map(|entry| vec![entry]);
         let stream = stream_cold_read(
             driver,
@@ -380,8 +350,8 @@ impl QueryManager {
             filter.as_deref(),
             seeks,
             exact,
-            // Metadata reads pull at most 1-2 cold segments per branch and are
-            // always <=1 segment, so pruning is skipped regardless (CHA-353).
+            // Metadata reads pull at most 1-2 cold segments per branch, so
+            // pruning never fires regardless of these values.
             2,
             1,
         );
@@ -392,38 +362,36 @@ impl QueryManager {
         Ok(batches)
     }
 
-    /// Resolve table metadata using the transactional auditable store
-    /// CTE (CHA-164). Returns raw rows without retention coalesce.
+    /// Resolve table metadata using the transactional auditable store CTE.
+    /// Returns raw rows without retention coalesce.
     ///
     /// Visibility resolves via JOIN against `commit_tx_log_partition(catalog,
     /// branch)`; rows are deduplicated by `table_uuid`. When
     /// `open_tx_uuid` is set, uncommitted rows from that tx are visible
     /// (read-your-own-writes).
     ///
-    /// CHA-168: routes through `stream_merged`, so it tolerates the
-    /// post-persist state where `__penca_system__.tables` rows live in
-    /// cold and the gating commit_tx_log entries are also in cold (hot
-    /// `commit_tx_log_partition` has been purged unconditionally up to
-    /// the persist watermark). Callers must supply a `DlDriver` for cold
-    /// segment access; a `ReadSnapshot::AsOfMicros` pinned to `pg_now`
-    /// is the standard choice for metadata reads (CHA-86).
+    /// Routes through `stream_merged`, so it tolerates the post-persist state
+    /// where both the `__penca_system__.tables` rows and their gating
+    /// commit_tx_log entries live in cold (hot `commit_tx_log_partition` is
+    /// purged unconditionally up to the persist watermark). Callers must
+    /// supply a `DlDriver` for cold segment access; a
+    /// `ReadSnapshot::AsOfMicros` pinned to `pg_now` is the standard choice
+    /// for metadata reads.
     ///
-    /// `filter`, when supplied, is appended (`AND`-joined) to the
-    /// optional builtin schema_uuid filter. Inline literals in the
-    /// filter (`u.row_uuid = '<uuid>'::uuid`); `stream_merged`'s SQL
-    /// builder does not support `$N` placeholders.
+    /// `filter`, when supplied, is appended (`AND`-joined) to the optional
+    /// builtin schema_uuid filter. Literals MUST be inlined
+    /// (`u.row_uuid = '<uuid>'::uuid`) — `stream_merged`'s SQL builder does
+    /// not support `$N` placeholders.
     ///
-    /// CHA-184: `schema_uuid` is `Option<&str>`. `Some(uuid)` keeps the
-    /// pre-CHA-184 per-schema filter (`l.schema_uuid = '<uuid>'`);
-    /// `None` returns rows for every schema on the branch — the
+    /// `schema_uuid = None` returns rows for every schema on the branch — the
     /// catalog-wide read shape that branch RPCs need to fan out across
     /// `s1.t1`, `s2.t2`, ... .
     ///
-    /// CHA-484: `table_names`, when supplied, selects by the built-in
-    /// composite `(schema_uuid, table_name)` name key — `schema_uuid` must be
-    /// `Some` (the key needs the scope) and `filter` must be `None`; the read
-    /// seeks the CHA-481 name index (DataFusion-free when snapshot-covered)
-    /// or degrades to the equivalent residual filter.
+    /// `table_names`, when supplied, selects by the built-in composite
+    /// `(schema_uuid, table_name)` name key — `schema_uuid` must be `Some`
+    /// (the key needs the scope) and `filter` must be `None`; the read seeks
+    /// the name index (DataFusion-free when snapshot-covered) or degrades to
+    /// the equivalent residual filter.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -432,14 +400,12 @@ impl QueryManager {
             branch = %branch_uuid,
             schema = ?schema_uuid,
             as_of_micros = ?snapshot.plan_as_of_micros(),
-            // Span-field NAME stays `row_uuids` — the CHA-473 acceptance
-            // suite (integration_metadata_point_read_test.py) pins
+            // The field NAME must stay `row_uuids`:
+            // tests/integration/integration_metadata_point_read_test.py pins
             // `row_uuids=1` on the resolve spans.
             row_uuids = table_uuids.map_or(0usize, <[Uuid]>::len),
         ),
     )]
-    // CHA-473/484: structured restriction + name-key params; the inputs are
-    // all genuinely independent (matches `build_merge_resolved`'s allow).
     #[allow(clippy::too_many_arguments)]
     pub async fn resolve_table_metadata<L>(
         &self,
@@ -460,17 +426,11 @@ impl QueryManager {
         let sys_tables_table_uuid = naming::system_tables_table_uuid(&catalog);
         let sys_arrow_schema: SchemaRef = Arc::new(PgDialect::system_tables_arrow_schema());
 
-        // CHA-177: schema_uuid on `__penca_system__.tables` is TEXT
-        // (Arrow utf8 → PG TEXT). No ::uuid cast.
-        //
-        // Qualify with `l.` (latest) — stream_merged appends the filter
-        // to the outer SELECT after the `latest l LEFT JOIN deletes d`
-        // join, so an unqualified `row_uuid` is ambiguous (both `l`
-        // and `d` carry it via USING(row_uuid)). `l.` is the
-        // projection-side alias.
-        //
-        // CHA-184: omit the schema_uuid clause when None so the read
-        // returns every schema's tables on the branch.
+        // Filter fragments below must qualify with `l.` (latest): stream_merged
+        // appends the filter to the outer SELECT after the
+        // `latest l LEFT JOIN deletes d` join, so an unqualified `row_uuid` is
+        // ambiguous — both `l` and `d` carry it via USING(row_uuid). `l.` is
+        // the projection-side alias.
         let selection = if let Some(names) = table_names {
             let Some(schema) = schema_uuid else {
                 return Err(MetadataError::Db(sqlx::Error::Protocol(
@@ -492,12 +452,10 @@ impl QueryManager {
                     .collect(),
             }
         } else if let Some(uuids) = table_uuids {
-            // CHA-473: the structured identity restriction; the schema scope
-            // (when supplied) stays a residual so a wrong-schema lookup still
-            // resolves to nothing.
-            // CHA-380: the caller passes table_uuids; derive each row_uuid
-            // canonically (`row_uuid_for_pk`) since row_uuid no longer equals
-            // the raw table_uuid. The identity seek stays on the `row_uuid` PK.
+            // The schema scope (when supplied) stays a residual so a
+            // wrong-schema lookup still resolves to nothing. `row_uuid` does
+            // NOT equal the raw table_uuid, so each is derived canonically via
+            // `row_uuid_for_pk`; the identity seek is on the `row_uuid` PK.
             SystemSelection::IdentitySeek {
                 row_uuids: uuids
                     .iter()
@@ -528,19 +486,19 @@ impl QueryManager {
     }
 
     /// The per-branch commit-order frontier: the highest committed
-    /// `commit_seq_num` = the `commit_tx_log_seq_num` counter's `seq_num - 1`. The
-    /// counter row (CHA-428) holds the NEXT `commit_seq_num` to allocate, and
-    /// aborts roll it back, so `seq_num - 1` is always the last committed
-    /// serial (and stays gapless). The counter leaf holds exactly one row;
-    /// an in-flight commit's increment is invisible under MVCC until it
-    /// commits, so this reads the last-committed frontier (O(1), never a
-    /// `MAX(commit_seq_num)` scan — same source `begin_tx_log` anchors on).
+    /// `commit_seq_num` = the `commit_tx_log_seq_num` counter's `seq_num - 1`.
+    /// The counter row holds the NEXT `commit_seq_num` to allocate, and aborts
+    /// roll it back, so `seq_num - 1` is always the last committed serial (and
+    /// stays gapless). The counter leaf holds exactly one row; an in-flight
+    /// commit's increment is invisible under MVCC until it commits, so this
+    /// reads the last-committed frontier (O(1), never a `MAX(commit_seq_num)`
+    /// scan — the same source `begin_tx_log` anchors on).
     ///
-    /// CHA-443 (IMPL-6): the seq-axis sibling of [`LifecycleManager::now_micros`] —
-    /// the default "read latest" pin for `resolve_read_snapshot` and the
-    /// data read. A fresh branch with no commit (`seq_num = 0`, or no
-    /// counter row) yields `SNAPSHOT_SEQ_GENESIS` (`-1`): `AsOfSeq(-1)`
-    /// sees nothing committed, which is correct for an empty branch.
+    /// The seq-axis sibling of [`LifecycleManager::now_micros`] — the default
+    /// "read latest" pin for `resolve_read_snapshot` and the data read. A
+    /// fresh branch with no commit (`seq_num = 0`, or no counter row) yields
+    /// `SNAPSHOT_SEQ_GENESIS` (`-1`): `AsOfSeq(-1)` sees nothing committed,
+    /// which is correct for an empty branch.
     pub async fn branch_seq_frontier(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -571,22 +529,20 @@ impl QueryManager {
     ///    through to the default.
     /// 2. `as_of_micros = Some` → [`ReadSnapshot::AsOfMicros`] (identifiers
     ///    resolve on the micros axis, matching a micros data read).
-    /// 3. `as_of_seq = Some` → [`ReadSnapshot::AsOfSeq`] (CHA-443: a seq
-    ///    time-travel read resolves identifiers on the SAME seq axis as its
-    ///    data, so a renamed table is found at its historical name).
+    /// 3. `as_of_seq = Some` → [`ReadSnapshot::AsOfSeq`] — a seq time-travel
+    ///    read resolves identifiers on the SAME seq axis as its data, so a
+    ///    renamed table is found at its historical name.
     /// 4. None → [`ReadSnapshot::LatestSeq`] pinned to the branch's commit
-    ///    frontier (CHA-443 / CHA-86: no unbounded reads; the default
-    ///    "read latest" pins the seq axis so identifiers + data compose with
-    ///    the seq tier-fence). `LatestSeq` (not `AsOfSeq`) flags this as the
-    ///    default current-time resolution — a distinction the DataFusion-free
-    ///    seek bypass still gates on (CHA-476), though CHA-492's W_snap-keyed
-    ///    snapshot-list cache no longer does. Callers
-    ///    that must share one pin across
-    ///    several resolutions in the same RPC (e.g. `read_data` pins
-    ///    identifier resolution + the data read together) capture the
-    ///    frontier once and thread it as `default_frontier`; callers with a
-    ///    single resolution per request pass `None` and let this method
-    ///    self-capture [`Self::branch_seq_frontier`].
+    ///    frontier. Never an unbounded read: the default "read latest" pins
+    ///    the seq axis so identifiers + data compose with the seq tier-fence.
+    ///    `LatestSeq` (not `AsOfSeq`) flags this as the default current-time
+    ///    resolution — a distinction the DataFusion-free seek bypass gates on.
+    ///    Callers that must share one pin across several resolutions in the
+    ///    same RPC (e.g. `read_data` pins identifier resolution + the data
+    ///    read together) capture the frontier once and thread it as
+    ///    `default_frontier`; callers with a single resolution per request
+    ///    pass `None` and let this method self-capture
+    ///    [`Self::branch_seq_frontier`].
     pub async fn resolve_read_snapshot(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -616,11 +572,6 @@ impl QueryManager {
         if let Some(seq) = as_of_seq {
             return Ok(ReadSnapshot::AsOfSeq(seq));
         }
-        // CHA-443 (IMPL-6): the default "read latest" pins the per-branch
-        // seq frontier (counter - 1) so identifier resolution and the data
-        // read share one bounded seq snapshot — the same axis the seq
-        // tier-fence partitions on. `branch_seq_frontier` is the seq sibling
-        // of the CHA-86 `now()` capture.
         let frontier = match default_frontier {
             Some(seq) => seq,
             None => Self::branch_seq_frontier(driver, catalog_uuid, branch_uuid).await?,
@@ -631,12 +582,9 @@ impl QueryManager {
     /// Get a single table by UUID or name, with retention coalesced from
     /// schema and catalog.
     ///
-    /// `table_uuid` is stable across branches;
-    /// after CHA-164 it is also the dedup column on the auditable-store
-    /// resolve, so the filter matches against `u.table_uuid`
-    /// directly — no physical UUID derivation needed.
-    ///
-    /// 1 SQL query (vs 2 in the Python implementation).
+    /// `table_uuid` is stable across branches and is the dedup column on the
+    /// auditable-store resolve, so the filter matches `u.table_uuid` directly
+    /// — no physical UUID derivation needed.
     pub async fn meta_get_table<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -653,14 +601,8 @@ impl QueryManager {
     {
         let resolved_branch = resolve_branch(driver, catalog_uuid, branch_uuid).await?;
 
-        // CHA-473: a by-uuid resolve threads the parsed table_uuid as the
-        // structured CHA-398 restriction; the IdentitySeek derives its
-        // row_uuid canonically (CHA-380: row_uuid_for_pk over
-        // `__penca_system__.tables`); CHA-484: a by-name resolve threads the
-        // name through the structured `table_names` selector (the built-in
-        // `(schema_uuid, table_name)` name key) instead of a filter string.
-        // The UUID is still parsed up front so a malformed value returns a
-        // typed error rather than injecting into the query.
+        // Parsed up front so a malformed UUID returns a typed error rather
+        // than injecting into the query.
         let (table_uuids, table_names) = if let Some(uuid_str) = table_uuid {
             let uuid = parse_meta_uuid(uuid_str, "table_uuid")?;
             (Some(vec![uuid]), None)
@@ -687,15 +629,13 @@ impl QueryManager {
         for batch in &batches {
             if batch.num_rows() > 0 {
                 let mut table = table_from_record_batch(catalog_uuid, schema_uuid, batch, 0);
-                // CHA-168: retention coalescing (table → schema →
-                // catalog) is *not* applied here. Callers that need
-                // resolved retention compose
-                // `get_table` + `get_schema` + catalog_store after
-                // the read; most read paths only need the table
-                // itself.
-                // CHA-492: attach the table's DEFINED indexes in the same
-                // upfront (cache-gated) metadata phase so a reader learns them
-                // without a second round-trip.
+                // Retention coalescing is *not* applied here — callers that
+                // need resolved retention compose `get_table` + `get_schema`
+                // after the read; most read paths only need the table itself.
+                //
+                // The DEFINED indexes are attached in this same upfront
+                // (cache-gated) metadata phase so a reader learns them without
+                // a second round-trip.
                 table.indexes = self
                     .resolve_table_indexes(
                         driver,
@@ -716,18 +656,14 @@ impl QueryManager {
     ///
     /// Unlike [`get_table`], this does not scope the read to a `schema_uuid`:
     /// it seeks `__penca_system__.tables` by the `table_uuid`-derived
-    /// `row_uuid` (CHA-380) alone, so it resolves the table regardless of
-    /// which schema it actually lives
-    /// in (`table_uuid` is globally unique by 128-bit entropy, CHA-236). That
-    /// is what lets by-uuid callers pass a *convenient* schema — or none at
-    /// all — and still resolve the `__penca_system__` bootstrap-table rows
-    /// (filed under `system_schema_uuid`). The returned `Table` carries the
-    /// row's own `schema_uuid`, read off the `__penca_system__.tables` row
-    /// (CHA-177) rather than a caller-supplied value. The metadata read applies
-    /// no `schema_uuid` filter, so it spans every schema on the branch.
+    /// `row_uuid` alone, so it resolves the table regardless of which schema
+    /// it actually lives in (`table_uuid` is globally unique by 128-bit
+    /// entropy). That is what lets by-uuid callers pass a *convenient* schema
+    /// — or none at all — and still resolve the `__penca_system__`
+    /// bootstrap-table rows (filed under `system_schema_uuid`). The returned
+    /// `Table` carries the row's own `schema_uuid`, read off the
+    /// `__penca_system__.tables` row rather than a caller-supplied value.
     /// Retention is *not* coalesced here — same contract as [`get_table`].
-    ///
-    /// 1 SQL query.
     pub async fn get_table_by_uuid<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -742,15 +678,11 @@ impl QueryManager {
     {
         let resolved_branch = resolve_branch(driver, catalog_uuid, branch_uuid).await?;
 
-        // Safe-by-construction: parse `table_uuid` before stitching it into
-        // the SQL `row_filter` string so a malformed UUID returns a typed
-        // error rather than injecting into the query (same guard as
-        // `get_table`).
+        // Parsed before stitching into SQL so a malformed UUID returns a typed
+        // error rather than injecting into the query. `schema_uuid = None`
+        // below drops the `l.schema_uuid` clause, so the read spans every
+        // schema on the branch.
         let uuid = parse_meta_uuid(table_uuid, "table_uuid")?;
-        // CHA-473: thread the parsed row_uuid as the structured CHA-398
-        // restriction (was an `l.row_uuid = '<uuid>'` filter string).
-        // `schema_uuid = None` → no `l.schema_uuid` clause: the read spans
-        // every schema on the branch (CHA-184 catalog-wide read shape).
         let batches = self
             .resolve_table_metadata(
                 driver,
@@ -767,13 +699,11 @@ impl QueryManager {
 
         for batch in &batches {
             if batch.num_rows() > 0 {
-                // The row self-describes its schema (CHA-177); read it off the
-                // row rather than scoping by a caller-supplied value.
+                // The row self-describes its schema; read it off the row
+                // rather than scoping by a caller-supplied value.
                 let row_schema_uuid =
                     convert::rb_uuid_str(batch, "schema_uuid", 0).unwrap_or_default();
                 let mut table = table_from_record_batch(catalog_uuid, &row_schema_uuid, batch, 0);
-                // CHA-492: a by-uuid GetTable must also carry the table's DEFINED
-                // indexes (same upfront cache-gated read as meta_get_table).
                 table.indexes = self
                     .resolve_table_indexes(
                         driver,
@@ -821,28 +751,22 @@ impl QueryManager {
                 snapshot,
             )
             .await?;
-        // CHA-496: read the DEFINED indexes for exactly the listed tables in
-        // ONE scan — a single `resolve_index_metadata` filtered to
-        // `l.table_uuid IN (<the N listed tables>)` — then demux by
-        // `table_uuid`, instead of a per-table `resolve_table_indexes` call (an
-        // N+1 on this list-many RPC: N identical fused watermark queries + N
-        // filtered reads of the one `__penca_system__.indexes` table). Bounded
-        // to the N listed tables — NOT the whole branch's index catalog, which
-        // spans every schema. `index_from_record_batch` already decodes
-        // `Index.table_uuid`, so the demux keys off the existing field.
+        // Read the DEFINED indexes for exactly the listed tables in ONE scan,
+        // then demux by `table_uuid`. A per-table `resolve_table_indexes` here
+        // would be an N+1 on this list-many RPC: N identical fused watermark
+        // queries + N filtered reads of the one `__penca_system__.indexes`
+        // table. Scoped to the N listed tables — NOT the whole branch's index
+        // catalog, which spans every schema.
         //
-        // CHA-499: when `__penca_system__.indexes` is snapshot-materialized,
-        // this bounded scan becomes an O(log n) leading-`table_uuid` prefix seek
+        // When `__penca_system__.indexes` is snapshot-materialized this
+        // bounded scan becomes an O(log n) leading-`table_uuid` prefix seek
         // over the composite `(table_uuid, index_name)` name sidecar. The
-        // `PrefixSeek` selection carries that seek AND a derived
+        // `PrefixSeek` selection carries that seek AND the derived
         // `l.table_uuid IN (…)` residual; the not-materialized case rides the
-        // residual (exactly this filtered read), so the seek is built on top of
-        // the scan, not instead of it.
+        // residual, so the seek sits on top of the scan, not instead of it.
         let table_uuids: Vec<String> = batches
             .iter()
             .flat_map(|batch| {
-                // CHA-380: table_uuid is now a first-class column (was the
-                // overloaded row_uuid).
                 (0..batch.num_rows())
                     .filter_map(move |i| convert::rb_uuid_str(batch, "table_uuid", i))
             })
@@ -870,9 +794,7 @@ impl QueryManager {
         for batch in &batches {
             for i in 0..batch.num_rows() {
                 let mut table = table_from_record_batch(catalog_uuid, schema_uuid, batch, i);
-                // CHA-492/496: attach this table's DEFINED indexes from the
-                // single scoped scan (was a per-table round-trip). `.remove`
-                // moves the `Vec<Index>` (no clone) onto the owned proto.
+                // `.remove` moves the `Vec<Index>` (no clone) onto the proto.
                 table.indexes = indexes_by_table
                     .remove(&table.table_uuid)
                     .unwrap_or_default();
@@ -885,20 +807,15 @@ impl QueryManager {
     /// Get the Arrow schema bytes, partition keys, clustering keys, and
     /// primary keys for a table on a branch.
     ///
-    /// CHA-185: primary_keys are returned so snapshot/persist paths can
-    /// construct the widened delete_log schema. clustering_keys drive the
-    /// in-partition sort at snapshot time (see `sort_record_batch_by_keys`).
+    /// primary_keys are returned so snapshot/persist paths can construct the
+    /// widened delete_log schema. clustering_keys drive the in-partition sort
+    /// at snapshot time (see `sort_record_batch_by_keys`).
     ///
-    /// `table_uuid` is globally unique by probabilistic 128-bit entropy
-    /// (CHA-236 made namespace UUIDs random server-side), so the by-uuid
-    /// restriction (CHA-473; `resolve_table_metadata` derives the identity seek
-    /// as `row_uuid = row_uuid_for_pk(system_tables_table_uuid, [table_uuid])`,
-    /// CHA-380) narrows to exactly one row — no additional `schema_uuid` filter
-    /// is needed or useful.
-    /// (`__penca_system__.tables` is partitioned by branch_uuid (CHA-177),
-    /// not by schema, so a schema filter wouldn't prune storage either.) We
-    /// pass `schema_uuid=None` to `resolve_table_metadata` per the CHA-184
-    /// convention for unique by-uuid reads.
+    /// `table_uuid` is globally unique by probabilistic 128-bit entropy, so
+    /// the by-uuid restriction narrows to exactly one row — an additional
+    /// `schema_uuid` filter is neither needed nor useful, and
+    /// `__penca_system__.tables` is partitioned by branch_uuid rather than by
+    /// schema, so it would not prune storage either. Hence `schema_uuid=None`.
     pub async fn get_table_schema_and_layout_keys<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -911,10 +828,8 @@ impl QueryManager {
     where
         L: DlDriver + ?Sized,
     {
-        // CHA-473: parse the uuid and thread it as the structured CHA-398
-        // restriction (was an `l.row_uuid = '<uuid>'` filter string) so the
-        // exclusion-set probe restricts to this one row. A malformed uuid
-        // returns a typed error rather than injecting into the query.
+        // Parsed so a malformed uuid returns a typed error rather than
+        // injecting into the query.
         let uuid = parse_meta_uuid(table_uuid, "table_uuid")?;
         let batches = self
             .resolve_table_metadata(
@@ -946,15 +861,14 @@ impl QueryManager {
     /// List all `table_uuid`s present on a branch, optionally filtered
     /// to a single schema.
     ///
-    /// CHA-177: per-branch data tables are deterministic in
-    /// `(table_uuid, branch_uuid)` — callers pass that pair to the
-    /// hot-tier helpers ([`naming::upsert_log_table`] /
-    /// [`naming::delete_log_table`]) directly, with no separate
-    /// prefix column.
+    /// Per-branch data tables are deterministic in `(table_uuid,
+    /// branch_uuid)` — callers pass that pair to the hot-tier helpers
+    /// ([`naming::upsert_log_table`] / [`naming::delete_log_table`]) directly,
+    /// with no separate prefix column.
     ///
-    /// CHA-184: `schema_uuid = None` returns every schema's tables on
-    /// the branch — the catalog-wide read shape that DeleteBranch needs
-    /// to fan out cold-storage cleanup.
+    /// `schema_uuid = None` returns every schema's tables on the branch — the
+    /// catalog-wide read shape DeleteBranch needs to fan out cold-storage
+    /// cleanup.
     pub async fn list_table_uuids_for_branch<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -966,7 +880,7 @@ impl QueryManager {
     where
         L: DlDriver + ?Sized,
     {
-        // CHA-86: pin to pg_now rather than an unbounded read.
+        // Pin to pg_now rather than an unbounded read.
         let snapshot = LifecycleManager::now_snapshot(driver).await?;
         let batches = self
             .resolve_table_metadata(
@@ -984,8 +898,6 @@ impl QueryManager {
             .await?;
         let mut out: Vec<String> = Vec::new();
         for batch in &batches {
-            // CHA-380: table_uuid is now a first-class column (was the
-            // overloaded row_uuid).
             let Some(col) = batch.column_by_name("table_uuid") else {
                 continue;
             };
@@ -1003,17 +915,14 @@ impl QueryManager {
     }
     /// Get a schema on `branch_uuid` (defaults to main when None).
     ///
-    /// CHA-177: schemas live in `__penca_system__.schemas` partitioned
-    /// per-branch. Each branch sees the schema set materialized at
-    /// CreateBranch time plus its own subsequent DDL.
+    /// Schemas live in `__penca_system__.schemas` partitioned per-branch. Each
+    /// branch sees the schema set materialized at CreateBranch time plus its
+    /// own subsequent DDL.
     ///
-    /// CHA-236: `schema_uuid` is random-minted server-side, so the
-    /// name-resolution path selects by the built-in `schema_name` name key
-    /// (CHA-484) instead of recomputing a hash. `snapshot` is caller-supplied so the
-    /// name→uuid lookup uses the same snapshot as any subsequent data
-    /// read on the resolved table.
-    ///
-    /// 1 SQL query.
+    /// `schema_uuid` is random-minted server-side, so the name-resolution path
+    /// selects by the built-in `schema_name` name key rather than recomputing
+    /// a hash. `snapshot` is caller-supplied so the name→uuid lookup uses the
+    /// same snapshot as any subsequent data read on the resolved table.
     pub async fn meta_get_schema<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -1027,13 +936,8 @@ impl QueryManager {
     where
         L: DlDriver + ?Sized,
     {
-        // CHA-473: a by-uuid resolve threads the parsed schema_uuid as the
-        // structured CHA-398 restriction; the IdentitySeek derives its
-        // row_uuid canonically (CHA-380: row_uuid_for_pk over
-        // `__penca_system__.schemas`); CHA-484: a by-name resolve threads
-        // the name through the structured `schema_names` selector. The UUID
-        // is still parsed up front so a malformed value returns a typed
-        // error rather than injecting into the query.
+        // Parsed up front so a malformed value returns a typed error rather
+        // than injecting into the query.
         let (schema_uuids, schema_names) = if let Some(uuid_str) = schema_uuid {
             let uuid = parse_meta_uuid(uuid_str, "schema_uuid")?;
             (Some(vec![uuid]), None)
@@ -1078,7 +982,7 @@ impl QueryManager {
         L: DlDriver + ?Sized,
     {
         let branch = resolve_branch(driver, catalog_uuid, branch_uuid).await?;
-        // CHA-86: pin to pg_now rather than an unbounded read.
+        // Pin to pg_now rather than an unbounded read.
         let snapshot = LifecycleManager::now_snapshot(driver).await?;
         let batches = self
             .resolve_schema_metadata(
@@ -1153,7 +1057,7 @@ impl QueryManager {
         L: DlDriver + ?Sized,
     {
         let branch = resolve_branch(driver, catalog_uuid, branch_uuid).await?;
-        // CHA-86: pin to pg_now rather than an unbounded read.
+        // Pin to pg_now rather than an unbounded read.
         let snapshot = LifecycleManager::now_snapshot(driver).await?;
         let batches = self
             .resolve_schema_metadata(
@@ -1170,8 +1074,6 @@ impl QueryManager {
         let mut out = Vec::new();
         for batch in &batches {
             for i in 0..batch.num_rows() {
-                // CHA-380: schema_uuid is now a first-class column (was the
-                // overloaded row_uuid).
                 if let Some(s) = convert::rb_uuid_str(batch, "schema_uuid", i) {
                     out.push(s);
                 }
@@ -1185,12 +1087,11 @@ impl QueryManager {
     ///
     /// Routes through [`Self::read_system_table`] so the lookup tolerates a
     /// post-persist state where the schema row + its create_schema
-    /// commit_tx_log entry both live in cold (CHA-168). `filter` is an
-    /// optional WHERE fragment applied to the outer SELECT — qualify
-    /// columns with `l.` (the latest CTE alias) to avoid ambiguity
-    /// with the deletes side of the merge. CHA-484: `schema_names` selects by
-    /// the built-in single-column `schema_name` key (must not compose with
-    /// `filter`).
+    /// commit_tx_log entry both live in cold. `filter` is an optional WHERE
+    /// fragment applied to the outer SELECT — qualify columns with `l.` (the
+    /// latest CTE alias) to avoid ambiguity with the deletes side of the
+    /// merge. `schema_names` selects by the built-in single-column
+    /// `schema_name` key and must not compose with `filter`.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -1198,7 +1099,7 @@ impl QueryManager {
             catalog = %catalog_uuid,
             branch = %branch_uuid,
             as_of_micros = ?snapshot.plan_as_of_micros(),
-            // Span-field NAME stays `row_uuids` (CHA-473 scrape pin).
+            // The field NAME must stay `row_uuids` — integration tests scrape it.
             row_uuids = schema_uuids.map_or(0usize, <[Uuid]>::len),
         ),
     )]
@@ -1231,7 +1132,7 @@ impl QueryManager {
                 tuples: names.iter().map(|name| vec![name.clone()]).collect(),
             }
         } else if let Some(uuids) = schema_uuids {
-            // CHA-380: derive each row_uuid canonically from schema_uuid.
+            // row_uuid does not equal schema_uuid; derive it canonically.
             SystemSelection::IdentitySeek {
                 row_uuids: uuids
                     .iter()
@@ -1266,10 +1167,10 @@ impl QueryManager {
     /// Resolve `__penca_system__.indexes` rows on a branch (mirror of
     /// [`Self::resolve_table_metadata`]). `filter`, when supplied, is
     /// `AND`-appended to the outer SELECT; qualify columns with `l.` (the
-    /// latest alias). CHA-484: `index_names` selects by the built-in
-    /// composite `(table_uuid, index_name)` key — the owning table scopes
-    /// the name (`index_name` is unique only within a table); must not
-    /// compose with `filter`.
+    /// latest alias). `index_names` selects by the built-in composite
+    /// `(table_uuid, index_name)` key — the owning table scopes the name
+    /// (`index_name` is unique only within a table); must not compose with
+    /// `filter`.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -1277,7 +1178,7 @@ impl QueryManager {
             catalog = %catalog_uuid,
             branch = %branch_uuid,
             as_of_micros = ?snapshot.plan_as_of_micros(),
-            // Span-field NAME stays `row_uuids` (CHA-473 scrape pin).
+            // The field NAME must stay `row_uuids` — integration tests scrape it.
             row_uuids = index_uuids.map_or(0usize, <[Uuid]>::len),
         ),
     )]
@@ -1315,9 +1216,9 @@ impl QueryManager {
                     .collect(),
             }
         } else if let Some(table_uuids) = table_uuid_prefixes {
-            // CHA-499: the batched ListTables selector — a leading `table_uuid`
-            // prefix seek over the composite name sidecar. The derived residual
-            // is the fallback, so it can't compose with a caller filter.
+            // The batched ListTables selector — a leading `table_uuid` prefix
+            // seek over the composite name sidecar. Its derived residual IS
+            // the fallback, so it can't compose with a caller filter.
             if filter.is_some() {
                 return Err(MetadataError::Db(sqlx::Error::Protocol(
                     "table_uuid prefix index resolve does not compose with a residual filter"
@@ -1329,7 +1230,7 @@ impl QueryManager {
                 table_uuids: table_uuids.to_vec(),
             }
         } else if let Some(uuids) = index_uuids {
-            // CHA-380: derive each row_uuid canonically from index_uuid.
+            // row_uuid does not equal index_uuid; derive it canonically.
             SystemSelection::IdentitySeek {
                 row_uuids: uuids
                     .iter()
@@ -1378,13 +1279,7 @@ impl QueryManager {
     {
         let resolved_branch = resolve_branch(driver, catalog_uuid, branch_uuid).await?;
 
-        // CHA-473: a by-index_uuid resolve threads the parsed index_uuid as
-        // the structured CHA-398 restriction; the IdentitySeek derives its
-        // row_uuid canonically (CHA-380: row_uuid_for_pk over
-        // `__penca_system__.indexes`); CHA-484: a by-name resolve threads
-        // `(table_uuid, name)` through the structured `index_names` selector.
-        // UUIDs are still parsed up front so a malformed value returns a
-        // typed error.
+        // UUIDs are parsed up front so a malformed value returns a typed error.
         let (index_uuids, owning_table, index_names) = if let Some(uuid_str) = index_uuid {
             let uuid = parse_meta_uuid(uuid_str, "index_uuid")?;
             (Some(vec![uuid]), None, None)
@@ -1444,12 +1339,12 @@ impl QueryManager {
     }
 
     /// Read a table's DEFINED indexes (`__penca_system__.indexes`) for an
-    /// ALREADY-resolved branch — the shared body behind [`Self::meta_list_indexes`]
-    /// and the `Table.indexes` population on GetTable/ListTables (CHA-492).
-    /// Routes through [`Self::resolve_index_metadata`] so the read rides the
-    /// shared CHA-472/492 W_snap-keyed snapshot-list cache in the same upfront
-    /// metadata phase — never a per-seek miss path (the CHA-492 perf
-    /// requirement).
+    /// ALREADY-resolved branch — the shared body behind
+    /// [`Self::meta_list_indexes`] and the `Table.indexes` population on
+    /// GetTable/ListTables. MUST route through
+    /// [`Self::resolve_index_metadata`] so the read rides the shared
+    /// W_snap-keyed snapshot-list cache in the same upfront metadata phase,
+    /// never a per-seek miss path.
     async fn resolve_table_indexes<L>(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
@@ -1514,9 +1409,7 @@ impl QueryManager {
     where
         L: DlDriver + ?Sized,
     {
-        // CHA-484: one shared plan+dispatch entry — the CHA-473 structured
-        // identity restriction (the row_uuid derived from table_uuid via
-        // row_uuid_for_pk, CHA-380) is an exact selection, so a
+        // The identity restriction below is an exact selection, so a
         // snapshot-covered default read serves it from the direct seek.
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
         let sys_arrow_schema: SchemaRef = Arc::new(PgDialect::system_tables_arrow_schema());
@@ -1529,8 +1422,7 @@ impl QueryManager {
                 &sys_tables_table_uuid,
                 &sys_arrow_schema,
                 SystemSelection::IdentitySeek {
-                    // CHA-380: derive row_uuid canonically from table_uuid
-                    // (row_uuid no longer equals the raw table_uuid).
+                    // row_uuid does not equal the raw table_uuid.
                     row_uuids: vec![naming::row_uuid_for_pk(
                         &sys_tables_table_uuid,
                         &[table_uuid.to_string().as_str()],
@@ -1543,10 +1435,10 @@ impl QueryManager {
         Ok(convert::extract_first_binary(&batches, "arrow_schema"))
     }
 
-    /// CHA-185: like [`Self::get_table_arrow_schema_by_branch`] but
-    /// returns both the arrow_schema bytes and the table's primary_keys
-    /// in one round-trip. Persist/compact paths need both to construct
-    /// the widened delete_log schema.
+    /// Like [`Self::get_table_arrow_schema_by_branch`] but returns both the
+    /// arrow_schema bytes and the table's primary_keys in one round-trip.
+    /// Persist/compact paths need both to construct the widened delete_log
+    /// schema.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -1569,8 +1461,6 @@ impl QueryManager {
     where
         L: DlDriver + ?Sized,
     {
-        // CHA-484: one shared plan+dispatch entry (see
-        // [`Self::get_table_arrow_schema_by_branch`]).
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
         let sys_arrow_schema: SchemaRef = Arc::new(PgDialect::system_tables_arrow_schema());
         let batches = self
@@ -1582,8 +1472,7 @@ impl QueryManager {
                 &sys_tables_table_uuid,
                 &sys_arrow_schema,
                 SystemSelection::IdentitySeek {
-                    // CHA-380: derive row_uuid canonically from table_uuid
-                    // (row_uuid no longer equals the raw table_uuid).
+                    // row_uuid does not equal the raw table_uuid.
                     row_uuids: vec![naming::row_uuid_for_pk(
                         &sys_tables_table_uuid,
                         &[table_uuid.to_string().as_str()],
@@ -1613,10 +1502,7 @@ mod tests {
 
     use super::{QueryManager, table_uuid_in_filter};
 
-    // CHA-496: the batched `ListTables` index read scopes to the listed tables
-    // via `l.table_uuid IN (...)`. Pin the exact residual shape (quoting,
-    // comma-join, `l.` alias) — the same filter-shape coverage the file gives
-    // `name_seek_residual` / `schema_scoped_filter`.
+    // Pins the exact residual shape: quoting, comma-join, `l.` alias.
     #[test]
     fn table_uuid_in_filter_shape() {
         assert_eq!(
@@ -1677,11 +1563,8 @@ mod tests {
         }
     }
 
-    // CHA-443 (IMPL-6): the metadata-side resolver pins the no-tx / no-as_of
-    // default to an `AsOfSeq` snapshot on the per-branch seq frontier (a
-    // threaded `default_frontier` pins exactly that value), so identifier
-    // resolution and the data read share one seq snapshot. Supersedes the
-    // CHA-86 `AsOfMicros` default.
+    // The no-tx / no-as_of default must pin the per-branch seq frontier, so
+    // identifier resolution and the data read share one seq snapshot.
     #[tokio::test]
     async fn resolve_read_snapshot_no_tx_no_as_of_pins_seq_frontier() {
         let catalog = uuid::Uuid::nil().to_string();
@@ -1699,9 +1582,9 @@ mod tests {
         .expect("resolution must not error on the no-tx / no-as_of path");
 
         // A threaded default_frontier pins exactly that seq (so a hardcoded
-        // constant could not satisfy this), and CHA-472 marks the default
-        // "read latest" pin as `LatestSeq` — the one cache-eligible shape —
-        // rather than an explicit `AsOfSeq` time-travel.
+        // constant could not satisfy this), and the default "read latest" pin
+        // is `LatestSeq` — the one cache-eligible shape — rather than an
+        // explicit `AsOfSeq` time-travel.
         assert_eq!(snapshot, ReadSnapshot::LatestSeq(7_654_321));
     }
 
@@ -1725,9 +1608,9 @@ mod tests {
         assert_eq!(snapshot, ReadSnapshot::AsOfMicros(9_876_543));
     }
 
-    // CHA-443 (IMPL-6): the commit frontier is the counter (next-to-allocate)
-    // minus one — so the first commit (counter advances 0 → 1) has frontier 0,
-    // consistent with the OpenTx `commit_seq_num < began_at_seq_num` rule.
+    // The frontier is the counter (next-to-allocate) minus one, so the first
+    // commit (counter 0 → 1) has frontier 0 — consistent with the OpenTx
+    // `commit_seq_num < began_at_seq_num` rule.
     #[test]
     fn seq_frontier_from_counter_maps_counter_minus_one() {
         assert_eq!(super::seq_frontier_from_counter(Some(5)), 4);
@@ -1744,8 +1627,8 @@ mod tests {
         assert_eq!(super::seq_frontier_from_counter(None), -1);
     }
 
-    // CHA-443 (IMPL-6): an explicit `as_of_seq` resolves identifiers on the
-    // seq axis verbatim — the metadata side of seq-uniform time travel.
+    // An explicit `as_of_seq` resolves identifiers on the seq axis verbatim —
+    // the metadata side of seq-uniform time travel.
     #[tokio::test]
     async fn resolve_read_snapshot_explicit_as_of_seq_maps_to_as_of_seq() {
         let catalog = uuid::Uuid::nil().to_string();
@@ -1764,8 +1647,6 @@ mod tests {
 
         assert_eq!(snapshot, ReadSnapshot::AsOfSeq(55));
     }
-
-    // ----- CHA-484: name-seek resolution (spec + residual, single source) ---
 
     #[test]
     fn resolve_name_seek_schemas_single_column_escapes_quotes() {
@@ -1847,8 +1728,6 @@ mod tests {
         assert!(err.is_err(), "empty name-key tuple set must fail fast");
     }
 
-    // ----- CHA-499: leading-prefix (table_uuid) seek resolution -------------
-
     #[test]
     fn resolve_prefix_seek_indexes_full_key_arity_one_tuples() {
         let catalog = uuid::Uuid::new_v4();
@@ -1871,12 +1750,11 @@ mod tests {
             resolved.seek.tuples,
             vec![vec!["tu1".to_string()], vec!["tu2".to_string()]],
         );
-        // Residual is the CHA-496 filtered scan, reused verbatim.
+        // Residual is the filtered scan, reused verbatim.
         assert_eq!(resolved.residual, "l.table_uuid IN ('tu1','tu2')");
     }
 
-    // The leading-column coupling (mitigation #2, resolve-boundary half): a
-    // prefix probe is only sound when the sidecar leads with table_uuid. The
+    // A prefix probe is only sound when the sidecar leads with table_uuid. The
     // schemas name index leads with schema_name, so a table_uuid prefix would
     // over-select — must fail fast, not silently.
     #[test]

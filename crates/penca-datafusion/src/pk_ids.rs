@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(decode(&bytes), batch);
     }
 
-    // ---- all_conjuncts_seeked: the exact-cover strip decision (CHA-492) ----
+    // all_conjuncts_seeked: the exact-cover strip decision (CHA-492)
 
     #[test]
     fn all_conjuncts_seeked_true_for_single_equality() {

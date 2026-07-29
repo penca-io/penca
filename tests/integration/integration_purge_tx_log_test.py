@@ -56,6 +56,7 @@ import time
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client.naming import (
     abort_tx_log_partition,
@@ -102,9 +103,6 @@ def _count_committed_persist_segments(catalog_uuid, branch_uuid, table_uuid):
         ).format(tbl=Identifier(seg_parent)),
         (branch_uuid, table_uuid),
     )[0][0]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _make_branch(client, catalog_uuid, name):
@@ -407,9 +405,6 @@ def _insert_synthetic_begin_tx_log_row(
             "test",
         ),
     )
-
-
-# ── Tests ─────────────────────────────────────────────────────────────
 
 
 class TestPurgeTxLogStableState:
@@ -915,6 +910,9 @@ class TestPurgeTxLogLiveQuerySafety:
     a consistent view even under churn. ``PurgeTxLog`` running in the
     background must not break in-flight ``read_data`` calls."""
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_live_query_safety_under_purge_tx_log_churn(self):
         """A ``read_data`` consumer running for ~3 seconds against a
         branch with concurrent Persist+Purge+PurgeTxLog churn returns
@@ -996,9 +994,6 @@ class TestPurgeTxLogLiveQuerySafety:
                 f"pillar 4: queries within query_timeout_seconds see a "
                 f"consistent view."
             )
-
-
-# ── CHA-444 / ADR 0027: Purge owns aborted hot cleanup (abort Pa axis) ──
 
 
 class TestPurgeTxLogAbortedCleanup:
@@ -1095,7 +1090,6 @@ class TestPurgeTxLogAbortedCleanup:
                 branch_uuid=branch_uuid,
             )
 
-        # Hot tier completely clean for T.
         from penca_client.naming import delete_log_table, upsert_log_table
 
         upsert_tbl = upsert_log_table(tables["t"], branch_uuid)
@@ -1267,5 +1261,4 @@ class TestPurgeTxLogAbortedCleanup:
         assert (
             _count_begin_tx_log_rows(catalog_uuid, branch_uuid, x_open.tx_uuid) == 0
         ), "X's begin_tx_log row must be GC'd."
-        # And no orphan hot rows in T_a.
         assert _hot_upsert_count() == 0

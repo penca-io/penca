@@ -1,4 +1,4 @@
-//! CHA-374: the pure decision for the auto-commit read-snapshot pin.
+//! The pure decision for the auto-commit read-snapshot pin.
 //!
 //! `GetFlightInfo` calls [`pin_as_of_seq`] to decide whether to pin a statement's
 //! read snapshot, then stamps the result on the `CommandTicket`. Keeping the
@@ -14,7 +14,7 @@
 //! enforced fail-fast at the read boundary (`penca-api`
 //! `resolve_query_snapshot`), never silently collapsed in this helper.
 
-/// Decide the auto-commit read-snapshot pin (CHA-374 / CHA-460). `None` when a
+/// Decide the auto-commit read-snapshot pin. `None` when a
 /// tx is open — the open tx carries the snapshot via `open_tx_uuid` and the pin
 /// is auto-commit-only; otherwise pin to the freshly captured `seq_frontier`
 /// (the branch's max committed `commit_seq_num`).

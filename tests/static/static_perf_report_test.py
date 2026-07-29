@@ -96,10 +96,8 @@ def test_compare_run_to_history_delta_and_no_baseline(tmp_path):
     entries = comparison.compare_run_to_history(run_rows, history)
     by_op = {entry["operation"]: entry for entry in entries}
 
-    # Slower-than-history run yields a positive delta vs the historical mean.
     assert by_op["read_data"]["delta_pct"] is not None
     assert by_op["read_data"]["delta_pct"] > 0
-    # A series with no history is flagged no-baseline (None delta).
     assert by_op["write_data"]["delta_pct"] is None
 
 

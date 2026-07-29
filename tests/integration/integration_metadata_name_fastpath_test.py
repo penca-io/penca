@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
+import pytest
 from penca_client.naming import (
     system_indexes_table_uuid,
     system_schema_uuid,
@@ -41,6 +42,10 @@ from .integration_helpers import (
     make_client,
     poll_log_for,
 )
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 # The DataFusion-free seek bypass marker — a `tracing` fmt-subscriber unquoted
 # bool field. CHA-380 unified metadata reads onto read_data's kernel, so this

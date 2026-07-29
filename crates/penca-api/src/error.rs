@@ -18,10 +18,8 @@ pub enum ApiError {
     #[error(transparent)]
     ColdStorage(#[from] ColdStorageError),
 
-    /// CHA-476: a failure in the DataFusion-free direct point-read seek
-    /// (`DatafusionDlDriver::seek_snapshot_point`). Maps to a gRPC internal
-    /// status (the `_` arm in `api_error_to_status`), like the cold-read
-    /// errors it wraps.
+    /// Failure in the DataFusion-free direct point-read seek
+    /// (`DatafusionDlDriver::seek_snapshot_point`). Maps to gRPC `INTERNAL`.
     #[error(transparent)]
     Dl(#[from] DlError),
 
@@ -43,10 +41,6 @@ pub enum ApiError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// CHA-236 — a Create* / Update* hit a name-uniqueness collision
-    /// (e.g. `CreateTable` against an existing `(branch, schema, name)`,
-    /// or `UpdateCatalog` renaming to a name another catalog already
-    /// holds). The gRPC layer maps this to `ALREADY_EXISTS`.
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
@@ -56,26 +50,19 @@ pub enum ApiError {
     #[error("not implemented: {0}")]
     Unimplemented(String),
 
-    /// ADR 0019 / CHA-233 — `read_data` or `audit_data` ran past the
-    /// system-wide cap. The message names the cap (`query_timeout_seconds`)
-    /// and the retry pattern; the gRPC layer maps it to
-    /// `RESOURCE_EXHAUSTED`.
+    /// ADR 0019 — `read_data`/`audit_data` ran past the system-wide cap.
+    /// Maps to gRPC `RESOURCE_EXHAUSTED`.
     #[error("query exceeded query_timeout_seconds: {0}")]
     QueryTimeout(String),
 
-    /// An internal invariant was violated — e.g. a scope constructor
-    /// failed to populate a field its public name promises. The gRPC
-    /// layer maps this to `INTERNAL`. Preferred over `.expect()` /
-    /// `.unwrap()` in library code so an invariant bug surfaces as a
-    /// typed error instead of a panic.
+    /// Preferred over `.expect()` / `.unwrap()` in library code so an
+    /// invariant bug surfaces as a typed error instead of a panic.
     #[error("internal invariant violated: {0}")]
     Internal(String),
 }
 
-/// Lift raw sqlx errors (e.g. from `PgDriver::advisory_lock` while
-/// acquiring/releasing the lock) into the metadata variant. Application
-/// queries already go through `LifecycleManager` and surface as
-/// `MetadataError`; this just covers the driver-level paths that don't.
+/// Covers the driver-level paths (e.g. `PgDriver::advisory_lock`) that raise
+/// raw sqlx errors; application queries already surface as `MetadataError`.
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         ApiError::Metadata(err.into())

@@ -1,9 +1,4 @@
-//! Sweep: grace-window drain for cold segment files (CHA-233 / ADR 0019).
-//!
-//! [`LifecycleManager::sweep_segments`] reads every
-//! `segment_delete_set` row on the branch whose `written_at_micros`
-//! is past the grace window and deletes the cold file followed by the
-//! row.
+//! Sweep: grace-window drain for cold segment files (ADR 0019).
 
 use penca_db::driver::pg::PgDriver;
 use penca_format::writer::FormatWriter;
@@ -16,21 +11,17 @@ use crate::resolve::{parse_resolved_uuid, resolve_branch, resolve_catalog};
 
 impl LifecycleManager {
     /// Physically delete cold segment files queued for removal by past
-    /// compact waves (CHA-233 / ADR 0019 §"Four-part mechanism" item 3).
+    /// compact waves (ADR 0019 §"Four-part mechanism" item 3), once
+    /// `written_at_micros + query_timeout < now`.
     ///
-    /// Reads every `segment_delete_set` row on the branch whose
-    /// `written_at_micros + query_timeout < now`, deletes the cold
-    /// file, then deletes the set row. The order is load-bearing:
-    /// the row only goes away once cold has confirmed the file is
-    /// gone, so a transient cold-storage failure leaves the row in
-    /// place for the next sweep to retry. The file delete passes
-    /// `ignore_missing = true` so a successful prior sweep that
-    /// crashed between file-delete and row-delete also drains cleanly.
+    /// File-delete-then-row-delete ordering is load-bearing: the row only goes
+    /// away once cold has confirmed the file is gone, so a transient
+    /// cold-storage failure leaves the row for the next sweep to retry.
+    /// `ignore_missing = true` covers the reverse case — a prior sweep that
+    /// crashed between the two deletes.
     ///
-    /// No advisory lock — the per-row PK DELETE on
-    /// `segment_delete_set` is safe under concurrent sweeps; two
-    /// sweepers racing on the same row both succeed (idempotent
-    /// DELETE).
+    /// No advisory lock: the per-row PK DELETE is idempotent, so two sweepers
+    /// racing on the same row both succeed.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -99,12 +90,10 @@ impl LifecycleManager {
             }
         }
 
-        // `eligible` already excludes refcount-pinned rows (CHA-405),
-        // so a persistent 0 here while the delete set grows reads as
-        // "everything still referenced" — the first triage signal for
-        // a standing blocked set (see CHA-435). `deleted` can lag
-        // `eligible` when a cold-file delete fails and the row is left
-        // for the next sweep to retry.
+        // Triage guide for these two fields: `eligible` already excludes
+        // refcount-pinned rows, so a persistent 0 while the delete set grows
+        // reads as "everything still referenced". `deleted` lagging `eligible`
+        // means cold-file deletes are failing and the rows await a retry.
         tracing::debug!(
             eligible = eligible_count,
             deleted = deleted_count,

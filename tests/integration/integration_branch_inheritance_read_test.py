@@ -519,7 +519,6 @@ def test_child_delete_of_inherited_row():
     )
     assert _names(got) == {"a", "b"}
 
-    # The child deletes the inherited row "a".
     _commit_delete(
         client,
         catalog_uuid=catalog_uuid,

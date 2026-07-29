@@ -1,5 +1,5 @@
 //! Compact two-phase commit (`compact_segment_metadata`), seal flips
-//! on `table_persist_segment_metadata`, and the CHA-233
+//! on `table_persist_segment_metadata`, and the
 //! `segment_delete_set` GC tombstone helpers (insert + eligibility
 //! scan + delete-by-PK) that drive `sweep_segments`. The cold-file
 //! reconciliation helper `get_compact_segment_uris_for_branch`
@@ -15,8 +15,6 @@ use crate::helpers::{epoch, parse_uuid, qi};
 use crate::{LifecycleManager, Result};
 
 impl LifecycleManager {
-    // -- CHA-202: compact_segment_metadata helpers ---------------------------
-    //
     // Concurrency safety for compaction itself comes from `SELECT FOR
     // UPDATE` on the input `table_persist_segment_metadata` rows, not
     // from anything this table does. The rows here are an audit-trail
@@ -61,7 +59,7 @@ impl LifecycleManager {
     }
 
     /// Mark a `compact_segment_metadata` row committed (Phase-2 of the
-    /// CHA-202 three-phase compact). Designed for in-tx use — the
+    /// three-phase compact). Designed for in-tx use — the
     /// caller batches this alongside `repoint_table_persist_segment`
     /// inside the same Phase-2 transaction so the URI swap on
     /// `table_persist_segment_metadata` and the compact-row commit are
@@ -97,7 +95,7 @@ impl LifecycleManager {
 
     /// Flip every `table_persist_segment_metadata` row in `segment_uuids`
     /// to `is_sealed = true`. Used on the seal-and-start-new boundary
-    /// of the CHA-202 active+sealed compact algorithm: the prior
+    /// of the active+sealed compact algorithm: the prior
     /// active's segment UUIDs (already in hand inside the merge tx)
     /// transition out of the unsealed set so they never participate
     /// in a future compact wave.
@@ -162,8 +160,6 @@ impl LifecycleManager {
             .collect())
     }
 
-    // -- CHA-233: segment_delete_set helpers ---------------------------------
-    //
     // ADR 0019 §"Four-part mechanism" item 3. Compact's merge tx
     // enqueues one row per replaced old URI inside its own tx — the
     // INSERT here is atomic with the URI swap on
@@ -174,7 +170,7 @@ impl LifecycleManager {
 
     /// Insert one `segment_delete_set` row per `object_uri` — cold
     /// files a compact merge tx is replacing or a snapshot retirement
-    /// tx (CHA-405) is releasing. Each row's deterministic
+    /// tx is releasing. Each row's deterministic
     /// `segment_delete_uuid` is derived here from
     /// `naming::segment_delete_uuid` so the uuid↔uri pairing lives in
     /// one place next to the `ON CONFLICT` arm that depends on it.
@@ -248,11 +244,10 @@ impl LifecycleManager {
 
     /// Read every `segment_delete_set` row past the grace window for
     /// a branch — `now_micros - written_at_micros > query_timeout`, the
-    /// cold-segment GC grace (ADR 0019's `query_timeout` bound, unchanged
-    /// by CHA-444 / ADR 0027) — whose file is at snapshot reference count
-    /// zero (ADR 0024 §4 / CHA-405). Returns `(segment_delete_uuid,
-    /// object_uri)` pairs;
-    /// the caller deletes the cold file then calls
+    /// cold-segment GC grace (ADR 0019's `query_timeout` bound) — whose file
+    /// is at snapshot reference count zero (ADR 0024 §4). Returns
+    /// `(segment_delete_uuid, object_uri)` pairs; the caller deletes the cold
+    /// file then calls
     /// [`Self::delete_segment_delete_set_row`] per row.
     ///
     /// The `NOT EXISTS` arm is the refcount gate: under carry-forward
@@ -307,7 +302,7 @@ impl LifecycleManager {
         let catalog = parse_uuid(catalog_uuid);
         let table = naming::segment_delete_set_table(&catalog);
         let seg_table = naming::table_snapshot_segment_metadata_table(&catalog);
-        // CHA-412: cold-index sidecars are their own files queued in the
+        // Cold-index sidecars are their own files queued in the
         // same delete set, and a carried sidecar copies the prior file's
         // `object_uri` by reference. So the refcount gate must pin a
         // queued URI while ANY base segment OR sidecar row still

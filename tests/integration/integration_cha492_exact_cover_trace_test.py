@@ -94,6 +94,9 @@ def _dump(label: str, window: str) -> None:
 
 
 class TestCha492ExactCoverTrace:
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
     def test_sql_pk_point_read_snapshot_only_takes_bypass(self, driver):
         """A SQL `WHERE pk = lit` read on a snapshot-only table is served by
@@ -105,7 +108,7 @@ class TestCha492ExactCoverTrace:
         ctx, kw = _snapshot_only_named(client)
         target = f"{ctx['schema_name']}.{ctx['table_name']}"
 
-        # ---- The user shape: SQL `WHERE pk = lit` over Flight SQL ------------
+        # The user shape: SQL `WHERE pk = lit` over Flight SQL
         since = len(container_log("query"))
         results = _sql_steps_via(
             driver,
@@ -163,6 +166,9 @@ class TestCha492ExactCoverTrace:
             "DataFusion cold scan (scan_snapshot span present)"
         )
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_no_filter_ids_read_contrast_takes_bypass(self):
         """Same snapshot-only table, gRPC `ids` read with NO residual filter:
         the identical plan shape has always taken the DataFusion-free bypass.
@@ -188,6 +194,9 @@ class TestCha492ExactCoverTrace:
             "the bypass must not build a DataFusion cold scan"
         )
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     @pytest.mark.parametrize("driver", ["adbc", "jdbc"])
     def test_sql_pk_point_read_inside_open_tx_takes_bypass(self, driver):
         """CHA-501: the exact-cover bypass must fire for a point read issued
@@ -213,7 +222,7 @@ class TestCha492ExactCoverTrace:
         target = f"{ctx['schema_name']}.{ctx['table_name']}"
         select = f"SELECT value FROM {target} WHERE name = 'alice'"
 
-        # ---- The user shape: a point SELECT inside an open tx over Flight SQL --
+        # The user shape: a point SELECT inside an open tx over Flight SQL
         since = len(container_log("query"))
         results = _sql_steps_via(
             driver, ["BEGIN", select, "COMMIT"], ctx["catalog_name"]

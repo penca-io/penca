@@ -3,14 +3,14 @@
 //! One SQL builder per tier resolves the committed log delta as a two-arm
 //! `UNION ALL` — visible upserts (`is_delete = false`) and winning tombstones
 //! (`is_delete = true`) — so a single scan per tier yields both the live rows
-//! and every touched `row_uuid` (CHA-368):
+//! and every touched `row_uuid`:
 //!   - Hot (Postgres) — [`sql::build_merge_resolved`] JOINs the hot
 //!     `commit_tx_log` partition to recover each row's `commit_micros`.
 //!     Executed via [`penca_storage_hot::execute_query_as_batch`].
-//!   - Cold (DataFusion over arrow) — [`sql::build_cold_merge_resolved`]
-//!     (CHA-218). Cold rows carry `commit_micros` inline (denormalized at
-//!     persist time per ADR 0017), so the cold side reads as a pure scan — no
-//!     JOIN against commit_tx_log. Executed via [`penca_dl::driver::DlDriver`].
+//!   - Cold (DataFusion over arrow) — [`sql::build_cold_merge_resolved`].
+//!     Cold rows carry `commit_micros` inline (denormalized at persist time per
+//!     ADR 0017), so the cold side reads as a pure scan — no JOIN against
+//!     commit_tx_log. Executed via [`penca_dl::driver::DlDriver`].
 //!
 //! Pipeline:
 //!   1. **Resolve** (per tier): run the two-arm resolve against hot and cold,
@@ -20,16 +20,13 @@
 //!      resolve IS the exclusion set (every touched row shadows any snapshot row
 //!      with the same `row_uuid`); the `is_delete = false` subset is the live
 //!      delta. Both are derived from the UNFILTERED resolve, before the user
-//!      `WHERE` residual (CHA-142), so a filtered-out current version can't let a
+//!      `WHERE` residual, so a filtered-out current version can't let a
 //!      stale snapshot version resurface. The user predicate is then applied once
 //!      as a DataFusion residual ([`apply_resolved_residual`]), the single
-//!      filter engine across tiers (CHA-368 / ADR 0023).
+//!      filter engine across tiers (ADR 0023).
 //!   3. **Snapshot scan**: scan the surviving snapshot segments through a
 //!      registered `SnapshotTableProvider`, with the exclusion-set anti-join
-//!      and residual filter expressed in the scan SQL (CHA-411).
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/api/query.py`
-//! `_merge_read_results`.
+//!      and residual filter expressed in the scan SQL.
 
 pub mod sql;
 
@@ -65,21 +62,16 @@ use tracing_futures::Instrument as _;
 use uuid::Uuid;
 
 use crate::output::{full_plan_predicate, project_to_output};
-// CHA-485: the planner covering-index pass (penca-api index_select) extracts
-// equality bindings through the same parse machinery the pruning path uses,
-// so predicate semantics can never diverge between pruning and selection —
+// Re-exported so the planner's covering-index pass (penca-api index_select)
+// extracts equality bindings through the same parse machinery the pruning path
+// uses — predicate semantics can never diverge between pruning and selection,
 // and DataFusion types stay inside this crate.
 pub use crate::output::equality_bindings;
-// CHA-368: the all-hot read path (`penca_api::query::stream_all_hot`) applies
-// the user predicate as a DataFusion residual through this same helper, so the
-// hot and cold tiers filter through one engine (`full_plan_predicate`). Also
-// used internally by `assemble_parts` for the merged/cold path. `ResidualFilter`
-// is the compile-once/apply-per-batch form the multi-batch hot stream needs.
+// Re-exported so the all-hot read path (`penca_api::query::stream_all_hot`)
+// applies the user predicate through this same helper — hot and cold filter
+// through one engine (`full_plan_predicate`). `ResidualFilter` is the
+// compile-once/apply-per-batch form the multi-batch hot stream needs.
 pub use crate::output::{ResidualFilter, apply_resolved_residual};
-// CHA-368 retired `cold_exclusion_row_uuids` (the separate Query-B probe): the
-// two-arm `resolve_cold` now yields the exclusion set as its full `row_uuid`
-// set. `fold_in_base_cold_source` uses `filter_live_rows` to split the base
-// resolve's live rows from its tombstones (CHA-178).
 use crate::resolve::{
     build_cold_resolved_and_exclusion_set, build_resolved_and_exclusion_set, collect_row_uuids,
     filter_live_rows, resolve_cold,
@@ -87,48 +79,21 @@ use crate::resolve::{
 use crate::schema::cold_persist_schemas;
 use crate::sql::{build_cold_snapshot_scan, build_cold_snapshot_scan_plain};
 
-/// Stream merge-on-read results for a single table.
-///
-/// The algorithm is symmetric across the hot and cold tiers — the same
-/// logical SQL runs against both (dialect-specialized for Postgres vs.
-/// DataFusion), the two resolved batches are unioned and deduped, and
-/// then the snapshot tier is scanned through a registered
-/// `SnapshotTableProvider` with the exclusion anti-join + residual in the plan.
-///
-/// `snapshot` selects which view of the data this read draws from. See
-/// [`ReadSnapshot`] for the two variants — `AsOfMicros` (point-in-time;
-/// the default read pins it to `pg_now`) and `OpenTx` (snapshot
-/// isolation + read-your-own-writes for an open tx). The variant
-/// determines the visibility predicate emitted by the SQL builder.
-///
-/// `filter` is an optional SQL WHERE fragment (CHA-142). CHA-368 makes
-/// DataFusion the single filter engine: the per-tier resolves run UNFILTERED
-/// (so the exclusion set derives from the full row_uuid set before any
-/// filtering), then the predicate is applied once as a residual
-/// ([`apply_resolved_residual`]) and inside each snapshot segment scan.
-///
-/// `segment_read_concurrency` caps how many snapshot segments are read
-/// in flight during phase 3. This is a memory-safety knob (each read
-/// materializes a segment in memory) — it comes from the hosting
-/// service's config and should be set to
-/// `floor(reader_memory_budget / max_segment_bytes)`.
-///
-/// CHA-482: an internal (never-proto) index-seek entry — a named (possibly
-/// composite) index and the tuple probes to union within it. The identity
-/// `row_uuid` index is `index_uuid: None` (per CHA-412 `index_uuid IS NULL`);
-/// a name/user index carries its stable `index_uuid` (stable across rename).
-/// Within an entry the tuples are a union (IN-list of composite keys); across
-/// entries the seek INTERSECTS (CHA-485 — AND over the covering indexes the
-/// planner selected). Tuples are owned so call sites stay one-liners.
+/// An internal (never-proto) index-seek entry — a named (possibly composite)
+/// index and the tuple probes to union within it. The identity `row_uuid` index
+/// is `index_uuid: None` (per CHA-412 `index_uuid IS NULL`); a name/user index
+/// carries its stable `index_uuid` (stable across rename). Within an entry the
+/// tuples are a union (IN-list of composite keys); across entries the seek
+/// INTERSECTS (AND over the covering indexes the planner selected).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexSeek {
     /// `None` = the internal row_uuid identity index; `Some` = a named index.
     pub index_uuid: Option<Uuid>,
-    /// The index's key column names in sort-priority order (CHA-485). Empty
-    /// for the identity index (its single Utf8 `row_uuid` key needs no
-    /// lookup); for a user index the seek derives each sidecar key column's
-    /// native DataType from the table schema through these names, so typed
-    /// (non-Utf8) sidecars decode against their real schema.
+    /// The index's key column names in sort-priority order. Empty for the
+    /// identity index (its single Utf8 `row_uuid` key needs no lookup); for a
+    /// user index the seek derives each sidecar key column's native DataType
+    /// from the table schema through these names, so typed (non-Utf8) sidecars
+    /// decode against their real schema.
     pub key_columns: Vec<String>,
     /// Union of composite-key probe tuples; arity = the index's key-column count
     /// (1 for the identity index).
@@ -137,8 +102,6 @@ pub struct IndexSeek {
 
 impl IndexSeek {
     /// The identity (row_uuid) seek entry: each `row_uuid` as an arity-1 tuple.
-    /// This is how `row_uuids` is subsumed — callers that previously passed a
-    /// `&[Uuid]` restriction now pass `[IndexSeek::identity(uuids)]`.
     pub fn identity(row_uuids: &[Uuid]) -> Self {
         Self {
             index_uuid: None,
@@ -149,29 +112,24 @@ impl IndexSeek {
 
     /// Build the single-entry identity seek a read's `row_uuid` restriction maps
     /// to, or `None` when unrestricted. The canonical `Option<&[Uuid]>` ->
-    /// `MergeReadRequest.seeks` construction — collapses the inline
-    /// `row_uuids.map(|us| vec![IndexSeek::identity(us)])` every read entry point
-    /// would otherwise repeat.
+    /// `MergeReadRequest.seeks` construction.
     pub fn identity_seeks(row_uuids: Option<&[Uuid]>) -> Option<Vec<Self>> {
         row_uuids.map(|uuids| vec![Self::identity(uuids)])
     }
 }
 
-/// Extract the identity (row_uuid) restriction the merge fallback applies — the
-/// subsumed `row_uuids`. `Ok(None)` when there is no seek (or only accelerator
-/// entries). Non-identity entries (`index_uuid.is_some()`) are legal here
-/// **iff a NON-EMPTY residual `filter` accompanies them** — the same
-/// emptiness predicate the SQL builder uses, so the gate can never pass
-/// while no residual WHERE is emitted (CHA-485: they ride the
-/// snapshot scan as selection accelerators and the residual re-applies the
-/// exact predicate, so a skipped or over-selecting entry is always correct;
-/// they never restrict the exclusion set — that stays identity-only,
-/// CHA-473/CHA-482). Without a filter a non-identity entry is a fail-fast: the
-/// exact-selection no-filter shape is served by the snapshot-only bypass, so
-/// one reaching the fallback is malformed. A metadata name/prefix seek that
-/// falls through DOES carry its residual `filter` (CHA-380), so it rides here
-/// as a selection accelerator exactly like a user covering index. A
-/// non-arity-1 identity tuple is likewise a fail-fast (malformed seek).
+/// Extract the identity (row_uuid) restriction the merge fallback applies.
+/// `Ok(None)` when there is no seek (or only accelerator entries).
+///
+/// Non-identity entries (`index_uuid.is_some()`) are legal here **iff a
+/// NON-EMPTY residual `filter` accompanies them** — `filter_present` must use
+/// the same emptiness predicate the SQL builder does, so the gate can never
+/// pass while no residual WHERE is emitted. With a residual they are pure
+/// selection accelerators on the snapshot scan (a skipped or over-selecting
+/// entry stays correct because the residual re-applies the exact predicate) and
+/// never restrict the exclusion set. Without one they are malformed — the
+/// exact-selection no-filter shape is served by the snapshot-only bypass — and
+/// fail fast, as does a non-arity-1 identity tuple.
 fn identity_row_uuids(
     seeks: Option<&[IndexSeek]>,
     filter_present: bool,
@@ -229,10 +187,10 @@ fn identity_seek_len(seeks: Option<&[IndexSeek]>) -> u64 {
     })
 }
 
-/// Map the CHA-485 accelerator entries (non-identity) onto the penca-dl
-/// boundary shape for the provider seek. `None` when there are none; the
-/// identity restriction stays on its own dedicated threading (it also
-/// restricts the exclusion set — these never do).
+/// Map the accelerator entries (non-identity) onto the penca-dl boundary shape
+/// for the provider seek. `None` when there are none; the identity restriction
+/// stays on its own dedicated threading because it also restricts the exclusion
+/// set — these never do.
 fn user_seek_specs(seeks: Option<&[IndexSeek]>) -> Option<Arc<Vec<SeekSpec>>> {
     let specs: Vec<SeekSpec> = seeks?
         .iter()
@@ -246,12 +204,11 @@ fn user_seek_specs(seeks: Option<&[IndexSeek]>) -> Option<Arc<Vec<SeekSpec>>> {
     (!specs.is_empty()).then(|| Arc::new(specs))
 }
 
-/// CHA-485: the seek bundle the snapshot stream executes against — the
-/// parsed identity restriction (CHA-398/CHA-454) plus the planner's
-/// covering-index accelerator entries — threaded as ONE value from the
-/// `*_parts` entry points down to the scan. Public because
-/// [`snapshot_segment_stream`] is the CHA-406 phase-C seam; external
-/// callers construct it via `Default` (the snapshot writer seeks nothing).
+/// The seek bundle the snapshot stream executes against — the parsed identity
+/// restriction plus the planner's covering-index accelerator entries —
+/// threaded as ONE value from the `*_parts` entry points down to the scan.
+/// External callers construct it via `Default` (the snapshot writer seeks
+/// nothing).
 #[derive(Debug, Default)]
 pub struct SnapshotSeeks {
     /// Identity (row_uuid) restriction: the ByCompletion scan SQL's
@@ -292,8 +249,7 @@ impl SnapshotSeeks {
         }
     }
 
-    /// The stringified identity set for the ByPlan per-batch
-    /// included-filter (CHA-398 restricted writer-path reads).
+    /// The stringified identity set for the ByPlan per-batch included-filter.
     fn identity_strings(&self) -> Option<HashSet<String>> {
         self.identity
             .as_ref()
@@ -308,42 +264,56 @@ pub struct MergeReadRequest<'a, D, L: ?Sized> {
     pub user_schema: &'a SchemaRef,
     /// The table's full (unprojected) user schema. `user_schema` is the
     /// projected view this read returns; `full_schema` is what the snapshot
-    /// segment cache decodes so one cached entry serves any projection
-    /// (CHA-252). Equal to `user_schema` when the read is unprojected.
+    /// segment cache decodes so one cached entry serves any projection.
+    /// Equal to `user_schema` when the read is unprojected.
     pub full_schema: &'a SchemaRef,
     pub snapshot: &'a ReadSnapshot,
     pub filter: Option<&'a str>,
-    /// CHA-482 internal index seeks (never on the proto). Subsumes the old
-    /// CHA-398 `row_uuids` point-lookup restriction as the identity entry
-    /// `IndexSeek::identity(uuids)`. Only the identity entry restricts the log
-    /// tiers + exclusion probes (threaded below the latest-wins dedup);
-    /// CHA-485 multi-entry: additional non-identity entries (planner-selected
-    /// covering user indexes) ride the snapshot scan as selection
-    /// accelerators — per segment, each entry's sidecar offsets are seeked
-    /// and INTERSECTED (AND across indexes) before the decode; they require a
-    /// residual `filter` (over-selection is re-filtered; ADR 0023) and never
-    /// touch the exclusion set. A no-filter non-identity entry is served by
-    /// the snapshot-only bypass (R/CHA-484), never this path.
-    /// TODO(CHA-489): range probes (a probe-enum variant on `IndexSeek`) are
-    /// the follow-up — tuples express equality/IN only.
-    /// `None` = unrestricted. Owned (not `&'a`): the request is moved into
-    /// `stream_*` and the identity restriction is extracted in `*_parts` before
-    /// the snapshot stream is built, so callers pass it without a side-local.
+    /// Internal index seeks (never on the proto); `None` = unrestricted.
+    ///
+    /// Only the identity entry restricts the log tiers + exclusion probes
+    /// (threaded below the latest-wins dedup). Non-identity entries
+    /// (planner-selected covering user indexes) ride the snapshot scan as
+    /// selection accelerators — per segment, each entry's sidecar offsets are
+    /// seeked and INTERSECTED (AND across indexes) before the decode; they
+    /// require a residual `filter` (over-selection is re-filtered; ADR 0023)
+    /// and never touch the exclusion set. A no-filter non-identity entry is
+    /// served by the snapshot-only bypass, never this path.
+    ///
+    /// TODO(CHA-489): range probes (a probe-enum variant on `IndexSeek`) —
+    /// tuples express equality/IN only.
     pub seeks: Option<Vec<IndexSeek>>,
-    /// Snapshot-segment delivery order (CHA-404). `ByCompletion` for
-    /// every read path (today's behavior); `ByPlan` only for the
-    /// snapshot writer's label-sorted run-grouping.
+    /// Snapshot-segment delivery order. `ByCompletion` for every read path;
+    /// `ByPlan` only for the snapshot writer's label-sorted run-grouping.
     pub segment_order: SegmentOrder,
+    /// Caps how many snapshot segments are read in flight during phase 3. A
+    /// memory-safety knob — each read materializes a segment in memory — so it
+    /// should be set to `floor(reader_memory_budget / max_segment_bytes)`.
     pub segment_read_concurrency: usize,
-    /// CHA-353: skip segment pruning (build no pruning predicate; read every
-    /// planned segment) unless the planned snapshot segment count *exceeds*
-    /// this. Pruning builds a full DataFusion plan of the filter (~hundreds of
-    /// µs), worth it only when there are enough segments to skip; the residual
+    /// Skip segment pruning (build no pruning predicate; read every planned
+    /// segment) unless the planned snapshot segment count *exceeds* this.
+    /// Pruning builds a full DataFusion plan of the filter (~hundreds of µs),
+    /// worth it only when there are enough segments to skip; the residual
     /// filter enforces correctness regardless. `0` always prunes; the
     /// deployment default is `1` (skip the single-segment case).
     pub snapshot_prune_min_segments: usize,
 }
 
+/// Stream merge-on-read results for a single table.
+///
+/// The algorithm is symmetric across the hot and cold tiers — the same
+/// logical SQL runs against both (dialect-specialized for Postgres vs.
+/// DataFusion), the two resolved batches are unioned and deduped, and
+/// then the snapshot tier is scanned through a registered
+/// `SnapshotTableProvider` with the exclusion anti-join + residual in the plan.
+///
+/// `req.snapshot` selects which view of the data this read draws from; the
+/// variant determines the visibility predicate emitted by the SQL builder.
+///
+/// `req.filter` is an optional SQL WHERE fragment. The per-tier resolves run
+/// UNFILTERED (so the exclusion set derives from the full row_uuid set before
+/// any filtering), then the predicate is applied once as a residual
+/// ([`apply_resolved_residual`]) and inside each snapshot segment scan.
 pub fn stream_merged<'a, D, L>(
     req: MergeReadRequest<'a, D, L>,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch, MergeError>> + Send + 'a>>
@@ -356,10 +326,6 @@ where
     // only the fact the composition owns — total rows emitted.
     let span = tracing::debug_span!("stream_merged", rows_emitted = tracing::field::Empty);
 
-    // Thin composition over `stream_merged_parts` (CHA-404): one canonical
-    // pipeline, two consumption shapes — interleaved here, split for
-    // callers that collect the resolved log rows but stream the
-    // snapshot tier.
     interleave_parts(span, stream_merged_parts(req))
 }
 
@@ -367,12 +333,9 @@ where
 /// (`plan.hot_storage == None`): composes only the cold arms —
 /// `resolve_cold` (the two-arm resolve whose row_uuid set is the exclusion
 /// set) + the snapshot scan — with no hot probes in the flow at all. Issues
-/// the same per-tier SQL
-/// an all-cold plan takes through [`stream_merged`] (whose hot arms
-/// self-skip at runtime); this entry makes the absence structural.
-///
-/// Interleaved composition over [`stream_all_cold_parts`], mirroring
-/// [`stream_merged`].
+/// the same per-tier SQL an all-cold plan takes through [`stream_merged`]
+/// (whose hot arms self-skip at runtime); this entry makes the absence
+/// structural.
 pub fn stream_all_cold<'a, D, L>(
     req: MergeReadRequest<'a, D, L>,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch, MergeError>> + Send + 'a>>
@@ -387,8 +350,7 @@ where
 /// Interleaved consumption of [`MergeReadParts`]: emit the resolved
 /// log-tier batch first (projected to `row_uuid` + user cols), then
 /// drive the snapshot stream, recording total rows emitted on `span`
-/// at exhaustion. Pure composition — all pipeline logic lives in the
-/// `*_parts` future.
+/// at exhaustion.
 fn interleave_parts<'a, F>(
     span: tracing::Span,
     parts_fut: F,
@@ -404,7 +366,6 @@ where
                 snapshot_stream,
             } = parts_fut.await?;
 
-            // Emit resolved upserts first (projected to row_uuid + user_cols).
             if resolved.num_rows() > 0 {
                 rows_emitted += resolved.num_rows() as i64;
                 yield resolved;
@@ -425,17 +386,17 @@ where
 
 /// The two halves of a merge read, split for callers that consume the
 /// resolved (log-tier) rows and the snapshot tier differently — the
-/// CHA-404 snapshot writer collects the delta but streams the prior
-/// snapshot through its partition packer.
+/// snapshot writer collects the delta but streams the prior snapshot
+/// through its partition packer.
 pub struct MergeReadParts<'a> {
     /// Phases 1 + 2: resolved hot+cold log rows, projected to the
     /// output schema (`row_uuid` + user cols). Empty batch when the
     /// logs resolve to nothing.
     pub resolved: RecordBatch,
-    /// Phase 3: the snapshot-tier stream — CHA-82 pruning, then the
-    /// exclusion expressed in the scan plan (ByCompletion, CHA-411) or
-    /// applied per batch after a plain scan (ByPlan, CHA-404). Empty
-    /// stream when the plan has no snapshot leg.
+    /// Phase 3: the snapshot-tier stream — segment pruning, then the
+    /// exclusion expressed in the scan plan (ByCompletion) or applied
+    /// per batch after a plain scan (ByPlan). Empty stream when the
+    /// plan has no snapshot leg.
     pub snapshot_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, MergeError>> + Send + 'a>>,
 }
 
@@ -450,8 +411,7 @@ pub struct MergeReadParts<'a> {
         has_hot_plan = req.plan.hot_storage.is_some(),
         has_cold_plan = req.plan.cold_storage.is_some(),
         filter_present = req.filter.is_some(),
-        // CHA-398/482: count of identity point-lookup keys; 0 = unrestricted
-        // (count only — PK values are PII-gated, same as `filter`).
+        // Count only — PK values are PII-gated, same as `filter`.
         ids_rows = identity_seek_len(req.seeks.as_deref()),
         segment_order = ?req.segment_order,
         segment_read_concurrency = req.segment_read_concurrency,
@@ -486,13 +446,9 @@ where
         snapshot_prune_min_segments,
     } = req;
 
-    // CHA-482: the merge fallback applies the identity (row_uuid) restriction
-    // subsumed into `seeks`; CHA-485 accelerator entries (non-identity, with a
-    // residual filter) pass through to the snapshot scan below.
     let row_uuids = identity_row_uuids(seeks.as_deref(), filter.is_some_and(|f| !f.is_empty()))?;
-    // CHA-485: non-identity entries become snapshot-scan seek accelerators —
-    // mapped at the penca-dl boundary (penca-merge owns IndexSeek, the
-    // provider owns SeekSpec; a dep cycle forbids sharing the type).
+    // Mapped at the penca-dl boundary: penca-merge owns IndexSeek, the provider
+    // owns SeekSpec — a dep cycle forbids sharing the type.
     let accelerators = user_seek_specs(seeks.as_deref());
 
     let user_cols: Vec<&str> = user_schema
@@ -502,14 +458,10 @@ where
         .collect();
     let log_schemas = cold_persist_schemas(user_schema);
 
-    // Phases 1 + 2: fan out the four tier probes and compose the
-    // (resolved batch, exclusion set) pair. See
-    // `build_resolved_and_exclusion_set` for the per-tier composition
-    // and exclusion-set folding.
-    // CHA-368: the resolves no longer carry the user filter — the exclusion set
-    // is derived from the UNFILTERED resolved batch here, and the residual is
-    // applied to the resolved rows inside `assemble_parts` (after cross-tier
-    // dedup), never per-source.
+    // Phases 1 + 2. The resolves carry no user filter: the exclusion set must be
+    // derived from the UNFILTERED resolved batch, so the residual is applied to
+    // the resolved rows inside `assemble_parts` (after cross-tier dedup), never
+    // per-source.
     let (resolved, exclusion_set) = build_resolved_and_exclusion_set(
         plan,
         driver,
@@ -522,8 +474,8 @@ where
     )
     .await?;
 
-    // CHA-178: fold the parent (base) cold source in below the child, at the
-    // resolved schema (pre-projection); assemble_parts projects the combined.
+    // Fold the parent (base) cold source in below the child at the resolved
+    // schema (pre-projection); assemble_parts projects the combined batch.
     let (resolved, exclusion_set) = fold_base_if_present(
         plan,
         dl,
@@ -561,7 +513,7 @@ where
 
 /// Run phases 1 + 2 of an all-cold merge read and hand back the
 /// snapshot-tier stream unconsumed. [`stream_all_cold`] is the
-/// interleaved composition of this; the CHA-404 snapshot writer is the
+/// interleaved composition of this; the snapshot writer is the
 /// split-consumption caller (its plan is cold-only by construction).
 ///
 /// The plan must be all-cold (`hot_storage == None`): the hot tier is
@@ -575,8 +527,7 @@ where
         snapshot = ?req.snapshot,
         has_cold_plan = req.plan.cold_storage.is_some(),
         filter_present = req.filter.is_some(),
-        // CHA-398/482: count of identity point-lookup keys; 0 = unrestricted
-        // (count only — PK values are PII-gated, same as `filter`).
+        // Count only — PK values are PII-gated, same as `filter`.
         ids_rows = identity_seek_len(req.seeks.as_deref()),
         segment_order = ?req.segment_order,
         segment_read_concurrency = req.segment_read_concurrency,
@@ -597,10 +548,7 @@ where
     D: Sync,
     L: DlDriver + ?Sized,
 {
-    // Phases 1 + 2, cold arms only (the all-cold fail-fast lives in
-    // `resolve_log_tiers`); phase 3 over the plan's full segment list.
-    // Carry-forward (CHA-406) is the split-consumption caller of the
-    // same two halves.
+    // The all-cold fail-fast lives in `resolve_log_tiers`.
     let ResolvedLogTiers {
         resolved,
         exclusion_set,
@@ -640,12 +588,10 @@ where
     })
 }
 
-/// Tail of [`stream_merged_parts`] (its only caller after the CHA-406
-/// split — `stream_all_cold_parts` recomposes the two public halves
-/// directly): project the resolved batch to the output schema
-/// (recording `resolved_rows` on the caller's span), construct the
-/// phase-3 snapshot stream via [`plan_snapshot_stream`] when the plan
-/// has a snapshot leg, and assemble the [`MergeReadParts`].
+/// Tail of [`stream_merged_parts`] (its only caller): project the resolved
+/// batch to the output schema (recording `resolved_rows` on the caller's span),
+/// construct the phase-3 snapshot stream via [`plan_snapshot_stream`] when the
+/// plan has a snapshot leg, and assemble the [`MergeReadParts`].
 #[allow(clippy::too_many_arguments)]
 async fn assemble_parts<'a, L>(
     plan: &'a Plan,
@@ -653,8 +599,8 @@ async fn assemble_parts<'a, L>(
     user_schema: &'a SchemaRef,
     full_schema: &'a SchemaRef,
     filter: Option<&'a str>,
-    // CHA-482/CHA-485: owned so the returned 'a snapshot stream captures the
-    // parsed seek bundle by move (it can't borrow a caller-local parse).
+    // Owned so the returned 'a snapshot stream captures the parsed seek bundle
+    // by move (it can't borrow a caller-local parse).
     seeks: SnapshotSeeks,
     resolved: RecordBatch,
     exclusion_set: HashSet<String>,
@@ -663,14 +609,12 @@ async fn assemble_parts<'a, L>(
 where
     L: DlDriver + ?Sized,
 {
-    // CHA-368: DataFusion is the single user-filter engine. The resolved
-    // log-tier batch arrives UNFILTERED (its per-tier SQL no longer carries the
-    // user WHERE); apply the residual here, once, after the cross-tier dedup
-    // that produced `resolved` — never per-source. The exclusion set was already
-    // derived from the unfiltered resolved rows upstream (CHA-142 invariant), so
-    // trimming rows here cannot let a shadowed snapshot version leak. The
-    // snapshot leg applies the identical `full_plan_predicate` inside its own
-    // scan, so both tiers evaluate one predicate.
+    // The resolved log-tier batch arrives UNFILTERED; apply the residual here,
+    // once, after the cross-tier dedup that produced it — never per-source. The
+    // exclusion set was already derived from the unfiltered resolved rows
+    // upstream, so trimming rows here cannot let a shadowed snapshot version
+    // leak. The snapshot leg applies the identical `full_plan_predicate` inside
+    // its own scan, so both tiers evaluate one predicate.
     let resolved = apply_resolved_residual(&dl.derive_session(), filter, resolved).await?;
     let resolved = project_resolved(resolved, user_schema)?;
     tracing::Span::current().record("resolved_rows", resolved.num_rows() as i64);
@@ -690,9 +634,9 @@ where
     })
 }
 
-/// CHA-178: fold the parent (base) cold source into a forked branch's read,
+/// Fold the parent (base) cold source into a forked branch's read,
 /// when the plan carries one. No-op (returns the inputs unchanged) for a
-/// non-forked branch, so a non-forked read is byte-identical to before.
+/// non-forked branch.
 #[allow(clippy::too_many_arguments)]
 async fn fold_base_if_present<L>(
     plan: &Plan,
@@ -729,7 +673,7 @@ where
     }
 }
 
-/// CHA-178: resolve the parent branch's cold source (at its own seq ceiling)
+/// Resolve the parent branch's cold source (at its own seq ceiling)
 /// and fold it in *below* the child (`hot > child-cold > parent-cold`) via a
 /// row_uuid anti-join: a parent row survives iff the child never touched that
 /// row_uuid (∉ `exclusion_set`). Survivors are disjoint from the child rows on
@@ -775,10 +719,9 @@ where
     };
     let ceiling = Some(base.commit_seq_ceiling);
 
-    // CHA-368: one two-arm resolve — no separate exclusion probe, no user filter
-    // spliced in. The full `row_uuid` set of the resolve is the base's exclusion
-    // contribution (every parent-touched uuid, upsert-winner or tombstone-winner);
-    // its `is_delete = false` subset is the base's live delta.
+    // The full `row_uuid` set of the resolve is the base's exclusion
+    // contribution (every parent-touched uuid, upsert-winner or
+    // tombstone-winner); its `is_delete = false` subset is the base's live delta.
     let resolved_base = resolve_cold(
         &base_plan,
         dl,
@@ -790,9 +733,9 @@ where
     )
     .await?;
 
-    // Base exclusion = EVERY parent-touched row_uuid, UNFILTERED (CHA-142) —
-    // collected before the live/residual split so a parent row failing the user
-    // filter still shadows its snapshot version.
+    // Base exclusion = EVERY parent-touched row_uuid, UNFILTERED — collected
+    // before the live/residual split so a parent row failing the user filter
+    // still shadows its snapshot version.
     let base_uuids = collect_row_uuids(&resolved_base)?;
 
     let live_base = filter_live_rows(&resolved_base)?;
@@ -856,12 +799,11 @@ fn plan_snapshot_stream<'a, L>(
 where
     L: DlDriver + ?Sized,
 {
-    // CHA-178: prefer the child's own snapshot leg; fall back to the parent
-    // baseline (`base_cold_storage`). These are mutually exclusive by the
-    // planner gate — the base source is enumerated only when the picker found
-    // no fork-covering child snapshot, so the child leg is None whenever the
-    // base leg is Some — but keeping the child leg authoritative here is the
-    // safe ordering if that ever changes.
+    // Prefer the child's own snapshot leg; fall back to the parent baseline
+    // (`base_cold_storage`). These are mutually exclusive by the planner gate —
+    // the base source is enumerated only when the picker found no fork-covering
+    // child snapshot — but keeping the child leg authoritative here is the safe
+    // ordering if that ever changes.
     let snapshot_plan = plan
         .cold_storage
         .as_ref()
@@ -903,8 +845,8 @@ fn project_resolved(
 }
 
 /// Phases 1 + 2 of an all-cold merge read as a separately-callable
-/// half (CHA-406): the resolved log-tier delta plus the exclusion set
-/// the snapshot scan must apply.
+/// half: the resolved log-tier delta plus the exclusion set the
+/// snapshot scan must apply.
 ///
 /// Carry-forward's split consumption: resolve the delta ONCE here,
 /// derive the touched-partition set from it, then stream only the
@@ -917,9 +859,9 @@ pub struct ResolvedLogTiers {
     /// (`row_uuid` + user cols). Empty batch when the logs resolve to
     /// nothing.
     pub resolved: RecordBatch,
-    /// Exclusion set built from the UNFILTERED logs (CHA-142) with the
-    /// resolved row_uuids folded in — apply to any snapshot-tier scan
-    /// of the same plan, whole or subset.
+    /// Exclusion set built from the UNFILTERED logs with the resolved
+    /// row_uuids folded in — apply to any snapshot-tier scan of the
+    /// same plan, whole or subset.
     pub exclusion_set: HashSet<String>,
 }
 
@@ -963,9 +905,8 @@ where
         .map(|f| f.name().as_str())
         .collect();
     let log_schemas = cold_persist_schemas(req.user_schema);
-    // CHA-482: the cold log-tier restriction is the identity entry subsumed
-    // into `seeks`; CHA-485 accelerator entries are legal when a residual
-    // filter is present (consumed by the snapshot scan, not the log tiers).
+    // Only the identity entry restricts the log tiers; accelerator entries are
+    // consumed by the snapshot scan.
     let row_uuids = identity_row_uuids(
         req.seeks.as_deref(),
         req.filter.is_some_and(|f| !f.is_empty()),
@@ -981,10 +922,9 @@ where
         row_uuids.as_deref(),
     )
     .await?;
-    // CHA-368: the cold resolve arrives UNFILTERED; the exclusion set above was
-    // derived from those unfiltered rows (CHA-142 invariant). Apply the user
-    // filter as the single DataFusion residual after the dedup, before
-    // projection. No-op when `filter` is None (e.g. the snapshot-writer caller).
+    // The cold resolve arrives UNFILTERED; the exclusion set above was derived
+    // from those unfiltered rows. Apply the user filter as the single
+    // DataFusion residual after the dedup, before projection.
     let resolved = apply_resolved_residual(&req.dl.derive_session(), req.filter, resolved).await?;
     let resolved = project_resolved(resolved, req.user_schema)?;
 
@@ -1019,7 +959,7 @@ where
 
 /// Keep only rows whose `row_uuid` is in the ids restriction — the
 /// ByPlan per-batch form of the `l.row_uuid IN (...)` the ByCompletion
-/// scan expresses in SQL (CHA-398).
+/// scan expresses in SQL.
 fn filter_to_included_row_uuids(
     batch: &RecordBatch,
     included: &HashSet<String>,
@@ -1065,28 +1005,20 @@ pub struct SnapshotStreamTuning {
 }
 
 /// Phase 3 of `stream_merged`: prune snapshot segments by user filter
-/// (CHA-82, snapshot-tier only per ADR 0022), then stream the surviving
-/// segments with bounded concurrency, applying the exclusion-set filter
-/// and the SQL filter per batch and projecting to the output schema.
+/// (snapshot-tier only per ADR 0022), then stream the surviving segments
+/// with bounded concurrency, applying the exclusion-set filter and the
+/// SQL filter per batch and projecting to the output schema.
 ///
-/// Returns a `Stream` of post-filter projected batches. The caller drives
-/// the stream and decides what to do with each batch (typically: bump a
-/// rows_emitted counter and yield to its own outer stream).
+/// Segment reads are independent by construction — the exclusion set is fully
+/// built before this fn is called, each read hits its own cold-storage file,
+/// and clients do not observe segment order — so `segment_read_concurrency`
+/// worth of IO can overlap while one batch is being filtered + yielded.
 ///
-/// The bounded concurrency knob `segment_read_concurrency` caps in-flight
-/// reads; `buffer_unordered` orders results by completion. Segment reads
-/// are independent by construction (the exclusion set is fully built
-/// before this fn is called; each read hits its own cold-storage file;
-/// clients do not observe segment order), so overlapping IO keeps cold
-/// storage busy while one batch is being filtered + yielded.
-///
-/// Public as the phase-C half of the split pipeline (CHA-406): the
-/// caller may pass a `SnapshotPlan` holding a SUBSET of the planned
-/// segments (carry-forward's touched partitions, in original plan
-/// order) together with the exclusion set a prior [`resolve_log_tiers`]
-/// produced. The exclusion set must stay the one built from the
-/// UNFILTERED logs (CHA-142) regardless of how the segment list is
-/// narrowed.
+/// The caller may pass a `SnapshotPlan` holding a SUBSET of the planned
+/// segments (carry-forward's touched partitions, in original plan order)
+/// together with the exclusion set a prior [`resolve_log_tiers`] produced. The
+/// exclusion set must stay the one built from the UNFILTERED logs regardless of
+/// how the segment list is narrowed.
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot_segment_stream<'a, L>(
     snapshot_plan: &'a SnapshotPlan,
@@ -1094,9 +1026,7 @@ pub fn snapshot_segment_stream<'a, L>(
     user_schema: &'a SchemaRef,
     full_schema: &'a SchemaRef,
     filter: Option<&'a str>,
-    // CHA-482/CHA-485: owned — moved into the returned 'a stream (the parsed
-    // seek bundle subsumed from `MergeReadRequest.seeks`; the phase-C snapshot
-    // writer passes `SnapshotSeeks::default()`).
+    // Owned — moved into the returned 'a stream.
     seeks: SnapshotSeeks,
     exclusion_set: HashSet<String>,
     tuning: SnapshotStreamTuning,
@@ -1109,10 +1039,8 @@ where
         snapshot_prune_min_segments,
         segment_order,
     } = tuning;
-    // `out_schema` (projected output) and `full_decode_schema` (the unprojected
-    // schema the snapshot cache decodes against, CHA-252) are both derived from
-    // the schemas passed in — kept here rather than as params to stay under the
-    // arg-count lint. `user_cols` feeds the snapshot-scan SQL builder.
+    // `full_decode_schema` is the unprojected schema the snapshot cache decodes
+    // against, so one cached entry serves any projection.
     let out_schema = snapshot_read_schema(user_schema);
     let full_decode_schema = snapshot_read_schema(full_schema);
     let user_cols: Vec<String> = user_schema
@@ -1121,18 +1049,15 @@ where
         .map(|f| f.name().clone())
         .collect();
     Box::pin(async_stream::try_stream! {
-        // CHA-82 snapshot segment pruning by user filter — snapshot-tier ONLY
-        // (ADR 0022; the persist tier reads all segments unfiltered to preserve
-        // the exclusion-set invariant). Pruning stays here in stream_merged; the
-        // surviving segments are handed to the SnapshotTableProvider.
+        // Segment pruning by user filter is snapshot-tier ONLY (ADR 0022): the
+        // persist tier must read all segments unfiltered to preserve the
+        // exclusion-set invariant.
         //
-        // CHA-353: the pruning predicate is the full-plan of the filter — the
-        // same filter string the residual `FilterExec` inside the scan derives
-        // from — so the two cannot diverge: a segment pruning skips holds no
-        // residual match. Pruning keeps-all on any build failure (it is an
-        // optimization). Only build the (full-plan) pruning predicate when there
-        // are enough segments for skipping to outweigh the build cost — see
-        // `MergeReadRequest::snapshot_prune_min_segments`.
+        // The pruning predicate is the full-plan of the filter — the same
+        // filter string the residual `FilterExec` inside the scan derives from —
+        // so the two cannot diverge: a segment pruning skips holds no residual
+        // match. Pruning keeps-all on any build failure, since it is only an
+        // optimization.
         let pruning_predicate = if snapshot_plan.segments.len() > snapshot_prune_min_segments {
             match filter {
                 Some(f) if !f.is_empty() => {
@@ -1168,19 +1093,12 @@ where
             return;
         }
 
-        // CHA-411: read the surviving snapshot segments through the
-        // SnapshotTableProvider via `scan_snapshot`.
-        //
         // ByCompletion (queries): the exclusion anti-join and residual
-        // filter are expressed in the scan SQL. The exclusion set was
-        // built from the unfiltered logs upstream (CHA-142); the SQL
-        // applies the user filter ONLY to the snapshot scan. CHA-252
-        // schema-tolerance happens inside the provider's partition
-        // stream. The filter is never pushed into the format read
-        // (ADR 0023).
+        // filter are expressed in the scan SQL. The filter is never
+        // pushed into the format read (ADR 0023).
         //
-        // ByPlan (CHA-404 snapshot writer): the in-plan NOT IN builds
-        // the anti-join hash table over the SNAPSHOT side (CollectLeft
+        // ByPlan (snapshot writer): the in-plan NOT IN builds the
+        // anti-join hash table over the SNAPSHOT side (CollectLeft
         // LeftAnti) — materializing the prior snapshot and destroying
         // plan order. Scan WITHOUT the join and apply the exclusion set
         // per batch here instead; the set is already resident (O(delta))
@@ -1196,13 +1114,10 @@ where
                     filter,
                     seeks.identity(),
                 );
-                // CHA-454/CHA-485: hand the seek entries to the provider —
-                // the identity entry (server-derived row_uuids) plus the
-                // planner's covering-index entries — so a segment carrying the
-                // matching sidecar(s) does a selective, offset-intersected
-                // seek instead of a full scan. The sql still carries the
-                // `row_uuid IN` residual + user filter for exactness (ADR
-                // 0023): the seek is selection, never the answer.
+                // A segment carrying the matching sidecar(s) does a selective,
+                // offset-intersected seek instead of a full scan. The sql still
+                // carries the `row_uuid IN` residual + user filter for
+                // exactness (ADR 0023): the seek is selection, never the answer.
                 let mut stream = dl
                     .scan_snapshot(
                         &segments,
@@ -1248,10 +1163,9 @@ where
                 let mut batches: u64 = 0;
                 let mut rows_excluded_total: u64 = 0;
                 let mut rows_ids_filtered_total: u64 = 0;
-                // CHA-398: the plain scan carries no ids restriction in
-                // its SQL (build_cold_snapshot_scan_plain); apply it per
-                // batch so a restricted ByPlan read cannot over-return.
-                // Writer reads are unrestricted, so this is a no-op there.
+                // `build_cold_snapshot_scan_plain` carries no ids restriction in
+                // its SQL; apply it per batch so a restricted ByPlan read cannot
+                // over-return.
                 let included: Option<HashSet<String>> = seeks.identity_strings();
                 while let Some(batch) = stream.try_next().await? {
                     let rows_before = batch.num_rows();
@@ -1285,13 +1199,14 @@ where
 mod tests {
     use super::resolve::string_column;
     use super::schema::resolved_schema;
+    use super::schema::test_fixtures::{resolved_batch_nullable, test_user_schema};
     use super::*;
 
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::common::DFSchema;
@@ -1305,11 +1220,10 @@ mod tests {
     use penca_dl::driver::DlError;
     use penca_dl::schema::LogSchemas;
 
-    // CHA-353: `full_plan_predicate` runs the filter through DataFusion's full
-    // planner once. A cross-type compare (`Int32` column vs `Int64` literal)
-    // is the canonical case the planner's TypeCoercion must fix — it errors at
-    // eval otherwise. Non-nullable fields exercise the all-nullable planning
-    // schema (the null dummy row would fail `RecordBatch::try_new` otherwise).
+    // A cross-type compare (`Int32` column vs `Int64` literal) is the canonical
+    // case the planner's TypeCoercion must fix — it errors at eval otherwise.
+    // Non-nullable fields exercise the all-nullable planning schema (the null
+    // dummy row would fail `RecordBatch::try_new` otherwise).
     #[tokio::test]
     async fn full_plan_predicate_coerces_cross_type() {
         use arrow::array::{Int32Array, StringArray};
@@ -1345,10 +1259,9 @@ mod tests {
         assert_eq!(names, vec!["b", "c"]);
     }
 
-    // CHA-353: a filter the optimizer folds to a constant drops the FilterExec
+    // A filter the optimizer folds to a constant drops the FilterExec
     // (always-true → scan only; always-false → EmptyExec). full_plan_predicate
-    // must return a keep-all / drop-all predicate, not error — matching the old
-    // `SELECT * FROM l WHERE {filter}`, which returned all / no rows.
+    // must return a keep-all / drop-all predicate, not error.
     #[tokio::test]
     async fn full_plan_predicate_handles_constant_fold() {
         use arrow::array::Int32Array;
@@ -1376,15 +1289,10 @@ mod tests {
         assert_eq!(apply_predicate(&batch, &drop_all).num_rows(), 0);
     }
 
-    // RT3 (CHA-421): full_plan_predicate must plan on the PASSED session (the
-    // driver's template-derived session) rather than a fresh
-    // SessionContext::new() it builds internally. Observable discriminator: it
-    // registers its planning table `l` into the session it uses, so after the
-    // call the passed session must carry `l`.
-    //
-    // Red against the I3 stub (full_plan_predicate ignores `session` and plans
-    // on an internal new(), so the passed session never gets `l`); green once
-    // I3 registers `l` into the passed session.
+    // full_plan_predicate must plan on the PASSED session (the driver's
+    // template-derived session) rather than a fresh SessionContext::new().
+    // Observable discriminator: it registers its planning table `l` into the
+    // session it uses, so after the call the passed session must carry `l`.
     #[tokio::test]
     async fn full_plan_predicate_plans_on_the_passed_session() {
         let session = SessionContext::new();
@@ -1403,10 +1311,9 @@ mod tests {
         );
     }
 
-    /// Evaluate a compiled physical predicate against a batch — the Arrow apply
-    /// the removed `apply_physical_filter` did. Kept in tests to exercise
-    /// `full_plan_predicate`'s coercion / constant-fold, which still drives
-    /// snapshot segment pruning (CHA-411 moved the residual into the scan plan).
+    /// Evaluate a compiled physical predicate against a batch, exercising
+    /// `full_plan_predicate`'s coercion / constant-fold — which drives snapshot
+    /// segment pruning.
     fn apply_predicate(
         batch: &RecordBatch,
         predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
@@ -1421,10 +1328,9 @@ mod tests {
         arrow::compute::filter_record_batch(batch, mask).unwrap()
     }
 
-    // CHA-353: isolates the warm cost of `SessionContext::new()` (the
-    // per-merge context the snapshot filter parse builds) vs a cached
-    // `parse_sql_expr` — the saving a process-wide cached context buys.
-    // Ignored by default; run with:
+    // Isolates the warm cost of `SessionContext::new()` (the per-merge context
+    // the snapshot filter parse builds) vs a cached `parse_sql_expr` — the
+    // saving a process-wide cached context buys. Run with:
     //   cargo test -p penca-merge bench_snapshot_parse_ctx -- --ignored --nocapture
     #[test]
     #[ignore = "timing microbench"]
@@ -1454,7 +1360,7 @@ mod tests {
         }
         let new_us = t.elapsed().as_micros() as f64 / n as f64;
 
-        // (b) parse on a cached ctx — the lever-1 end state.
+        // (b) parse on a cached ctx.
         let ctx = SessionContext::new();
         let t = Instant::now();
         for _ in 0..n {
@@ -1463,7 +1369,7 @@ mod tests {
         }
         let cached_parse_us = t.elapsed().as_micros() as f64 / n as f64;
 
-        // (c) new()+parse each iter — the current per-merge behavior.
+        // (c) new()+parse each iter — the per-merge behavior.
         let t = Instant::now();
         for _ in 0..n {
             let ctx = SessionContext::new();
@@ -1482,8 +1388,8 @@ mod tests {
         );
     }
 
-    // ----- Mock DB driver (returns nothing — hot resolve stays empty) -----
-
+    // Every method returns nothing, so hot resolve stays empty and the tests
+    // below exercise the cold-only arms.
     struct MockDriver;
 
     impl DbDriver for MockDriver {
@@ -1536,38 +1442,30 @@ mod tests {
         }
     }
 
-    // ----- Mock DL driver (returns pre-set batches) ----------------------
-    //
-    // CHA-368: one cold resolve per read — `execute_sql` returns the two-arm
-    // resolved batch (`is_delete`-flagged upserts + tombstones). The exclusion
-    // set is derived from that batch's row_uuid column upstream, so there is no
-    // separate exclusion probe to route on anymore.
-
     #[derive(Default)]
     struct MockDlDriver {
         resolved: Option<RecordBatch>,
         snapshots: HashMap<String, RecordBatch>,
-        // CHA-411: records the (pruned) segment uuids handed to each
-        // scan_snapshot — the pruning tests assert which segments survived
-        // filter-based pruning.
+        /// The (pruned) segment uuids handed to each scan_snapshot — the
+        /// pruning tests assert which segments survived filter-based pruning.
         snapshot_read_log: Arc<std::sync::Mutex<Vec<String>>>,
-        // CHA-411: records the exclusion set handed to scan_snapshot, so a test
-        // can assert stream_merged folded the resolved row_uuids into it (the
-        // provider applies the anti-join — covered by penca-dl R-A/R-D).
+        /// The exclusion set handed to scan_snapshot, so a test can assert
+        /// stream_merged folded the resolved row_uuids into it (the provider
+        /// applies the anti-join, covered in penca-dl).
         scan_exclusion_log: Arc<std::sync::Mutex<Vec<String>>>,
-        // CHA-411: records the SQL stream_merged built (build_cold_snapshot_scan).
-        // The provider runs it in production (penca-dl R-A/R-D); this lets a
-        // merge test guard the table names + user cols + residual the merge
-        // layer emits, which is otherwise unexercised across the crate boundary.
+        /// The SQL stream_merged built. The provider runs it in production;
+        /// this lets a merge test guard the table names + user cols + residual
+        /// the merge layer emits, otherwise unexercised across the crate
+        /// boundary.
         scan_sql_log: Arc<std::sync::Mutex<Vec<String>>>,
-        // CHA-427: records the resolve/exclusion SQL handed to execute_sql,
-        // so the sibling-equivalence test can pin log-tier pushdown parity
-        // (filter + ids) between stream_merged and stream_all_cold.
+        /// The resolve/exclusion SQL handed to execute_sql, so the
+        /// sibling-equivalence test can pin log-tier pushdown parity
+        /// (filter + ids) between stream_merged and stream_all_cold.
         exec_sql_log: Arc<std::sync::Mutex<Vec<String>>>,
-        // CHA-454: records the seek_keys handed to each scan_snapshot, so a
-        // test pins that the ByCompletion arm derives them from row_uuids (and
-        // ByPlan passes None) — else a dropped derivation silently reverts to
-        // the full-scan path with still-correct rows.
+        /// The seeks handed to each scan_snapshot, so a test pins that the
+        /// ByCompletion arm derives them from row_uuids (and ByPlan passes
+        /// None) — else a dropped derivation silently reverts to the full-scan
+        /// path with still-correct rows.
         seeks_log: Arc<std::sync::Mutex<Vec<Option<Vec<SeekSpec>>>>>,
     }
 
@@ -1615,9 +1513,6 @@ mod tests {
             sql: &str,
             _log_schemas: &LogSchemas,
         ) -> Result<RecordBatch, DlError> {
-            // CHA-368: one resolve per read — return the configured two-arm
-            // (`is_delete`-flagged) resolved batch; the exclusion set falls out
-            // of its row_uuid column upstream. No exclusion-probe SQL to route on.
             self.exec_sql_log.lock().unwrap().push(sql.to_string());
             Ok(match &self.resolved {
                 Some(b) => b.clone(),
@@ -1636,11 +1531,9 @@ mod tests {
             _order: SegmentOrder,
             seeks: Option<Arc<Vec<SeekSpec>>>,
         ) -> Result<datafusion::execution::SendableRecordBatchStream, DlError> {
-            // Record the (pruned) segments + the exclusion set + the SQL
-            // stream_merged handed us, then stream the configured snapshot batches
-            // for those segments. The exclusion anti-join + residual are the
-            // provider+SQL's job in production (covered by penca-dl R-A/R-D);
-            // the mock does not apply them — it tests stream_merged's orchestration.
+            // The exclusion anti-join + residual are the provider+SQL's job in
+            // production (covered in penca-dl); the mock deliberately does not
+            // apply them — it tests stream_merged's orchestration only.
             self.scan_sql_log.lock().unwrap().push(sql.to_string());
             self.seeks_log
                 .lock()
@@ -1669,17 +1562,7 @@ mod tests {
         }
     }
 
-    // ----- Fixtures ------------------------------------------------------
-
-    fn test_user_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-        ]))
-    }
-
-    /// A resolved batch of live (`is_delete = false`) upsert rows — the common
-    /// case (CHA-368: the resolve is now `is_delete`-flagged).
+    /// A resolved batch of live (`is_delete = false`) upsert rows.
     fn make_resolved_batch(
         row_uuids: &[&str],
         names: &[&str],
@@ -1691,8 +1574,8 @@ mod tests {
     }
 
     /// Like [`make_resolved_batch`] but with explicit `is_delete` flags — a
-    /// `true` row is a winning tombstone (CHA-368): it contributes its row_uuid
-    /// to the exclusion set but is dropped from the live delta.
+    /// `true` row is a winning tombstone: it contributes its row_uuid to the
+    /// exclusion set but is dropped from the live delta.
     fn make_resolved_batch_flagged(
         row_uuids: &[&str],
         names: &[&str],
@@ -1700,18 +1583,13 @@ mod tests {
         committed_ats: &[i64],
         is_deletes: &[bool],
     ) -> RecordBatch {
-        let schema = resolved_schema(&test_user_schema());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(row_uuids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(committed_ats.to_vec())),
-                Arc::new(arrow::array::BooleanArray::from(is_deletes.to_vec())),
-            ],
+        resolved_batch_nullable(
+            row_uuids,
+            &names.iter().copied().map(Some).collect::<Vec<_>>(),
+            &values.iter().copied().map(Some).collect::<Vec<_>>(),
+            committed_ats,
+            is_deletes,
         )
-        .unwrap()
     }
 
     fn make_snapshot_batch(row_uuids: &[&str], names: &[&str], values: &[i32]) -> RecordBatch {
@@ -1841,12 +1719,6 @@ mod tests {
         uuids.iter().map(|s| s.to_string()).collect()
     }
 
-    // ----- fold_in_base_cold_source (CHA-368 x CHA-178) -------------------
-    //
-    // Unit-level guards for the two-arm adaptation of the parent-cold fold. The
-    // parent resolve is driven by the mock's `resolved` batch; the child batch
-    // and exclusion set are passed in directly.
-
     /// The base's exclusion contribution is EVERY parent-touched row_uuid —
     /// upsert-winner AND tombstone-winner — but a tombstone never reaches the
     /// output. Locks the two-arm split: exclusion from the full resolve,
@@ -1929,7 +1801,7 @@ mod tests {
     /// All-cold path (`project_base_to_output = true`): the child was already
     /// residual-filtered upstream, so the base is filtered HERE. A base row
     /// failing the filter drops from the output but STILL shadows the base
-    /// snapshot (CHA-142: the exclusion set is unfiltered).
+    /// snapshot, because the exclusion set is unfiltered.
     #[tokio::test]
     async fn fold_base_all_cold_path_filters_output_but_not_exclusion() {
         let user_schema = test_user_schema();
@@ -2004,8 +1876,6 @@ mod tests {
         );
     }
 
-    // ----- Tests ---------------------------------------------------------
-
     #[tokio::test]
     async fn empty_plan_yields_empty() {
         let plan = Plan {
@@ -2068,11 +1938,10 @@ mod tests {
 
     #[tokio::test]
     async fn by_completion_scan_receives_seek_keys_from_row_uuids() {
-        // CHA-454: a restricted (ids) read must hand the stringified row_uuids to
-        // scan_snapshot as seek_keys so the provider can take the index-seek path
-        // — a dropped derivation would silently revert to full scan with still-
-        // correct rows. The negative half (an unrestricted read passes None) is
-        // asserted below.
+        // A restricted (ids) read must hand the stringified row_uuids to
+        // scan_snapshot as seek_keys so the provider can take the index-seek
+        // path — a dropped derivation would silently revert to full scan with
+        // still-correct rows.
         let plan = plan_with_snapshot(vec![snapshot_segment("seg1")]);
         let driver = MockDriver;
         let dl = MockDlDriver::default()
@@ -2164,11 +2033,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_uuid_passed_to_snapshot_exclusion() {
-        // CHA-411: stream_merged folds every resolved row_uuid into the exclusion
-        // set (they shadow same-uuid snapshot rows) and hands it to
-        // scan_snapshot; the SnapshotTableProvider applies the anti-join in
-        // production (covered by penca-dl R-A/R-D). Here we assert the seam:
-        // the resolved uuid reaches scan_snapshot's exclusion.
+        // stream_merged folds every resolved row_uuid into the exclusion set
+        // (they shadow same-uuid snapshot rows) and hands it to scan_snapshot;
+        // the provider applies the anti-join in production. This asserts the
+        // seam only: the resolved uuid reaches scan_snapshot's exclusion.
         let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("seg1")]);
         let driver = MockDriver;
         let dl = MockDlDriver::default()
@@ -2202,13 +2070,11 @@ mod tests {
 
     #[tokio::test]
     async fn by_plan_parts_apply_exclusion_per_batch() {
-        // CHA-404: the ByPlan path scans WITHOUT the in-plan anti-join
-        // (which would build its hash table over the snapshot side) and
-        // drops excluded row_uuids per batch here in penca-merge. The
-        // mock never applies exclusions itself, so r1 disappearing from
-        // the snapshot stream proves the per-batch filter ran; the
-        // exclusion handed to scan_snapshot must be empty and the SQL
-        // free of the NOT IN join.
+        // The ByPlan path scans WITHOUT the in-plan anti-join (which would
+        // build its hash table over the snapshot side) and drops excluded
+        // row_uuids per batch here in penca-merge. The mock never applies
+        // exclusions itself, so r1 disappearing from the snapshot stream
+        // proves the per-batch filter ran.
         let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("seg1")]);
         let driver = MockDriver;
         let dl = MockDlDriver::default()
@@ -2259,11 +2125,8 @@ mod tests {
 
     #[tokio::test]
     async fn by_plan_parts_apply_ids_restriction_per_batch() {
-        // CHA-398: the ByPlan plain scan carries no ids restriction in
-        // its SQL, so the per-batch keep-filter is the sole enforcement
-        // on that arm. One matching and one non-matching snapshot row:
-        // the non-matching row must be dropped here, and the scan SQL
-        // must stay free of an IN clause.
+        // The ByPlan plain scan carries no ids restriction in its SQL, so the
+        // per-batch keep-filter is the sole enforcement on that arm.
         let keep = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let keep_str = keep.to_string();
         let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("seg1")]);
@@ -2308,12 +2171,9 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_sql_references_tables_filter_and_cols() {
-        // CHA-411: guard the merge-side SQL construction across the crate
-        // boundary — stream_merged must build build_cold_snapshot_scan over the
-        // registered table names with the user filter at the outer WHERE. The
-        // mock ignores the SQL (the provider runs it in production — penca-dl
-        // R-A/R-D); this pins exactly what stream_merged emits, which is otherwise
-        // unexercised (R-D builds the scan SQL inline).
+        // Guards the merge-side SQL construction across the crate boundary:
+        // the mock ignores the SQL (the provider runs it in production), so
+        // this pins exactly what stream_merged emits, otherwise unexercised.
         let plan = plan_with_snapshot(vec![snapshot_segment("seg1")]);
         let driver = MockDriver;
         let dl = MockDlDriver::default()
@@ -2358,10 +2218,9 @@ mod tests {
     #[tokio::test]
     async fn cross_tier_dedup_keeps_latest_committed_at() {
         // Cold has r1 with older committed_at; emulate by only feeding cold
-        // (hot is empty via MockDriver). The AsOfMicros snapshot wins by
-        // default. A present persist tier is required for CHA-352's
-        // cold-skip to consult the mock (snapshot-only plans short-circuit
-        // resolve_cold to empty).
+        // (hot is empty via MockDriver). A present persist tier is required
+        // for the mock to be consulted at all — snapshot-only plans
+        // short-circuit resolve_cold to empty.
         let plan = Plan {
             hot_storage: None,
             cold_storage: Some(ColdStoragePlan {
@@ -2406,12 +2265,10 @@ mod tests {
 
     #[test]
     fn cold_persist_schemas_layout() {
-        // FOLLOWUP-A: both merge-path schemas are narrowed to exactly
-        // the columns `build_cold_merge_resolved` references. The
-        // audit/compact paths use the wider `cold_upsert_schema` /
-        // `cold_delete_schema` (with `began_at_micros`, `comment`,
-        // `author`, and — on the delete side — PKs); those are
-        // exercised by the audit-path tests.
+        // Both merge-path schemas are narrowed to exactly the columns
+        // `build_cold_merge_resolved` references. The audit/compact paths use
+        // the wider `cold_upsert_schema` / `cold_delete_schema`, exercised by
+        // the audit-path tests.
         let user_schema = test_user_schema();
         let s = cold_persist_schemas(&user_schema);
         let upsert_cols: Vec<&str> = s
@@ -2420,8 +2277,8 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        // CHA-429: the merge orders/filters on commit_seq_num, so both
-        // merge-path schemas now also declare it (trailing).
+        // The merge orders/filters on commit_seq_num, so both merge-path
+        // schemas declare it (trailing).
         assert_eq!(
             upsert_cols,
             vec![
@@ -2477,13 +2334,11 @@ mod tests {
 
     #[test]
     fn tighten_for_hot_open_tx_is_identity() {
-        // CHA-429: OpenTx now pins the SEQ axis (`commit_seq_num <
-        // began_at_seq_num`), an exact bound. `hot_max` is a
-        // `commit_micros` upper bound, so there is nothing to
-        // intersect against the seq bound — tighten_for_hot is identity for
-        // OpenTx regardless of hot_max (the per-row seq predicate is exact;
-        // the committed_at hot fence still applies separately via the plan's
-        // `committed_at > hot_min`).
+        // OpenTx pins the SEQ axis (`commit_seq_num < began_at_seq_num`), an
+        // exact bound. `hot_max` is a `commit_micros` upper bound, so there is
+        // nothing to intersect against the seq bound — tighten_for_hot is
+        // identity for OpenTx regardless of hot_max. The committed_at hot fence
+        // still applies separately via the plan's `committed_at > hot_min`.
         let tx = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let open = ReadSnapshot::OpenTx {
             began_at_seq_num: 500,
@@ -2493,8 +2348,6 @@ mod tests {
         assert_eq!(open.tighten_for_hot(Some(10_000)), open);
         assert_eq!(open.tighten_for_hot(None), open);
     }
-
-    // ----- CHA-82 R1: snapshot segment pruning red test -----------------
 
     /// Build a SnapshotSegment whose `statistics` field is produced by
     /// `penca_dl::stats::compute_segment_statistics` over a 2-row batch
@@ -2540,20 +2393,6 @@ mod tests {
         // [200,299]. With filter `value BETWEEN 110 AND 150` only the middle
         // segment can possibly match; snapshot pruning should skip the other
         // two and stream_merged should only fetch the middle one.
-        //
-        // Expected failure today: recorded read count == 3 (all segments
-        // fetched) rather than 1, because `stream_merged` Phase 3 iterates
-        // `snapshot_plan.segments` unconditionally via `buffer_unordered`
-        // — no `prune_segments_by_stats` call exists at the Phase-3
-        // entry-point yet. CHA-82 I2 wires the pruning helper into Phase 3
-        // against the parsed user filter; CHA-82 I1 makes
-        // compute/parse_segment_statistics real so the helper has
-        // meaningful per-segment min/max to consult.
-        //
-        // After both I1 and I2 land, this test flips green without
-        // modification — the segment fixture above goes through real
-        // compute_segment_statistics, real parse_segment_statistics, and
-        // real prune_segments_by_stats inside stream_merged.
         let plan = plan_with_snapshot(vec![
             snapshot_segment_with_value_stats("seg-low", 0, 99),
             snapshot_segment_with_value_stats("seg-mid", 100, 199),
@@ -2590,10 +2429,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_pruning_union_stats_prune_and_read() {
-        // CHA-82 R5: one segment whose stats span a wide union range
-        // [0, 299] — e.g. a multi-partition packed file's whole-file
-        // stats (CHA-404). The assertion is about merge_read's pruning
-        // behavior on such a segment.
+        // One segment whose stats span a wide union range [0, 299] — e.g. a
+        // multi-partition packed file's whole-file stats.
         //
         // Two subcases:
         //   subcase 2: filter `value > 999` can't match stats [0,299]
@@ -2601,7 +2438,7 @@ mod tests {
         //   subcase 1 (correctness sanity): filter `value > 200` DOES
         //     intersect [0,299] → segment IS read → recorded reads == 1.
 
-        // ---- subcase 2: filter pruning excludes the segment ----
+        // subcase 2: filter pruning excludes the segment
         let plan = plan_with_snapshot(vec![snapshot_segment_with_value_stats(
             "seg-merged",
             0,
@@ -2634,7 +2471,7 @@ mod tests {
             dl.recorded_snapshot_reads()
         );
 
-        // ---- subcase 1: filter intersects the segment, so it IS read ----
+        // subcase 1: filter intersects the segment, so it IS read
         let plan2 = plan_with_snapshot(vec![snapshot_segment_with_value_stats(
             "seg-merged",
             0,
@@ -2666,16 +2503,12 @@ mod tests {
         );
     }
 
-    // ----- CHA-351: snapshot pruning works with `l.`-qualified filter ----
-
     /// System-internal stream_merged callers (`penca-storage-meta`,
     /// `penca-sql-server` DML) always qualify their filter columns with
     /// `l.` — the alias the hot/cold SQL paths agree on. The snapshot
     /// pruning parse must accept the same qualifier so pruning stays
-    /// active on those reads. Today the parse fails (DFSchema is built
-    /// unqualified, `l.value` won't resolve) and the code falls back
-    /// to keep-all — the [0, 299] segment is read despite `l.value > 999`
-    /// excluding it.
+    /// active on those reads; if the parse rejects it the code falls back
+    /// to keep-all and the pruning silently stops happening.
     #[tokio::test]
     async fn snapshot_pruning_works_with_l_qualified_filter() {
         let plan = plan_with_snapshot(vec![snapshot_segment_with_value_stats(
@@ -2711,7 +2544,77 @@ mod tests {
         );
     }
 
-    // ----- CHA-427: stream_all_cold ≡ stream_merged on all-cold plans ----
+    /// A tombstone whose user columns are NULL — production's actual
+    /// shape once a Snapshot has fenced the row's upsert out of `latest` — must
+    /// flow through the read, not abort it. The table declares `name`/`value`
+    /// non-nullable (`test_user_schema`), which is exactly the condition that
+    /// used to make `RecordBatch::try_new` reject the resolve and wedge every
+    /// later read.
+    ///
+    /// The schema assertion is the half that distinguishes this fix from the
+    /// silent-corruption alternative: relaxing the OUTPUT contract too would
+    /// also make the read succeed, while handing clients an all-nullable schema
+    /// for a table they declared strict.
+    #[tokio::test]
+    async fn null_carrying_tombstone_resolves_without_wedging_the_read() {
+        let plan = plan_with_snapshot_and_persist(vec![snapshot_segment("s1")]);
+        let schema = test_user_schema();
+        let dl = MockDlDriver::default()
+            .with_resolved(resolved_batch_nullable(
+                &["u1", "d1"],
+                &[Some("a"), None],
+                &[Some(1), None],
+                &[100, 150],
+                &[false, true],
+            ))
+            .with_snapshot("s1", make_snapshot_batch(&["s-row"], &["s"], &[9]));
+
+        let batches = collect_stream(stream_all_cold(MergeReadRequest {
+            segment_order: SegmentOrder::ByCompletion,
+            plan: &plan,
+            driver: &MockDriver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &ReadSnapshot::AsOfMicros(2_000),
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 2,
+            snapshot_prune_min_segments: 0,
+        }))
+        .await
+        .expect("a NULL-carrying tombstone must not abort the read");
+
+        // Static panic messages, nothing derived from `emitted` interpolated
+        // into them: row_uuids are PK-derived, and CodeQL's cleartext-logging
+        // rule treats an assert message as a log sink and taints anything
+        // reached from them — including `.len()`, whose receiver carries the
+        // taint. `assert!` evaluates its condition without printing it.
+        let emitted = all_row_uuids(&batches);
+        assert!(
+            emitted.len() == 2,
+            "expected exactly the live row and the snapshot row"
+        );
+        assert!(
+            !emitted.contains(&"d1".to_string()),
+            "the tombstone must be dropped from the live delta"
+        );
+        assert!(
+            emitted.contains(&"u1".to_string()),
+            "the live row must survive"
+        );
+        assert!(
+            dl.recorded_scan_exclusion().contains(&"d1".to_string()),
+            "the tombstone must still shadow its snapshot version"
+        );
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                snapshot_read_schema(&test_user_schema()),
+                "the strict output contract must survive the carrier's relaxation"
+            );
+        }
+    }
 
     /// For an all-cold plan, the dedicated cold path must produce the
     /// exact batches the merged path produces (whose hot arms self-skip
@@ -2729,10 +2632,9 @@ mod tests {
         // shared code by construction).
         let filter = Some("l.value > 0");
         let ids = vec![Uuid::nil()];
-        // CHA-368: the resolve is one two-arm batch — live upserts (u1, u2) plus
-        // a winning tombstone (d1, is_delete = true). d1 lands in the exclusion
-        // set but not the live delta, exercising the derived-exclusion path along
-        // which the two entries could drift.
+        // Live upserts (u1, u2) plus a winning tombstone (d1, is_delete = true).
+        // d1 lands in the exclusion set but not the live delta, exercising the
+        // derived-exclusion path along which the two entries could drift.
         let make_dl = || {
             MockDlDriver::default()
                 .with_resolved(make_resolved_batch_flagged(
@@ -2796,8 +2698,8 @@ mod tests {
         );
 
         // Log-tier parity: both entries must hand the single cold `resolve_cold`
-        // the same SQL (ids pushdown included; CHA-368 dropped the user filter
-        // from the resolve). Sorted for order-insensitive comparison.
+        // the same SQL (ids pushdown included; the resolve carries no user
+        // filter). Sorted for order-insensitive comparison.
         let mut exec_merged = dl_merged.recorded_exec_sql();
         let mut exec_cold = dl_cold.recorded_exec_sql();
         exec_merged.sort();
@@ -2923,7 +2825,7 @@ mod tests {
         );
     }
 
-    /// CHA-406 split-consumption contract: resolve the log tiers once,
+    /// Split-consumption contract: resolve the log tiers once,
     /// then stream a SUBSET `SnapshotPlan` (one of two planned segments)
     /// through the now-public `snapshot_segment_stream` with the
     /// exclusion set that resolve produced. Only the subset segment is
@@ -3013,14 +2915,9 @@ mod tests {
         );
     }
 
-    // ----- CHA-482 (RT2): MergeReadRequest.seeks subsumes row_uuids ---------
-
-    /// A single identity `IndexSeek` entry must thread to every tier exactly as
-    /// the pre-CHA-482 `row_uuids` restriction did: the provider receives the
-    /// uuid strings as seek_keys (CHA-454) and the snapshot scan SQL carries the
-    /// `row_uuid IN` residual. The equivalent composite-seek == residual-row-set
-    /// property is pinned at the kernel by penca-dl RT1 (explicit rows that ARE
-    /// the residual selection); here we pin the identity subsumption.
+    /// A single identity `IndexSeek` entry must thread to every tier: the
+    /// provider receives the uuid strings as seek_keys and the snapshot scan
+    /// SQL carries the `row_uuid IN` residual.
     #[tokio::test]
     async fn seeks_identity_subsumes_row_uuids() {
         let plan = plan_with_snapshot(vec![snapshot_segment("s1")]);
@@ -3064,8 +2961,7 @@ mod tests {
 
     /// A non-identity seek entry (`index_uuid: Some`) reaching the merge
     /// fallback with NO residual `filter` is malformed and fails fast — a
-    /// filter-accompanied one is legal and rides as a selection accelerator
-    /// (CHA-380 metadata name/prefix seeks, CHA-492 user covering indexes).
+    /// filter-accompanied one is legal and rides as a selection accelerator.
     /// Without this guard a filterless name seek would silently full-scan.
     #[tokio::test]
     async fn seeks_name_index_in_merge_fallback_fails_fast() {
@@ -3139,9 +3035,9 @@ mod tests {
         }
     }
 
-    /// CHA-485: a non-identity entry with a residual filter is a legal
-    /// accelerator — skipped by the identity extraction — while the
-    /// no-filter shape keeps CHA-484's fail-fast guard.
+    /// A non-identity entry with a residual filter is a legal accelerator —
+    /// skipped by the identity extraction — while the no-filter shape keeps
+    /// the fail-fast guard.
     #[test]
     fn identity_row_uuids_accelerator_entries_require_filter() {
         let accelerator = IndexSeek {
@@ -3160,14 +3056,14 @@ mod tests {
         // not Some(empty) — an empty restriction would exclude every row).
         let only = vec![accelerator];
         assert_eq!(identity_row_uuids(Some(&only), true).unwrap(), None);
-        // Without a filter the CHA-484 guard stands.
+        // Without a filter the fail-fast guard stands.
         assert!(matches!(
             identity_row_uuids(Some(&only), false),
             Err(MergeError::InvalidPlan(_))
         ));
     }
 
-    /// CHA-485: a filtered read carrying identity + covering-index entries
+    /// A filtered read carrying identity + covering-index entries
     /// threads BOTH to the provider — identity first (the only
     /// exclusion-restricting pass), accelerators after, in caller order.
     #[tokio::test]
@@ -3221,7 +3117,7 @@ mod tests {
         );
     }
 
-    /// CHA-485: accelerator-only shape — no identity restriction, a filter,
+    /// Accelerator-only shape — no identity restriction, a filter,
     /// one covering-index entry. Pins `to_scan_specs`'s copy-free
     /// `(None, Some)` arm end-to-end: the provider receives exactly the
     /// accelerator entries (no identity spec is synthesized).

@@ -20,6 +20,7 @@ Run: ``just integration-test --test-arg integration_snapshot_list_cache_test``.
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client._time import micros_to_datetime
 from penca_client.naming import TABLE_SNAPSHOT_SEGMENT_METADATA
@@ -53,6 +54,9 @@ def _force_cold_snapshot(client, ctx) -> None:
     client.snapshot(**kw)
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestSnapshotListCache:
     def test_snapshot_list_cache_hit_cuts_pg_read(self):
         """A warm current-time read serves the snapshot segment list from the
@@ -266,6 +270,9 @@ class TestSnapshotListCache:
         )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestHotExistenceGate:
     """The hot existence-gate (phase-1 predicate-parity probe) lets a read with
     no emittable hot rows take the snapshot-only fast path — observable as a
@@ -439,6 +446,9 @@ class TestDecompositionParity:
         )
 
 
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+@pytest.mark.serial
 class TestSystemTableResolveCache:
     """CHA-472 red-tests — extend the CHA-441 snapshot-list cache to the
     ``__penca_system__.tables`` IDENTIFIER resolve (hit on every read/write)

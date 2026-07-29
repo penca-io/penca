@@ -24,12 +24,12 @@ impl LifecycleManager {
     /// and bootstrap the main branch.
     ///
     /// `main_branch_uuid` and `public_schema_uuid` are random-minted by
-    /// the caller (CHA-236); the system schema + its two tables remain
+    /// the caller; the system schema + its two tables remain
     /// deterministic per-catalog anchors. Inserts the four system rows
     /// (`public` + `__penca_system__` schemas, `__penca_system__.schemas`
     /// + `__penca_system__.tables` tables) so the catalog is discoverable
     ///   via `list_schemas` / `list_tables` and persist against system
-    ///   tables can find their arrow schemas (CHA-177).
+    ///   tables can find their arrow schemas.
     #[tracing::instrument(
         skip_all,
         fields(
@@ -67,8 +67,8 @@ impl LifecycleManager {
         let genesis_tx = naming::genesis_tx_uuid(&catalog).to_string();
         let system_schema_uuid = naming::system_schema_uuid(&catalog).to_string();
 
-        // Schema rows: __penca_system__ (deterministic anchor, CHA-164)
-        // + public (random-minted by caller, CHA-236).
+        // `__penca_system__` is a deterministic anchor; `public` is
+        // random-minted by the caller.
         for (schema_uuid, schema_name, description) in [
             (
                 system_schema_uuid.clone(),
@@ -111,9 +111,6 @@ impl LifecycleManager {
 
         let sys_schemas_arrow = serialize(PgDialect::system_schemas_arrow_schema())?;
         let sys_tables_arrow = serialize(PgDialect::system_tables_arrow_schema())?;
-        // CHA-455: `__penca_system__.indexes` is the third dogfooded
-        // system table; seed its self-describing row alongside schemas +
-        // tables.
         let sys_indexes_arrow = serialize(PgDialect::system_indexes_arrow_schema())?;
         // `seed_membership` co-locates intent per table: the genesis tx
         // wrote rows to `schemas` (the schema rows) and `tables` (these
@@ -123,9 +120,9 @@ impl LifecycleManager {
         // (its self-describing row + data tables) but excluded from
         // membership — an empty table with a tx_table_log entry but no
         // persist watermark would pin PurgeTxLog's `min(purged_at)` at 0
-        // forever (CHA-455). CreateIndex adds the membership on a real write.
+        // forever. CreateIndex adds the membership on a real write.
         let mut system_table_uuids: Vec<String> = Vec::with_capacity(2);
-        // CHA-380: seed each self-describing row with its declared PK
+        // Seed each self-describing row with its declared PK
         // (`schema_uuid` / `table_uuid` / `index_uuid`) so the `primary_keys`
         // column accurately describes the table — persist of
         // `__penca_system__.indexes` reads its PK off this row.
@@ -176,7 +173,7 @@ impl LifecycleManager {
             }
         }
 
-        // CHA-181: seed tx_table_log with genesis-tx → system-table
+        // Seed tx_table_log with genesis-tx → system-table
         // membership so consumers can resolve the system tables via the
         // (tx_uuid, table_uuid) index just like user tables.
         let tx_table_part = naming::tx_table_log_partition(&catalog, &parse_uuid(main_branch_uuid));
@@ -200,7 +197,7 @@ impl LifecycleManager {
     /// Drop all per-catalog tables (CASCADE drops sub-partitions).
     ///
     /// `main_branch_uuid` is required so main's system-table physicals
-    /// can be located (post-CHA-236 it's random-minted and threaded by
+    /// can be located (it is random-minted and threaded by
     /// the caller).
     pub async fn drop_catalog_tables(
         driver: &impl DbDriver<Row = PgRow>,
@@ -225,11 +222,11 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// CHA-487: seed a forked child's `commit_seq_num` counter from the fork
+    /// Seed a forked child's `commit_seq_num` counter from the fork
     /// commit's seq. See [`PgDialect::seed_commit_seq_num_from_fork`]. Run after
     /// [`Self::ensure_branch_partitions`] and before the child's first commit
     /// (the fork/materialization tx). `fork_seq` = `commit_seq_num(T)`, resolved
-    /// once under PersistBranch (CHA-273 rework).
+    /// once under PersistBranch.
     pub async fn seed_commit_seq_num_from_fork(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -256,7 +253,7 @@ impl LifecycleManager {
 
     /// Create per-table upsert and delete log tables from an Arrow schema.
     ///
-    /// CHA-185: `primary_keys` widens the delete_log schema to carry the
+    /// `primary_keys` widens the delete_log schema to carry the
     /// PK columns alongside `row_uuid` / `tx_uuid`.
     pub async fn create_data_tables(
         driver: &impl DbDriver<Row = PgRow>,

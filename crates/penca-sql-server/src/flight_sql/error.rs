@@ -7,7 +7,6 @@
 //!
 //! All four wrappers stringify the source error via `{:?}` into
 //! `Status::internal` (or, for the reverse direction, `FlightError::Tonic`).
-//! Behavior preserved exactly from the in-service.rs originals.
 
 use arrow_flight::error::FlightError;
 use datafusion::arrow::error::ArrowError;

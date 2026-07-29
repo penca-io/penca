@@ -46,6 +46,7 @@ import time
 from uuid import uuid4
 
 import pyarrow as pa
+import pytest
 from penca_client import Mutation
 from penca_client.naming import (
     abort_tx_log_partition,
@@ -84,11 +85,6 @@ TABLE_SNAPSHOT_METADATA = "table_snapshot_metadata"
 # pattern in ``integration_grace_window_test.py``.
 _QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 _GRACE_WAIT_SECONDS = _QUERY_TIMEOUT_SECONDS + 1.0
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_branch(client, catalog_uuid, name):
@@ -258,11 +254,6 @@ def _commit_tx_deleting_rows(
     )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 class TestPerTableLifecycle:
     def test_per_table_persist_isolation(self):
         """``Persist(T1)`` writes only T1's persist metadata + cold segments.
@@ -287,7 +278,6 @@ class TestPerTableLifecycle:
             {"name": ["alice"], "value": [1]},
         )
 
-        # Per-table persist of T1 only.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -365,11 +355,9 @@ class TestPerTableLifecycle:
             branch_uuid=branch_uuid,
             table_uuid=tables["t1"],
         )
-        # Purge advanced the seq fence Pu.
         assert purge_response.HasField("purged_at_micros")
         pu = purge_response.purged_at_micros
 
-        # Hot upsert log is now empty.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 0
         # Delete log is empty too (no deletes were written in this tx).
         assert _count_hot_delete_log_rows(tables["t1"], branch_uuid) == 0
@@ -413,9 +401,7 @@ class TestPerTableLifecycle:
             table_uuid=tables["t1"],
         )
 
-        # Hot still has the rows post-persist.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 3
-        # Cold has them too (persist wrote a committed segment).
         assert (
             _count_committed_persist_segments(catalog_uuid, branch_uuid, tables["t1"])
             >= 1
@@ -476,9 +462,7 @@ class TestPerTableLifecycle:
             table_uuid=tables["t1"],
         )
 
-        # Hot is empty.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 0
-        # Cold still holds the rows.
         assert (
             _count_committed_persist_segments(catalog_uuid, branch_uuid, tables["t1"])
             >= 1
@@ -659,7 +643,6 @@ class TestPerTableLifecycle:
             catalog_uuid=catalog_uuid,
             branch_uuid=branch_uuid,
         )
-        # Re-persist after the abort.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -676,6 +659,9 @@ class TestPerTableLifecycle:
         )[0][0]
         assert abort_count == 1, "abort_tx_log row must survive per-table persist"
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_lock_serialization_per_table(self):
         """Persist's lock key is ``persist:{table_uuid}:{branch_uuid}``
         (ADR 0019 §"Lock scoping").
@@ -1159,12 +1145,6 @@ class TestPerTableLifecycle:
         assert result.num_rows == 0
 
 
-# ---------------------------------------------------------------------------
-# CHA-227: stamping rule (max(committed_at) over persisted rows) and
-# Snapshot's direct-watermark reads
-# ---------------------------------------------------------------------------
-
-
 def _max_committed_persist_segment_max_tx(catalog_uuid, branch_uuid, table_uuid):
     """Return ``max(max_tx_commit_micros)`` over committed persist
     segments for ``(branch, table)`` — the *true* watermark over the
@@ -1216,7 +1196,6 @@ class TestPerTableLifecycleCHA227:
             client, catalog_uuid, schema_uuid, branch_uuid, ["t1"]
         )
 
-        # Commit a tx; capture its commit_micros via the response.
         tx = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1472,11 +1451,6 @@ class TestPerTableLifecycleCHA227:
             f"persisted_at ({persisted_at}); got "
             f"{snapshot_response.snapshotted_at_micros}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Proto-shape regressions
-# ---------------------------------------------------------------------------
 
 
 class TestPerTableLifecycleProtoShape:

@@ -3,10 +3,9 @@
 //! [`penca_core::Plan`] (via the pure `assemble_plan`), plus the snapshot
 //! + persist-segment readers it composes.
 
-// CHA-472: these methods carry the multi-arg SQL-read signatures relocated
-// verbatim from `penca-storage-meta` (which blanket-allowed this crate-wide);
-// adding the `&self` receiver pushes several past the lint threshold. Preserve
-// the source crate's posture at module scope rather than per-method.
+// The multi-arg SQL-read signatures here plus the `&self` receiver push
+// several methods past the lint threshold; allowed at module scope rather
+// than per-method.
 #![allow(clippy::too_many_arguments)]
 
 use penca_core::{
@@ -30,7 +29,7 @@ use penca_storage_meta::{MetadataError, Result, RetentionFloor, SnapshotResult};
 use super::QueryManager;
 use super::meta_resolve::parse_meta_uuid;
 
-/// CHA-178: a branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num)`.
+/// A branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num)`.
 type BranchLineage = (String, i64);
 
 /// Result of [`Self::read_and_classify_persist_segments`].
@@ -39,7 +38,7 @@ struct ClassifiedPersistSegments {
     delete_segments: Vec<PersistSegment>,
 }
 
-/// CHA-492: the snapshot a cache-eligible read resolves to, captured by the
+/// The snapshot a cache-eligible read resolves to, captured by the
 /// fused [`QueryManager::hot_min_and_snapshot_pick`]. `w_snap` keys the
 /// snapshot-list cache; `table_snapshot_uuid` is threaded into the miss-path
 /// segment fetch so it reads THIS snapshot by identity (no re-pick), making the
@@ -58,7 +57,7 @@ impl QueryManager {
     /// 2. Pre-Persist (`hot_min == 0`): emit `cold_storage = None`; hot owns
     ///    every row (`hot_present = true`). Post-Persist: query the latest
     ///    committed snapshot bounded by `hot_min - 1` (yielding `W_snap`), then
-    ///    the CHA-441 phase-1 fused capture — ONE round-trip returning the seq
+    ///    the phase-1 fused capture — ONE round-trip returning the seq
     ///    `fence = max(Pu, W_snap)` and the hot existence gate `hot_present`
     ///    (see [`Self::phase_one_fence_and_existence`]) — then the committed
     ///    persist segments in `[snapshotted_at + 1, cold_max)`.
@@ -70,10 +69,8 @@ impl QueryManager {
     /// 1 SQL query pre-Persist, 4 SQL queries post-Persist (hot_min, snapshot,
     /// phase-1 fence+existence, persist).
     ///
-    /// `cache` (CHA-441) is threaded for the snapshot-list cache that
-    /// the snapshot-list read path consumes; latest-snapshot current-time reads pass
-    /// `Some(&cache)`, every other caller (write / lifecycle / time-travel /
-    /// system-table) passes `None`. Inert here — a follow-up lands the signature.
+    /// `cache`, when `Some`, is the W_snap-keyed snapshot-list cache the
+    /// snapshot-list read consumes; `None` opts out per service.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -93,8 +90,8 @@ impl QueryManager {
         branch_uuid: &str,
         as_of_micros: i64,
         commit_seq_upper: Option<i64>,
-        // CHA-433: the effective retention duration (`None` when retention is
-        // disabled). Drives the folded floor read; the caller enforces the
+        // The effective retention duration (`None` when retention is
+        // disabled). Drives the folded floor read; the CALLER enforces the
         // `as_of < floor` check on the returned coordinates.
         retention_duration_seconds: Option<i64>,
         cache: Option<&SnapshotListCache>,
@@ -107,23 +104,22 @@ impl QueryManager {
         let delete_table_name = naming::delete_log_table(&table, &branch);
         let commit_tx_log_table_name = naming::commit_tx_log_partition(&catalog, &branch);
 
-        // CHA-233: hot/cold visibility cutoff is `persisted_at_micros`
-        // (per ADR 0019, reverting ADR 0018's `purged_at` choice).
+        // The hot/cold visibility cutoff is `persisted_at_micros` (ADR 0019).
         // Pre-Persist (`hot_min == 0`) hot owns every row; `assemble_plan`
-        // returns `cold_storage = None` so the merge layer never sees
-        // double presence. Post-Persist the cold tier serves
-        // `committed_at < hot_min` and hot serves `>= hot_min` — a strict
-        // tier partition `PersistPlan.committed_at` makes explicit. Between
-        // Persist's commit and Purge's grace-bounded delete the same rows
-        // live physically in both tiers, but the plan filter excludes the
-        // cold-side rows from hot reads; the universal grace window keeps
-        // them present in hot long enough for any concurrent
-        // pre-cutoff-pinned plan to finish (ADR 0019, mechanism 2).
-        // CHA-492: fused capture — `hot_min` (the persist watermark, drives the
-        // tier branch below) AND `cache_pick` (the resolved snapshot's IDENTITY
-        // + W_snap) in ONE round-trip, so the cache can key on the snapshot
-        // version AND the miss-path can fetch it by identity, before the segment
-        // read — the snapshot is picked exactly once, here.
+        // returns `cold_storage = None` so the merge layer never sees double
+        // presence. Post-Persist the cold tier serves `committed_at < hot_min`
+        // and hot serves `>= hot_min` — a strict tier partition
+        // `PersistPlan.committed_at` makes explicit. Between Persist's commit
+        // and Purge's grace-bounded delete the same rows live physically in
+        // both tiers, but the plan filter excludes the cold-side rows from hot
+        // reads; the universal grace window keeps them present in hot long
+        // enough for any concurrent pre-cutoff-pinned plan to finish (ADR 0019,
+        // mechanism 2).
+        //
+        // Fused capture: `hot_min` AND `cache_pick` (the resolved snapshot's
+        // IDENTITY + W_snap) in ONE round-trip, so the cache keys on the
+        // snapshot version AND the miss-path fetches it by identity — the
+        // snapshot is picked exactly once, here.
         let (hot_min, cache_pick, retention_floor, lineage) = self
             .hot_min_and_snapshot_pick(
                 driver,
@@ -136,7 +132,7 @@ impl QueryManager {
             )
             .await?;
 
-        // CHA-178: the seq of the child snapshot this read will resolve on
+        // The seq of the child snapshot this read will resolve on
         // (`SNAPSHOT_SEQ_GENESIS` when none is picked — a fresh fork or a
         // time-travel read below any child snapshot). The base-source gate
         // keys on this: any real child snapshot has `w_snap > fork_seed`, so a
@@ -149,13 +145,13 @@ impl QueryManager {
         // cold fetch AND the phase-1 capture — `assemble_plan` ignores the
         // cold inputs and omits cold_storage, `fence = None` (hot serves all),
         // and `hot_present = true`. Post-Persist: read the snapshot first (it
-        // yields `W_snap`), THEN the CHA-441 phase-1 fused capture (which needs
+        // yields `W_snap`), THEN the phase-1 fused capture (which needs
         // `W_snap` to floor the fence), THEN the persist window — bounding BOTH
         // the snapshot picker (`compute_snapshot_picker_as_of`) and the persist
         // window (`cold_max`, recomputed identically inside `assemble_plan` for
         // the committed_at filter) by the single captured `hot_min`, so a
         // concurrent Persist+Snapshot+Purge between these reads can't shift
-        // this plan's hot/cold cutoff (CHA-227 plan v11).
+        // this plan's hot/cold cutoff.
         let (cold, fence, hot_present) = if hot_min == 0 {
             (
                 ColdInputs {
@@ -171,19 +167,17 @@ impl QueryManager {
             )
         } else {
             let snapshot_as_of = watermarks::compute_snapshot_picker_as_of(as_of_micros, hot_min);
-            // CHA-198: thread the branch UUID through the per-catalog
-            // reads to partition-prune via `branch_uuid = $N`.
             let SnapshotResult {
                 snapshotted_at_micros,
-                // CHA-443 (IMPL-4): W_snap of the picked snapshot — stamped onto
-                // SnapshotPlan.commit_seq_num so the merge / CHA-444 read it, and
-                // (CHA-441) floors the phase-1 fence below.
+                // W_snap of the picked snapshot — stamped onto
+                // SnapshotPlan.commit_seq_num for the merge, and floors the
+                // phase-1 fence below.
                 commit_seq_num: snapshot_seq,
                 snapshot_segments,
-                // CHA-485: declared user-index defs → SnapshotPlan.indexes.
+                // Declared user-index defs → SnapshotPlan.indexes.
                 indexes,
-                // The recorded layout keys drive CHA-406 carry-forward in
-                // the snapshot writer, not query planning.
+                // The recorded layout keys drive carry-forward in the snapshot
+                // writer, not query planning.
                 ..
             } = self
                 .list_snapshot_segments(
@@ -193,23 +187,21 @@ impl QueryManager {
                     branch_uuid,
                     table_uuid,
                     snapshot_as_of,
-                    // CHA-443 (IMPL-3): on an AsOfSeq read, also bound the snapshot
-                    // PICK on W_snap <= N (not just the persist residual) so the
-                    // baseline can't leak rows past the seq cutoff (CHA-457).
+                    // On an AsOfSeq read this must also bound the snapshot PICK
+                    // on `W_snap <= N`, not just the persist residual, or the
+                    // baseline leaks rows past the seq cutoff.
                     commit_seq_upper,
-                    // CHA-492: the fused pick (identity + W_snap) — the cache key
-                    // AND the uuid the miss-path fetches by, so no re-pick.
+                    // The fused pick (identity + W_snap) — the cache key AND
+                    // the uuid the miss-path fetches by, so no re-pick.
                     cache_pick,
                 )
                 .await?;
-            // CHA-443 (IMPL-4): W_snap from the picked snapshot. `None` ⇒ no
-            // committed snapshot (SnapshotPlan is omitted anyway), so the
-            // genesis base is inert.
+            // W_snap from the picked snapshot. `None` ⇒ no committed snapshot
+            // (SnapshotPlan is omitted anyway), so the genesis base is inert.
             let w_snap = snapshot_seq.unwrap_or(watermarks::SNAPSHOT_SEQ_GENESIS);
 
-            // CHA-441 phase-1 fused capture: ONE round-trip → `(fence,
-            // hot_present)`, replacing the standalone `Pu` read. `fence =
-            // max(Pu, W_snap)` (CHA-444 / ADR 0027) is captured ONCE here and
+            // Phase-1 fused capture: ONE round-trip → `(fence, hot_present)`.
+            // `fence = max(Pu, W_snap)` (ADR 0027) MUST be captured once and
             // used for BOTH the hot existence gate and (threaded into
             // `assemble_plan` below) the cold-persist fence — independent
             // per-side `Pu` reads would open the silent-gap window ADR-0019's
@@ -233,10 +225,10 @@ impl QueryManager {
             // served by hot) is excluded before the cold tier ever sees it.
             let cold_max = cold_committed_at_max(as_of_micros, hot_min);
             let from_micros = snapshotted_at_micros.map(|s| s.saturating_add(1));
-            // CHA-429 #4: on a seq-axis read the `committed_at` window above
-            // is the tier fence (`< hot_min`); `commit_seq_upper` additionally
-            // skips segments whose every row is past the seq cutoff. `None`
-            // (micros / OpenTx axes) leaves selection on `committed_at` alone.
+            // On a seq-axis read the `committed_at` window above is the tier
+            // fence (`< hot_min`); `commit_seq_upper` additionally skips
+            // segments whose every row is past the seq cutoff. `None` (micros
+            // / OpenTx axes) leaves selection on `committed_at` alone.
             let (upsert_segments, delete_segments) = self
                 .read_persist_segments_for_window(
                     driver,
@@ -263,7 +255,7 @@ impl QueryManager {
             )
         };
 
-        // CHA-178: enumerate the parent's cold tier as a second source for a
+        // Enumerate the parent's cold tier as a second source for a
         // forked branch, gated on the picked child snapshot NOT already
         // covering the fork (`child_snapshot_seq < fork_commit_seq_num`). When
         // a child snapshot covers the fork it has folded the parent's data into
@@ -293,8 +285,7 @@ impl QueryManager {
             _ => None,
         };
         // Permanent gate-observability marker (dormant unless `penca=debug`),
-        // mirroring `tier_shape` — the acceptance seam CHA-178's post-snapshot
-        // test scrapes.
+        // mirroring `tier_shape` — the post-snapshot integration test scrapes it.
         tracing::debug!(
             base_cold_source = if base_cold_storage.is_some() {
                 "present"
@@ -317,25 +308,25 @@ impl QueryManager {
             },
         );
         plan.base_cold_storage = base_cold_storage;
-        // CHA-433: return the retention floor alongside the plan; read_data /
-        // plan_audit enforce the below-floor check on it.
+        // The floor rides back with the plan; read_data / plan_audit enforce
+        // the below-floor check on it.
         Ok((plan, retention_floor))
     }
 
-    /// CHA-441 phase-1 fused capture: ONE Postgres round-trip returning the
+    /// Phase-1 fused capture: ONE Postgres round-trip returning the
     /// hot↔cold seq `fence` and the hot-existence gate `hot_present` for
     /// `(branch, table)`.
     ///
     /// `fence = GREATEST(Pu, W_snap)` where `Pu = MAX(last_purged_commit_seq_num)`
-    /// over committed `table_purge_metadata` (the cold read fence, CHA-444 /
-    /// ADR 0027) and `W_snap` (the snapshot watermark, bound as `$3`) floors it
+    /// over committed `table_purge_metadata` (the cold read fence, ADR 0027)
+    /// and `W_snap` (the snapshot watermark, bound as `$3`) floors it
     /// so hot never overlaps the snapshot baseline while `Pu` lags `W_snap`.
     /// `Pu` NULL (no committed purge yet) ⇒ `GREATEST` returns `W_snap`. The
     /// fence is computed in the `fence` CTE so it is captured ONCE and returned
     /// for the cold-persist fence — a single cutoff per plan (ADR-0019's grace
     /// assumes one; independent per-side `Pu` reads would open a silent gap).
     ///
-    /// `hot_present` is a deliberately **loose** existence gate (CHA-473):
+    /// `hot_present` is a deliberately **loose** existence gate:
     /// `true` iff either hot log holds ANY row (`EXISTS(upsert) OR
     /// EXISTS(delete)`), with NO fence/as_of predicate and NO `commit_tx_log` join.
     /// This is a safe over-approximation — `hot_present` only decides whether
@@ -344,12 +335,12 @@ impl QueryManager {
     /// rows merely runs the hot read, which re-filters (pre-Persist already
     /// passes `hot_present = true` unconditionally). It never false-negatives: a
     /// visible hot row IS a log row, so an empty log ⇒ no hot rows. The open
-    /// tx's own writes are rows in the log, so the bare EXISTS subsumes the old
-    /// RYOW arm without threading the tx uuid. The tight predicate it replaces
-    /// forced a full `commit_tx_log` scan + per-row probe (~1,724 shared-buffer hits)
-    /// whose wall-clock ballooned under contention; the bare EXISTS
-    /// short-circuits at the first row and is a ~0-page scan on the post-purge
-    /// empty hot log.
+    /// tx's own writes are rows in the log, so the bare EXISTS covers RYOW
+    /// without threading the tx uuid. Do not tighten it: a fence/as_of
+    /// predicate forces a full `commit_tx_log` scan + per-row probe (~1,724
+    /// shared-buffer hits) whose wall-clock balloons under contention, where
+    /// the bare EXISTS short-circuits at the first row and is a ~0-page scan
+    /// on the post-purge empty hot log.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn phase_one_fence_and_existence(
         &self,
@@ -363,11 +354,6 @@ impl QueryManager {
     ) -> Result<(i64, bool)> {
         let catalog = parse_uuid(catalog_uuid);
         let purge_table = naming::table_purge_metadata_table(&catalog);
-        // CHA-473: `hot_present` is the loose `EXISTS(upsert) OR EXISTS(delete)`
-        // over-approximation (see the doc-comment for the safety argument); the
-        // `fence` CTE still computes GREATEST(Pu, W_snap) for the cold-persist
-        // side. No `commit_tx_log` join, no fence/as_of predicate — so a point read
-        // never pays the full hot-log scan the tight gate forced.
         let sql = format!(
             "WITH fence AS (\
                  SELECT GREATEST(\
@@ -400,7 +386,7 @@ impl QueryManager {
         Ok((row.get("fence"), row.get("hot_present")))
     }
 
-    /// CHA-492: fused capture — ONE round-trip returning the persist watermark
+    /// Fused capture — ONE round-trip returning the persist watermark
     /// (→ `hot_min = persist_wm + 1`) AND the IDENTITY of the snapshot THIS read
     /// resolves to ([`PickedSnapshot`]: `table_snapshot_uuid` + its `W_snap`),
     /// the as_of-/seq-bounded pick. [`Self::list_snapshot_segments`] keys the
@@ -436,9 +422,9 @@ impl QueryManager {
         let table = parse_meta_uuid(table_uuid, "table_uuid")?;
         let persist_name = naming::table_persist_metadata_table(&catalog);
         let snap_name = naming::table_snapshot_metadata_table(&catalog);
-        // CHA-178: fold the child's fork lineage into this already-per-read
-        // query (a branch_store PK join) so a non-forked read pays no extra
-        // round-trip for the base-source gate.
+        // Fold the child's fork lineage into this already-per-read query (a
+        // branch_store PK join) so a non-forked read pays no extra round-trip
+        // for the base-source gate.
         let branch_store = naming::branch_store_table(&catalog);
         // The seq bind trails `$3` (as_of) at `$4` when present.
         let seq_clause = match commit_seq_upper {
@@ -453,12 +439,12 @@ impl QueryManager {
         if let Some(seq) = commit_seq_upper {
             params.push(SqlValue::Int64(seq));
         }
-        // CHA-433: fold the retention floor onto the SAME round trip when
-        // retention is enabled — an independent LATERAL over the CURRENT durable
-        // snapshots, with the window start computed from the DB clock (no
-        // `now_micros` threading). `None` ⇒ no floor read (the null-floor no-op).
-        // Reuses `retention_floor_select` so the durable/committed predicate
-        // lives in one place (shared with `LifecycleManager::retention_floor`).
+        // Fold the retention floor onto the SAME round trip when retention is
+        // enabled — an independent LATERAL over the CURRENT durable snapshots,
+        // with the window start computed from the DB clock (no `now_micros`
+        // threading). `None` ⇒ no floor read. Reuses `retention_floor_select`
+        // so the durable/committed predicate lives in one place, shared with
+        // `LifecycleManager::retention_floor`.
         let (floor_cols, floor_join) = match retention_duration_seconds {
             Some(duration_seconds) => {
                 params.push(SqlValue::Int64(duration_seconds));
@@ -517,8 +503,8 @@ impl QueryManager {
                 w_snap,
             })
         });
-        // CHA-433: the floor columns are absent from the projection when
-        // retention is disabled (the fold is omitted) → `try_get` errors → None;
+        // The floor columns are absent from the projection when retention is
+        // disabled (the fold is omitted) → `try_get` errors → None;
         // when present but no durable precedes the window, the LATERAL leaves
         // them NULL → None.
         let floor = row.and_then(|r| {
@@ -530,9 +516,9 @@ impl QueryManager {
                 snapshotted_at_micros,
             })
         });
-        // CHA-178: the child's fork lineage. `parent_branch_uuid` is nullable
-        // (NULL = non-forked, e.g. main); `fork_commit_seq_num` is NOT NULL
-        // (CHA-505; main = 0), so the fork signal is parent presence alone.
+        // `parent_branch_uuid` is nullable (NULL = non-forked, e.g. main) while
+        // `fork_commit_seq_num` is NOT NULL (main = 0), so the fork signal is
+        // parent presence alone.
         // Propagate a genuine decode error rather than masking it as "no
         // lineage" — on this live read path that would make a forked branch
         // silently drop its parent cold source and return incomplete data.
@@ -550,7 +536,7 @@ impl QueryManager {
         Ok((persist_wm.map_or(0, |p| p + 1), pick, floor, lineage))
     }
 
-    /// CHA-441/492: cache-aware wrapper over [`Self::read_snapshot_segments_for_table`].
+    /// Cache-aware wrapper over [`Self::read_snapshot_segments_for_table`].
     ///
     /// The snapshot segment list is immutable between snapshot commits, so a
     /// `Some(cache)` serves the `(catalog, branch, table, W_snap)` entry from
@@ -601,12 +587,10 @@ impl QueryManager {
             table_uuid.to_string(),
             pick.w_snap,
         );
-        // CHA-492: the key IS the validity — a given `W_snap` is one immutable
-        // snapshot, so a hit needs no frontier re-check (the old CHA-441 pin
-        // guard is subsumed: a newer snapshot mints a distinct key).
+        // The key IS the validity — a given `W_snap` is one immutable snapshot,
+        // so a hit needs no frontier re-check: a newer snapshot mints a
+        // distinct key.
         if let Some(hit) = cache.get(&key) {
-            // CHA-441 (34mf): cache hit/miss observability — dormant unless
-            // penca=debug.
             tracing::debug!(snapshot_list_cache = "hit", table = table_uuid);
             return Ok(SnapshotResult {
                 snapshotted_at_micros: Some(hit.snapshotted_at_micros),
@@ -619,12 +603,10 @@ impl QueryManager {
         }
         tracing::debug!(snapshot_list_cache = "miss", table = table_uuid);
 
-        // CHA-492: fetch the VALUE by the fused pick's `table_snapshot_uuid`, not
-        // a re-pick. The fused query already resolved the snapshot this read maps
-        // to, so reading it by identity means the cached segments are exactly the
-        // keyed snapshot's — KEY (`w_snap`) and VALUE come from one pick and can
-        // never diverge (the race is impossible by construction; no
-        // as_of/seq re-bind needed, the uuid IS the pin).
+        // Fetch the VALUE by the fused pick's `table_snapshot_uuid`, never a
+        // re-pick: reading by identity means the cached segments are exactly
+        // the keyed snapshot's, so KEY (`w_snap`) and VALUE come from one pick
+        // and cannot diverge. The uuid IS the pin — no as_of/seq re-bind.
         let result = self
             .read_snapshot_segments_for_table(
                 driver,
@@ -667,20 +649,14 @@ impl QueryManager {
     /// un-applied from a materialized form. When `as_of_micros = None`
     /// (current-time read), pick the absolute latest snapshot.
     ///
-    /// CHA-198: reads the per-catalog parents
-    /// `{catalog_uuid}_table_snapshot_metadata` /
-    /// `{catalog_uuid}_table_snapshot_segment_metadata`, with
-    /// `branch_uuid = $2` on every WHERE for partition pruning.
-    /// CHA-404: segment rows come back `ORDER BY seg.chunk_idx` — write
-    /// order, which is label-sorted partition-run order. The snapshot
-    /// writer's ByPlan run-grouping depends on it; other callers get a
-    /// deterministic order for free.
-    /// CHA-203: filters on `snap.table_uuid` instead of the dropped
-    /// `data_log_prefix_uuid` column.
-    // CHA-353: trace span isolates this PG round-trip in a read-plan
-    // decomposition (busy vs idle). Dormant under the default
-    // `penca=debug`; enable with `…,penca_storage_meta=trace` +
-    // `PENCA_SPAN_TIMING=1` to time it.
+    /// `branch_uuid = $2` sits on every WHERE for partition pruning.
+    /// Segment rows come back `ORDER BY seg.chunk_idx` — write order, which is
+    /// label-sorted partition-run order. The snapshot writer's ByPlan
+    /// run-grouping depends on that; other callers get a deterministic order
+    /// for free.
+    // The span isolates this PG round-trip in a read-plan decomposition (busy
+    // vs idle). Dormant under the default `penca=debug`; enable with
+    // `…,penca_storage_meta=trace` + `PENCA_SPAN_TIMING=1` to time it.
     #[tracing::instrument(
         level = "trace",
         skip_all,
@@ -696,16 +672,15 @@ impl QueryManager {
         branch_uuid: &str,
         table_uuid: &str,
         as_of_micros: Option<i64>,
-        // CHA-443 (IMPL-3): seq-axis pick bound. `Some(N)` (an AsOfSeq read)
-        // picks the latest snapshot whose W_snap (`commit_seq_num`) <= N, so the
-        // baseline can't surface rows past the read's seq cutoff (the CHA-457
-        // leak). `None` (micros / OpenTx / lifecycle construction) leaves
-        // selection on `snapshotted_at_micros` alone. Ignored when
-        // `pinned_snapshot_uuid` is `Some` (identity read, no pick).
+        // Seq-axis pick bound. `Some(N)` (an AsOfSeq read) picks the latest
+        // snapshot whose W_snap (`commit_seq_num`) <= N, so the baseline can't
+        // surface rows past the read's seq cutoff. `None` (micros / OpenTx /
+        // lifecycle construction) leaves selection on `snapshotted_at_micros`
+        // alone. Ignored when `pinned_snapshot_uuid` is `Some`.
         commit_seq_upper: Option<i64>,
-        // CHA-492: `Some(uuid)` reads THAT snapshot by identity — the cache
-        // miss-path threads the fused pick's `table_snapshot_uuid`, so there is
-        // no re-pick and `as_of_micros`/`commit_seq_upper` are unused. `None`
+        // `Some(uuid)` reads THAT snapshot by identity — the cache miss-path
+        // threads the fused pick's `table_snapshot_uuid`, so there is no
+        // re-pick and `as_of_micros`/`commit_seq_upper` are unused. `None`
         // picks the latest snapshot bounded by as_of / seq (the non-cache
         // callers: lifecycle snapshot writer, not-yet-cached reads).
         pinned_snapshot_uuid: Option<Uuid>,
@@ -713,12 +688,12 @@ impl QueryManager {
         let catalog = parse_uuid(catalog_uuid);
         // Parse fallibly (unlike the panicking `parse_uuid` above): a malformed
         // `table_uuid` surfaces as the same typed protocol error the
-        // `meta_resolve` getters produce (CHA-473).
+        // `meta_resolve` getters produce.
         let table = parse_meta_uuid(table_uuid, "table_uuid")?;
         let snap_name = naming::table_snapshot_metadata_table(&catalog);
         let seg_name = naming::table_snapshot_segment_metadata_table(&catalog);
-        // CHA-454: the internal row_uuid index parent/child (CHA-412) — joined
-        // in below so a planned snapshot segment carries its sidecar inline.
+        // The internal row_uuid index parent/child, joined in below so a
+        // planned snapshot segment carries its sidecar inline.
         let idx_parent = naming::table_snapshot_index_metadata_table(&catalog);
         let idx_child = naming::table_snapshot_segment_index_metadata_table(&catalog);
         // Params `$1` = table, `$2` = branch (fixed in the JOINs / WHERE); the
@@ -727,9 +702,6 @@ impl QueryManager {
         // numbering scheme.
         let mut params: Vec<SqlValue> =
             vec![SqlValue::Uuid(table), SqlValue::uuid_str(branch_uuid)?];
-        // CHA-492: the snapshot selection. `Some(uuid)` (the cache miss-path)
-        // reads THAT snapshot by identity — no pick, no as_of/seq. `None` picks
-        // the latest snapshot bounded by as_of / seq (the non-cache callers).
         let snapshot_selection = if let Some(uuid) = pinned_snapshot_uuid {
             params.push(SqlValue::Uuid(uuid));
             format!("snap.table_snapshot_uuid = ${}", params.len())
@@ -758,33 +730,29 @@ impl QueryManager {
                 snap_table = qi(&snap_name),
             )
         };
-        // CHA-454: LEFT JOIN the index parents (CHA-412) so each segment
-        // carries its sidecars' read-coordinates inline — one query, no
-        // separate resolve round-trip. CHA-485 generalizes the parent join
-        // from the internal header only (`index_uuid IS NULL`) to EVERY
-        // committed parent, so rows become (segment × parent): the identity
-        // parent's child feeds the dedicated `row_uuid_index_sidecar` slot,
-        // keyed parents feed the keyed `index_sidecars`. Two kinds of keyed
-        // parent qualify: user secondary indexes (non-NULL `key_columns`,
-        // also feeding the plan's `SnapshotIndexDef` planner list) and — the
-        // CHA-484 fold-in — the built-in system name index (CHA-481, non-NULL
-        // uuid + NULL `key_columns`, matched by its deterministic
-        // `system_name_index_uuid` via `name_parent_clause`; it lands in
-        // `index_sidecars` too but is NOT a planner candidate, so it never
-        // enters `SnapshotIndexDef`). Both joins stay LEFT (a segment without
-        // a built sidecar yields all-NULL `c.*` → no sidecar → full-scan
-        // fallback). Segment-row contiguity comes from the primary ORDER BY
-        // alone (`chunk_idx` is segment-unique within the picked snapshot);
-        // the secondary `index_uuid` key only stabilizes within-segment row
-        // order for determinism. The supporting indexes were created by
-        // CHA-412 (pg.rs schema).
+        // LEFT JOIN the index parents so each segment carries its sidecars'
+        // read-coordinates inline — one query, no separate resolve round-trip.
+        // The join admits EVERY committed parent, so rows become (segment ×
+        // parent): the identity parent's child feeds the dedicated
+        // `row_uuid_index_sidecar` slot, keyed parents feed `index_sidecars`.
+        // Two kinds of keyed parent qualify — user secondary indexes (non-NULL
+        // `key_columns`, which also feed the plan's `SnapshotIndexDef` planner
+        // list) and the built-in system name index (non-NULL uuid + NULL
+        // `key_columns`, matched by its deterministic `system_name_index_uuid`
+        // via `name_parent_clause`; it lands in `index_sidecars` but is NOT a
+        // planner candidate, so it never enters `SnapshotIndexDef`).
         //
-        // CHA-484: `system_name_index_spec` classifies the target — `Some` on
-        // the three `__penca_system__` tables that carry a built-in name
-        // index (bind its `index_uuid` and widen the parent filter to admit
-        // that parent), `None` on every user table (no extra clause, no extra
-        // bind — the user-table plan SQL is byte-identical to CHA-485's). The
-        // name bind trails the optional as_of / seq binds.
+        // Both joins MUST stay LEFT: a segment without a built sidecar yields
+        // all-NULL `c.*` → no sidecar → full-scan fallback. Segment-row
+        // contiguity comes from the primary ORDER BY alone (`chunk_idx` is
+        // segment-unique within the picked snapshot); the secondary
+        // `index_uuid` key only stabilizes within-segment row order.
+        //
+        // `system_name_index_spec` classifies the target: `Some` on the three
+        // `__penca_system__` tables carrying a built-in name index (bind its
+        // `index_uuid`, widen the parent filter to admit it), `None` on every
+        // user table — so the user-table plan SQL gains no extra clause and no
+        // extra bind. The name bind trails the optional as_of / seq binds.
         let name_spec = naming::system_name_index_spec(&catalog, &table);
         let name_parent_clause = match &name_spec {
             Some(spec) => {
@@ -839,36 +807,34 @@ impl QueryManager {
         let mut clustering_keys: Option<Vec<String>> = None;
         let mut snapshot_commit_seq_num: Option<i64> = None;
         let mut snapshot_segments: Vec<SnapshotSegment> = Vec::new();
-        // CHA-485: distinct user-index defs across the parent rows (each def
-        // repeats once per segment row — dedupe by uuid, sort at the end).
+        // Distinct user-index defs across the parent rows — each def repeats
+        // once per segment row, so dedupe by uuid and sort at the end.
         let mut indexes: Vec<SnapshotIndexDef> = Vec::new();
         let mut seen_index_uuids: HashSet<Uuid> = HashSet::new();
 
         for row in &snapshot_rows {
-            // CHA-228: capture the watermark from every row, including
-            // zero-row placeholder segments (emitted by snapshot_locked
-            // when the cold merge nets to empty). Skipping placeholders
-            // before reading `snapshotted_at_micros` would lose the
-            // watermark and force the next Snapshot(T) to redo the
-            // cold merge-read forever.
+            // Capture the watermark from every row, INCLUDING zero-row
+            // placeholder segments (emitted by snapshot_locked when the cold
+            // merge nets to empty). Skipping placeholders before reading
+            // `snapshotted_at_micros` loses the watermark and forces the next
+            // Snapshot(T) to redo the cold merge-read forever.
             if snapshotted_at_micros.is_none() {
                 snapshotted_at_micros = Some(row.get("snapshotted_at_micros"));
-                // CHA-443: W_snap rides the same parent row (NOT NULL column).
+                // W_snap rides the same parent row (NOT NULL column).
                 snapshot_commit_seq_num = Some(row.get("commit_seq_num"));
-                // CHA-406: the layout keys are parent-level (identical
-                // across the snapshot's rows). Decoding as
-                // `Option<Vec<String>>` preserves SQL NULL as `None`
-                // (pre-CHA-404 parent) vs `Some(vec![])` (`{}`,
-                // known-no-keys) — the carry-forward eligibility gate
-                // depends on the distinction — while still panicking on
-                // a genuine type mismatch, like every other `get` here.
+                // The layout keys are parent-level (identical across the
+                // snapshot's rows). Decoding as `Option<Vec<String>>`
+                // preserves SQL NULL as `None` vs `Some(vec![])` (`{}`,
+                // known-no-keys) — the carry-forward eligibility gate depends
+                // on that distinction — while still panicking on a genuine
+                // type mismatch, like every other `get` here.
                 partition_keys = row.get::<Option<Vec<String>>, _>("partition_keys");
                 clustering_keys = row.get::<Option<Vec<String>>, _>("clustering_keys");
             }
-            // CHA-485: collect user-index defs BEFORE the placeholder skip so
-            // the declared set doesn't depend on data presence. The `Some(cols)`
+            // Collect user-index defs BEFORE the placeholder skip so the
+            // declared set doesn't depend on data presence. The `Some(cols)`
             // guard below keeps this planner list to user indexes only — the
-            // CHA-484 built-in name parent is admitted by the join
+            // built-in name parent is admitted by the join
             // (`name_parent_clause`) but has NULL `key_columns`, so it lands in
             // `index_sidecars` without ever becoming a planner candidate.
             let parent_index_uuid: Option<Uuid> = row.get("parent_index_uuid");
@@ -900,7 +866,7 @@ impl QueryManager {
             let statistics: Option<Vec<u8>> = row.get("statistics");
             let child_sidecar = decode_child_sidecar(row)?;
 
-            // CHA-485: rows are (segment × parent), contiguous per segment
+            // Rows are (segment × parent), contiguous per segment
             // because `chunk_idx` (the primary ORDER BY) is segment-unique
             // within the snapshot — the first row creates the segment, the
             // rest only attach their parent's sidecar.
@@ -950,7 +916,7 @@ impl QueryManager {
         })
     }
 
-    /// CHA-218: return every committed `(upsert, delete)` persist segment
+    /// Return every committed `(upsert, delete)` persist segment
     /// for a table that overlaps the audit window
     /// `[from_micros, to_micros)` — the cold-side committed-at window.
     /// Shared by `audit_data` (audit horizon, may span the snapshot
@@ -962,10 +928,9 @@ impl QueryManager {
     /// `(snapshotted_at, as_of]` overlap filter via
     /// `snapshotted_at = from - 1` (since `from` is inclusive) and
     /// `as_of = to - 1` (since `to` is exclusive).
-    // CHA-353: trace span isolates this PG round-trip in a read-plan
-    // decomposition (busy vs idle). Dormant under the default
-    // `penca=debug`; enable with `…,penca_storage_meta=trace` +
-    // `PENCA_SPAN_TIMING=1` to time it.
+    // The span isolates this PG round-trip in a read-plan decomposition (busy
+    // vs idle). Dormant under the default `penca=debug`; enable with
+    // `…,penca_storage_meta=trace` + `PENCA_SPAN_TIMING=1` to time it.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn read_persist_segments_for_window(
         &self,
@@ -984,9 +949,9 @@ impl QueryManager {
         // bounds via `x ≥ y ≡ x > y − 1` and `x < y ≡ x ≤ y − 1`:
         //   `seg.max_tx ≥ from`  →  `min_segment_max_micros = from − 1`
         //   `seg.min_tx < to`    →  `max_segment_min_micros = to − 1`
-        // `commit_seq_upper` (CHA-429 #4) passes through unchanged — it is
-        // an inclusive `seg.min_commit_seq_num <= N` skip, not a `[from, to)`
-        // window, so it needs no `− 1` translation.
+        // `commit_seq_upper` passes through unchanged — it is an inclusive
+        // `seg.min_commit_seq_num <= N` skip, not a `[from, to)` window, so it
+        // needs no `− 1` translation.
         let min_segment_max_micros = from_micros.map(|f| f.saturating_sub(1));
         let max_segment_min_micros = to_micros.map(|t| t.saturating_sub(1));
         let ClassifiedPersistSegments {
@@ -1007,7 +972,7 @@ impl QueryManager {
         Ok((upsert_segments, delete_segments))
     }
 
-    /// CHA-178: read a branch's fork lineage from `branch_store` — the parent
+    /// Read a branch's fork lineage from `branch_store` — the parent
     /// branch and the fork commit's seq. `None` for `main` and any branch with
     /// NULL lineage (non-forked). The read planner consults this to decide
     /// whether to enumerate a parent cold source for a forked-branch read.
@@ -1034,7 +999,7 @@ impl QueryManager {
         // `None` — a masked failure would make a forked branch silently drop
         // its parent cold source and return incomplete data. `parent_branch_uuid`
         // is nullable (NULL = non-forked); `fork_commit_seq_num` is NOT NULL
-        // (CHA-505; `main` = 0), so the fork signal is parent presence alone.
+        // (`main` = 0), so the fork signal is parent presence alone.
         let parent: Option<Uuid> = row
             .try_get("parent_branch_uuid")
             .map_err(MetadataError::Db)?;
@@ -1044,7 +1009,7 @@ impl QueryManager {
         Ok(parent.map(|parent_branch_uuid| (parent_branch_uuid.to_string(), fork_commit_seq_num)))
     }
 
-    /// CHA-178: enumerate the parent branch's cold tier as a second cold
+    /// Enumerate the parent branch's cold tier as a second cold
     /// source for a forked branch's read, capped at `commit_seq_ceiling`
     /// (= `min(fork_commit_seq_num, as_of_seq)`). Reuses the same two cold
     /// getters keyed on the parent `branch_uuid`; the ceiling both bounds the
@@ -1058,8 +1023,8 @@ impl QueryManager {
     /// branch is unsnapshotted would drop the grandparent's rows: persist-at-
     /// fork flushes only a branch's *own* hot tier, and `B` inherits `main` by
     /// read-time merge rather than by copying `main`'s data into `B`'s cold, so
-    /// `C`'s single-level read of `B`'s cold never sees `main`. CHA-178 forks
-    /// from `main` (single level); CHA-509 removes this assumption.
+    /// `C`'s single-level read of `B`'s cold never sees `main`. Sound today
+    /// only because forks are `main`-only.
     #[tracing::instrument(
         level = "trace",
         skip_all,
@@ -1146,11 +1111,9 @@ impl QueryManager {
     /// Read committed log segments for upsert/delete tables and
     /// classify them per-bucket.
     ///
-    /// CHA-218: cold commit_tx_log segments no longer exist (commit_tx_log is
-    /// hot-only). Each upsert/delete cold row carries its own
-    /// `commit_micros, began_at_micros, comment, author`
-    /// denormalized columns, so the cold side has no JOIN partner to
-    /// resolve.
+    /// Each upsert/delete cold row carries its own `commit_micros,
+    /// began_at_micros, comment, author` denormalized columns, so the cold
+    /// side has no JOIN partner to resolve.
     ///
     /// `min_segment_max_micros` / `max_segment_min_micros` are
     /// inequality-neutral overlap bounds against the per-segment
@@ -1169,8 +1132,8 @@ impl QueryManager {
         max_segment_min_micros: Option<i64>,
         commit_seq_upper: Option<i64>,
     ) -> Result<ClassifiedPersistSegments> {
-        // CHA-203: two-hop JOIN — segment → table_persist_metadata
-        // surfaces `log_kind` (upsert/delete classification).
+        // Two-hop JOIN — segment → table_persist_metadata surfaces `log_kind`
+        // (upsert/delete classification).
         //
         // **Overlap filter on the per-segment watermark interval
         // `[seg.min_tx, seg.max_tx]`.** Two inequalities, both
@@ -1186,7 +1149,7 @@ impl QueryManager {
         //   encode "min_tx < to". Segments that
         //   straddle the bound from below are intentionally included;
         //   per-row filtering downstream prunes the over-bound rows.
-        // - `seg.min_commit_seq_num <= commit_seq_upper` (CHA-429 #4) — a
+        // - `seg.min_commit_seq_num <= commit_seq_upper` — a
         //   seq-axis read additionally drops segments whose smallest
         //   `commit_seq_num` already exceeds the cutoff. Composes with the
         //   committed_at tier fence; absent for the micros / OpenTx axes
@@ -1217,12 +1180,12 @@ impl QueryManager {
             max_segment_min_micros,
             commit_seq_upper,
         ));
-        // CHA-410: order the persist segment list on the gapless commit_seq_num
-        // commit axis (not commit_micros, which has unordered ties) so
-        // the single concatenated PersistTableProvider stream is globally
-        // non-decreasing in commit_seq_num — the segment-listing half of the
-        // output_ordering honesty contract. Within-segment sort is IMPL1
-        // (chunk_persist_batch); the chunk_idx tiebreak preserves that order.
+        // Order on the gapless commit_seq_num axis, NOT commit_micros (which
+        // has unordered ties), so the single concatenated
+        // PersistTableProvider stream is globally non-decreasing in
+        // commit_seq_num — the segment-listing half of the output_ordering
+        // honesty contract. Within-segment sort comes from
+        // `chunk_persist_batch`; the chunk_idx tiebreak preserves it.
         log_sql.push_str(" ORDER BY seg.min_commit_seq_num, seg.chunk_idx");
 
         let log_rows = driver
@@ -1282,7 +1245,7 @@ impl QueryManager {
         })
     }
 
-    /// CHA-443 (IMPL-2): `MAX(seg.max_commit_seq_num)` over the committed persist
+    /// `MAX(seg.max_commit_seq_num)` over the committed persist
     /// segments that overlap the snapshot's `[from_micros, to_micros)`
     /// committed-at window — the segment side of the snapshot seq watermark
     /// `W_snap` (fed into [`penca_storage_meta::watermarks::compute_snapshot_seq_watermark`]).
@@ -1290,8 +1253,8 @@ impl QueryManager {
     /// snapshot). Mirrors [`Self::read_and_classify_persist_segments`]' JOIN +
     /// commit gating + overlap clause, returning a scalar aggregate instead of
     /// the segment rows (`PersistSegment` carries no seq column).
-    // CHA-353: trace span isolates this PG round-trip in a read-plan
-    // decomposition (busy vs idle), matching its spanned sibling
+    // The span isolates this PG round-trip in a read-plan decomposition (busy
+    // vs idle), matching its spanned sibling
     // `read_persist_segments_for_window`. Dormant under the default
     // `penca=debug`; enable with `…,penca_storage_meta=trace` +
     // `PENCA_SPAN_TIMING=1` to time it.
@@ -1345,7 +1308,7 @@ impl QueryManager {
 /// watermark interval `[seg.min_tx, seg.max_tx]` — callers translate their
 /// own `[from, to)` domain onto `min_segment_max_micros` / `max_segment_min_micros`.
 ///
-/// `commit_seq_upper` (CHA-429 #4) is the seq-axis skip — `min_commit_seq_num
+/// `commit_seq_upper` is the seq-axis skip — `min_commit_seq_num
 /// <= N` drops cold segments whose every row is past the seq cutoff. It
 /// composes with the committed_at tier fence rather than replacing it:
 /// the lower bound stays the snapshot-baseline `committed_at` watermark.
@@ -1378,10 +1341,9 @@ pub(crate) struct HotTableNames {
 /// Decode one row's LEFT-JOINed child-sidecar columns into an
 /// [`IndexSidecar`], or `None` when no child matched (NULL
 /// `sidecar_object_uri`). The object_uri-presence gate stands in for "the
-/// whole child row matched": offset/length/format/segment_index_uuid are
-/// all NOT NULL in the CHA-412 schema, so the non-Option `row.get`s cannot
-/// hit a NULL while object_uri is present (revisit if a nullable child
-/// column is ever added).
+/// whole child row matched": offset/length/format/segment_index_uuid are all
+/// NOT NULL in the schema, so the non-Option `row.get`s cannot hit a NULL
+/// while object_uri is present. Revisit if a nullable child column is added.
 fn decode_child_sidecar(row: &PgRow) -> Result<Option<IndexSidecar>> {
     row.get::<Option<String>, _>("sidecar_object_uri")
         .map(|object_uri| -> Result<IndexSidecar> {
@@ -1405,14 +1367,13 @@ fn decode_child_sidecar(row: &PgRow) -> Result<Option<IndexSidecar>> {
         .transpose()
 }
 
-/// CHA-485: route one (segment × parent) row's child sidecar onto the
-/// segment being folded. Identity parent — or no parent at all (all-NULL
-/// LEFT JOIN) — owns the dedicated `row_uuid_index_sidecar` slot; a keyed
-/// parent with a built child lands in the keyed `index_sidecars` (a user
-/// secondary index, or the CHA-484 built-in system name index — both routed
-/// here purely by their non-NULL `index_uuid`); a keyed parent without a
-/// child for this segment attaches nothing — the seek treats that entry as
-/// unresolved (safe over-selection).
+/// Route one (segment × parent) row's child sidecar onto the segment being
+/// folded. Identity parent — or no parent at all (all-NULL LEFT JOIN) — owns
+/// the dedicated `row_uuid_index_sidecar` slot; a keyed parent with a built
+/// child lands in `index_sidecars` (user secondary index or built-in system
+/// name index, both routed purely by their non-NULL `index_uuid`); a keyed
+/// parent without a child for this segment attaches nothing — the seek treats
+/// that entry as unresolved, a safe over-selection.
 fn attach_parent_row(
     segment: &mut SnapshotSegment,
     parent_index_uuid: Option<Uuid>,
@@ -1435,22 +1396,21 @@ fn attach_parent_row(
 pub(crate) struct ColdInputs {
     pub snapshotted_at_micros: Option<i64>,
     /// `W_snap` — the snapshot seq watermark stamped onto
-    /// `SnapshotPlan.commit_seq_num` (CHA-443; threaded from the picker's
-    /// `SnapshotResult` by IMPL-4).
+    /// `SnapshotPlan.commit_seq_num`.
     pub snapshot_seq: i64,
     pub snapshot_segments: Vec<penca_core::SnapshotSegment>,
-    /// CHA-485: user-index defs declared for the picked snapshot — stamped
+    /// User-index defs declared for the picked snapshot — stamped
     /// onto `SnapshotPlan.indexes` for planner covering-index selection.
     pub indexes: Vec<penca_core::SnapshotIndexDef>,
     pub upsert_segments: Vec<penca_core::PersistSegment>,
     pub delete_segments: Vec<penca_core::PersistSegment>,
 }
 
-/// CHA-441: the cache entry for a snapshot read result, or `None` when the
-/// table has no committed snapshot yet (`snapshotted_at_micros` / `commit_seq_num`
-/// not both `Some`). The pure, unit-tested decision behind
-/// [`QueryManager::list_snapshot_segments`]'s insert: caching a `None`-
-/// watermark row would later be served as a bogus committed snapshot.
+/// The cache entry for a snapshot read result, or `None` when the table has no
+/// committed snapshot yet (`snapshotted_at_micros` / `commit_seq_num` not both
+/// `Some`). Split out as the pure decision behind
+/// [`QueryManager::list_snapshot_segments`]'s insert: caching a
+/// `None`-watermark row would later be served as a bogus committed snapshot.
 fn cached_snapshot_list(result: &SnapshotResult) -> Option<CachedSnapshotList> {
     let (Some(snapshotted_at_micros), Some(commit_seq_num)) =
         (result.snapshotted_at_micros, result.commit_seq_num)
@@ -1459,8 +1419,8 @@ fn cached_snapshot_list(result: &SnapshotResult) -> Option<CachedSnapshotList> {
     };
     Some(CachedSnapshotList {
         segments: result.snapshot_segments.clone(),
-        // CHA-485: the declared user-index defs ride the cache entry — a
-        // cache-served default read must still be able to seek.
+        // The declared user-index defs must ride the cache entry — a
+        // cache-served default read still has to be able to seek.
         indexes: result.indexes.clone(),
         commit_seq_num,
         snapshotted_at_micros,
@@ -1471,7 +1431,7 @@ fn cached_snapshot_list(result: &SnapshotResult) -> Option<CachedSnapshotList> {
 
 /// Cold-tier committed-at upper cutoff = `min(as_of + 1, hot_min)`: the user
 /// `as_of` wins when tighter than the persist watermark (time-travel must not
-/// expand visibility past the request). Single source of truth for the CHA-227
+/// expand visibility past the request). Single source of truth for the
 /// cutoff — `plan()` calls it to bound the persist-segment *fetch* and
 /// `plan_cold_storage` calls it to stamp `PersistPlan.committed_at.max_micros`;
 /// the two must be byte-identical or a concurrent Persist/Purge could shift the
@@ -1484,8 +1444,7 @@ fn cold_committed_at_max(as_of_micros: i64, hot_min: i64) -> i64 {
 /// and the cold inputs. Pure (no IO): the single captured `hot_min` bounds
 /// the cold committed-at window (`cold_max = min(as_of + 1, hot_min)`) — the
 /// same `hot_min` the caller threads into the snapshot-picker bound — so a
-/// concurrent Persist/Purge between the fetches can't shift the cutoff
-/// (CHA-227).
+/// concurrent Persist/Purge between the fetches can't shift the cutoff.
 pub(crate) fn assemble_plan(
     hot_min: i64,
     fence: Option<i64>,
@@ -1495,15 +1454,14 @@ pub(crate) fn assemble_plan(
     hot: HotTableNames,
 ) -> Plan {
     Plan {
-        // CHA-441 hot existence gate: emit the hot tier only when the phase-1
-        // probe found a row past the fence. `!hot_present` ⇒ `hot_storage =
-        // None`, engaging the staged `is_all_cold` / `stream_all_cold` dispatch
-        // in `read_data`. Pre-Persist callers pass `hot_present = true` (hot
-        // owns every row).
+        // Hot existence gate: emit the hot tier only when the phase-1 probe
+        // found a row past the fence. `!hot_present` ⇒ `hot_storage = None`,
+        // engaging the staged `is_all_cold` / `stream_all_cold` dispatch in
+        // `read_data`. Pre-Persist callers pass `hot_present = true`.
         hot_storage: hot_present.then(|| plan_hot_storage(fence, as_of_micros, hot)),
         cold_storage: plan_cold_storage(hot_min, fence, as_of_micros, cold),
-        // CHA-178: populated by `plan()` (IMPL-5) for a forked branch; the
-        // pure assembler leaves it `None`.
+        // Populated by `plan()` for a forked branch; the pure assembler leaves
+        // it `None`.
         base_cold_storage: None,
     }
 }
@@ -1524,19 +1482,16 @@ fn plan_cold_storage(
         segments: cold.snapshot_segments,
         indexes: cold.indexes,
         snapshotted_at_micros: ts,
-        // CHA-443 (IMPL-4): W_snap from the cold inputs — the seq-aware picker
-        // (IMPL-3) selected a snapshot whose watermark is this value.
         commit_seq_num: cold.snapshot_seq,
     });
-    // CHA-443 (IMPL-5): de-entangle the cold committed-at filter from the tier
-    // cutoff. `committed_at.max_micros` is now `as_of + 1` (exclusive) — pure
-    // `AsOfMicros` visibility, no longer `min(as_of + 1, hot_min)`. The tier
-    // fence moved onto `commit_seq` below; the two are equivalent
-    // (`committed_at < hot_min ⟺ commit_seq_num <= W_persist`), so the
-    // persist-segment *fetch* in `plan()` still bounds by `cold_committed_at_max`
-    // (it brings in exactly the rows the seq filter then passes). On an AsOfSeq
-    // read `as_of_micros` is `i64::MAX`, so this committed_at bound is inert and
-    // the seq fence does all the work.
+    // The cold committed-at filter is deliberately NOT the tier cutoff:
+    // `max_micros` is `as_of + 1` (exclusive), pure `AsOfMicros` visibility.
+    // The tier fence lives on `commit_seq` below; the two are equivalent
+    // (`committed_at < hot_min ⟺ commit_seq_num <= W_persist`), which is why
+    // the persist-segment *fetch* in `plan()` can still bound by
+    // `cold_committed_at_max` — it brings in exactly the rows the seq filter
+    // then passes. On an AsOfSeq read `as_of_micros` is `i64::MAX`, so this
+    // bound is inert and the seq fence does all the work.
     let cold_visibility_max = as_of_micros.saturating_add(1);
     let persist_plan = if cold.upsert_segments.is_empty() && cold.delete_segments.is_empty() {
         None
@@ -1548,7 +1503,7 @@ fn plan_cold_storage(
                 min_micros: None,
                 max_micros: Some(cold_visibility_max),
             }),
-            // CHA-444 (ADR 0027): the cold seq fence is upper-only —
+            // The cold seq fence is upper-only (ADR 0027) —
             // `commit_seq_num <= fence` (inclusive), `fence = max(Pu, W_snap)`.
             // There is deliberately NO per-row lower bound — the segment fetch
             // (`from_micros = snapshotted_at + 1`) plus the snapshot exclusion
@@ -1576,12 +1531,11 @@ fn plan_cold_storage(
 }
 
 /// Hot-tier plan: the per-table log table names + the as-of window + the seq
-/// tier fence. CHA-443/CHA-444: the hot lower bound is on `commit_seq_num` — hot
-/// serves `commit_seq_num > fence` (`fence = max(Pu, W_snap)`, ADR 0027), carried
-/// in `commit_seq.min_seq`. `committed_at` keeps only the `max_micros = as_of`
-/// visibility cap (CHA-361 — every read pins a bounded `as_of`); its
-/// `min_micros` tier lower bound is gone. `fence` is `None` pre-Persist ⇒
-/// `commit_seq = None`, so hot owns every committed row.
+/// tier fence. The hot lower bound is on `commit_seq_num` — hot serves
+/// `commit_seq_num > fence` (`fence = max(Pu, W_snap)`, ADR 0027), carried in
+/// `commit_seq.min_seq`. `committed_at` carries only the `max_micros = as_of`
+/// visibility cap, with no `min_micros` tier lower bound. `fence` is `None`
+/// pre-Persist ⇒ `commit_seq = None`, so hot owns every committed row.
 fn plan_hot_storage(fence: Option<i64>, as_of_micros: i64, hot: HotTableNames) -> HotStoragePlan {
     HotStoragePlan {
         upsert_table_name: hot.upsert_table_name,
@@ -1598,7 +1552,7 @@ fn plan_hot_storage(fence: Option<i64>, as_of_micros: i64, hot: HotTableNames) -
     }
 }
 
-/// CHA-433: does the read's `as_of` fall strictly below the retention floor?
+/// Does the read's `as_of` fall strictly below the retention floor?
 ///
 /// Compares on the axis the read arrives on — the seq axis when a
 /// `plan_commit_seq_upper` is present (an explicit seq read, or the
@@ -1724,9 +1678,8 @@ mod assemble_tests {
         }
     }
 
-    // 1. Pre-persist (`hot_min == 0`, no persist seq): no cold_storage; hot
-    //    window `[None, as_of]` and — CHA-443 (IMPL-5) — no seq fence (hot owns
-    //    every committed row).
+    // Pre-persist (`hot_min == 0`, no persist seq): no cold_storage; hot
+    // window `[None, as_of]` and no seq fence — hot owns every committed row.
     #[test]
     fn pre_persist_omits_cold_and_bounds_hot_to_as_of() {
         let plan = assemble_plan(0, None, true, 1_000, empty_cold(), hot_names());
@@ -1749,12 +1702,12 @@ mod assemble_tests {
         );
     }
 
-    // 2. CHA-443 (IMPL-5) post-persist tier partition now rides `commit_seq_num`:
-    //    hot lower == W_persist (exclusive, on commit_seq.min_seq); cold upper ==
-    //    W_persist (inclusive, on commit_seq.max_seq). The cold side carries NO
-    //    per-row seq lower (segment fetch + snapshot exclusion own the baseline
-    //    overlap). `committed_at` is de-entangled — hot keeps only the as_of
-    //    cap, cold's upper is now `as_of + 1` (not `min(as_of+1, hot_min)`).
+    // The post-persist tier partition rides `commit_seq_num`: hot lower ==
+    // W_persist (exclusive, on commit_seq.min_seq); cold upper == W_persist
+    // (inclusive, on commit_seq.max_seq). The cold side carries NO per-row seq
+    // lower — segment fetch + snapshot exclusion own the baseline overlap.
+    // `committed_at` stays de-entangled: hot keeps only the as_of cap, cold's
+    // upper is `as_of + 1`, not `min(as_of+1, hot_min)`.
     #[test]
     fn post_persist_partitions_on_seq() {
         let cold = ColdInputs {
@@ -1801,9 +1754,9 @@ mod assemble_tests {
         );
     }
 
-    // 3. CHA-443 (IMPL-5): the cold committed_at upper is now `as_of + 1`
-    //    regardless of hot_min (de-entangled — the seq fence owns the tier
-    //    cutoff). The micros bound is pure AsOfMicros visibility.
+    // The cold committed_at upper is `as_of + 1` regardless of hot_min — the
+    // seq fence owns the tier cutoff, so the micros bound is pure AsOfMicros
+    // visibility.
     #[test]
     fn cold_committed_at_upper_is_as_of_plus_one() {
         for (hot_min, as_of) in [(500_i64, 1_000_i64), (5_000, 1_000), (300, 299)] {
@@ -1831,7 +1784,6 @@ mod assemble_tests {
         }
     }
 
-    // 4. Empty cold (hot_min>0, no snapshot, no persist) → no cold_storage.
     #[test]
     fn empty_cold_yields_no_cold_storage() {
         let plan = assemble_plan(500, Some(42), true, 1_000, empty_cold(), hot_names());
@@ -1841,9 +1793,6 @@ mod assemble_tests {
         );
     }
 
-    // 5. CHA-443 / CHA-457: the Plan carries the snapshot seq watermark W_snap.
-    //    assemble_plan must stamp ColdInputs.snapshot_seq onto
-    //    SnapshotPlan.commit_seq_num.
     #[test]
     fn plan_carries_snapshot_seq_watermark() {
         let cold = ColdInputs {
@@ -1866,10 +1815,9 @@ mod assemble_tests {
         );
     }
 
-    // 6. CHA-441 hot existence gate: `hot_present = false` drops the hot tier
-    //    (engaging the staged all-cold dispatch), while the cold tier is
-    //    assembled exactly as when the gate is open. `hot_present = true`
-    //    keeps hot — verified by tests 1–5 above.
+    // `hot_present = false` drops the hot tier (engaging the staged all-cold
+    // dispatch), while the cold tier is assembled exactly as when the gate is
+    // open.
     #[test]
     fn gate_false_drops_hot_storage_keeping_cold() {
         let cold = ColdInputs {
@@ -1901,8 +1849,8 @@ mod assemble_tests {
         }
     }
 
-    /// CHA-485: the (segment × parent) row-routing helper — identity slot,
-    /// keyed user slot, and the unresolved (no child) no-op.
+    /// The (segment × parent) row-routing helper — identity slot, keyed user
+    /// slot, and the unresolved (no child) no-op.
     #[test]
     fn attach_parent_row_routes_slots() {
         let mut segment = SnapshotSegment::default();
@@ -1954,8 +1902,8 @@ mod overlap_clause_tests {
 
     #[test]
     fn overlap_clause_appends_seq_skip_after_committed_at() {
-        // CHA-429 #4: a seq-axis read ANDs `min_commit_seq_num <= N` onto the
-        // committed_at tier fence (composes, not replaces).
+        // A seq-axis read ANDs `min_commit_seq_num <= N` onto the committed_at
+        // tier fence — it composes, it does not replace.
         assert_eq!(
             persist_segment_overlap_clause(Some(99), Some(200), Some(7)),
             " AND seg.max_tx_commit_micros > 99 \
@@ -1970,12 +1918,4 @@ mod overlap_clause_tests {
             " AND seg.min_commit_seq_num <= 0"
         );
     }
-
-    // NB (CHA-443 decision 2026-06-17, IMPL-5 guard): the seq tier-fence is
-    // ADDITIVE — the committed_at segment overlap must survive alongside the
-    // seq predicate for the audit `commit_micros` arm + the explicit-as_of_micros
-    // plan path. That invariant is already pinned exactly by
-    // `overlap_clause_emits_committed_at_window_without_seq` (seq-absent) and
-    // `overlap_clause_appends_seq_skip_after_committed_at` (seq-present), so no
-    // extra guard is added here.
 }

@@ -38,7 +38,7 @@ pub(super) trait SegmentScope: Send + Sync {
 
     fn seg_uuid_str(step: &Self::Step) -> &str;
     fn uri(step: &Self::Step) -> &str;
-    /// The segment's standalone in-memory Arrow footprint (CHA-347):
+    /// The segment's standalone in-memory Arrow footprint:
     /// recorded as `size_bytes` so it compares like-for-like against
     /// `max_segment_bytes`. Carried on the step from the chunker, not
     /// re-derived from the on-disk file the writer produces.
@@ -78,8 +78,7 @@ pub(super) trait SegmentScope: Send + Sync {
 /// The segment rows that share one durable FILE — the unit of
 /// crash-safe write and rollback. One group per durable-write step: a
 /// persist group is a single segment (`write_segment`); a packed
-/// snapshot group has one row per partition (`write_segment_group`,
-/// CHA-404).
+/// snapshot group has one row per partition (`write_segment_group`).
 ///
 /// `written_uri` is the group's file once the file write has
 /// succeeded; `None` means the rows are file-less (inserted, file
@@ -127,7 +126,7 @@ impl<S: SegmentScope> DurableSegmentWriter<S> {
         S::write_file(writer, step).await?;
         self.current_group().written_uri = Some(S::uri(step).to_string());
 
-        // CHA-347: record the standalone in-memory footprint carried on
+        // Record the standalone in-memory footprint carried on
         // the step (from the chunker) so `size_bytes` compares
         // like-for-like against `max_segment_bytes`. `write_file` no
         // longer surfaces the on-disk size — that unit is gone from the
@@ -177,10 +176,6 @@ impl<S: SegmentScope> DurableSegmentWriter<S> {
             .expect("open_group precedes row recording")
     }
 }
-
-// ---------------------------------------------------------------------------
-// Persist scope
-// ---------------------------------------------------------------------------
 
 /// Per-segment data for one persist-side write step. Owned because
 /// `phase1_durable_writes` borrows each chunk from `chunk_row_ranges`
@@ -294,10 +289,6 @@ impl<'a> SegmentScope for PersistSegmentScope<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot scope
-// ---------------------------------------------------------------------------
-
 /// Per-segment data for one snapshot-side write step.
 pub(super) struct SnapshotSegmentStep {
     pub seg_uuid_str: String,
@@ -342,7 +333,7 @@ impl<'a> SegmentScope for SnapshotSegmentScope<'a> {
             &step.snap_uuid_str,
             step.chunk_idx,
             &step.uri,
-            // A single-segment file is the whole-file range (CHA-404).
+            // A single-segment file is the whole-file range.
             // (This write_segment arm currently has no caller —
             // snapshot writes go through `write_segment_group`.)
             0,
@@ -404,10 +395,6 @@ impl<'a> SegmentScope for SnapshotSegmentScope<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Packed snapshot files (CHA-404)
-// ---------------------------------------------------------------------------
-
 /// One packed snapshot segment FILE: several whole partitions
 /// concatenated into `file_batch`, written to one `uri`, with one
 /// metadata row per partition (`segment_rows`). Produced by
@@ -422,17 +409,16 @@ pub(super) struct SnapshotFileStep {
 /// One per-partition segment metadata row inside a packed file.
 /// `offset`/`length` are the partition's row range within the file —
 /// `length` doubles as the catalog `row_count` (a packed row IS its
-/// row range; the columns are NOT NULL since CHA-407). `size_bytes`
+/// row range; both columns are NOT NULL). `size_bytes`
 /// and `statistics` are computed over the slice only, so pruning
 /// stats stay partition-tight.
 pub(super) struct SnapshotSegmentRowSpec {
     pub seg_uuid_str: String,
     pub chunk_idx: u32,
     /// The partition this row covers — the packer's grouping identity,
-    /// pinned by the snapshot_op packing tests (not a DB column since
-    /// CHA-407). TODO(CHA-406): carry-forward's per-partition rewrite
-    /// is the production consumer; drop the dead_code allow when it
-    /// lands.
+    /// pinned by the snapshot_op packing tests; not a DB column.
+    /// TODO(CHA-406): carry-forward's per-partition rewrite is the production
+    /// consumer; drop the dead_code allow when it lands.
     #[cfg_attr(not(test), allow(dead_code))]
     pub partition_value: Option<String>,
     pub offset: i64,
@@ -506,7 +492,7 @@ impl<'a> DurableSegmentWriter<SnapshotSegmentScope<'a>> {
 
 #[cfg(test)]
 mod bookkeeping_tests {
-    //! CHA-404: drive the REAL `write_segment` and `cleanup_on_err`
+    //! Drive the REAL `write_segment` and `cleanup_on_err`
     //! paths with a no-IO scope (the `&PgDriver` is a never-connected
     //! lazy pool that only flows into scope hooks, which don't touch
     //! it; the file delete goes through the injectable `FormatWriter`)

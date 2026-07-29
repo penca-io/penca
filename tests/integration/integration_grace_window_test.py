@@ -71,8 +71,6 @@ from .integration_helpers import (
     setup_schema,
 )
 
-# ── Constants ─────────────────────────────────────────────────────────
-
 QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 # Grace pad: extra wall-clock past the cap before re-issuing a
 # grace-gated operation. Keeps the tests deterministic against clock
@@ -86,9 +84,6 @@ GRACE_WAIT_SECONDS = QUERY_TIMEOUT_SECONDS + GRACE_EPSILON_SECONDS
 TABLE_PERSIST_METADATA = "table_persist_metadata"
 TABLE_PURGE_METADATA = "table_purge_metadata"
 SEGMENT_DELETE_SET = "segment_delete_set"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _make_branch(client, catalog_uuid, name):
@@ -145,15 +140,15 @@ def _count_segment_delete_set_rows(catalog_uuid, branch_uuid):
     return rows[0][0]
 
 
-# ── Tests ─────────────────────────────────────────────────────────────
-
-
 class TestQueryTimeoutCap:
     """ADR 0019 §"Four-part mechanism" item 4 — ``read_data`` and
     ``audit_data`` cancel exactly at ``T_q + query_timeout`` with
     gRPC ``RESOURCE_EXHAUSTED``. The cap is what closes the grace
     correctness argument."""
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_query_exceeds_cap_returns_resource_exhausted(self):
         """A ``read_data`` call that runs past ``query_timeout_seconds``
         must terminate with ``RESOURCE_EXHAUSTED``.
@@ -410,6 +405,9 @@ class TestPerOperationLockKeys:
         thread = threading.Thread(target=run, daemon=True)
         return thread, done, error
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_concurrent_persist_and_purge_on_T_run_in_parallel(self):
         """``Persist(T)`` and ``Purge(T)`` on the same table must NOT
         serialize on the ADR-0018 shared key. Pre-hold
@@ -477,6 +475,9 @@ class TestPerOperationLockKeys:
             "Persist's 'persist:{table_uuid}:{branch_uuid}'."
         )
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Contention, not a side channel, so it outlives CHA-519.
+    @pytest.mark.serial
     def test_concurrent_snapshot_and_purge_on_T_run_in_parallel(self):
         """``Snapshot(T)`` and ``Purge(T)`` on the same table must NOT
         serialize on the ADR-0018 shared key. Same shape as

@@ -14,7 +14,7 @@ impl LifecycleManager {
     ///
     /// 1 SQL query.
     ///
-    /// CHA-178: `parent_branch_uuid` records the fork lineage (the source
+    /// `parent_branch_uuid` records the fork lineage (the source
     /// branch) so the read planner can enumerate the parent's cold tier as a
     /// second cold source, capped at the fork (`fork_commit_seq_num`, seeded
     /// by CHA-505). `None` for `main` / any non-forked branch — `main` is

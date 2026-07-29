@@ -1,13 +1,12 @@
 //! Arrow ↔ Postgres row codec helpers shared across the hot-tier modules.
 //!
-//! Both directions dispatch through [`penca_core::types::CanonicalType`]
-//! (CHA-386): `from_arrow` is the supported-set gate (a miss here is an
+//! Both directions dispatch through [`penca_core::types::CanonicalType`]:
+//! `from_arrow` is the supported-set gate (a miss here is an
 //! internal-invariant violation — the column type was validated at
 //! `WriteService::create_table` before any row reached storage), and the
 //! per-variant match is exhaustive with **no `_` arm**, so a new canonical
 //! type is a compile error until both directions handle it. Types whose
-//! codec arms have not landed yet return `UnsupportedType` explicitly; the
-//! Phase-2 widen tasks replace those arms with real encode/decode.
+//! codec arms have not landed yet return `UnsupportedType` explicitly.
 
 use std::sync::Arc;
 
@@ -792,7 +791,7 @@ fn bigdecimal_to_i128(bd: &BigDecimal, scale: i8) -> Result<i128, HotStorageErro
     // and a value at the declared scale fitting 38 decimal digits always
     // fits i128 (~38 digits). The fail-loud guard stays in case a PG
     // NUMERIC wider than the column's declared precision ever reaches
-    // here — surfaced as a conversion error, not a pencaated "unsupported
+    // here — surfaced as a conversion error, not a misleading "unsupported
     // type".
     i128::try_from(unscaled).map_err(|_| {
         HotStorageError::Arrow(arrow::error::ArrowError::ComputeError(format!(

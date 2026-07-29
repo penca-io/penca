@@ -133,7 +133,6 @@ class TestNamingParity:
             == "dd2e0844-f72a-a0b7-f1ce-c28c26aa6bb3_data_write_seq"
         )
 
-    # ── CHA-203: deterministic persist/snapshot UUID chain ──────────────
     # Cross-language parity goldens for the reshaped/new helpers.
     # The Rust mirror at ``crates/penca-core/src/naming.rs`` ships
     # matching ``test_parity_*`` cases with the same inputs and same
