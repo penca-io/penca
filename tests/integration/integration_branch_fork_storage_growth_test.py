@@ -40,9 +40,14 @@ _FORKS = 3
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _distinct_slice_bytes(catalog_uuid):
-    """``(distinct_file_count, total_bytes)`` over every committed
-    snapshot segment in the catalog, deduped by storage slice.
+def _distinct_slice_bytes(catalog_uuid, table_name=TABLE_SNAPSHOT_SEGMENT_METADATA):
+    """``(distinct_file_count, total_bytes)`` over every committed segment row in
+    ``table_name``, deduped by storage slice.
+
+    Parameterized over the segment table because both cold tiers carry
+    ``object_uri`` / ``"offset"`` / ``size_bytes`` and the same slice identity
+    applies to each. Defaults to the snapshot tier, which is the only one
+    carry-forward shares.
 
     ``size_bytes`` is the *partition slice's* in-memory footprint
     (CHA-347), not a file size: the packer emits one segment row per
@@ -54,7 +59,7 @@ def _distinct_slice_bytes(catalog_uuid):
     the row it references and contributes nothing — which is exactly the
     "referenced, not copied" distinction being measured.
     """
-    seg = f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+    seg = f"{catalog_uuid}_{table_name}"
     rows = get_pg_driver().execute(
         SQL(
             "SELECT count(DISTINCT object_uri), coalesce(sum(bytes), 0) FROM ("
@@ -191,7 +196,23 @@ def test_fork_materializes_metadata_reference_rows_per_cold_segment():
     assert parent_persist > 0 and parent_snapshot > 0, (
         "the parent must hold committed rows in both cold tiers before the fork"
     )
-    baseline_files, baseline_bytes = _distinct_slice_bytes(catalog_uuid)
+    # Both tiers, because the fork materializes reference rows in both. Measuring
+    # only the snapshot tier would let an implementation satisfy the persist
+    # assertion above by re-materializing the parent's persist segments under the
+    # child's own per-branch prefix — O(N forks x persist bytes) of real storage —
+    # and still report "unchanged".
+    baseline = {
+        table_name: _distinct_slice_bytes(catalog_uuid, table_name)
+        for table_name in (
+            TABLE_PERSIST_SEGMENT_METADATA,
+            TABLE_SNAPSHOT_SEGMENT_METADATA,
+        )
+    }
+    for table_name, (files, byte_total) in baseline.items():
+        assert files > 0 and byte_total > 0, (
+            f"{table_name} baseline is {files} files / {byte_total} bytes, so the"
+            " neutrality assertion below would be vacuous"
+        )
 
     # Fork only — no write, no snapshot on the child. Isolates what the FORK
     # materializes from what a later child snapshot would produce.
@@ -216,10 +237,12 @@ def test_fork_materializes_metadata_reference_rows_per_cold_segment():
             f" segment; parent has {parent_snapshot}, child has {child_snapshot}"
         )
 
-    # ...and the rows must be references, not copies: same slices, same bytes.
-    final_files, final_bytes = _distinct_slice_bytes(catalog_uuid)
-    assert (final_files, final_bytes) == (baseline_files, baseline_bytes), (
-        f"{_FORKS} forks changed cold storage from {baseline_files} files /"
-        f" {baseline_bytes} bytes to {final_files} / {final_bytes}. The fork copies"
-        " METADATA only; a change here means it started copying data."
-    )
+    # ...and the rows must be references, not copies: same slices, same bytes,
+    # in EVERY tier the fork wrote a reference row for.
+    for table_name, expected in baseline.items():
+        actual = _distinct_slice_bytes(catalog_uuid, table_name)
+        assert actual == expected, (
+            f"{_FORKS} forks changed {table_name} from {expected[0]} files /"
+            f" {expected[1]} bytes to {actual[0]} / {actual[1]}. The fork copies"
+            " METADATA only; a change here means it started copying data."
+        )
