@@ -342,7 +342,20 @@ If self-verification fails (test errored instead of failing for the right reason
 4. Commit: `<type>(<scope>): <description>`, footer `CHA-XX`.
 5. `kata close <ref> --done --commit <sha> --message "<≥40 chars: scope + verification>"`.
 
-Each commit triggers the post-commit hook → `roborev post-commit` → async review → on completion, `scripts/roborev-kata-hook.sh` enqueues findings with `--label approved` and extends every in-flight `orch:*` task's `--blocked-by` to include the new findings. Findings drain via priority (severity-mapped: critical/high → 1, medium → 2, low → 3) before orchestration tasks (priority 4).
+Each commit triggers the post-commit hook → `roborev post-commit` → async review → on completion, `scripts/roborev-kata-hook.sh` enqueues findings with `--label approved` and extends every in-flight `orch:*` task's `--blocked-by` to include the new findings. Findings drain via priority (severity-mapped: critical/high → 1, medium → 2, low → 3) before orchestration tasks (priority 4). `review_min_severity = 'medium'` (set by `just init-agent-tools`) means Lows never reach the queue.
+
+**Consolidate before draining a backlog of findings.** Reviews are per-commit and isolated: roborev sees one diff, with no memory of earlier reviews and no view of the current tree. So a nit raised against commit 1 is re-raised against commits 2 and 3 for code that never changed, and a finding a later commit already fixed stays open. Both are queue volume that no diff will ever retire.
+
+When more than ~3 roborev findings are open at once, run the consolidation pass before working any of them:
+
+```bash
+roborev compact --wait     # verifies open findings against the CURRENT tree,
+                           # merges duplicates, closes the superseded originals
+```
+
+Then re-read the queue — findings whose roborev jobs `compact` closed should be closed in kata too (`kata close <ref> --wontfix --message "superseded by roborev compact: <reason>"`). Working the list before consolidating means implementing the same finding two or three times and fixing things already fixed.
+
+**When the finding rate is the problem, fix the calibration, not the findings.** If a whole class of finding keeps arriving and keeps getting closed `--wontfix`, that is a guidelines gap, not a work queue. Run `roborev insights` (it mines review history for "noise candidates" — findings consistently dismissed without a code change), fold the result into `scripts/roborev-review-guidelines.md`, and re-apply with `just init-agent-tools`. Do this at `orch:run-cleanup` time, not mid-drain.
 
 **`orch:run-cleanup`** — invoke cleanup-pass skills, close:
 1. Compute the touched-files scope: `git diff --name-only $(git merge-base origin/main HEAD)..HEAD`.
