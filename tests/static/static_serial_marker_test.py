@@ -79,11 +79,27 @@ def _called_names(node: ast.AST) -> set[str]:
     return names
 
 
+def _is_serial_mark(node: ast.AST) -> bool:
+    """True only for the ``pytest.mark.serial`` dotted path.
+
+    Matching any attribute named ``serial`` would accept an unrelated mention
+    inside another decorator's arguments — ``@pytest.mark.parametrize("mode",
+    [Mode.serial])`` on a scraping test would satisfy the check and mask a
+    genuinely missing mark. This file's whole job is to be the thing that
+    cannot be fooled, so it requires the ``.mark.`` parent too.
+    """
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "serial"
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "mark"
+    )
+
+
 def _has_serial_mark(node: ast.AST) -> bool:
     for decorator in getattr(node, "decorator_list", []):
-        for attr in ast.walk(decorator):
-            if isinstance(attr, ast.Attribute) and attr.attr == "serial":
-                return True
+        if any(_is_serial_mark(n) for n in ast.walk(decorator)):
+            return True
 
     return False
 
@@ -104,9 +120,8 @@ def _body_sets_serial_pytestmark(body: list[ast.stmt]) -> bool:
         ):
             continue
 
-        for attr in ast.walk(node.value):
-            if isinstance(attr, ast.Attribute) and attr.attr == "serial":
-                return True
+        if any(_is_serial_mark(n) for n in ast.walk(node.value)):
+            return True
 
     return False
 

@@ -810,7 +810,8 @@ integration-test *services:
     # scratch file is created here and cleaned up here rather than by a trap of
     # its own.
     collect_out=$(mktemp)
-    trap 'just penca-down --profile=test; rm -f "$collect_out"' EXIT
+    collect_err=$(mktemp)
+    trap 'just penca-down --profile=test; rm -f "$collect_out" "$collect_err"' EXIT
 
     # `.client.env` — the 6 PENCA_*_URL values for PencaClient.
     # `.baseline.env` — PENCA_DB_* for white-box tests that open a direct
@@ -863,10 +864,12 @@ integration-test *services:
     # non-zero is a real collection failure — a bad service name gives exit 4 —
     # and must not be silently counted as zero.
     count_tests() {
-        uv run pytest "$@" --collect-only -q >"$collect_out" 2>&1
+        # stdout and stderr to separate files: a warning or traceback line
+        # containing "::" would otherwise inflate the node-id count.
+        uv run pytest "$@" --collect-only -q >"$collect_out" 2>"$collect_err"
         collect_rc=$?
         if [ "$collect_rc" -ne 0 ] && [ "$collect_rc" -ne 5 ]; then
-            cat "$collect_out" >&2
+            cat "$collect_out" "$collect_err" >&2
             echo "collection failed (pytest exit $collect_rc)" >&2
             return 1
         fi
@@ -1046,6 +1049,12 @@ perf-test *paths:
         export CARGO_PROFILE=profiling
     fi
 
+    # Pin the pool back to the compose default. docker/test.env raises
+    # PG_POOL_MAX for the integration suite's parallel phase and this profile
+    # is shared, but a perf run measured against a deeper pool than production
+    # uses is not comparable with the history in .perf/perf.db. A shell export
+    # wins over --env-file for compose interpolation.
+    export PG_POOL_MAX=4
     just penca-up --profile=test
     trap 'just penca-down --profile=test' EXIT
 
