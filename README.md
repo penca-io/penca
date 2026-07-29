@@ -291,8 +291,8 @@ in-process library call (`penca-storage-meta`), not a service hop.
                                                     │  Flight SQL
                                                     ▼
  ┌──────────────────────────┐           ┌───────────────────────────┐
- │ Programmatic client      │           │ penca-sql-server         │
- │ (PencaClient, or any    │           │ (Flight SQL + DataFusion; │
+ │ Programmatic client      │           │ penca-sql-server          │
+ │ (PencaClient, or any     │           │ (Flight SQL + DataFusion; │
  │  gRPC client built from  │           │  proxies query / write    │
  │  the proto files)        │           │  via gRPC)                │
  └────────────┬─────────────┘           └────────────┬──────────────┘
