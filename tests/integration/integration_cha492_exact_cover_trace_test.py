@@ -213,7 +213,7 @@ class TestCha492ExactCoverTrace:
         target = f"{ctx['schema_name']}.{ctx['table_name']}"
         select = f"SELECT value FROM {target} WHERE name = 'alice'"
 
-        # ---- The user shape: a point SELECT inside an open tx over Flight SQL --
+        # The user shape: a point SELECT inside an open tx over Flight SQL
         since = len(container_log("query"))
         results = _sql_steps_via(
             driver, ["BEGIN", select, "COMMIT"], ctx["catalog_name"]

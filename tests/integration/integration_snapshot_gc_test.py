@@ -63,14 +63,9 @@ from .integration_helpers import (
     setup_schema,
 )
 
-# ── Constants ─────────────────────────────────────────────────────────
-
 QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 GRACE_EPSILON_SECONDS = 1.0
 GRACE_WAIT_SECONDS = QUERY_TIMEOUT_SECONDS + GRACE_EPSILON_SECONDS
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _make_branch(client, catalog_uuid, name):
@@ -237,9 +232,6 @@ def _segment_chunk_uris(catalog_uuid, branch_uuid, snapshot_uuid):
     )
 
 
-# ── Tests ─────────────────────────────────────────────────────────────
-
-
 class TestSnapshotNoRetirement:
     """CHA-468 — a Snapshot commit only materialises a baseline; it no
     longer retires prior snapshots. Retirement is a separate,
@@ -294,7 +286,6 @@ class TestSnapshotNoRetirement:
             f"Snapshot no longer retires (CHA-468); got {sorted(enqueued)}"
         )
 
-        # The latest snapshot still serves reads.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,

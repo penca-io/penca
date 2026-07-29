@@ -505,7 +505,6 @@ def sync(
     projects: list[dict] = []
     lp_by_name: dict[str, str] = {}
 
-    # --- Labels ---
     if sync_labels:
         scopes = load_scopes()
         labels = list_labels(api_key, team_id)
@@ -528,7 +527,6 @@ def sync(
         write_scopes(scopes)
         print(f"\n{labels_created} labels created. labels.toml updated.")
 
-    # --- Projects ---
     if sync_projects:
         projects = load_projects()
         linear_projects = list_linear_projects(api_key)
@@ -551,7 +549,6 @@ def sync(
         write_projects(projects)
         print(f"{projects_created} projects created. projects.toml updated.\n")
 
-    # --- Retag ---
     if retag:
         # Ensure we have data loaded even if --labels/--projects wasn't passed
         if not scopes:
@@ -587,7 +584,6 @@ def sync(
                     la["id"] for la in issue.get("labels", {}).get("nodes", [])
                 }
 
-                # Scope labels
                 matched_labels = classification.get("labels", [])
                 new_label_ids = set()
                 for label_name in matched_labels:
@@ -602,7 +598,6 @@ def sync(
                     added = ", ".join(matched_labels)
                     print(f"  {identifier} +labels {added}")
 
-                # Project
                 matched_proj = classification.get("project")
                 current_project = (
                     issue["project"]["name"] if issue.get("project") else None
@@ -629,7 +624,6 @@ def sync(
                 f" {project_tagged} issues assigned to projects."
             )
 
-    # --- Archive old ---
     if archive_old:
         print("\nArchiving old scope-based projects...")
         linear_projects = list_linear_projects(api_key)

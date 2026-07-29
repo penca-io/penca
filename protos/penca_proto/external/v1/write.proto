@@ -52,9 +52,6 @@ import "penca_proto/external/v1/common.proto";
 // metadata storage (the per-catalog `commit_tx_log`, `__penca_system__.schemas`,
 // `__penca_system__.tables`) which the rest of the tx machinery depends
 // on. Author / comment plumbing therefore doesn't apply here.
-//
-// TODO: consider adding authorization metadata (e.g., a list of
-// users/groups with access and their roles: read / write / admin).
 
 // Creates a new catalog.
 message CreateCatalogRequest {

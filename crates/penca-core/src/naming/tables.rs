@@ -1,5 +1,3 @@
-// -- Global tables (fixed names) ------------------------------------------
-
 use uuid::Uuid;
 
 use super::uuids::{
@@ -82,8 +80,6 @@ pub fn system_name_index_spec(
     })
 }
 
-// -- TX log family (fixed names) ------------------------------------------
-//
 // Fixed-suffix strings shared by each tx-log family helper pair
 // (`get_*_table` and `get_*_partition`). Mirrors the persist/snapshot
 // family convention (e.g. [`TABLE_PERSIST_METADATA`]).
@@ -112,8 +108,6 @@ pub const COMMIT_TX_LOG_SEQ_NUM: &str = "commit_tx_log_seq_num";
 /// Implemented like the commit counter (locked counter row, incremented in the
 /// abort INSERT).
 pub const ABORT_SEQ_NUM: &str = "abort_seq_num";
-
-// -- Segment metadata tables (fixed names) --------------------------------
 
 pub const TABLE_PERSIST_METADATA: &str = "table_persist_metadata";
 pub const TABLE_PERSIST_SEGMENT_METADATA: &str = "table_persist_segment_metadata";
@@ -157,8 +151,6 @@ pub const TABLE_SNAPSHOT_INDEX_METADATA: &str = "table_snapshot_index_metadata";
 /// commit + `segment_delete_set` GC participation). Carries forward by
 /// reference with its base segment.
 pub const TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA: &str = "table_snapshot_segment_index_metadata";
-
-// -- Per-catalog tables (UUID-prefixed) -----------------------------------
 
 pub fn branch_store_table(catalog_uuid: &Uuid) -> String {
     format!("{catalog_uuid}_branch_store")
@@ -224,8 +216,6 @@ pub fn write_sequence(table_uuid: &Uuid, branch_uuid: &Uuid) -> String {
     )
 }
 
-// -- Partitions of per-catalog tables -------------------------------------
-//
 // The tx-log family (commit_tx_log, begin_tx_log, abort_tx_log) plus the
 // per-tx affected-tables index (tx_table_log, CHA-181) are
 // LIST-partitioned by branch_uuid (one leaf per branch). Schemas and
@@ -237,7 +227,7 @@ pub fn write_sequence(table_uuid: &Uuid, branch_uuid: &Uuid) -> String {
 // Each partition_uuid derives directly from
 // `row_uuid_for_pk(catalog_uuid, [branch_uuid, partition_tag])` where
 // `partition_tag` is the fixed PG-name suffix (e.g. `"commit_tx_log"`). The
-// tag doubles as the hash-input-space discriminator across the 12
+// tag doubles as the hash-input-space discriminator across the
 // arity-2 catalog-rooted partition helpers below; see
 // [`table_persist_uuid`]'s doc-comment for the catalog-rooted
 // arity invariant.
@@ -271,8 +261,6 @@ pub fn tx_table_log_partition(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> String
     partition_name(catalog_uuid, branch_uuid, TX_TABLE_LOG)
 }
 
-// -- Per-catalog persist + snapshot metadata parents (CHA-198) -------------
-//
 // Five segment-metadata tables move from global-bare to per-catalog
 // `{catalog_uuid}_<base>` parents, each LIST-partitioned by `branch_uuid`.
 // All five sit alongside the tx-log family (per-catalog parent + per-
@@ -480,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_partition_helpers_distinct_per_tag() {
-        // All 12 partition helpers share the arity-3 catalog-rooted
+        // All partition helpers share the arity-3 catalog-rooted
         // shape `[catalog, branch, tag]`; distinct tags must yield
         // distinct partition UUIDs so partition names don't alias.
         let partitions = [

@@ -216,7 +216,6 @@ mod tests {
         let cell = cell();
         let _guard = PlanResolutionMemoGuard::install(cell.clone());
 
-        // Miss until resolved.
         assert_eq!(memo_get_schema(&cell, "public"), None);
         memo_put_schema(&cell, "public".into(), Some("public".into()));
         assert_eq!(

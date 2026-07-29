@@ -277,7 +277,6 @@ class TestPerTableLifecycle:
             {"name": ["alice"], "value": [1]},
         )
 
-        # Per-table persist of T1 only.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -355,11 +354,9 @@ class TestPerTableLifecycle:
             branch_uuid=branch_uuid,
             table_uuid=tables["t1"],
         )
-        # Purge advanced the seq fence Pu.
         assert purge_response.HasField("purged_at_micros")
         pu = purge_response.purged_at_micros
 
-        # Hot upsert log is now empty.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 0
         # Delete log is empty too (no deletes were written in this tx).
         assert _count_hot_delete_log_rows(tables["t1"], branch_uuid) == 0
@@ -403,9 +400,7 @@ class TestPerTableLifecycle:
             table_uuid=tables["t1"],
         )
 
-        # Hot still has the rows post-persist.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 3
-        # Cold has them too (persist wrote a committed segment).
         assert (
             _count_committed_persist_segments(catalog_uuid, branch_uuid, tables["t1"])
             >= 1
@@ -466,9 +461,7 @@ class TestPerTableLifecycle:
             table_uuid=tables["t1"],
         )
 
-        # Hot is empty.
         assert _count_hot_upsert_log_rows(tables["t1"], branch_uuid) == 0
-        # Cold still holds the rows.
         assert (
             _count_committed_persist_segments(catalog_uuid, branch_uuid, tables["t1"])
             >= 1
@@ -649,7 +642,6 @@ class TestPerTableLifecycle:
             catalog_uuid=catalog_uuid,
             branch_uuid=branch_uuid,
         )
-        # Re-persist after the abort.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1149,10 +1141,6 @@ class TestPerTableLifecycle:
         assert result.num_rows == 0
 
 
-# CHA-227: stamping rule (max(committed_at) over persisted rows) and
-# Snapshot's direct-watermark reads
-
-
 def _max_committed_persist_segment_max_tx(catalog_uuid, branch_uuid, table_uuid):
     """Return ``max(max_tx_commit_micros)`` over committed persist
     segments for ``(branch, table)`` — the *true* watermark over the
@@ -1204,7 +1192,6 @@ class TestPerTableLifecycleCHA227:
             client, catalog_uuid, schema_uuid, branch_uuid, ["t1"]
         )
 
-        # Commit a tx; capture its commit_micros via the response.
         tx = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,

@@ -48,7 +48,6 @@ def validate(message: str) -> list[str]:
 
     subject = lines[0]
 
-    # Skip merge commits
     if subject.startswith("Merge "):
         return errors
 

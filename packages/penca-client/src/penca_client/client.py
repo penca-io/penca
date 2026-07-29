@@ -177,8 +177,6 @@ class PencaClient:
             branch=branch,
         )
 
-    # -- Catalog / branch properties --------------------------------------
-
     @property
     def catalog(self) -> str | None:
         """The catalog this client operates against.
@@ -312,8 +310,6 @@ class PencaClient:
 
         return catalog_uuid, catalog_name
 
-    # -- Catalog ----------------------------------------------------------
-
     def create_catalog(
         self,
         catalog_name: str,
@@ -416,8 +412,6 @@ class PencaClient:
             raise rpc_error_to_api_error(e) from e
 
         return response.catalog_uuid
-
-    # -- Schema -----------------------------------------------------------
 
     def create_schema(
         self,
@@ -627,8 +621,6 @@ class PencaClient:
             raise rpc_error_to_api_error(e) from e
 
         return response.schema_uuid
-
-    # -- Table ------------------------------------------------------------
 
     def create_table(
         self,
@@ -878,8 +870,6 @@ class PencaClient:
 
         return response.table_uuid
 
-    # -- Index DDL (CHA-455) ----------------------------------------------
-
     def create_index(
         self,
         *,
@@ -1094,8 +1084,6 @@ class PencaClient:
 
         return response.index_uuid
 
-    # -- Branching --------------------------------------------------------
-
     def create_branch(
         self,
         branch_name: str,
@@ -1309,8 +1297,6 @@ class PencaClient:
         except RpcError as e:
             raise rpc_error_to_api_error(e) from e
 
-    # -- Transactions -----------------------------------------------------
-
     def begin_tx(
         self,
         *,
@@ -1413,8 +1399,6 @@ class PencaClient:
         except RpcError as e:
             raise rpc_error_to_api_error(e) from e
 
-    # -- Data mutations ---------------------------------------------------
-
     def write_data(
         self,
         tx_uuid: str | None,
@@ -1465,8 +1449,6 @@ class PencaClient:
             return self._write.WriteData(request)
         except RpcError as e:
             raise rpc_error_to_api_error(e) from e
-
-    # -- Lifecycle --------------------------------------------------------
 
     def persist(
         self,
@@ -1794,8 +1776,6 @@ class PencaClient:
         except RpcError as e:
             raise rpc_error_to_api_error(e) from e
 
-    # -- Reads ------------------------------------------------------------
-
     def read_data(
         self,
         catalog_uuid: str | None = None,
@@ -2015,8 +1995,6 @@ class PencaClient:
 
         return Table.from_batches(upsert_batches), Table.from_batches(delete_batches)
 
-    # -- SQL --------------------------------------------------------------
-    #
     # Query vs. update are exposed as two methods because ADBC Python's
     # DB-API ``cursor.execute`` unconditionally routes through the query
     # RPC path (``GetFlightInfo`` + ``DoGet``), while Arrow Flight SQL

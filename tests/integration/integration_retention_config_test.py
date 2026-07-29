@@ -48,18 +48,12 @@ from penca_proto.external.v1.write_pb2 import (
 
 from .integration_helpers import USER_SCHEMA, make_client
 
-# RT1 — seconds round-trip + per-field coalesce + retain_max_versions removed
-
 
 def test_retain_max_versions_field_removed():
     # RED pre-reshape: retain_max_versions still exists, so the constructor does
     # NOT raise and pytest.raises fails. GREEN once the field is dropped.
     with pytest.raises(ValueError):
         RetentionConfig(retain_max_versions=1)  # ty: ignore[unknown-argument]
-
-
-# RT2 — validation: snapshot_density_seconds <= retention_duration_seconds
-# (scope-B: on the schema — the broadest scope — and the table)
 
 
 def test_validation_density_exceeds_duration_rejected_on_schema():

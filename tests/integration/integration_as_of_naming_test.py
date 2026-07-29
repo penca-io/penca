@@ -76,9 +76,6 @@ def _write_rows_returning_commit(
     return committed.commit_micros
 
 
-# 19-23. as_of_micros-aware name resolution
-
-
 class TestAsOfNameResolution:
     def test_as_of_name_resolution_finds_table_at_historical_name(self):
         """CHA-236 #19: rename ``foo → bar`` at T_rename;

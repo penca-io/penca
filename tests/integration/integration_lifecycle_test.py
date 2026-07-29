@@ -266,7 +266,6 @@ class TestPersistCorrectness:
             table_uuid=table_uuid,
         )
 
-        # Purge is what empties hot.
         rows_after = get_pg_driver().execute(
             SQL("SELECT count(*) FROM {}").format(Identifier(hot_upsert_table)),
         )
@@ -284,7 +283,6 @@ class TestPersistCorrectness:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # First tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -310,7 +308,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Second tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -366,7 +363,6 @@ class TestPersistCorrectness:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # Committed tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -392,7 +388,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Uncommitted tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -505,7 +500,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Delete alice
         client.write_data(
             tx.tx_uuid,
             Mutation(
@@ -530,7 +524,6 @@ class TestPersistCorrectness:
         )
         assert response.persisted_at_micros > 0
 
-        # After persist, only bob should be visible (alice was deleted).
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -581,7 +574,6 @@ class TestPersistCorrectness:
             branch_uuid=branch_b.branch_uuid,
         )
 
-        # Persist only branch A's table.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -589,7 +581,6 @@ class TestPersistCorrectness:
             table_uuid=table_uuid,
         )
 
-        # Branch B hot data should still be readable
         result_b = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -615,7 +606,6 @@ class TestPersistTwoPhase:
             table_uuid=table_uuid,
         )
 
-        # Check upsert log segment has commit_micros set.
         # CHA-203: classification flows through the parent's `log_kind`
         # column; segments JOIN up to find their kind.
         seg_parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
@@ -711,7 +701,6 @@ class TestBranchDeletionColdStorageCleanup:
         branch, _tx = _setup_branch_with_committed_data(
             client, catalog_uuid, schema_uuid, table_uuid, "delete_cold_branch"
         )
-        # Persist to create segment metadata.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -731,7 +720,6 @@ class TestBranchDeletionColdStorageCleanup:
         )
         assert rows_before[0][0] > 0
 
-        # Delete the branch
         client.delete_branch(
             catalog_uuid=catalog_uuid,
             branch_uuid=branch.branch_uuid,
@@ -1048,7 +1036,6 @@ class TestCompactPersistSegments:
         # deleted post-commit; the metadata rows point at the new one).
         assert post_wave2[0][0] != wave1_active_uri
 
-        # Data still queryable.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1182,7 +1169,6 @@ class TestCompactPersistSegments:
         # The sealed and new-active files must be distinct cold files.
         assert sealed[0][0] != unsealed[0][0]
 
-        # Data still queryable across sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1399,7 +1385,6 @@ class TestCompactPersistSegments:
         )
         assert list(response.merged_object_uris) == []
 
-        # Data still queryable across sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1494,7 +1479,6 @@ class TestCompactPersistSegments:
         assert len({u for (u, _) in unsealed}) == 1
         assert sealed[0][0] != unsealed[0][0]
 
-        # Data still queryable across the sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1617,7 +1601,6 @@ class TestCompactSegmentMetadata:
             table_uuid=table_uuid,
         )
 
-        # Pre-compact: no compact_segment_metadata rows for this scope.
         assert (
             _count_compact_segment_rows(
                 catalog_uuid, branch_uuid=branch_uuid, table_uuid=table_uuid
@@ -1633,7 +1616,6 @@ class TestCompactSegmentMetadata:
         )
         assert len(response.merged_object_uris) >= 1
 
-        # Post-compact: at least one committed row in scope, zero NULL.
         in_scope_total = _count_compact_segment_rows(
             catalog_uuid, branch_uuid=branch_uuid, table_uuid=table_uuid
         )
@@ -1701,7 +1683,6 @@ class TestCompactSegmentMetadata:
             table_uuid=table_uuid,
         )
 
-        # Post-persist snapshot — all segments committed.
         post_persist = _select_segment_commit_micros(
             catalog_uuid, branch_uuid, table_uuid
         )
@@ -1978,7 +1959,6 @@ class TestSnapshot:
         assert partition_keys == [], partition_keys
         assert clustering_keys == ["name"], clustering_keys
 
-        # Check child table_snapshot_segment_metadata rows.
         seg_rows = get_pg_driver().execute(
             SQL(
                 "SELECT commit_micros, row_count"
@@ -2291,7 +2271,6 @@ class TestCarryForwardSnapshot:
             "layout-key mismatch must force a full rewrite (zero shared"
             f" tuples); shared: {sorted(tuples3 & tuples2)}"
         )
-        # ...and the content is correct through the rewrite.
         client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = env
         by_name = client.read_data(
             catalog_uuid=catalog_uuid,
@@ -3843,8 +3822,6 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
                 table_uuid=table,
             )
 
-        # Pull every persisted (catalog, branch, uri) tuple across both
-        # segment metadata parents for both catalogs.
         def _segment_uris(catalog_uuid: str) -> list[tuple[str, str, str]]:
             tfsm = _per_catalog_metadata_table(
                 catalog_uuid, TABLE_PERSIST_SEGMENT_METADATA
@@ -3877,7 +3854,6 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
                 f"object_uri {uri!r} must contain catalog+branch prefix"
                 f" /{catalog_uuid}/{branch_uuid}/ (CHA-203 layout)"
             )
-            # The next path component must be one of persist / snapshot.
             tail_re = re.compile(
                 rf"/{re.escape(catalog_uuid)}/{re.escape(branch_uuid)}/(persist|snapshot)/"
             )
@@ -3943,7 +3919,6 @@ class TestSnapshotWatermarkFromColdPersistSegments:
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
         main_uuid = main_branch_uuid
 
-        # tx_upsert: seed two rows. Then tx_delete: delete one.
         tx_upsert = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
