@@ -6,9 +6,12 @@ path, so N forks that each touch a single partition cost N full copies
 of the table. With cross-branch carry-forward, untouched partitions are
 shared by reference and only the touched partition is rewritten.
 
-Distinct ``object_uri`` is the unit of measurement: carried rows share
-a uri with the parent, so deduping by uri is exactly what separates
-"referenced" from "copied".
+The ``(object_uri, offset)`` **slice** is the unit of measurement, not
+the file: the packer emits one segment row per partition and packs
+several small partitions into one file, so a uri is not a unit of
+storage. Carry-forward copies both columns verbatim, so a carried slice
+collapses onto the row it references and contributes nothing — which is
+exactly what separates "referenced" from "copied".
 
 Run via ``just integration-test branch_fork_storage_growth``.
 """
@@ -82,7 +85,7 @@ def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upsert
     assert response.HasField("snapshotted_at_micros")
 
 
-def _distinct_uri_bytes(catalog_uuid):
+def _distinct_slice_bytes(catalog_uuid):
     """``(distinct_file_count, total_bytes)`` over every committed
     snapshot segment in the catalog, deduped by storage slice.
 
@@ -129,7 +132,7 @@ def test_fork_storage_growth_is_o_delta():
             schema=USER_SCHEMA,
         ),
     )
-    baseline_files, baseline_bytes = _distinct_uri_bytes(catalog_uuid)
+    baseline_files, baseline_bytes = _distinct_slice_bytes(catalog_uuid)
 
     # Guard the metric before asserting on it: size_bytes defaults to 0,
     # so a table of zero-byte segments would make the bound below pass
@@ -158,7 +161,7 @@ def test_fork_storage_growth_is_o_delta():
             ),
         )
 
-    final_files, final_bytes = _distinct_uri_bytes(catalog_uuid)
+    final_files, final_bytes = _distinct_slice_bytes(catalog_uuid)
     growth = final_bytes - baseline_bytes
 
     # A full rewrite per fork adds ~one table's bytes per fork. Carrying
