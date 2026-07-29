@@ -933,6 +933,17 @@ pub struct ResolvedLogTiers {
 /// fails fast with [`MergeError::InvalidPlan`] — this entry never
 /// probes the hot tier, so accepting one would silently drop hot
 /// upserts and delete-exclusions.
+///
+/// `plan.base_cold_storage`, when set, is folded in underneath (CHA-178,
+/// moved here in CHA-531 so the field is honoured on every plan this
+/// entry accepts). **A split consumer must enumerate the base's delete
+/// segments itself.** The fold runs [`filter_live_rows`] over the base,
+/// so a base tombstone reaches `exclusion_set` but never `resolved` —
+/// which is complete for a full-stream consumer, since the exclusion set
+/// covers the whole snapshot leg, and incomplete for one that streams
+/// only a touched subset. `snapshot_op`'s carry-forward writer is the
+/// latter: it reads `base.cold.persist.delete_segments` directly so the
+/// base's deletes still mark their partitions touched.
 pub async fn resolve_log_tiers<'a, D, L>(
     req: &MergeReadRequest<'a, D, L>,
 ) -> Result<ResolvedLogTiers, MergeError>
@@ -2825,6 +2836,90 @@ mod tests {
             matches!(result, Err(MergeError::InvalidPlan(_))),
             "hot plan must be rejected, got {result:?}",
             result = result.as_ref().map(|_| "Ok(MergeReadParts)")
+        );
+    }
+
+    /// CHA-531: the base-cold fold must fire at THIS entry, not only at
+    /// [`stream_all_cold_parts`]. Asserted here rather than on
+    /// `fold_in_base_cold_source` because the bug this pins was exactly a
+    /// correct helper that the entry never called — every other plan-level
+    /// test sets `base_cold_storage: None`, so moving the call back out
+    /// leaves them all green.
+    ///
+    /// The child's cold plan is empty (`persist: None` short-circuits
+    /// `resolve_cold`), so everything in the output came from the base.
+    #[tokio::test]
+    async fn resolve_log_tiers_folds_base_cold_storage() {
+        let schema = test_user_schema();
+        let dl = MockDlDriver::default().with_resolved(make_resolved_batch_flagged(
+            &["u_a", "u_d"],
+            &["a", "d"],
+            &[1, 0],
+            &[100, 200],
+            &[false, true], // u_a live upsert, u_d winning tombstone
+        ));
+        let empty_child = Plan {
+            hot_storage: None,
+            cold_storage: Some(ColdStoragePlan {
+                snapshot: None,
+                persist: None,
+            }),
+            base_cold_storage: None,
+        };
+        let with_base = Plan {
+            base_cold_storage: Some(base_cold(i64::MAX)),
+            ..empty_child.clone()
+        };
+        let snapshot = ReadSnapshot::AsOfMicros(i64::MAX);
+        let driver = MockDriver;
+
+        let without = resolve_log_tiers(&MergeReadRequest {
+            segment_order: SegmentOrder::ByPlan,
+            plan: &empty_child,
+            driver: &driver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &snapshot,
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 4,
+            snapshot_prune_min_segments: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            without.resolved.num_rows(),
+            0,
+            "control: with no base the empty child plan resolves to nothing",
+        );
+        assert!(without.exclusion_set.is_empty());
+
+        let tiers = resolve_log_tiers(&MergeReadRequest {
+            segment_order: SegmentOrder::ByPlan,
+            plan: &with_base,
+            driver: &driver,
+            dl: &dl,
+            user_schema: &schema,
+            full_schema: &schema,
+            snapshot: &snapshot,
+            filter: None,
+            seeks: None,
+            segment_read_concurrency: 4,
+            snapshot_prune_min_segments: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            all_row_uuids(std::slice::from_ref(&tiers.resolved)),
+            vec!["u_a".to_string()],
+            "the base's live row must reach `resolved` through this entry",
+        );
+        assert_eq!(
+            tiers.exclusion_set,
+            str_set(&["u_a", "u_d"]),
+            "the base's tombstone shadows the snapshot leg via the exclusion \
+             set even though it is filtered out of `resolved`",
         );
     }
 
