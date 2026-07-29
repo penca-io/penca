@@ -126,11 +126,13 @@ def _coupled_functions(trees: list[ast.Module], roots: frozenset[str]) -> set[st
     Fixed-point rather than one pass: a test may call a helper that calls a
     helper.
 
-    Takes every module at once rather than one at a time, because these
-    modules import helpers from each other — the cha492 suites both pull
-    ``_sql_steps_via`` from the point-read suite, which is itself a scraper
-    definer. Resolving per module would leave those callees unresolved and
-    their callers unflagged, which fails quiet.
+    Takes every module at once rather than one at a time because imports are
+    not modelled at all: a callee resolves purely by name, so a helper defined
+    in a sibling test module is invisible to a per-module walk. These modules
+    do import helpers from each other, so that gap is reachable — no current
+    test depends on it (today's cross-module callers also scrape directly and
+    are flagged on their own), but the resolution should not rest on that.
+    Note the same-name unioning below therefore spans modules too.
 
     Names are NOT unique — the Flight SQL suite defines ``_exec_query`` in
     three classes, and the write suite defines ``_setup`` twice — so a name
@@ -264,9 +266,9 @@ def test_every_side_channel_test_is_marked_serial():
     )
 
     # Coarse: catches a scan that has stopped seeing most of the suite,
-    # whatever the cause. 47 today; the floor is set close enough to bite
-    # (dropping `container_log` alone yields exactly 30) but with room for
-    # ordinary edits. It does NOT catch subtler walk regressions that leave the
+    # whatever the cause. 47 today, re-derived under the global closure; the
+    # floor is set close enough to bite (dropping `container_log` alone yields
+    # exactly 30) but with room for ordinary edits. It does NOT catch subtler walk regressions that leave the
     # count intact — the existence check above is the precise instrument.
     assert scanned >= 40, (
         f"only {scanned} side-channel tests found; the check has stopped "

@@ -836,6 +836,29 @@ integration-test *services:
     # CHA-519 retires the first reason, not the second, so it shrinks this
     # phase rather than deleting it.
     #
+    # Count both phases up front and require them to partition the selection.
+    # This is the split's actual correctness property — every test runs in
+    # exactly one phase — and asserting it here catches a mistyped `-m` before
+    # a 30-minute run rather than after. A one-sided typo (`-m "seriall"`)
+    # drops the serial tests from BOTH phases, so the sum falls short and this
+    # fails; nothing downstream has to infer intent from an exit code.
+    #
+    # Counting collected node ids rather than parsing pytest's summary line,
+    # whose wording differs between the deselected and non-deselected cases.
+    count_tests() {
+        uv run pytest "$@" --collect-only -q 2>/dev/null | grep -c '::' || true
+    }
+    total_n=$(count_tests "${files[@]}")
+    serial_n=$(count_tests "${files[@]}" -m "serial")
+    parallel_n=$(count_tests "${files[@]}" -m "not serial")
+
+    if [ "$((serial_n + parallel_n))" -ne "$total_n" ]; then
+        echo "phase selectors do not partition the suite:" >&2
+        echo "  serial=$serial_n + parallel=$parallel_n != total=$total_n" >&2
+        echo "  a test in neither phase would silently never run" >&2
+        exit 1
+    fi
+
     # Serial first, and the order is load-bearing. `container_log` buffers and
     # ANSI-strips the container's whole stdout on EVERY call, and `poll_log_for`
     # repeats that every 100ms for up to 5s per assertion. The services log at
@@ -857,69 +880,32 @@ integration-test *services:
     # the pool is no longer the binding constraint; if that override is ever
     # dropped, lower this cap to match or the parallel phase goes red.
     #
-    # PENCA_TEST_JOBS binds `-n`, not `--maxprocesses`, so it can raise as well
-    # as lower. That matters because `--maxprocesses` is only a ceiling on
-    # `-n auto`: on a 2-core box no value could reach CI's 4 workers, leaving
-    # the queue as the only place contention was reproducible. The cap stays as
-    # a separate backstop for `auto` on a large dev machine.
+    # PENCA_TEST_JOBS sets `-n` directly so it can raise as well as lower —
+    # without that, a 2-core box could never reach CI's 4 workers and the queue
+    # was the only place contention showed up. The cap applies ONLY to `auto`:
+    # xdist clamps `min(numprocesses, maxprocesses)` for an explicit `-n` too,
+    # so passing both would silently cap a deliberate request.
     parallel_rc=0
-    uv run pytest "${files[@]}" -m "not serial" \
-        -n "${PENCA_TEST_JOBS:-auto}" --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
+    if [ -n "${PENCA_TEST_JOBS:-}" ]; then
+        uv run pytest "${files[@]}" -m "not serial" \
+            -n "$PENCA_TEST_JOBS" || parallel_rc=$?
+    else
+        uv run pytest "${files[@]}" -m "not serial" \
+            -n auto --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
+    fi
 
-    # pytest exits 5 (NO_TESTS_COLLECTED) when a phase deselects everything,
-    # which is indistinguishable from collecting nothing. Each phase may
-    # legitimately be empty, but only under conditions the other phase proves,
-    # so neither tolerance is unconditional and they are not symmetric.
-    #
-    # SERIAL empty: fine only when the SELECTED files hold no serial test —
-    # true for most named subsets, and true everywhere once CHA-519 lands. The
-    # exit code alone cannot say WHY: `-m` expressions are unvalidated, so a
-    # mistyped `-m "seriall"` also collects zero while the other phase still
-    # excludes those tests — every side-channel test skipped, gate green.
-    #
-    # Ask pytest rather than pattern-matching the source. Earlier revisions
-    # grepped for the mark, which meant maintaining a second definition of
-    # "is marked" alongside the static check's AST walk — and the two drifted
-    # (prose mentions, multi-line `pytestmark` lists, recursion scope) every
-    # time either moved. A collect-only run over the same files with the same
-    # `-m` cannot disagree with the phase it is vouching for.
-    serial_collected=1
-    if [ "$serial_rc" -eq 5 ]; then
-        serial_collected=0
-
-        set +e
-        uv run pytest "${files[@]}" -m "serial" --collect-only -q >/dev/null 2>&1
-        collect_rc=$?
-        set -e
-
-        if [ "$collect_rc" -eq 0 ]; then
-            echo "serial phase collected zero tests while serial-marked tests exist" >&2
-            exit 1
-        fi
-
-        if [ "$collect_rc" -ne 5 ]; then
-            echo "could not collect the selected tests (pytest exit $collect_rc)" >&2
-            exit 1
-        fi
-
+    # pytest exits 5 (NO_TESTS_COLLECTED) when a phase selects nothing. The
+    # counts taken up front say whether that was expected, so neither phase has
+    # to infer it from an exit code — an empty phase is fine exactly when its
+    # count was zero. That covers a fully-serial named subset, and the
+    # post-CHA-519 world where no serial tests remain, without special-casing
+    # either.
+    if [ "$serial_rc" -eq 5 ] && [ "$serial_n" -eq 0 ]; then
         serial_rc=0
     fi
 
-    # PARALLEL empty: fine only for a named subset whose serial phase DID
-    # collect — i.e. every selected module is fully serial, which eight of them
-    # are (module-level `pytestmark`), so `just integration-test
-    # direct_point_read` runs green in phase 1 and legitimately selects nothing
-    # here. Never tolerated for the full suite, where this phase is everything
-    # CI runs and swallowing it would turn "ran nothing" into a green required
-    # check; and never when the serial phase was also empty, which means the
-    # selection matched nothing at all.
-    if [ "$parallel_rc" -eq 5 ]; then
-        if [ -n "{{services}}" ] && [ "$serial_collected" -eq 1 ]; then
-            parallel_rc=0
-        else
-            echo "parallel phase collected zero tests" >&2
-            exit 1
-        fi
+    if [ "$parallel_rc" -eq 5 ] && [ "$parallel_n" -eq 0 ]; then
+        parallel_rc=0
     fi
 
     # Surface the first non-zero. Written as a full `if` rather than
