@@ -68,7 +68,7 @@ Read `docs/style-guide.md`, `docs/development-methodology-guide.md`, and `.claud
 Cheat sheet for the kata calls this skill makes:
 
 - `kata create --label cha-NNN --label plan-draft --label <kind> [--label <source>] --priority N [--blocked-by <ref>] -- "<title>"` — create a task. `<kind>` is one of `red-test`, `impl`, `orch:run-cleanup`, `orch:open-pr`, `orch:spawn-review`. `<source>` (optional) marks late-arriving findings: `roborev`, `review-pr`, `cleanup-pass`, `agent-discovered`. Priority is 0..4 with 0 = highest (direct numeric pass-through from Linear: Urgent=1 → kata 1, None=0 → kata 0).
-- **`--json` shapes differ per subcommand — this is the single biggest footgun in this skill.** Verified against the CLI 2026-07-29:
+- **`--json` shapes differ per subcommand — this is the single biggest footgun in this skill.** Every row below was verified by running the installed CLI on throwaway tasks (2026-07-29). **Verify this way, not by reading kata's source:** `kata version` reports `dev` with an unknown commit, so the installed binary is not necessarily the tagged release in the module cache — a source-read of `ListIssues`/`ReadyIssues` suggests repeated `--label` AND-intersects, and the running binary demonstrably does not.
 
   | subcommand | wrapper | `qualified_id` | `labels` |
   |---|---|---|---|
@@ -85,7 +85,7 @@ Cheat sheet for the kata calls this skill makes:
   # approved set (labels only exist on `list`) ∩ ready set (blockers/ownership only known to `ready`)
   comm -12 \
     <(kata list  --label cha-NNN --json | jq -r '.issues[] | select(.labels | index("approved")) | .short_id' | sort) \
-    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[].short_id' | sort)
+    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[]?.short_id' | sort)
   ```
   Skipping the intersection breaks the Step-3 gate in one of two ways: post-filtering `ready` on `.labels` surfaces *nothing*, and not filtering at all surfaces unapproved `plan-draft` tasks. The human-readable `kata ready --label cha-NNN` (no `--json`) is reliable when you just need to eyeball what's ready — the `--json` shape is the unreliable part, not the readiness computation.
 - `kata claim <ref>` — atomic claim. If a previous loop tick abandoned a claim (session restart, crash), `kata claim --force <ref>` is the recovery path (kata has no TTL-based auto-release).
@@ -314,7 +314,7 @@ while true; do
   # but not readiness. Intersect them — see the --json shape table in the cheat sheet.
   short=$(comm -12 \
     <(kata list  --label cha-NNN --json | jq -r '.issues[] | select(.labels | index("approved")) | .short_id' | sort) \
-    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[].short_id' | sort) \
+    <(kata ready --unowned --label cha-NNN --json | jq -r '.issues[]?.short_id' | sort) \
     | head -1)
   [ -z "$short" ] && break
   ref="penca#$short"
@@ -337,8 +337,15 @@ pr_state=$(gh pr view --json state -q .state 2>/dev/null || echo "NOT_OPEN")
 # Parse the COUNTS off the Jobs line. A bare `grep -qE 'queued|running'` is always
 # true: the header reads "Daemon: running" and the Jobs line spells out both words
 # even at "0 queued, 0 running" — a wait-loop built on it never terminates.
+# No `Jobs:` line at all means the daemon is down or unreachable ("Daemon not
+# running…"), which is NOT idle — report `unknown` so the sweep blocks instead of
+# declaring itself clean without ever having queried a queue.
 roborev_busy=$(roborev status 2>&1 \
-  | awk '/^Jobs:/ { print ($2 + $4 > 0) ? 1 : 0; found=1 } END { if (!found) print 0 }')
+  | awk '/^Jobs:/ { print ($2 + $4 > 0) ? 1 : 0; found=1 } END { if (!found) print "unknown" }')
+if [ "$roborev_busy" = "unknown" ]; then
+  echo "roborev unreachable — cannot certify the review sweep; surface to the user" >&2
+  exit
+fi
 open_orch=$(kata list --label cha-NNN --status open --json 2>/dev/null \
   | jq '[.issues[] | .labels[] | select(startswith("orch:"))] | length')
 

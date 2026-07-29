@@ -14,6 +14,7 @@
 - [feedback_no_subagents.md](feedback_no_subagents.md) — Don't delegate via the Agent tool. EXCEPTION: /do-issue `orch:spawn-review` — DO spawn the Opus `/review-pr` subagent.
 - [feedback_autonomous_drain_no_checkins.md](feedback_autonomous_drain_no_checkins.md) — During an autonomous drain, bank task after task; halt only for course-changing issues.
 - [feedback_poll_roborev_after_any_commits.md](feedback_poll_roborev_after_any_commits.md) — roborev fires on EVERY commit; poll to quiet + drain kata findings before declaring done.
+- [reference_roborev_kata_bridge_needs_cha_branch.md](reference_roborev_kata_bridge_needs_cha_branch.md) — The kata bridge only enqueues on `cha-NNN` branches; elsewhere an empty queue is NOT a clean review — read `roborev show` by hand.
 - [feedback_discuss_before_implementing.md](feedback_discuss_before_implementing.md) — "should we", "I feel like", "is this right" = discuss; don't start editing.
 - [feedback_simplest_correct_mechanism_no_hedging.md](feedback_simplest_correct_mechanism_no_hedging.md) — Lead with the simplest correct mechanism; don't over-engineer or hedge.
 - [feedback_tickets_are_spirit_not_spec.md](feedback_tickets_are_spirit_not_spec.md) — Tickets = spirit, not spec; derive the best mechanism, surface alternatives at the gate.
