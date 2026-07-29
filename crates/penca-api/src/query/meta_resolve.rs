@@ -1516,8 +1516,9 @@ mod tests {
         );
     }
 
-    // No-op driver: the no-tx / no-as_of and explicit-as_of resolution
-    // paths never query the database.
+    // No-op driver. The no-tx / no-as_of and explicit-as_of resolution paths
+    // never query the database; the open-tx path does, and an empty result set
+    // is exactly the "tx absent from begin_tx_log" case.
     struct NoopDriver;
 
     impl DbDriver for NoopDriver {
@@ -1586,6 +1587,34 @@ mod tests {
         // is `LatestSeq` — the one cache-eligible shape — rather than an
         // explicit `AsOfSeq` time-travel.
         assert_eq!(snapshot, ReadSnapshot::LatestSeq(7_654_321));
+    }
+
+    // A supplied `open_tx_uuid` that is not an open tx must ERROR, not fall
+    // through to `LatestSeq`. The downgrade is silently wrong data: reads inside
+    // an aborted or expired tx would resolve at committed-latest while the caller
+    // believes it is inside a transaction. `None` is the only legitimate
+    // fall-through — that means "no tx supplied", covered by the tests either
+    // side of this one.
+    #[tokio::test]
+    async fn resolve_read_snapshot_dead_open_tx_is_an_error() {
+        let catalog = uuid::Uuid::nil().to_string();
+        let branch = uuid::Uuid::nil().to_string();
+        let result = QueryManager::resolve_read_snapshot(
+            &NoopDriver,
+            &catalog,
+            &branch,
+            /*open_tx_uuid=*/ Some("11111111-1111-1111-1111-111111111111"),
+            /*as_of_micros=*/ None,
+            /*as_of_seq=*/ None,
+            /*default_frontier=*/ None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a supplied-but-not-open open_tx_uuid must error, got {:?}",
+            result.ok()
+        );
     }
 
     // Regression guard: explicit `as_of_micros` resolves verbatim.
