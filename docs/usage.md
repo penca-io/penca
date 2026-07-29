@@ -45,8 +45,9 @@ methods for the gRPC surface.
 
 ## Your first table
 
-The same table, created and read twice — once over SQL, once over gRPC. Both land in
-the same place, because they are the same engine.
+One table, written over both surfaces. The gRPC arm below appends to the *same* table
+the SQL arm created, and the final read returns every row — they are the same engine
+addressing the same data, not two parallel worlds.
 
 ### Over SQL
 
@@ -58,7 +59,7 @@ from penca_client import PencaClient
 
 client = PencaClient.from_settings()
 
-client.execute_update("CREATE SCHEMA IF NOT EXISTS shop")
+client.execute_update("CREATE SCHEMA shop")
 client.execute_update(
     "CREATE TABLE shop.orders (order_id BIGINT PRIMARY KEY, customer VARCHAR, total BIGINT)"
 )
@@ -69,14 +70,18 @@ client.execute_update(
 print(client.execute_query("SELECT * FROM shop.orders ORDER BY order_id"))
 ```
 
-The catalog is pinned per connection at handshake, so unqualified names resolve against
-the session's default catalog — there is no `USE` statement to issue.
+The catalog is pinned per connection at handshake — unqualified names resolve against
+the session's default catalog (`public` in the shipped compose stack), and there is no
+`USE` statement to issue. Note that `IF NOT EXISTS` is not supported on either
+`CREATE SCHEMA` or `CREATE TABLE`; re-running this block against a live stack fails on
+the already-existing schema rather than silently no-opping.
 
 ### Over gRPC
 
-The gRPC surface is explicit about the hierarchy and hands back the UUIDs, which is why
-the demos use it for setup: forking a branch needs a `commit_seq_num` that SQL does not
-return.
+The gRPC surface is explicit about the hierarchy and hands identity back to you, which
+is why the demos use it for setup: forking a branch pins to a `commit_seq_num` that SQL
+does not return. It accepts human-readable names anywhere a UUID is expected, so it can
+address the table the SQL arm just made:
 
 ```python
 import pyarrow as pa
@@ -90,44 +95,33 @@ SCHEMA = pa.schema([
     pa.field("total", pa.int64()),
 ])
 
-catalog_uuid, main_branch_uuid = client.create_catalog("shop", "owner")
-schema_uuid = client.create_schema("orders_ns", catalog_uuid=catalog_uuid, author="demo")
-table_uuid = client.create_table(
-    "orders",
-    SCHEMA,
-    primary_keys=["order_id"],
-    catalog_uuid=catalog_uuid,
-    schema_uuid=schema_uuid,
-    author="demo",
-)
-
-tx = client.begin_tx(catalog_uuid=catalog_uuid, branch_uuid=main_branch_uuid, author="demo")
+tx = client.begin_tx(catalog_name="public", branch_name="main", author="demo")
 client.write_data(
     tx.tx_uuid,
     Mutation(
-        table_uuid=table_uuid,
+        table_name="orders",
         upserts=pa.table(
-            {"order_id": [1, 2], "customer": ["ada", "grace"], "total": [4200, 1300]},
-            schema=SCHEMA,
+            {"order_id": [3], "customer": ["hopper"], "total": [900]}, schema=SCHEMA
         ),
     ),
-    catalog_uuid=catalog_uuid,
-    schema_uuid=schema_uuid,
-    branch_uuid=main_branch_uuid,
+    catalog_name="public",
+    schema_name="shop",
+    branch_name="main",
 )
-client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=main_branch_uuid)
+client.commit_tx(tx.tx_uuid, catalog_name="public", branch_name="main")
 
+# All three rows: ada and grace from SQL, hopper from gRPC.
 print(client.read_data(
-    catalog_uuid=catalog_uuid,
-    schema_uuid=schema_uuid,
-    branch_uuid=main_branch_uuid,
-    table_uuid=table_uuid,
+    catalog_name="public", schema_name="shop", branch_name="main", table_name="orders"
 ))
 ```
 
 Every write is an upsert — the unified upsert log means there is no client-side
 insert-versus-update distinction. `read_data` resolves the latest committed version per
-row and applies tombstones; `audit_data` returns the version history instead.
+row and applies tombstones; `audit_data` returns the version history instead. To build
+the whole hierarchy over gRPC instead of SQL — `create_catalog` → `create_schema` →
+`create_table` — see `examples/audit_demo.py`, which suffixes its catalog name with a
+random hex string so repeat runs do not collide.
 
 ## Connecting DataGrip
 
@@ -150,7 +144,9 @@ DataGrip ships no Arrow Flight SQL driver, so register Apache's as a custom driv
    `useEncryption` defaults to **true**, and the shipped stack serves plaintext, so
    this parameter is required — without it the connection fails at the TLS handshake.
    Parameter names are case-sensitive. Leave user/password empty: Penca does not
-   authenticate today (see the README's shortcomings section).
+   authenticate today — no auth interceptor, no TLS, and the Flight SQL handshake is
+   unimplemented (see
+   [Current shortcomings](../README.md#current-shortcomings)).
 4. **On JDK 9+**, add `--add-opens=java.base/java.nio=ALL-UNNAMED` to the driver's VM
    options, which the Arrow driver requires for off-heap buffer access.
 
