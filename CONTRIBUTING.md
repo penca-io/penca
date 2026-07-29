@@ -9,13 +9,15 @@ If you are interested in helping drive Penca through its early stage development
 as a maintainer, please email **info@penca.io**.
 
 Penca is early, and we don't currently have the bandwidth to review outside
-work. **We are not accepting external contributions or pull requests at this
-time.** A PR opened today may sit unreviewed — that's intentional, not neglect,
-and we'd rather say so up front than leave you waiting on something that can't
-be merged.
+work. Since most project development is already agent based, we really need help
+at the architecture level and in managing/reviewing agent development work. **We
+are not accepting external contributions or pull requests at this time.** A PR
+opened today may sit unreviewed — that's intentional, not neglect, and we'd
+rather say so up front than leave you waiting on something that can't be merged.
 
 This will likely change as the project matures. If you'd like to follow along,
-watch or star the repository for updates.
+watch or star the repository for updates. Again, if you'd like to get involved
+in active development as a maintainer, please reach out to **info@penca.io**.
 
 ## Questions
 
