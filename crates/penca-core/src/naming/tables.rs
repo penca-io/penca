@@ -486,6 +486,7 @@ mod tests {
             segment_delete_set_partition(&CAT, &BR),
             table_snapshot_index_metadata_partition(&CAT, &BR),
             table_snapshot_segment_index_metadata_partition(&CAT, &BR),
+            abort_seq_num_partition(&CAT, &BR),
         ];
         for i in 0..partitions.len() {
             for j in (i + 1)..partitions.len() {
