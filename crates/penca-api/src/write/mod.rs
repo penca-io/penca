@@ -1059,10 +1059,29 @@ impl WriteManager {
             .into_iter()
             .collect();
 
-        // Phase 2: drop the metadata and queue the files, atomically.
+        // Phase 2: queue the files and drop the metadata, atomically. One
+        // transaction because removing the references and queueing the files must
+        // be a single fact: a crash between them leaves either an unreferenced
+        // file nothing will ever collect, or a queued file still referenced with
+        // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
+        // already queued by another branch's retirement the later grace clock.
         with_pg_tx(pool, async |tx| {
             let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
             if deleted {
+                // BEFORE the partition drops, matching `retire.rs`, which is the
+                // only other writer that touches both `segment_delete_set` and
+                // the segment-metadata parents: it enqueues first, then deletes
+                // segment rows. Dropping a partition takes ACCESS EXCLUSIVE on
+                // the catalog-wide parent, so enqueueing afterwards inverts that
+                // order — a retirement wave holding an uncommitted delete-set row
+                // for a shared URI and waiting on the parent, against a teardown
+                // holding the parent and waiting on that row, is a cycle PG
+                // resolves by aborting one side. A URI shared across a fork edge
+                // is the carry-forward case this whole path exists for, not a
+                // corner case. Still one transaction, so atomicity is unchanged.
+                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
+                    .await?;
+
                 for table_uuid_str in &table_uuid_strs {
                     LifecycleManager::drop_data_tables(
                         tx,
@@ -1081,15 +1100,6 @@ impl WriteManager {
                 // deletes (Phase 2 above) and the data-table drops above
                 // are tier-specific and stay here.
                 LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
-
-                // Same tx as the row drop: removing the references and queueing
-                // the files must be one atomic fact, or a crash between them
-                // leaves either an unreferenced file nothing will ever collect
-                // or a queued file still referenced with no clock to reconcile.
-                // The enqueue's ON CONFLICT refresh gives a URI already queued
-                // by another branch's retirement the later grace clock.
-                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
-                    .await?;
             }
             Ok(())
         })
