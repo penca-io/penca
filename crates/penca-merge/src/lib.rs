@@ -2732,20 +2732,23 @@ mod tests {
         .await
         .expect("a NULL-carrying tombstone must not abort the read");
 
-        // Assert on membership and count rather than interpolating the uuids:
-        // row_uuids are PK-derived and this crate's spans already record only
-        // their count for that reason (`ids_rows`), a convention CodeQL's
-        // cleartext-logging rule enforces on panic messages too.
+        // Static panic messages, nothing derived from `emitted` interpolated
+        // into them: row_uuids are PK-derived, and CodeQL's cleartext-logging
+        // rule treats an assert message as a log sink and taints anything
+        // reached from them — including `.len()`, whose receiver carries the
+        // taint. `assert!` evaluates its condition without printing it.
         let emitted = all_row_uuids(&batches);
         assert!(
+            emitted.len() == 2,
+            "expected exactly the live row and the snapshot row"
+        );
+        assert!(
             !emitted.contains(&"d1".to_string()),
-            "the tombstone must be dropped from the live delta; {} rows emitted",
-            emitted.len()
+            "the tombstone must be dropped from the live delta"
         );
         assert!(
             emitted.contains(&"u1".to_string()),
-            "the live row must survive; {} rows emitted",
-            emitted.len()
+            "the live row must survive"
         );
         assert!(
             dl.recorded_scan_exclusion().contains(&"d1".to_string()),
