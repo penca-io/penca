@@ -158,12 +158,24 @@ where
             .into_inner()
             .watermark
             .ok_or_else(|| {
+                // Echo whichever identification the caller supplied — CreateBranch
+                // accepts either UUIDs or names, and a placeholder would be
+                // useless in exactly the name-based case.
+                let branch = req
+                    .source_branch_uuid
+                    .as_deref()
+                    .or(req.source_branch_name.as_deref())
+                    .unwrap_or("<unidentified>");
+                let catalog = req
+                    .catalog_uuid
+                    .as_deref()
+                    .or(req.catalog_name.as_deref())
+                    .unwrap_or("<unidentified>");
                 Status::internal(format!(
-                    "CreateBranch aborted: source branch {} in catalog {} could \
-                     not be fully flushed hot→cold. The lifecycle service logged \
-                     one warn per failing table with these two fields.",
-                    req.source_branch_uuid.as_deref().unwrap_or("<by name>"),
-                    req.catalog_uuid.as_deref().unwrap_or("<by name>"),
+                    "CreateBranch aborted: source branch {branch} in catalog \
+                     {catalog} could not be fully flushed hot→cold. The lifecycle \
+                     service logged one warn per failing table, keyed by the \
+                     resolved catalog and branch UUIDs."
                 ))
             })?;
         let resp = self
