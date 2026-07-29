@@ -199,6 +199,22 @@ impl LifecycleManager {
     /// `table_snapshot_segment_metadata` (the retirement tx does the
     /// same with its segment-row deletes).
     ///
+    /// **Lock-ordering invariant — call this BEFORE touching the
+    /// segment-metadata parents in the same transaction.** Three
+    /// writers mutate both this table and those parents: the compact
+    /// merge (`lifecycle::compact`, repoint → `ROW EXCLUSIVE` on the
+    /// parent), snapshot retirement (`lifecycle::retire`, row deletes),
+    /// and branch teardown (`write::delete_branch`, `DROP PARTITION` →
+    /// `ACCESS EXCLUSIVE` on the parent). Any writer that takes a parent
+    /// lock before this row lock forms a deadlock cycle with one that
+    /// does the reverse, and PG resolves it by aborting a side — a
+    /// nondeterministic user-visible failure or a killed lifecycle wave.
+    /// A URI shared across a fork edge makes the cycle reachable without
+    /// any misuse, since carry-forward and the CHA-539 fork copy both
+    /// leave one file referenced from several branches. Enqueue first,
+    /// unconditionally; there is no case where a parent lock must come
+    /// first.
+    ///
     /// 1 SQL query.
     pub async fn insert_segment_delete_set_rows(
         driver: &impl DbDriver<Row = PgRow>,

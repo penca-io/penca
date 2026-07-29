@@ -1068,17 +1068,15 @@ impl WriteManager {
         with_pg_tx(pool, async |tx| {
             let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
             if deleted {
-                // BEFORE the partition drops, matching `retire.rs`, which is the
-                // only other writer that touches both `segment_delete_set` and
-                // the segment-metadata parents: it enqueues first, then deletes
-                // segment rows. Dropping a partition takes ACCESS EXCLUSIVE on
-                // the catalog-wide parent, so enqueueing afterwards inverts that
-                // order — a retirement wave holding an uncommitted delete-set row
-                // for a shared URI and waiting on the parent, against a teardown
-                // holding the parent and waiting on that row, is a cycle PG
-                // resolves by aborting one side. A URI shared across a fork edge
-                // is the carry-forward case this whole path exists for, not a
-                // corner case. Still one transaction, so atomicity is unchanged.
+                // BEFORE the partition drops, per the lock-ordering invariant on
+                // `insert_segment_delete_set_rows`: every writer of the delete
+                // set takes its row locks before touching the segment-metadata
+                // parents. Dropping a partition takes ACCESS EXCLUSIVE on the
+                // catalog-wide parent, so enqueueing afterwards would invert that
+                // against both other writers — retirement and the compact merge —
+                // and a URI shared across a fork edge makes the cycle reachable
+                // with no misuse. Still one transaction, so atomicity is
+                // unchanged.
                 LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
                     .await?;
 
