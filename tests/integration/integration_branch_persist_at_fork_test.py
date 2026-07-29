@@ -17,7 +17,14 @@ import pyarrow as pa
 import pytest
 from penca_client import Mutation
 from penca_client.errors import InvalidRequestError
-from penca_client.naming import TABLE_PERSIST_SEGMENT_METADATA
+from penca_client.naming import (
+    TABLE_PERSIST_METADATA,
+    TABLE_PERSIST_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_INDEX_METADATA,
+    TABLE_SNAPSHOT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_METADATA,
+)
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import USER_SCHEMA, get_pg_driver, make_client, setup_schema
@@ -342,3 +349,258 @@ def test_persist_and_snapshot_branch_returns_watermark():
     assert response.watermark.commit_seq_num > 0
     assert response.watermark.commit_micros > 0
     assert _committed_seg_count(catalog_uuid, main_branch_uuid, table_uuid) > 0
+
+
+# CHA-539 — CreateBranch materializes the child's OWN cold reference rows,
+# pointing at the parent's object_uris, so the GC refcount gate can see the
+# fork's claim on those files. Metadata only: no data copy, no new object.
+_COLD_REFERENCE_TABLES = (
+    TABLE_PERSIST_METADATA,
+    TABLE_PERSIST_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_INDEX_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
+)
+
+# The two segment tables whose rows name a cold file. Measured as a set of
+# `object_uri`s, the same metadata-side proxy for stored objects
+# `integration_branch_fork_storage_growth_test.py` uses — a fork that copies
+# only metadata leaves this set unchanged.
+_SEGMENT_URI_TABLES = (
+    TABLE_PERSIST_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_METADATA,
+)
+
+
+def _branch_row_count(catalog_uuid, branch_uuid, table_name) -> int:
+    """Committed rows on ``table_name`` for one branch.
+
+    ``table_snapshot_segment_index_metadata`` has no ``table_uuid`` column (the
+    index identity lives on its parent header), so this counts per branch only.
+    """
+    rows = get_pg_driver().execute(
+        SQL("SELECT count(*) FROM {tbl} WHERE branch_uuid = %s").format(
+            tbl=Identifier(f"{catalog_uuid}_{table_name}")
+        ),
+        (branch_uuid,),
+    )
+
+    return rows[0][0]
+
+
+def _segment_uris(catalog_uuid, branch_uuid=None, table_uuid=None) -> set[str]:
+    """Committed segment ``object_uri``s, optionally narrowed to a branch/table."""
+    uris: set[str] = set()
+    for table_name in _SEGMENT_URI_TABLES:
+        clause, params = "commit_micros IS NOT NULL", []
+        for column, value in ("branch_uuid", branch_uuid), ("table_uuid", table_uuid):
+            if value is not None:
+                clause += f" AND {column} = %s"
+                params.append(value)
+
+        rows = get_pg_driver().execute(
+            SQL("SELECT DISTINCT object_uri FROM {tbl} WHERE " + clause).format(
+                tbl=Identifier(f"{catalog_uuid}_{table_name}")
+            ),
+            tuple(params),
+        )
+        uris.update(row[0] for row in rows)
+
+    return uris
+
+
+def _max_copied_persist_seq(catalog_uuid, branch_uuid) -> int | None:
+    """``MAX(max_commit_seq_num)`` over a branch's committed persist segments."""
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT max(max_commit_seq_num) FROM {tbl} "
+            "WHERE branch_uuid = %s AND commit_micros IS NOT NULL"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}")),
+        (branch_uuid,),
+    )
+
+    return rows[0][0]
+
+
+def _seed_straddling_parent(client):
+    """Seed ``main`` so its persist segments span a wide seq range, and return a
+    fork position that lands INSIDE one of them.
+
+    This is the ordinary case, not an edge case: the parent persists on the
+    scheduler's cadence, so a fork at any non-head position falls mid-segment.
+    Two commits are flushed by ONE persist, so the resulting segment covers
+    ``[seq(first), seq(second)]`` and forking at ``seq(first)`` straddles it.
+    """
+    schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    def commit(name, value):
+        return _write_committed_rows(
+            client,
+            branch_uuid=main_branch_uuid,
+            rows={"name": [name], "value": [value]},
+            **scope,
+        )
+
+    # Persisted together -> one segment spanning both seqs.
+    fork_seq = commit("inside_lo", 1)
+    above_fork_seq = commit("inside_hi", 2)
+    client.persist(branch_uuid=main_branch_uuid, **scope)
+    client.snapshot(branch_uuid=main_branch_uuid, **scope)
+
+    return scope, main_branch_uuid, fork_seq, above_fork_seq
+
+
+def test_fork_materializes_child_cold_reference_rows():
+    """CHA-539: CreateBranch writes the child's own cold reference rows, naming
+    the parent's ``object_uri``s.
+
+    Fails today: ``create_branch`` materializes branch_store, partitions, the
+    seq seed and schema/table metadata — no cold metadata at all.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+    _write_committed_rows(
+        client,
+        branch_uuid=main_branch_uuid,
+        rows={"name": ["a1", "a2"], "value": [1, 2]},
+        **scope,
+    )
+    client.persist(branch_uuid=main_branch_uuid, **scope)
+    client.snapshot(branch_uuid=main_branch_uuid, **scope)
+
+    parent_uris = _segment_uris(catalog_uuid, main_branch_uuid, table_uuid)
+    assert parent_uris, "parent must hold cold segments before the fork is meaningful"
+
+    child = client.create_branch("child", "t", "fork", catalog_uuid=catalog_uuid)
+
+    missing = [
+        table_name
+        for table_name in _COLD_REFERENCE_TABLES
+        if _branch_row_count(catalog_uuid, child.branch_uuid, table_name) == 0
+    ]
+    assert not missing, (
+        f"the fork must materialize the child's cold reference rows; {missing} "
+        "have no row on the child"
+    )
+
+    child_uris = _segment_uris(catalog_uuid, child.branch_uuid, table_uuid)
+    assert child_uris <= parent_uris, (
+        "every child reference must name a file the PARENT already wrote, not a "
+        f"fresh one; {child_uris - parent_uris} are new"
+    )
+
+
+def test_fork_writes_no_new_cold_objects():
+    """The fork's COPY step is metadata-only: reference rows, never a cold file.
+
+    Scoped to the user table on purpose. CreateBranch's flush is catalog-wide, so
+    it also persists the `__penca_system__` schemas/tables — whose DDL rows are
+    still hot here — and those legitimately produce new cold objects. Comparing
+    catalog-wide would fail on that pre-existing flush and say nothing about the
+    copy.
+
+    Green before CHA-539 (nothing is copied at all) and green after (only
+    metadata is copied) — the guard that the copy stays metadata-only.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+    _write_committed_rows(
+        client,
+        branch_uuid=main_branch_uuid,
+        rows={"name": ["a1", "a2"], "value": [1, 2]},
+        **scope,
+    )
+    client.persist(branch_uuid=main_branch_uuid, **scope)
+    client.snapshot(branch_uuid=main_branch_uuid, **scope)
+
+    before = _segment_uris(catalog_uuid, table_uuid=table_uuid)
+    assert before, "no cold segments to compare against"
+
+    client.create_branch("child", "t", "fork", catalog_uuid=catalog_uuid)
+
+    after = _segment_uris(catalog_uuid, table_uuid=table_uuid)
+    assert after == before, (
+        "CreateBranch must reference the parent's existing cold files, not write "
+        f"new ones; {after - before} appeared"
+    )
+
+
+def test_copied_persist_rows_are_seq_clamped():
+    """CHA-539: a copied persist row must not claim rows past the fork.
+
+    The fork position lands inside an existing parent segment, so a verbatim
+    copy would carry that segment's full ``max_commit_seq_num`` and expose the
+    parent's post-fork rows to the child. The copy is clamped to the fork seq.
+
+    Fails today: the child has no persist rows to assert over.
+    """
+    client = make_client()
+    scope, main_branch_uuid, fork_seq, above_fork_seq = _seed_straddling_parent(client)
+
+    parent_max = _max_copied_persist_seq(scope["catalog_uuid"], main_branch_uuid)
+    assert parent_max is not None and parent_max >= above_fork_seq, (
+        "fixture must produce a parent segment reaching past the fork seq; "
+        f"parent max is {parent_max}, fork at {fork_seq}"
+    )
+
+    child = client.create_branch(
+        "child",
+        "t",
+        "fork",
+        commit_seq_num=fork_seq,
+        catalog_uuid=scope["catalog_uuid"],
+    )
+
+    child_max = _max_copied_persist_seq(scope["catalog_uuid"], child.branch_uuid)
+    assert child_max is not None, (
+        "the fork must copy the parent's persist segment rows onto the child"
+    )
+    assert child_max == fork_seq, (
+        "the straddling segment's copy must be CLAMPED to the fork seq (not "
+        f"dropped, not verbatim); child max is {child_max}, fork at {fork_seq}, "
+        f"parent max {parent_max}"
+    )
+
+
+def test_fork_at_historical_seq_hides_parents_post_fork_rows():
+    """A fork inside an already-written parent segment sees the parent's rows at
+    or below the fork, and none above it.
+
+    Green today via the base-cold arm's plan-wide ``PersistPlan.commit_seq
+    .max_seq`` ceiling; after CHA-539 the same guarantee has to come from the
+    per-segment ``max_commit_seq_num`` ceiling applied to the clamped copies.
+    This is the test that catches an unclamped or unenforced copy.
+    """
+    client = make_client()
+    scope, _main_branch_uuid, fork_seq, _above = _seed_straddling_parent(client)
+
+    child = client.create_branch(
+        "child",
+        "t",
+        "fork",
+        commit_seq_num=fork_seq,
+        catalog_uuid=scope["catalog_uuid"],
+    )
+
+    got = client.read_data(branch_uuid=child.branch_uuid, **scope)
+    names = set(got.column("name").to_pylist())
+    assert names == {"inside_lo"}, (
+        "the child must inherit only the parent rows at or below the fork seq; "
+        f"saw {names}"
+    )
