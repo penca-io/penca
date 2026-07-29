@@ -15,6 +15,7 @@
 - [feedback_no_subagents.md](feedback_no_subagents.md) — Don't delegate via the Agent tool. EXCEPTION: /do-issue `orch:spawn-review` — DO spawn the Opus `/review-pr` subagent.
 - [feedback_autonomous_drain_no_checkins.md](feedback_autonomous_drain_no_checkins.md) — During an autonomous drain, bank task after task; halt only for course-changing issues.
 - [feedback_poll_roborev_after_any_commits.md](feedback_poll_roborev_after_any_commits.md) — roborev fires on EVERY commit; poll to quiet + drain kata findings before declaring done.
+- [reference_roborev_severity_threshold_met_is_clean.md](reference_roborev_severity_threshold_met_is_clean.md) — `SEVERITY_THRESHOLD_MET` means CLEAN; trust `.verdict_bool` (1=clean), not the string.
 - [feedback_discuss_before_implementing.md](feedback_discuss_before_implementing.md) — "should we", "I feel like", "is this right" = discuss; don't start editing.
 - [feedback_simplest_correct_mechanism_no_hedging.md](feedback_simplest_correct_mechanism_no_hedging.md) — Lead with the simplest correct mechanism; don't over-engineer or hedge.
 - [feedback_tickets_are_spirit_not_spec.md](feedback_tickets_are_spirit_not_spec.md) — Tickets = spirit, not spec; derive the best mechanism, surface alternatives at the gate.
@@ -41,6 +42,7 @@
 - [reference_buffer_unordered_send_hrtb.md](reference_buffer_unordered_send_hrtb.md) — Send-for-all-lifetimes cold reads: chunked `try_join_all`, NOT `buffer_unordered`; catch with `cargo check -p penca-server-grpc`.
 - [feedback_capture_test_output_once.md](feedback_capture_test_output_once.md) — Pipe slow runs to a logfile once; grep the file afterwards.
 - [feedback_worktrees.md](feedback_worktrees.md) — VM-per-ticket uses plain `git checkout -b`; worktrees are the laptop-only fallback.
+- [reference_memory_dir_symlinks_into_repo.md](reference_memory_dir_symlinks_into_repo.md) — the auto-memory dir symlinks into the repo's TRACKED `.claude/memory/`; saving a memory dirties the tree and can leak into a feature PR.
 - [feedback_self_sufficient_resume_comment.md](feedback_self_sufficient_resume_comment.md) — Mid-workflow Linear checkpoints go in ONE self-sufficient comment; edit in place.
 - [feedback_linear_workflow.md](feedback_linear_workflow.md) — Repo TOML + just commands for Linear projects/labels; MCP for ad-hoc issue work.
 - [feedback_read_linear_comments_first.md](feedback_read_linear_comments_first.md) — list_comments before drafting plans; constraints land in comments, not the description.
@@ -60,7 +62,7 @@
 - [reference_kata_show_json_links.md](reference_kata_show_json_links.md) — `kata show --json` puts blocked-by edges in `.links[]`, not `.relationships.blocked_by`.
 
 ## Tool choices
-- [reference_vm_task_limit_docker_test_workarounds.md](reference_vm_task_limit_docker_test_workarounds.md) — Bg/compile tasks are SIGTERM-killed at ~10 min. Isolate `penca-up` from tests; pytest against a kept-up stack needs `COMPOSE_PROJECT_NAME="penca-$(basename "$PWD")"` exported (Justfile-only, NOT in docker/*.env — omitting it cost 45 false failures) plus `source docker/*.env`. `cargo test --workspace` can't finish locally.
+- [reference_vm_task_limit_docker_test_workarounds.md](reference_vm_task_limit_docker_test_workarounds.md) — Bg/compile tasks are SIGTERM-killed at ~10 min. Isolate `penca-up` from tests; pytest against a kept-up stack needs `COMPOSE_PROJECT_NAME="penca-$(basename "$PWD")"` exported (Justfile-only, NOT in docker/*.env — omitting it cost 45 false failures) plus `source docker/*.env`. `cargo test --workspace` can't finish locally. Killing a gate wrapper leaves `just integration-test` detached — the survivor races the next run and every test fails with NO error text.
 - [feedback_rust_rename_symbol.md](feedback_rust_rename_symbol.md) — Typed Rust renames: prefer rename_symbol, verify sites in session-edited files, kill the server after (~3GB).
 - [feedback_docker_cargo_user_flag.md](feedback_docker_cargo_user_flag.md) — Docker stand-in for cargo: `--user $(id -u):$(id -g) -e CARGO_HOME=/tmp/.cargo`.
 - [reference_linear_attachment_visibility.md](reference_linear_attachment_visibility.md) — Linear file-attachments don't render in the UI; surface assets via a markdown link in a comment.
