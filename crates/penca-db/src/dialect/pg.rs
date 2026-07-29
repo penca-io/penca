@@ -830,7 +830,10 @@ impl PgDialect {
         // and `MAX(snapshotted_at_micros)` in `get_table_metadata`. The
         // `(table_uuid, commit_micros DESC)` shape acts as a point lookup by
         // `table_uuid` only — neither consumer sorts on `commit_micros`, so the
-        // DESC ordering does nothing useful; reshaping is tracked separately.
+        // DESC ordering does nothing useful, and `branch_uuid` (in every
+        // consumer's WHERE) is absent from the key entirely.
+        // TODO(CHA-535): reshape to what the consumers actually filter and
+        // order by, once measurement confirms it matters at realistic scale.
         let idx_tsm_t = format!("idx_{cat_u}_tsm_t");
         driver
             .execute_no_result(&format!(
