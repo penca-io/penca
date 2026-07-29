@@ -23,7 +23,6 @@ use penca_db::driver::pg::{PgDriver, PgTransactionDriver};
 use penca_db::driver::{DbDriver, SqlValue};
 use penca_dl::driver::DlDriver;
 use penca_format::reader::FormatReader;
-use penca_format::writer::FormatWriter;
 use penca_proto::external::v1::create_branch_request::ForkPoint;
 use penca_proto::external::v1::{
     AbortTxRequest, AbortTxResponse, BeginTxRequest, BeginTxResponse, Branch, Change,
@@ -929,15 +928,21 @@ impl WriteManager {
         })
     }
 
-    /// Delete a branch with 3-phase cleanup.
+    /// Delete a branch: enumerate its cold URIs, then drop its metadata and
+    /// enqueue those URIs for the refcount gate, atomically.
     ///
-    /// Phase 1: collect cold storage URIs.
-    /// Phase 2: delete cold files via FormatWriter.
-    /// Phase 3: transactional metadata cleanup.
+    /// A pure metadata operation — it unlinks nothing itself. Dropping the
+    /// branch's segment rows is what makes a file unreferenced; the next
+    /// `sweep_segments` decides, past the universal grace window, whether any
+    /// other branch still names it. That indirection is the whole point: since
+    /// CHA-531 a carried row lives in one branch's partition while its
+    /// `object_uri` names the file another branch wrote, so a teardown that
+    /// unlinked what its own enumeration reached would destroy a sibling's data
+    /// in either direction across a fork edge (CHA-539).
     ///
-    /// Catalog-scoped: phases 1–3 walk every schema's tables on the branch,
-    /// so cold segments + log/snapshot metadata for `s1.t1`, `s2.t2`, ... are
-    /// all cleaned up.
+    /// Catalog-scoped: the walk covers every schema's tables on the branch, so
+    /// cold segments + log/snapshot metadata for `s1.t1`, `s2.t2`, ... are all
+    /// cleaned up.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -950,7 +955,6 @@ impl WriteManager {
         &self,
         pool: &PgDriver,
         dl_driver: &L,
-        writer: &impl FormatWriter,
         request: &DeleteBranchRequest,
     ) -> Result<DeleteBranchResponse, ApiError> {
         let catalog = resolve_catalog(
@@ -1007,6 +1011,26 @@ impl WriteManager {
             snap_segments.extend(segs);
         }
 
+        // Cold-index sidecars are their own files and their own delete-set
+        // participants (ADR 0026 §5), but they are not reachable from the base
+        // segment enumeration above — they hang off an index header. Without
+        // this they would leak past the partition CASCADE below, and an
+        // enqueue-only teardown would make that leak permanent rather than
+        // merely untidy.
+        let snap_segment_uuids: Vec<String> =
+            snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
+        let sidecar_uris: Vec<String> =
+            LifecycleManager::list_segment_index_metadata(
+                pool,
+                &catalog_str,
+                &branch_str,
+                &snap_segment_uuids,
+            )
+            .await?
+            .into_iter()
+            .map(|sidecar| sidecar.object_uri)
+            .collect();
+
         // Also enumerate in-flight compact merged files tracked in
         // `compact_segment_metadata`. Two cases:
         //   - committed rows: the merged file is still referenced by
@@ -1021,21 +1045,21 @@ impl WriteManager {
             LifecycleManager::get_compact_segment_uris_for_branch(pool, &catalog_str, &branch_str)
                 .await?;
 
-        // Phase 2: Delete cold storage files. Best-effort: the metadata
-        // rows pointing at them go away in Phase 3 via DROP PARTITION
-        // CASCADE regardless of which file deletes succeed, so a
-        // residual orphan-file scan would be the only follow-up needed.
-        for (_, uri) in &persist_segments {
-            let _ = writer.delete(uri, true).await;
-        }
-        for (_, uri) in &snap_segments {
-            let _ = writer.delete(uri, true).await;
-        }
-        for uri in &compact_uris {
-            let _ = writer.delete(uri, true).await;
-        }
+        // Every URI the branch referenced, queued as one set. Deduped because
+        // one physical file legitimately backs several rows (the packer packs
+        // many partitions into one file) and `segment_delete_set` holds one row
+        // per file.
+        let queued_uris: Vec<String> = persist_segments
+            .into_iter()
+            .map(|(_, uri)| uri)
+            .chain(snap_segments.into_iter().map(|(_, uri)| uri))
+            .chain(compact_uris)
+            .chain(sidecar_uris)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
 
-        // Phase 3: Transactional metadata cleanup.
+        // Phase 2: drop the metadata and queue the files, atomically.
         with_pg_tx(pool, async |tx| {
             let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
             if deleted {
@@ -1057,6 +1081,15 @@ impl WriteManager {
                 // deletes (Phase 2 above) and the data-table drops above
                 // are tier-specific and stay here.
                 LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
+
+                // Same tx as the row drop: removing the references and queueing
+                // the files must be one atomic fact, or a crash between them
+                // leaves either an unreferenced file nothing will ever collect
+                // or a queued file still referenced with no clock to reconcile.
+                // The enqueue's ON CONFLICT refresh gives a URI already queued
+                // by another branch's retirement the later grace clock.
+                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
+                    .await?;
             }
             Ok(())
         })

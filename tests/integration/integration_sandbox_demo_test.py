@@ -191,8 +191,13 @@ def test_demo_forks_diverges_and_isolates_main():
 
     # These reads happen AFTER the three delete_branch calls, so they pin more than
     # "the run left prod alone": main's rows live in one cold object that all three
-    # forks were reading, and it has to survive their deletion. delete_branch is
-    # safe today (every enumeration pins branch_uuid), but a regression there would
+    # forks were reading, and it has to survive their deletion. Pinning branch_uuid
+    # in every enumeration used to be the reason that was safe; it stopped being
+    # sufficient once CHA-531 let one file be referenced across a fork edge. What
+    # makes it safe now is that teardown only ENQUEUES onto segment_delete_set and
+    # the refcount gate spares a file another branch still names (CHA-539). This
+    # demo is a weak guard on that either way — its forks are discarded before they
+    # ever snapshot, so they hold no carried rows — but a regression would
     # otherwise still print a green demo.
     # The whole expected map, not a predicate over whatever came back: all() is
     # vacuously true for an empty read, so a main that VANISHED — the delete_branch

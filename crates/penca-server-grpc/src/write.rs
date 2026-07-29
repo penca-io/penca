@@ -200,12 +200,7 @@ where
         crate::validation::validate_delete_branch(request.get_ref())?;
         let resp = self
             .manager
-            .delete_branch(
-                &self.pool,
-                self.dl_driver.as_ref(),
-                &*self.writer,
-                request.get_ref(),
-            )
+            .delete_branch(&self.pool, self.dl_driver.as_ref(), request.get_ref())
             .await
             .map_err(api_error_to_status)?;
         Ok(Response::new(resp))
