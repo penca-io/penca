@@ -936,12 +936,10 @@ integration-test *services:
     #
     # The cap is 4 because that is what CI has, not because of a measured
     # ceiling. Worker count WAS bounded by the servicers' PG pools — at 4
-    # workers against the default pool of 4, 28 tests failed, every one with
-    # "pool timed out while waiting for an open connection" and nothing else —
-    # but docker/test.env now raises PG_POOL_MAX for the test profile, so that
-    # is no longer what binds. If that override is ever dropped, this cap must
-    # come down to the pool depth — 4 workers against a pool of 4 is the
-    # configuration that produced those 28 failures.
+    # workers against a pool of 4, 28 tests failed, every one with "pool timed
+    # out while waiting for an open connection" and nothing else — which is why
+    # docker/compose.yml now defaults that pool to 12. Keep workers at or under
+    # the pool depth if either number moves.
     #
     # What binds now is CPU against the deliberately small
     # QUERY_TIMEOUT_SECONDS=2: at 4 workers on a 2-core box, two heavy
@@ -1074,12 +1072,6 @@ perf-test *paths:
         export CARGO_PROFILE=profiling
     fi
 
-    # Pin the pool back to the compose default. docker/test.env raises
-    # PG_POOL_MAX for the integration suite's parallel phase and this profile
-    # is shared, but a perf run measured against a deeper pool than production
-    # uses is not comparable with the history in .perf/perf.db. A shell export
-    # wins over --env-file for compose interpolation.
-    export PG_POOL_MAX=4
     just penca-up --profile=test
     trap 'just penca-down --profile=test' EXIT
 
