@@ -671,6 +671,11 @@ impl LifecycleManager {
         // coincide, so the plan-shape win is preserved. `resolve_committed_tx`
         // waterfalls hot `commit_tx_log` → cold `tx_log`, so a PurgeTxLog'd
         // position still resolves.
+        //
+        // TODO(CHA-500): once snapshot's as-of cutoff arrives as a
+        // `commit_seq_num` rather than micros, this whole block is
+        // `fold_seqs.push(fork_commit_seq_num.min(as_of_seq))` — the
+        // translation belongs at the API boundary, not here.
         let mut fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
         if let Some((parent_branch_uuid, fork_commit_seq_num)) = &fork_edge {
             let parent_uuid = Uuid::parse_str(parent_branch_uuid)
