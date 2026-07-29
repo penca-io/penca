@@ -128,7 +128,13 @@ def _body_sets_serial_pytestmark(body: list[ast.stmt]) -> bool:
         ):
             continue
 
-        if any(_is_serial_mark(n) for n in ast.walk(node.value)):
+        # `pytestmark` is either one mark or a sequence of them. Test each
+        # element's head, for the same reason `_has_serial_mark` does: walking
+        # the value would match a `serial` nested in another mark's arguments,
+        # which marks a parameter rather than the module.
+        value = node.value
+        marks = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+        if any(_is_serial_mark(_decorator_head(mark)) for mark in marks):
             return True
 
     return False
