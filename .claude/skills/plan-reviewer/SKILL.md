@@ -39,7 +39,13 @@ For each task, verify:
 
 After per-task checks pass, audit the graph:
 
-6. **Every implementation task is `--blocked-by` at least one red-test task.** Walk `kata show <ref> --json` for each task; collect `relationships.blocked_by`. An implementation task with no `--blocked-by` edge breaks the mechanism-bound red gate — flag it.
+6. **Every implementation task is `--blocked-by` at least one red-test task.** Walk `kata show <ref> --json` for each task and collect its blockers. **The edges are in `.links[]`, not `.relationships.blocked_by`** — that path is null (verified 2026-07-29). `kata show --json` returns top-level `{kata_api_version, issue, labels, links, comments}`: issue scalars (title, body, short_id, status) are under `.issue`, `.labels` is an array of *objects* (the string is `.labels[].label`, unlike `kata list --json` where labels are plain strings), and each link is `{from:{short_id}, to:{short_id}, type:"blocks"}` where **`from` blocks `to`** — so a task's blockers are the `from`s of links whose `to.short_id` is that task. Reading `.relationships.blocked_by` yields null for every task, which reads as "no task has blockers" and silently passes this check.
+
+   ```bash
+   kata show <ref> --json | jq -r '.links[]? | select(.type=="blocks") | "\(.from.short_id) -> \(.to.short_id)"'
+   ```
+
+   Dedup the edges across all tasks to build the graph. An implementation task with no `--blocked-by` edge breaks the mechanism-bound red gate — flag it.
 7. **The `--blocked-by` graph is acyclic.** Build the edge list across the set; run a topological-sort check. A cycle is structural, not editorial — return `REJECT` and quote the cycle. Cycles indicate the planner didn't think through ordering; the right output is a rewrite, not a label-by-label fix in the TUI.
 8. **No dangling `--blocked-by` references.** Every `blocked_by` ref must point at a task in the set (or a task already `approved`/closed). Stale references usually mean a task got deleted but its blockers weren't pruned — flag the dangler.
 9. **Graph context section present + cross-references verified.** Non-trivial plans on a **cross-reference-bearing** ticket — one whose description cites other `CHA-NNN`s, or that carries `blockedBy` / `relatedTo` / `parent` relations — must carry a `## Graph context` section naming the neighborhood's current state (roadmap position, built-vs-in-flight, flagged stale refs). Absent → `REVISE`. And every cross-reference the ticket asserts must be checked against the **live graph**: if a ticket asserts a relation the live graph contradicts (e.g. the CHA-385 / CHA-412 stale-ref case from CHA-406), `REVISE` and quote the contradicted reference. `N-A` only when the ticket makes no cross-ticket references at all. This is the plan-time gate the `/do-issue` Step-1 graph-context traversal feeds; do not silently approve a cross-reference-bearing plan that skipped it.
