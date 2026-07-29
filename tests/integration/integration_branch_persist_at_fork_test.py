@@ -374,15 +374,23 @@ _SEGMENT_URI_TABLES = (
 
 
 def _branch_row_count(catalog_uuid, branch_uuid, table_name) -> int:
-    """Committed rows on ``table_name`` for one branch.
+    """COMMITTED rows on ``table_name`` for one branch.
+
+    ``commit_micros IS NOT NULL`` is the assertion's teeth, not decoration: it is
+    what plan visibility gates on, and every table here has it nullable because
+    the storage-meta writers all insert NULL then stamp it in a second phase.
+    Without the predicate a copy that inserts the child's reference rows and
+    never commits them — the most likely way a two-phase copy gets built wrong —
+    counts as present while no reader can see it.
 
     ``table_snapshot_segment_index_metadata`` has no ``table_uuid`` column (the
     index identity lives on its parent header), so this counts per branch only.
     """
     rows = get_pg_driver().execute(
-        SQL("SELECT count(*) FROM {tbl} WHERE branch_uuid = %s").format(
-            tbl=Identifier(f"{catalog_uuid}_{table_name}")
-        ),
+        SQL(
+            "SELECT count(*) FROM {tbl} "
+            "WHERE branch_uuid = %s AND commit_micros IS NOT NULL"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{table_name}")),
         (branch_uuid,),
     )
 
