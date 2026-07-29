@@ -2732,14 +2732,20 @@ mod tests {
         .await
         .expect("a NULL-carrying tombstone must not abort the read");
 
+        // Assert on membership and count rather than interpolating the uuids:
+        // row_uuids are PK-derived and this crate's spans already record only
+        // their count for that reason (`ids_rows`), a convention CodeQL's
+        // cleartext-logging rule enforces on panic messages too.
         let emitted = all_row_uuids(&batches);
         assert!(
             !emitted.contains(&"d1".to_string()),
-            "the tombstone must be dropped from the live delta; got {emitted:?}"
+            "the tombstone must be dropped from the live delta; {} rows emitted",
+            emitted.len()
         );
         assert!(
             emitted.contains(&"u1".to_string()),
-            "the live row must survive; got {emitted:?}"
+            "the live row must survive; {} rows emitted",
+            emitted.len()
         );
         assert!(
             dl.recorded_scan_exclusion().contains(&"d1".to_string()),
