@@ -5,16 +5,14 @@
 //! merge-on-read SQL builder can run the same query against either tier
 //! by swapping only the dialect.
 //!
-//! CHA-218: commit_tx_log is hot-only — cold has no commit_tx_log table. Per-row tx
+//! commit_tx_log is hot-only — cold has no commit_tx_log table. Per-row tx
 //! metadata is carried inline on each upsert/delete cold segment row.
 //!
-//! The provider reads segments through a [`FormatReader`] and pushes
-//! column projection into the reader. Filter pushdown stays
-//! `Unsupported` for the persist tier: per ADR 0022 persist segments
-//! are NOT pruned by user filter to preserve CHA-142's exclusion-set
-//! invariant. Persist `TableProvider::statistics()` does expose a
-//! `Precision::Inexact` aggregate (row counts, per-column min/max)
-//! for DataFusion's CBO cardinality estimation (CHA-82).
+//! Filter pushdown stays `Unsupported` for the persist tier: per ADR 0022
+//! persist segments are NOT pruned by user filter, which would break the
+//! exclusion-set invariant. Persist `TableProvider::statistics()` does expose a
+//! `Precision::Inexact` aggregate (row counts, per-column min/max) for
+//! DataFusion's CBO cardinality estimation.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -57,31 +55,27 @@ use crate::session_template::{derive_cold_session, derive_cold_session_single_pa
 /// Projection is pushed down into the [`FormatReader`]; filter pushdown
 /// stays `Unsupported` (see ADR 0022 — persist segments are not pruned
 /// by user filter). The scan advertises `output_ordering = [commit_seq_num
-/// ASC, write_seq_num ASC]` (CHA-410 / CHA-431) — the write side sorts each
-/// segment by the composite `(commit_seq_num, write_seq_num)` and the plan lists
-/// segments in `commit_seq_num` order, so the single concatenated stream is
-/// genuinely ordered on the total version order. That advertised order
-/// survives to a downstream operator only on an un-repartitioned plan
-/// (single output partition); an order-aware consumer must keep the
-/// persist scan from being repartitioned (cf. the snapshot `ByPlan`
-/// `target_partitions=1` pin in `derive_cold_session_single_partition`).
-/// No consumer requires this ordering yet — it is latent today. Kept
-/// `pub(crate)` because external callers go through
-/// [`build_persist_session`] — the provider itself is an implementation
-/// detail of penca-dl's DataFusion backend.
+/// ASC, write_seq_num ASC]` — the write side sorts each segment by the
+/// composite `(commit_seq_num, write_seq_num)` and the plan lists segments in
+/// `commit_seq_num` order, so the single concatenated stream is genuinely
+/// ordered on the total version order. That advertised order survives to a
+/// downstream operator only on an un-repartitioned plan (single output
+/// partition); an order-aware consumer must keep the persist scan from being
+/// repartitioned (cf. the snapshot `ByPlan` `target_partitions=1` pin in
+/// `derive_cold_session_single_partition`). No consumer requires this ordering
+/// yet — it is latent today.
 pub(crate) struct PersistTableProvider<R: FormatReader + 'static> {
     segments: Arc<Vec<PersistSegment>>,
     readers: Arc<HashMap<i32, R>>,
-    /// Process-lifetime decoded-segment cache shared with the snapshot tier
-    /// (CHA-474). A persist segment file is immutable once written and keyed by
-    /// its globally-unique `segment_uuid`, so it shares the one byte budget with
-    /// no TTL — W-TinyLFU eviction is the whole mechanism, as for snapshot.
+    /// Process-lifetime decoded-segment cache shared with the snapshot tier. A
+    /// persist segment file is immutable once written and keyed by its
+    /// globally-unique `segment_uuid`, so it shares the one byte budget with no
+    /// TTL — W-TinyLFU eviction is the whole mechanism, as for snapshot.
     cache: Arc<SegmentCache>,
     schema: SchemaRef,
-    // CHA-82: parsed once at construction; used by `statistics()` to
-    // fold a Precision::Inexact table-level summary for DataFusion's
-    // CBO cardinality estimation. Persist segments are NOT pruned by
-    // user filter (ADR 0022), but the aggregate is consumed.
+    // Parsed once at construction. Persist segments are NOT pruned by user
+    // filter (ADR 0022), but `statistics()` still folds these into a table-level
+    // summary the CBO consumes.
     parsed_stats: Vec<crate::stats::ParsedSegmentStats>,
 }
 
@@ -141,18 +135,11 @@ impl<R: FormatReader + 'static> TableProvider for PersistTableProvider<R> {
             None => self.schema.clone(),
         };
 
-        // CHA-410 / CHA-431: advertise the persist total version order
-        // `(commit_seq_num, write_seq_num)`. Write-side (`chunk_persist_batch` sorts
-        // each segment by the composite) + plan-side segment-list ordering make
-        // the single concatenated stream globally non-decreasing in the
-        // composite, so the optimizer can elide a redundant `SortExec` and pick
-        // order-aware operators. NULLS LAST matches DataFusion's `ORDER BY`
-        // default; honest because both columns are non-nullable. `write_seq_num`
-        // is appended only when BOTH columns are emitted — a projection that
-        // drops `write_seq_num` falls back to the honest `[commit_seq_num]` prefix,
-        // and dropping `commit_seq_num` drops the ordering entirely (we can't claim
-        // an order over a column we don't emit). Planner metadata only — never
-        // an execution seek (CHA-454).
+        // NULLS LAST matches DataFusion's `ORDER BY` default and is honest here
+        // because both columns are non-nullable. The ordering is narrowed to
+        // what the projection actually emits: we cannot claim an order over a
+        // column we don't emit, so dropping `write_seq_num` leaves the
+        // `[commit_seq_num]` prefix and dropping `commit_seq_num` drops it all.
         let asc = SortOptions {
             descending: false,
             nulls_first: false,
@@ -238,14 +225,9 @@ impl<R: FormatReader + 'static> PartitionStream for PersistPartitionStream<R> {
         let output_schema = self.output_schema.clone();
 
         let stream = async_stream::try_stream! {
-            // CHA-474: cache-aware per-segment reads through the shared
-            // SegmentCache. A miss decodes the whole segment (so one
-            // cached entry serves any projection) and admits it; a hit is an
-            // Arc::clone. Each segment is then normalized to `output_schema`.
-            // Sequential, preserving the plan order the advertised
-            // (commit_seq_num, write_seq_num) ordering relies on — a reorder
-            // would violate CHA-410/CHA-431. Empty batches are dropped; the
-            // StreamingTableExec carries `output_schema` for an empty scan.
+            // Sequential ON PURPOSE: the advertised (commit_seq_num,
+            // write_seq_num) ordering relies on plan order, so concurrent reads
+            // that complete out of order would make the advertisement a lie.
             for segment in segments.iter() {
                 let batch = read_cached_persist_segment(
                     readers.as_ref(),
@@ -284,9 +266,8 @@ pub(crate) fn build_persist_session<R: FormatReader + 'static>(
     cache: Arc<SegmentCache>,
     schemas: &LogSchemas,
 ) -> Result<SessionContext> {
-    // CHA-421: derive a per-query context from the process template (microsecond
-    // clone of the registry + rules, fresh isolated catalog) instead of paying
-    // the ~1.4 ms `SessionContext::new()` registration per cold read.
+    // Derive from the process template rather than `SessionContext::new()`,
+    // which costs ~1.4 ms of registry registration per cold read.
     let ctx = derive_cold_session(template);
 
     let (upsert_segs, delete_segs) = match &plan.persist {
@@ -331,33 +312,29 @@ fn register_persist<R: FormatReader + 'static>(
 }
 
 /// `TableProvider` exposing pruned cold-storage snapshot segments as a
-/// queryable table (CHA-411). Mirrors [`PersistTableProvider`] but reads
-/// through the process-lifetime [`SegmentCache`] with bounded
-/// concurrency and null-fills each batch to the declared output schema
-/// (CHA-252) before yielding.
+/// queryable table. Reads through the process-lifetime [`SegmentCache`] with
+/// bounded concurrency and null-fills each batch to the declared output schema
+/// before yielding.
 ///
 /// Pruning is done **externally** in `penca_merge::stream_merged` (snapshot-tier
 /// only, ADR 0022); the surviving segments are handed to [`Self::new`]. The
-/// provider advertises no `PruningStatistics` and pushes no filter into the
-/// reader (`supports_filters_pushdown` → `Unsupported`, ADR 0023). No
-/// `output_ordering` is advertised — that is CHA-459.
+/// provider advertises no `PruningStatistics`, no `output_ordering`, and pushes
+/// no filter into the reader (`supports_filters_pushdown` → `Unsupported`,
+/// ADR 0023).
 pub(crate) struct SnapshotTableProvider<R: FormatReader + 'static> {
     segments: Arc<Vec<SnapshotSegment>>,
     readers: Arc<HashMap<i32, R>>,
     cache: Arc<SegmentCache>,
     /// Unprojected schema the cache decodes against, so one cached entry serves
-    /// any projection (CHA-252).
+    /// any projection.
     full_decode_schema: SchemaRef,
     /// Declared/projected output schema; each read batch is null-filled to this.
     out_schema: SchemaRef,
     segment_read_concurrency: usize,
     order: SegmentOrder,
-    /// CHA-454/CHA-485 seek entries. `None` ⇒ the scan streams every segment
-    /// (the CHA-411 path); `Some` ⇒ per segment, each entry resolving to a
-    /// sidecar (identity → `row_uuid_index_sidecar`, keyed → `index_sidecars`)
-    /// is seeked and the offsets INTERSECT before the decode; a segment
-    /// resolving none falls back to the full scan. Set via
-    /// [`Self::with_seeks`]; defaults to `None`.
+    /// `None` ⇒ the scan streams every segment; `Some` ⇒ per segment, each
+    /// entry resolving to a sidecar is seeked and the offsets INTERSECT before
+    /// the decode, and a segment resolving none falls back to the full scan.
     seeks: Option<Arc<Vec<SeekSpec>>>,
 }
 
@@ -383,9 +360,7 @@ impl<R: FormatReader + 'static> SnapshotTableProvider<R> {
         }
     }
 
-    /// Attach seek entries (CHA-454 identity / CHA-485 covering-index).
-    /// Chainable at the construction site (`build_snapshot_session`); a
-    /// `None` argument leaves the full-scan path.
+    /// Attach seek entries; a `None` argument leaves the full-scan path.
     pub(crate) fn with_seeks(mut self, seeks: Option<Arc<Vec<SeekSpec>>>) -> Self {
         self.seeks = seeks;
         self
@@ -424,9 +399,8 @@ impl<R: FormatReader + 'static> TableProvider for SnapshotTableProvider<R> {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // DataFusion requests (in `projection`) every column the query
         // references — the output columns plus any the residual `FilterExec`
-        // needs — so the partition null-fills each batch to exactly this
-        // projected schema (CHA-252). No filter is pushed into the read
-        // (ADR 0023); no ordering is advertised (CHA-459).
+        // needs — so the partition must null-fill each batch to exactly this
+        // projected schema, not to `out_schema`.
         let output_schema = match projection {
             Some(indices) => Arc::new(self.out_schema.project(indices)?),
             None => self.out_schema.clone(),
@@ -467,13 +441,11 @@ impl<R: FormatReader + 'static> TableProvider for SnapshotTableProvider<R> {
 }
 
 /// Resolve one index (`index_uuid`) to a segment's sidecar — the single source
-/// of truth for the identity-vs-keyed selection, shared by the snapshot-scan
-/// seek (`resolve_seek_entries`) and the DataFusion-free aggregate seek
-/// (`driver::seek_snapshot_point` via `selected_sidecar`). `None` → the
-/// dedicated `row_uuid_index_sidecar` identity slot; `Some(uuid)` → the keyed
-/// `index_sidecars` (user secondary indexes + the built-in system name index).
-/// Unresolved (`None`) ⇒ the caller full-scans; over-selection is safe — the
-/// residual `FilterExec` re-applies the exact predicate (ADR 0023).
+/// of truth for the identity-vs-keyed selection. `None` → the dedicated
+/// `row_uuid_index_sidecar` identity slot; `Some(uuid)` → the keyed
+/// `index_sidecars`. Unresolved (`None`) ⇒ the caller full-scans; over-selection
+/// is safe, since the residual `FilterExec` re-applies the exact predicate
+/// (ADR 0023).
 pub(crate) fn sidecar_for_index<'s>(
     segment: &'s SnapshotSegment,
     index_uuid: Option<&str>,
@@ -488,9 +460,9 @@ pub(crate) fn sidecar_for_index<'s>(
     }
 }
 
-/// CHA-454/CHA-485: pair each seek entry with the sidecar it resolves to on one
-/// segment (via [`sidecar_for_index`]). Entries that don't resolve are dropped
-/// (the caller full-scans when NONE resolve).
+/// Pair each seek entry with the sidecar it resolves to on one segment.
+/// Entries that don't resolve are dropped; the caller full-scans when NONE
+/// resolve.
 fn resolve_seek_entries<'seg, 'spec>(
     segment: &'seg SnapshotSegment,
     seeks: Option<&'spec [SeekSpec]>,
@@ -546,13 +518,6 @@ impl<R: FormatReader + 'static> PartitionStream for SnapshotPartitionStream<R> {
 
         let order = self.order;
         let stream = async_stream::try_stream! {
-            // Bounded-concurrency cache-aware reads. ByCompletion preserves
-            // the pre-CHA-411 `buffer_unordered(segment_read_concurrency)`
-            // from stream_merged Phase 3 — segment order not observable to
-            // queries (CHA-459). ByPlan (CHA-404 snapshot writer) keeps the
-            // planned segment order with `buffered` readahead, same
-            // concurrency cap. Each segment is null-filled to
-            // `output_schema` before yielding (CHA-252).
             let segs: Vec<SnapshotSegment> = segments.iter().cloned().collect();
             let read_futures = futures::stream::iter(segs)
                 .map(|segment| {
@@ -562,9 +527,6 @@ impl<R: FormatReader + 'static> PartitionStream for SnapshotPartitionStream<R> {
                     let out = output_schema.clone();
                     let seeks = seeks.clone();
                     async move {
-                        // CHA-454/CHA-485: seek + intersect when at least one
-                        // entry resolves, else stream the whole segment (the
-                        // CHA-411 full-scan path).
                         let resolved =
                             resolve_seek_entries(&segment, seeks.as_deref().map(Vec::as_slice));
                         let batch = if resolved.is_empty() {
@@ -612,12 +574,11 @@ impl<R: FormatReader + 'static> PartitionStream for SnapshotPartitionStream<R> {
 }
 
 /// Adapt `batch` to `out_schema`'s columns in order, null-filling any column
-/// in `out_schema` the decoded segment lacks (CHA-252: a cache entry decoded
-/// against an older table schema, before an `ALTER TABLE ADD COLUMN`). A
-/// non-nullable missing column is a hard error. Mirrors the schema-tolerant
-/// `penca_merge::output::project_to_output` (which adapts the resolved batch
-/// for the Phase-1 emit); the two are kept separate by error type — `ArrowError`
-/// here (inside a DataFusion partition stream) vs `MergeError` there.
+/// in `out_schema` the decoded segment lacks — e.g. a cache entry decoded
+/// against an older table schema, before an `ALTER TABLE ADD COLUMN`. A
+/// non-nullable missing column is a hard error. Deliberately kept separate from
+/// `penca_merge::output::project_to_output` by error type: `ArrowError` here
+/// (inside a DataFusion partition stream) vs `MergeError` there.
 pub(crate) fn project_batch_to_schema(
     batch: &RecordBatch,
     out_schema: &SchemaRef,
@@ -639,17 +600,15 @@ pub(crate) fn project_batch_to_schema(
     RecordBatch::try_new(out_schema.clone(), columns)
 }
 
-/// Build a per-query [`SessionContext`] for the CHA-411 snapshot scan: the
+/// Build a per-query [`SessionContext`] for the snapshot scan: the
 /// [`SnapshotTableProvider`] registered under `l`, plus a single-column
 /// `row_uuid` exclusion `MemTable` under `exclusion`. `segments` are the
 /// already-pruned survivors (snapshot-tier pruning is upstream, ADR 0022). The
 /// caller's SQL (`penca_merge::sql::build_cold_snapshot_scan`) joins the two.
 //
-// CHA-421's `template` param crosses clippy's 7-arg default. The eight inputs
-// are all distinct snapshot-session-construction inputs with no clean data
-// clump to bundle (the two schemas serve different roles — `full_decode_schema`
-// feeds the segment cache, `out_schema` the projected output); a
-// parameter-object refactor is out of scope for this perf change.
+// No clean data clump to bundle: the two schemas serve different roles —
+// `full_decode_schema` feeds the segment cache, `out_schema` the projected
+// output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_snapshot_session<R: FormatReader + 'static>(
     template: &SessionState,
@@ -663,9 +622,8 @@ pub(crate) fn build_snapshot_session<R: FormatReader + 'static>(
     order: SegmentOrder,
     seeks: Option<Arc<Vec<SeekSpec>>>,
 ) -> Result<SessionContext> {
-    // CHA-421: derive from the process template (see build_persist_session).
     // ByPlan pins target_partitions = 1 so the physical optimizer never
-    // inserts a RepartitionExec above the provider (order-destroying).
+    // inserts an order-destroying RepartitionExec above the provider.
     let ctx = match order {
         SegmentOrder::ByPlan => derive_cold_session_single_partition(template),
         SegmentOrder::ByCompletion => derive_cold_session(template),
@@ -806,8 +764,6 @@ mod tests {
         assert_eq!(output_schema.field(0).name(), "name");
     }
 
-    // CHA-82 R6: persist provider statistics aggregate
-
     fn r6_fixture_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("row_uuid", DataType::Utf8, false),
@@ -855,24 +811,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_table_provider_statistics_aggregate() {
-        // CHA-82 R6: validates that PersistTableProvider::statistics()
-        // returns a table-level Precision::Inexact aggregate folded over
-        // the per-segment stats. This is the CBO cardinality contract per
-        // ADR 0022 — persist segments carry stats for this aggregate,
-        // even though they are NOT pruned by user filter.
-        //
-        // Today's failure: PersistTableProvider doesn't override
-        // statistics(), so the default returns Statistics::new_unknown
-        // (all Precision::Absent). The first assertion fires with
-        // Absent != Inexact(35).
-        //
-        // After CHA-82 I1 makes compute_segment_statistics +
-        // parse_segment_statistics + aggregate_table_statistics real,
-        // and CHA-82 I2 wires PersistTableProvider::statistics() to call
-        // aggregate_table_statistics(&self.parsed, &self.schema), this
-        // test flips green without modification — the fixture goes
-        // through real compute (writer) → real parse (reader at
-        // provider construction) → real aggregate end-to-end.
+        // The CBO cardinality contract per ADR 0022: persist segments carry
+        // stats for this table-level aggregate even though they are NOT pruned
+        // by user filter. The fixture goes through real compute (writer) → real
+        // parse (reader at provider construction) → real aggregate end-to-end.
         use datafusion::common::stats::{Precision, Statistics};
         use datafusion::scalar::ScalarValue;
 
@@ -890,11 +832,9 @@ mod tests {
             Arc::new(SegmentCache::new(1 << 20)),
         );
 
-        // Default TableProvider::statistics() returns not_impl_err today;
-        // fold that into Statistics::new_unknown so the assertion below
-        // hits the Absent-vs-Inexact comparison rather than a panic
-        // unwrapping the error. After CHA-82 I2, statistics() returns
-        // Ok(aggregate) and the unwrap_or_else is a no-op.
+        // The default `TableProvider::statistics()` returns `None`; folding that
+        // into `Statistics::new_unknown` keeps a regression surfacing as the
+        // Absent-vs-Inexact assertion below rather than an unwrap panic.
         let stats = provider
             .statistics()
             .unwrap_or_else(|| Statistics::new_unknown(&schema));
@@ -927,10 +867,8 @@ mod tests {
         );
     }
 
-    // CHA-410: persist-tier output_ordering advertisement
-
-    /// Schema carrying the Int64 `commit_seq_num` + `write_seq_num` columns — the
-    /// persist total-version-order axes CHA-410 / CHA-431 advertise.
+    /// Schema carrying the Int64 `commit_seq_num` + `write_seq_num` columns —
+    /// the persist total-version-order axes.
     fn seq_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("row_uuid", DataType::Utf8, false),
@@ -942,10 +880,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_provider_scan_advertises_composite_seq_ordering() {
-        // CHA-410 / CHA-431: PersistTableProvider declares its scan output is
-        // ordered by (commit_seq_num ASC, write_seq_num ASC) — the total version
-        // order — so EnforceSorting can elide a redundant SortExec and
-        // order-aware operators can stream. Planner metadata only.
         let readers: Arc<HashMap<i32, AnyFormatReader>> = Arc::new(HashMap::new());
         let provider = PersistTableProvider::new(
             vec![],
@@ -977,8 +911,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_provider_falls_back_to_commit_seq_num_when_write_seq_num_projected_out() {
-        // CHA-431: projecting write_seq_num away leaves the honest [commit_seq_num]
-        // prefix — a weaker but still-true ordering over the emitted columns.
         let readers: Arc<HashMap<i32, AnyFormatReader>> = Arc::new(HashMap::new());
         let provider = PersistTableProvider::new(
             vec![],
@@ -1008,8 +940,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_provider_ordering_dropped_when_commit_seq_num_projected_out() {
-        // CHA-410: cannot honestly advertise an order over a column the scan
-        // does not emit — projecting commit_seq_num away drops the ordering.
         let readers: Arc<HashMap<i32, AnyFormatReader>> = Arc::new(HashMap::new());
         let provider = PersistTableProvider::new(
             vec![],
@@ -1032,17 +962,12 @@ mod tests {
 
     #[tokio::test]
     async fn persist_scan_elides_sortexec_for_commit_seq_num_order() {
-        // CHA-410: with the advertised ordering, an ORDER BY commit_seq_num over the
-        // persist scan elides its SortExec. This pins the *mechanism* under its
-        // minimal condition: target_partitions=1 keeps the single ordered
-        // partition stream from being repartitioned before the sort. Production
-        // persist reads run under `derive_cold_session` (multi-partition), so
-        // this elision is LATENT there — no current consumer carries an
-        // `ORDER BY commit_seq_num` (the merge window sorts by row_uuid-partitioned
-        // `commit_seq_num DESC`, a different requirement). A future order-aware
-        // consumer must keep the persist scan un-repartitioned to use the
-        // advertised order, the way the snapshot ByPlan path pins
-        // target_partitions=1 (`derive_cold_session_single_partition`).
+        // Pins the elision under its minimal condition: target_partitions=1
+        // keeps the single ordered partition stream from being repartitioned
+        // before the sort. Production persist reads run under
+        // `derive_cold_session` (multi-partition), so the elision is LATENT
+        // there — a future order-aware consumer must keep the persist scan
+        // un-repartitioned to use the advertised order.
         use datafusion::physical_plan::displayable;
         let readers: Arc<HashMap<i32, AnyFormatReader>> = Arc::new(HashMap::new());
         let provider = PersistTableProvider::new(
@@ -1069,11 +994,9 @@ mod tests {
         );
     }
 
-    // CHA-411 R-A: SnapshotTableProvider session behavior
-
-    /// In-test `FormatReader` returning a preset decoded batch (a stand-in for a
-    /// snapshot segment / file). Ignores the requested projection — the test
-    /// controls the batch shape; the provider null-fills / projects downstream.
+    /// In-test `FormatReader` returning a preset decoded batch. Ignores the
+    /// requested projection — the test controls the batch shape; the provider
+    /// null-fills / projects downstream.
     struct FixtureReader {
         batch: RecordBatch,
     }
@@ -1220,8 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_provider_null_fills_added_column() {
         // Decoded against the OLDER narrow schema {row_uuid, name} — `value`
-        // was added later (CHA-252). The provider's declared out_schema carries
-        // a nullable `value` that must be null-filled.
+        // was added later. The provider's declared out_schema carries a
+        // nullable `value` that must be null-filled.
         let narrow_schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("row_uuid", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
@@ -1278,8 +1201,6 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_provider_scan_advertises_no_ordering() {
-        // CHA-459 (not this ticket) owns output_ordering — the scan must
-        // advertise no sort order.
         let schema = ra_schema();
         let mut readers = HashMap::new();
         readers.insert(
@@ -1333,8 +1254,6 @@ mod tests {
         );
     }
 
-    // CHA-454 R3: provider index-driven selective read
-
     /// A `FormatReader` serving a different preset batch per uri — lets the seek
     /// test register both the base segment and its index sidecar.
     struct MapReader {
@@ -1358,9 +1277,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_index_seek_emits_only_matches() {
-        // Base rows r0..r4; the internal row_uuid sidecar is build_segment_index
-        // over the row_uuid column. Seeking "r3" must emit ONLY r3 (O(matches)),
-        // not the whole segment (O(rows)). RED until I4 wires the seek path.
         let schema = ra_schema();
         let base = RecordBatch::try_new(
             schema.clone(),
@@ -1509,8 +1425,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_seek_keys_but_no_sidecar_full_scans() {
-        // seek_keys present but the segment has no row_uuid_index_sidecar ⇒ the
-        // CHA-411 full scan still streams every row (the seam must not break it).
         let schema = ra_schema();
         let mut readers = HashMap::new();
         readers.insert(
@@ -1546,7 +1460,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_sidecar_but_no_seek_keys_full_scans() {
-        // row_uuid_index_sidecar present but seek_keys = None ⇒ full scan (CHA-411).
         let schema = ra_schema();
         let mut readers = HashMap::new();
         readers.insert(
@@ -1586,9 +1499,8 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_multi_entry_seek_intersects_offsets() {
-        // CHA-485: identity entry matches {r1, r3}; a user index over the
-        // `name` column probes "x" matching {r1, r2}. The AND across entries
-        // must emit ONLY the intersection {r1}.
+        // Identity entry matches {r1, r3}; a user index over `name` probes "x"
+        // matching {r1, r2}. The AND across entries must emit only {r1}.
         let schema = ra_schema();
         let base = RecordBatch::try_new(
             schema.clone(),
@@ -1682,10 +1594,9 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_unresolved_entry_is_skipped() {
-        // CHA-485: an entry whose index has no sidecar on this segment is
-        // skipped — the remaining resolved (identity) entry still seeks, and
-        // the result over-selects relative to the full AND (the residual
-        // FilterExec's job, ADR 0023) rather than erroring or full-scanning.
+        // The result over-selects relative to the full AND — exactness is the
+        // residual FilterExec's job (ADR 0023) — rather than erroring or
+        // degrading to a full scan.
         let schema = ra_schema();
         let base = RecordBatch::try_new(
             schema.clone(),
@@ -1808,7 +1719,6 @@ mod tests {
         assert_eq!(resolved.len(), 2, "unknown-index entry drops");
         assert_eq!(resolved[0].0.object_uri, "mem://identity");
         assert_eq!(resolved[1].0.object_uri, "mem://user");
-        // No seeks at all — and no sidecars resolving — both give empty.
         assert!(resolve_seek_entries(&segment, None).is_empty());
         let bare = SnapshotSegment::default();
         assert!(resolve_seek_entries(&bare, Some(&specs)).is_empty());
@@ -1816,9 +1726,9 @@ mod tests {
 
     #[tokio::test]
     async fn scan_snapshot_typed_user_sidecar_seeks() {
-        // CHA-485: a user index over the Int32 `value` column — the sidecar's
-        // key schema is typed, decoded via the entry's key_columns mapped
-        // through the table schema (NOT the all-Utf8 identity shape).
+        // A user index over the Int32 `value` column: the sidecar's key schema
+        // is typed, decoded via the entry's key_columns mapped through the
+        // table schema, NOT the all-Utf8 identity shape.
         let schema = ra_schema();
         let base = RecordBatch::try_new(
             schema.clone(),
@@ -1999,8 +1909,8 @@ mod tests {
     }
 }
 
-/// CHA-404: the `ByPlan` ordered-scan contract the snapshot writer's
-/// label-sorted run-grouping depends on.
+/// The `ByPlan` ordered-scan contract the snapshot writer's label-sorted
+/// run-grouping depends on.
 #[cfg(test)]
 mod by_plan_order_tests {
     use std::collections::HashMap;
@@ -2131,14 +2041,11 @@ mod by_plan_order_tests {
         );
     }
 
-    /// The ByPlan physical plan must be a bare streaming projection:
-    /// no order-destroying RepartitionExec and — decisively — no
-    /// HashJoinExec at all. The first version of this test proved the
-    /// in-plan `NOT IN` anti-join builds its hash table over the
-    /// SNAPSHOT side (CollectLeft LeftAnti), materializing the whole
-    /// prior snapshot and emitting hash order; the production ByPlan
-    /// SQL therefore carries no exclusion join (penca-merge applies
-    /// the exclusion per batch instead).
+    /// The ByPlan physical plan must be a bare streaming projection: no
+    /// order-destroying RepartitionExec and — decisively — no HashJoinExec at
+    /// all. An in-plan `NOT IN` anti-join builds its hash table over the
+    /// SNAPSHOT side (CollectLeft LeftAnti), materializing the whole prior
+    /// snapshot and emitting hash order.
     #[tokio::test]
     async fn by_plan_physical_plan_shape_is_memory_safe() {
         let ctx = session_for(SegmentOrder::ByPlan, &[]);

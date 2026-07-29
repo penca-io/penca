@@ -13,15 +13,15 @@ use crate::row_codec::{empty_batch, rows_to_batch};
 use crate::sql_literal::build_committed_at_filter;
 use crate::{HotStorageClient, HotStorageError};
 
-/// CHA-218: tx metadata fields the persist-side JOIN against `commit_tx_log`
+/// Tx metadata fields the persist-side JOIN against `commit_tx_log`
 /// carries onto each cold upsert/delete row. Column order matches the
 /// `SELECT t.commit_micros, t.began_at_micros, t.commit_seq_num` projection in
 /// [`HotStorageClient::read_committed_upserts`] and
 /// [`HotStorageClient::read_committed_deletes`].
 ///
-/// CHA-507: `author`/`comment` are no longer denormalized onto cold rows —
+/// `author`/`comment` are no longer denormalized onto cold rows —
 /// they live once per tx in the cold `tx_log` and are joined on demand by
-/// `audit_data`. The trailing `commit_seq_num` (CHA-430) position is
+/// `audit_data`. The trailing `commit_seq_num` position is
 /// load-bearing: the cold on-disk schema tail must match this JOIN result tail
 /// or DataFusion projection fails — keep it in sync with `penca_merge`'s
 /// `cold_tx_metadata_fields`.
@@ -36,11 +36,11 @@ fn joined_tx_metadata_fields() -> Vec<Arc<Field>> {
 impl HotStorageClient {
     /// Read committed upsert rows joined with `commit_tx_log`.
     ///
-    /// CHA-218: widened JOIN. Returns a `RecordBatch` with the upsert
+    /// Widened JOIN. Returns a `RecordBatch` with the upsert
     /// columns followed by the denormalized tx metadata fields —
-    /// `commit_micros, began_at_micros` and (CHA-430) `commit_seq_num`. The
-    /// caller projects these onto each cold persist segment row. CHA-507:
-    /// `author`/`comment` are no longer denormalized here — `audit_data`
+    /// `commit_micros, began_at_micros` and `commit_seq_num`. The
+    /// caller projects these onto each cold persist segment row.
+    /// `author`/`comment` are deliberately NOT denormalized here — `audit_data`
     /// joins them from the cold tx_log on demand.
     #[tracing::instrument(
         level = "debug",
@@ -97,14 +97,13 @@ impl HotStorageClient {
 
     /// Read committed delete rows joined with `commit_tx_log`.
     ///
-    /// CHA-218: widened JOIN. The trailing tx metadata columns get
+    /// Widened JOIN. The trailing tx metadata columns get
     /// pre-joined onto each cold delete segment row so the cold side reads
     /// as a pure scan.
     ///
-    /// CHA-185: returns a `RecordBatch` with columns
+    /// Returns a `RecordBatch` with columns
     /// `(version_uuid, row_uuid, <pk_cols...>, tx_uuid, write_seq_num,
     ///   commit_micros, began_at_micros, commit_seq_num)`. The trailing
-    /// `commit_seq_num` is CHA-430; CHA-507 dropped `comment`/`author`.
     /// PK columns interleave between `row_uuid` and `tx_uuid` in
     /// table-declared order; their types are resolved from `user_schema`.
     #[allow(clippy::too_many_arguments)]
@@ -142,7 +141,7 @@ impl HotStorageClient {
             format!(", {}", pk_select.join(", "))
         };
 
-        // CHA-431: project `d.write_seq_num` (the within-tx mutation ordinal)
+        // Project `d.write_seq_num` (the within-tx mutation ordinal)
         // alongside the tx metadata so persist + audit projections
         // downstream can carry it onto cold/audit rows.
         let sql = format!(
@@ -170,7 +169,7 @@ impl HotStorageClient {
             fields.push(Arc::new(field));
         }
         fields.push(Arc::new(Field::new("tx_uuid", DataType::Utf8, false)));
-        // CHA-431: write_seq_num follows tx_uuid (matches the SELECT order +
+        // write_seq_num follows tx_uuid (matches the SELECT order +
         // the upsert read schema), projected through to cold.
         fields.push(Arc::new(Field::new(
             "write_seq_num",
@@ -348,7 +347,7 @@ mod tests {
     /// DataFusion projection error. `penca-merge` (which can't be a dep
     /// here without a cycle) pins the cold side against the same literal
     /// in its own test (`CANONICAL_TX_METADATA_TAIL`); keep the two in
-    /// sync. CHA-218 + CHA-430.
+    /// sync.
     #[test]
     fn joined_tx_metadata_tail_is_canonical() {
         let expected: &[(&str, DataType, bool)] = &[

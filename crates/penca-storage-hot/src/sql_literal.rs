@@ -21,7 +21,7 @@ pub(crate) fn build_committed_at_filter(
     filter
 }
 
-/// CHA-429: half-open `commit_seq_num` window for the audit `committed`
+/// Half-open `commit_seq_num` window for the audit `committed`
 /// seq-axis cursor — sibling of [`build_committed_at_filter`] on the
 /// commit-order serial (sourced from the `commit_tx_log` JOIN, alias `t`).
 /// Composes after `WHERE TRUE` alongside the committed_at fragment; an

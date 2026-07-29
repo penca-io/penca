@@ -2,8 +2,6 @@
 //!
 //! [`DbDriver`] defines the async query execution interface. Implementations
 //! manage connection pooling, transactions, and result streaming.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/db/driver/__init__.py`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,7 +18,7 @@ pub mod pg;
 /// database type catalog.
 ///
 /// Each variant is *typed* so the driver encodes it with the correct
-/// native database type from the start (CHA-135) — a `Uuid` binds to a PG
+/// native database type from the start — a `Uuid` binds to a PG
 /// `uuid` column, an `Int32` to `int4`, an `Int64` to `int8` — instead of
 /// binding everything as `text` and relying on `$N::uuid` / `$N::integer`
 /// casts scattered through every SQL string. A `Null` carries its target
@@ -202,9 +200,9 @@ pub trait DbDriver: Send + Sync {
 mod tests {
     use super::{SqlType, SqlValue};
 
-    // CHA-135: the Penca-owned mapping is the `from_opt_*` helpers and the
-    // variant→SqlType pairing for typed NULLs. sqlx's own encode path is not
-    // under test here (that is the deferred pg_typeof work, CHA-395).
+    // The Penca-owned mapping is the `from_opt_*` helpers and the
+    // variant→SqlType pairing for typed NULLs; sqlx's own encode path is
+    // deliberately not under test here.
 
     #[test]
     fn from_opt_i64_some_is_int64() {

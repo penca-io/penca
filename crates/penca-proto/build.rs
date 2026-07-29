@@ -1,15 +1,5 @@
 // Proto compilation for Penca's gRPC services.
 //
-// This build script compiles all .proto files under protos/ into Rust types
-// at build time. It generates:
-//   - Message structs (via prost) for all request/response/domain types
-//   - gRPC server traits and client stubs (via tonic) for all 4 services:
-//       * WriteService     — catalog/schema/table DDL, branching,
-//                            transactions, data mutations
-//       * QueryService     — catalog/schema/table reads, branch/tx reads,
-//                            ReadData, AuditData
-//       * LifecycleService — persist, compact, snapshot, dirty-set listing
-//
 // Uses protox (pure-Rust protobuf parser) instead of system protoc to avoid
 // version issues with proto3 optional fields (requires protoc >= 3.15).
 //

@@ -5,19 +5,10 @@
 //! depend on `penca-db` — a datalake crate shouldn't pull in the
 //! transactional-DB crate just to satisfy a trait.
 //!
-//! - [`dialect::DfDialect`] — DataFusion `Dialect` impl (`ROW_NUMBER()`
-//!   variant of `latest_per_partition`).
-//! - [`driver::DlDriver`] — abstraction for running SQL + reading
-//!   snapshot segments against the cold tier.
-//! - [`driver::DatafusionDlDriver`] — production impl backed by
-//!   DataFusion + [`penca_format::reader::FormatReader`].
-//! - [`schema`] — public contract types (`LogSchemas`, log-table name
-//!   constants) consumed by [`driver::DlDriver::execute_sql`] and by
-//!   `penca-merge`'s SQL builder.
-//!
-//! The DataFusion `TableProvider` + session builder that wires cold
-//! persist segments into a queryable table live in a private
-//! `provider` module — implementation detail of
+//! [`schema`] carries the public contract types (`LogSchemas`, log-table name
+//! constants) shared between [`driver::DlDriver::execute_sql`] and
+//! `penca-merge`'s SQL builder; the `provider` module that wires cold segments
+//! into a queryable `TableProvider` stays private, an implementation detail of
 //! [`driver::DatafusionDlDriver`].
 
 pub mod cache;

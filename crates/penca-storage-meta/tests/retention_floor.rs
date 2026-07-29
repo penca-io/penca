@@ -1,17 +1,13 @@
-//! CHA-432: `LifecycleManager::retention_floor` — the newest `durable` snapshot
+//! `LifecycleManager::retention_floor` — the newest `durable` snapshot
 //! at/before the retention window start (`now − retention_duration_seconds`).
 //!
-//! This is the substrate read the downstream retention ops consume: the persist
-//! prune (CHA-434) and snapshot retirement (CHA-55) call it directly; CHA-433
-//! folds the same predicate onto the plan-time `hot_min` round trip. It must
-//! return BOTH coordinates `(commit_seq_num, snapshotted_at_micros)` so each
-//! consumer compares on the axis its `as_of`/`from` arrives on, with no
-//! micros↔seq mapping.
+//! It must return BOTH coordinates `(commit_seq_num, snapshotted_at_micros)`
+//! so each downstream consumer compares on the axis its `as_of`/`from` arrives
+//! on, with no micros↔seq mapping.
 //!
-//! Fail-first TDD: red until `retention_floor` lands (the test target won't
-//! build without the symbol). Behavioral cases run against live Postgres
-//! (`PENCA_DB_*` env, e.g. via `just penca-up`) and skip cleanly when that env
-//! is absent so a bare `cargo test` doesn't hard-fail.
+//! Behavioral cases run against live Postgres (`PENCA_DB_*` env, e.g. via
+//! `just penca-up`) and skip cleanly when that env is absent so a bare
+//! `cargo test` doesn't hard-fail.
 
 use penca_core::naming;
 use penca_db::dialect::Dialect;

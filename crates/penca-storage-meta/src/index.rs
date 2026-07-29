@@ -1,5 +1,5 @@
-//! Index-metadata reads and writes against `__penca_system__.indexes`
-//! (CHA-455) — the user-facing auditable *definition* store for cold
+//! Index-metadata reads and writes against `__penca_system__.indexes` —
+//! the user-facing auditable *definition* store for cold
 //! indexes, the third dogfooded system Penca Table alongside
 //! `__penca_system__.{schemas,tables}`. Query planning never reads this;
 //! it reads the per-segment `segment_index_metadata` materialization
@@ -42,9 +42,8 @@ impl LifecycleManager {
         let sys_indexes_table_uuid = naming::system_indexes_table_uuid(&catalog);
         let table = naming::upsert_log_table(&sys_indexes_table_uuid, &branch);
 
-        // CHA-380: index_uuid is the row's own PK column; derive row_uuid
-        // canonically (`row_uuid_for_pk`). table_uuid stays a distinct foreign
-        // key (the owning table), not the row's own identity.
+        // `table_uuid` stays a distinct foreign key (the owning table), NOT
+        // the row's own identity — `index_uuid` is the PK.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_indexes_table_uuid,
             &[parse_uuid(index_uuid).to_string().as_str()],
@@ -101,9 +100,8 @@ impl LifecycleManager {
         let delete_part = naming::delete_log_table(&sys_indexes_table_uuid, &branch);
         let commit_tx_log_part = naming::commit_tx_log_partition(&catalog, &branch);
 
-        // CHA-380: derive row_uuid canonically; the resolve filter
-        // (`u.row_uuid = $1`) matches the derived row_uuid now stored, and
-        // index_uuid is the widened delete-log PK column (CHA-185).
+        // `index_uuid` is the widened delete-log PK column, populated to match
+        // the upsert row.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_indexes_table_uuid,
             &[parse_uuid(index_uuid).to_string().as_str()],
@@ -171,8 +169,8 @@ impl LifecycleManager {
         let sys_indexes_table_uuid = naming::system_indexes_table_uuid(&catalog);
         let table = naming::upsert_log_table(&sys_indexes_table_uuid, &branch);
 
-        // CHA-380: derive row_uuid canonically so CreateBranch materialize
-        // yields the same row_uuid as the parent's `insert_index_metadata`.
+        // Derive row_uuid canonically so CreateBranch materialize yields the
+        // same row_uuid as the parent's `insert_index_metadata`.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_indexes_table_uuid,
             &[parse_uuid(index_uuid).to_string().as_str()],

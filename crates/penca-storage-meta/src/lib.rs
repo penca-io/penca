@@ -1,22 +1,17 @@
 //! Write- and lifecycle-side metadata store: catalog / schema / table /
 //! branch / transaction / log-segment / snapshot writes plus the
-//! lifecycle-side reads (persist, purge, compact, snapshot). CHA-472 (ADR
-//! 0028) rehomed the query-side reads — the read-plan assembly and the
-//! `__penca_system__` resolves/getters — onto `penca_api::QueryManager`, so
-//! this struct is the write/lifecycle remainder, renamed [`LifecycleManager`].
-//!
-//! This is the Rust port of
-//! `packages/penca/src/penca/lib/storage/metadata.py`.
+//! lifecycle-side reads (persist, purge, compact, snapshot). The query-side
+//! reads — read-plan assembly and the `__penca_system__` resolves/getters —
+//! live on `penca_api::QueryManager` instead (ADR 0028).
 
 #![allow(clippy::too_many_arguments)]
 
 mod branch;
 mod catalog;
 mod compact;
-// CHA-472: `convert` + `helpers` are now consumed cross-crate by the read
-// methods rehomed onto `penca_api::QueryManager` (the `rb_*` row decoders,
-// `extract_first_binary`, and the `parse_uuid`/`qi`/`epoch`/`resolve_branch`
-// call-site aliases), so both modules are `pub`.
+// `pub` because the read methods on `penca_api::QueryManager` consume these
+// cross-crate: the `rb_*` row decoders, `extract_first_binary`, and the
+// `parse_uuid`/`qi`/`epoch`/`resolve_branch` call-site aliases.
 pub mod convert;
 mod ddl;
 pub mod helpers;
@@ -31,10 +26,8 @@ mod table;
 mod tx_log;
 pub mod watermarks;
 
-// Load-bearing re-export: `penca-api::write` imports the `rb_*`
-// helpers as `use penca_storage_meta::{LifecycleManager, rb_binary,
-// rb_opt_i32, rb_opt_i64, rb_str, rb_string_list, rb_uuid_str};`.
-// See CHA-295's Phase-2 plan edit log for the verification.
+// Load-bearing re-export: `penca-api::write` imports the `rb_*` helpers
+// through this path.
 pub use convert::{rb_binary, rb_opt_i32, rb_opt_i64, rb_str, rb_string_list, rb_uuid_str};
 pub use snapshot::{RetentionFloor, retention_floor_select, retention_window_start_expr};
 pub use tx_log::{TxLogSegment, tx_log_arrow_schema};
@@ -62,21 +55,20 @@ pub struct SnapshotResult {
     /// `snapshotted_at_micros` of the latest committed snapshot, or
     /// `None` when no committed snapshot exists for the table.
     pub snapshotted_at_micros: Option<i64>,
-    /// `commit_seq_num` watermark `W_snap` of the latest committed snapshot
-    /// (CHA-443), or `None` when no committed snapshot exists. The seq sibling
-    /// of `snapshotted_at_micros` — the seq-aware picker (IMPL-3) and the read
-    /// Plan (IMPL-4) consume it.
+    /// `commit_seq_num` watermark `W_snap` of the latest committed snapshot, or
+    /// `None` when none exists. The seq sibling of `snapshotted_at_micros`,
+    /// consumed by the seq-aware snapshot picker and the read Plan.
     pub commit_seq_num: Option<i64>,
     pub snapshot_segments: Vec<SnapshotSegment>,
-    /// CHA-485: user-index defs declared for the picked snapshot (parent rows
+    /// User-index defs declared for the picked snapshot (parent rows
     /// with non-NULL `key_columns`), sorted by `index_uuid`. Planner
     /// covering-index candidates; empty when none are declared.
     pub indexes: Vec<SnapshotIndexDef>,
-    /// The latest snapshot's recorded write-time partition keys (CHA-404
-    /// parent column). `None` = SQL NULL (a pre-CHA-404 parent row →
-    /// carry-forward ineligible, force full rewrite); `Some(vec![])` =
-    /// `{}` (known: the table declares no partition keys). CHA-406's
-    /// key-change detection relies on the NULL-vs-empty distinction.
+    /// The latest snapshot's recorded write-time partition keys. `None` = SQL
+    /// NULL (a parent row predating layout keys → carry-forward ineligible,
+    /// force full rewrite); `Some(vec![])` = the table declares no partition
+    /// keys. Carry-forward key-change detection relies on that NULL-vs-empty
+    /// distinction.
     pub partition_keys: Option<Vec<String>>,
     /// The latest snapshot's recorded write-time clustering keys (already
     /// resolved to the primary-key default at write time). Same
@@ -85,8 +77,8 @@ pub struct SnapshotResult {
     pub clustering_keys: Option<Vec<String>>,
 }
 
-/// One untouched prior-snapshot segment carried forward by reference
-/// (CHA-406): a new `table_snapshot_segment_uuid` under the new
+/// One untouched prior-snapshot segment carried forward by reference:
+/// a new `table_snapshot_segment_uuid` under the new
 /// snapshot pointing at the SAME prior file (`object_uri` + `offset` +
 /// `length`), assigned the next dense `chunk_idx` in label order.
 ///
@@ -106,10 +98,9 @@ pub struct CarriedSegmentSpec {
     pub prior_seg_uuid_str: String,
 }
 
-/// A committed `table_snapshot_segment_index_metadata` child sidecar row
-/// (CHA-412). The planning-read shape
-/// ([`LifecycleManager::list_segment_index_metadata`]) consumed by the cold index
-/// seek (CHA-454) and the lifecycle GC enqueue.
+/// A committed `table_snapshot_segment_index_metadata` child sidecar row — the
+/// planning-read shape ([`LifecycleManager::list_segment_index_metadata`])
+/// consumed by the cold index seek and the lifecycle GC enqueue.
 #[derive(Debug, Clone)]
 pub struct SegmentIndexMetadata {
     pub segment_index_uuid: String,
@@ -123,14 +114,13 @@ pub struct SegmentIndexMetadata {
     pub length: i64,
     pub format: String,
     pub size_bytes: i64,
-    /// Indexed-key min/max bounds (binary) the CHA-454 cold seek consults
-    /// in-planner. The internal `row_uuid` index leaves this empty (`&[]`) —
-    /// a uniform hash has no useful bounds; ordered user indexes (CHA-463)
-    /// populate it.
+    /// Indexed-key min/max bounds (binary) the cold seek consults in-planner.
+    /// The internal `row_uuid` index leaves this empty (`&[]`) — a uniform hash
+    /// has no useful bounds; ordered user indexes populate it.
     pub statistics: Vec<u8>,
 }
 
-/// A committed `table_snapshot_index_metadata` parent row (CHA-412): the
+/// A committed `table_snapshot_index_metadata` parent row: the
 /// per-`(snapshot, index)` header the planner reads ("does snapshot S have
 /// index X?"). The internal `row_uuid` index is the row with `index_uuid` NULL.
 #[derive(Debug, Clone)]
@@ -141,8 +131,7 @@ pub struct TableSnapshotIndexMetadata {
     pub index_uuid: Option<String>,
 }
 
-/// Write- and lifecycle-side metadata store backed by Postgres (CHA-472: the
-/// query-side reads were rehomed onto `penca_api::QueryManager`).
+/// Write- and lifecycle-side metadata store backed by Postgres.
 ///
 /// Stateless unit struct — all methods take an explicit driver.
 /// The caller owns the driver and transaction lifecycle.

@@ -5,8 +5,6 @@
 //! `RecordBatch` row for sys-table reads that route through
 //! `stream_merged`) to the corresponding proto message. Column names
 //! must match the projection used in the query.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/util/proto.py`.
 
 use arrow::array::{
     Array, BinaryArray, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
@@ -32,8 +30,8 @@ pub fn catalog_from_row(row: &PgRow) -> Catalog {
 /// Construct a [`Branch`] from a per-catalog `branch_store` row.
 ///
 /// Expected columns: `branch_uuid`, `branch_name`, `fork_commit_seq_num`.
-/// `catalog_uuid` is supplied by the caller (branches are catalog-scoped
-/// post-CHA-163; the catalog is implicit in the branch_store table name).
+/// `catalog_uuid` is supplied by the caller — branches are catalog-scoped and
+/// the catalog is implicit in the branch_store table name.
 pub fn branch_from_row(catalog_uuid: &str, row: &PgRow) -> Branch {
     let uuid: uuid::Uuid = row.get("branch_uuid");
     Branch {
@@ -44,7 +42,6 @@ pub fn branch_from_row(catalog_uuid: &str, row: &PgRow) -> Branch {
     }
 }
 
-// -- RecordBatch helpers (CHA-168) ----------------------------------------
 //
 // stream_merged returns sys-table reads as Arrow RecordBatches. The
 // helpers below extract typed columns at row index `i` so callers
@@ -199,7 +196,7 @@ fn retention_config_from_record_batch(batch: &RecordBatch, row: usize) -> Option
 /// need catalog-coalesced retention compose the call after this
 /// conversion).
 pub fn schema_from_record_batch(catalog_uuid: &str, batch: &RecordBatch, row: usize) -> Schema {
-    // CHA-380: schema_uuid is a first-class column, no longer the row_uuid.
+    // schema_uuid is a first-class column, distinct from the row_uuid.
     let schema_uuid = rb_uuid_str(batch, "schema_uuid", row).unwrap_or_default();
     let retention_config = retention_config_from_record_batch(batch, row);
 
@@ -222,7 +219,7 @@ pub fn table_from_record_batch(
     batch: &RecordBatch,
     row: usize,
 ) -> Table {
-    // CHA-380: table_uuid is a first-class column, no longer the row_uuid.
+    // table_uuid is a first-class column, distinct from the row_uuid.
     let table_uuid = rb_uuid_str(batch, "table_uuid", row).unwrap_or_default();
     let arrow_schema = rb_binary(batch, "arrow_schema", row).unwrap_or_default();
     let retention_config = retention_config_from_record_batch(batch, row);
@@ -238,16 +235,16 @@ pub fn table_from_record_batch(
         clustering_keys: rb_string_list(batch, "clustering_keys", row),
         description: rb_str(batch, "description", row),
         retention_config,
-        // CHA-492: the defined-index set is a separate `__penca_system__.indexes`
+        // The defined-index set is a separate `__penca_system__.indexes`
         // read; the metadata-resolve caller attaches it (this row-converter only
         // sees the `tables` row).
         indexes: Vec::new(),
     }
 }
 
-/// Build an [`Index`] from a `__penca_system__.indexes` resolved row
-/// (CHA-455). `index_uuid` is a first-class PK column (CHA-380, no longer
-/// the overloaded `row_uuid`); the remaining columns are the
+/// Build an [`Index`] from a `__penca_system__.indexes` resolved row.
+/// `index_uuid` is a first-class PK column, distinct from `row_uuid`; the
+/// remaining columns are the
 /// `system_indexes_arrow_schema` user columns. `index_type` is the
 /// `IndexType` enum stored as its i32 value.
 pub fn index_from_record_batch(batch: &RecordBatch, row: usize) -> Index {
