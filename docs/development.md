@@ -74,8 +74,8 @@ Requires Docker.
 
 | Profile | Behavior |
 |---|---|
-| `test` (default) | Random host ports — parallel-worktree-safe |
-| `dev` | Fixed ports 50052–50055 + 50060 |
+| `dev` (default) | Fixed ports 50052–50055 + 50060, lifecycle scheduler running |
+| `test` | Random host ports — parallel-worktree-safe; scheduler idle so it can't race a suite's manual lifecycle calls |
 
 To keep your data across restarts, give it a directory — both Postgres and the object
 store write there, and it survives `just penca-down`:
@@ -124,7 +124,7 @@ crates/                                 # Rust workspace (production server)
 ├── penca-dl/                          # Cold-tier `DlDriver`/`Dialect` + DataFusion impl (`DatafusionDlDriver`)
 ├── penca-format/                      # Columnar reader/writer trait + Parquet & Lance impls
 ├── penca-storage-hot/                 # Stateless `HotStorageClient` (Postgres upsert/delete logs)
-├── penca-storage-meta/                # Stateless `MetadataClient` (~50 methods: catalog/schema/table/branch/tx CRUD, segments, snapshots, plan)
+├── penca-storage-meta/                # Metadata storage layer — `LifecycleManager` plus the segment/snapshot/tx-log row shapes (read surface rehomed onto `QueryManager`, ADR 0028)
 ├── penca-storage-cold/                # Stateless `ColdStorageClient` (object-store list/get/put + format dispatch)
 ├── penca-merge/                       # Symmetric per-tier merge-on-read SQL builder (`penca_merge::sql`)
 ├── penca-datafusion/                  # `PencaCatalogProviderList` / `SchemaProvider` / `PencaTableProvider`; per-conn `ConnScope`

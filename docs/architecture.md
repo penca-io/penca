@@ -22,7 +22,7 @@ scaling profile. Per-service design docs live under
 
 The query and lifecycle services read Postgres and object storage
 directly. Read planning (deciding *what to read and where*) is an
-in-process library call (`penca-storage-meta`), not a service hop.
+in-process call inside the query service, not a service hop.
 
 ```
                                        ┌──────────────────────────┐
@@ -71,10 +71,11 @@ per row id and apply tombstones, then a **cross-tier merge** unions
 the two with hot taking precedence over cold. See
 [algorithms.md](algorithms.md#read-path).
 
-The in-process read planner (`penca-storage-meta`, `MetadataClient::plan`)
-is the index that knows where data lives across both tiers — it tells the
-query engine *what to read and where*, computed in-process rather than over
-a service hop, and never touches the data itself.
+The in-process read planner (`QueryManager::plan`, in `penca-api`) is the index that
+knows where data lives across both tiers — it tells the query engine *what to read and
+where*, computed in-process rather than over a service hop, and never touches the data
+itself. Metadata reads live on the query layer alongside it, sharing its caches
+([ADR 0028](decisions/0028-metadata-reads-on-query-layer.md)).
 
 ## Concepts
 
@@ -121,30 +122,36 @@ atomically. No soft-delete, no undo.
 
 ### Identity
 
-Every entity with an immutable key has a deterministic `xxh3_128`
-UUID derived from that key — `catalog_uuid = xxh3(catalog_name)`,
-`schema_uuid = xxh3(catalog_uuid:schema_name)`, and so on through
-table and branch. User-row UUIDs derive from `(table_uuid, pk_values)`;
-derived rows in the persist + snapshot family chain off their parent
-UUID via the recursive `row_uuid_for_pk` mechanism (ADR 0016). Each
-UUID transitively encodes its parent identity through its hash input.
+Namespace UUIDs — `catalog_uuid`, `schema_uuid`, `branch_uuid`, `table_uuid` — are
+**server-minted at `Create*` time** and persisted on the namespace row
+([ADR 0020](decisions/0020-non-deterministic-namespace-uuids.md)). They are random
+rather than derived from the name, and that is exactly what makes them
+**rename-stable**: names are mutable (`UpdateCatalog` / `UpdateSchema` / `UpdateTable`
+each accept a `new_*_name`), while every physical address, lifecycle chain entry and
+client reference keyed on a UUID survives the rename untouched.
 
-This means name → UUID is a pure computation: no database lookups, no
-caches, no staleness. The same entity on different branches has the
-same `table_uuid`; deleting and recreating produces the same UUID
-(the merge-on-read CTE handles re-insert-after-delete correctly via
-time-aware deletes).
+Deterministic `xxh3_128` identity is still load-bearing, but scoped to the places the
+storage layer must address without a lookup:
 
-User-supplied keys — catalog / schema / table / branch names, primary
-keys — are **immutable** after creation. Changing them would
-invalidate UUID references throughout the system. Only `tx_uuid` uses
-a random UUID (events with no immutable key).
+- **Structural anchors** — the `__penca_system__` schema and its two bootstrap tables,
+  derived from `catalog_uuid` so server-internal write paths can reach them with no
+  prior state.
+- **Per-branch partition leaves** — the tx-log family and the per-table log tables.
+- **Row identity** — user rows hash from `(table_uuid, pk_values)`, and derived rows in
+  the persist + snapshot family chain off their parent via the recursive
+  `row_uuid_for_pk` mechanism
+  ([ADR 0013](decisions/0013-auditable-store-invariant-deterministic-version-uuid.md),
+  [ADR 0016](decisions/0016-canonical-uuid-construction-for-derived-rows.md)).
 
-API request messages accept human-readable names anywhere a UUID is
-expected — the server resolves names to UUIDs via pure hash
-computation. Per-message comments in the `.proto` files document
-which identifier combinations are sufficient for each RPC; when both
-a UUID and a name are supplied, the UUID always wins.
+Primary-key **values** stay immutable after insert: a row's identity hashes from them,
+so changing one is a delete plus an insert, not an update.
+
+API request messages accept human-readable names anywhere a UUID is expected. Since a
+namespace UUID is no longer computable from its name, that resolution is a metadata
+read rather than a pure hash — a round trip ADR 0020 accepted deliberately as the price
+of rename support. Per-message comments in the `.proto` files document which identifier
+combinations are sufficient for each RPC; when both a UUID and a name are supplied, the
+UUID always wins.
 
 ### Tables: log vs store vs auditable store
 
