@@ -23,10 +23,15 @@ Run via ``just integration-test branch_delete_refcount``.
 
 from __future__ import annotations
 
+import time
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client.naming import SEGMENT_DELETE_SET, TABLE_SNAPSHOT_SEGMENT_METADATA
+from penca_client.naming import (
+    SEGMENT_DELETE_SET,
+    TABLE_PERSIST_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_METADATA,
+)
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
@@ -57,6 +62,37 @@ def _snapshot_uris(catalog_uuid, branch_uuid) -> set[str]:
     )
 
     return {r[0] for r in rows}
+
+
+def _age_queued_rows(catalog_uuid, uris):
+    """Push the queued rows past the grace window.
+
+    Load-bearing for any post-sweep survival assertion: the gate is
+    `written_at_micros < now - query_timeout`, and the teardown enqueue stamps
+    `now`. With QUERY_TIMEOUT_SECONDS=2 in docker/test.env a sweep firing
+    milliseconds later finds the rows ineligible whatever the refcount arms
+    say, so an unaged assertion passes on a fix that enqueues but leaves the
+    gate blind — and flips to testing the gate only if teardown happens to take
+    over 2s. Aging first makes the sweep's decision the only variable.
+    """
+    tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
+    get_pg_driver().execute_no_result(
+        SQL(
+            "UPDATE {tbl} SET written_at_micros = %s WHERE object_uri = ANY(%s)"
+        ).format(tbl=Identifier(tbl)),
+        (int(time.time() * 1_000_000) - 10_000_000, list(uris)),
+    )
+
+
+def _drop_reference_rows(catalog_uuid, branch_uuid):
+    """Drop a branch's committed cold reference rows in both tiers."""
+    for table_name in (TABLE_PERSIST_SEGMENT_METADATA, TABLE_SNAPSHOT_SEGMENT_METADATA):
+        get_pg_driver().execute_no_result(
+            SQL("DELETE FROM {tbl} WHERE branch_uuid = %s").format(
+                tbl=Identifier(f"{catalog_uuid}_{table_name}")
+            ),
+            (branch_uuid,),
+        )
 
 
 def _queued_uris(catalog_uuid, uris) -> set[str]:
@@ -98,12 +134,12 @@ def test_delete_parent_queues_its_files_instead_of_unlinking_them():
     parent_uris = _snapshot_uris(catalog_uuid, main_branch)
     assert parent_uris, "setup failed: the parent must hold committed cold segments"
 
-    client.create_branch(
+    child = client.create_branch(
         f"bdr_child_{uuid4().hex[:6]}",
         catalog_uuid=catalog_uuid,
         author="test",
         comment="cha-539",
-    )
+    ).branch_uuid
 
     client.delete_branch(branch_uuid=main_branch, catalog_uuid=catalog_uuid)
 
@@ -114,12 +150,26 @@ def test_delete_parent_queues_its_files_instead_of_unlinking_them():
         f" the queue: {sorted(parent_uris - queued)}"
     )
 
-    # The fork's claim is what must keep them alive through a sweep.
+    # The fork's claim is what must keep them alive through a sweep. Age the
+    # rows first, or the sweep skips them on grace alone and proves nothing.
+    _age_queued_rows(catalog_uuid, parent_uris)
     client.sweep_segments(catalog_uuid=catalog_uuid)
     still_queued = _queued_uris(catalog_uuid, parent_uris)
     assert still_queued == parent_uris, (
         "the sweep collected files the fork still inherits; the refcount gate"
         f" did not see the fork's reference. Swept: {sorted(parent_uris - still_queued)}"
+    )
+
+    # Positive control. Surviving an aged sweep is also what a sweep that never
+    # considered the URIs eligible looks like. Drop the fork's reference rows so
+    # nothing names the files, then sweep again: the queue must drain, proving
+    # the sweep was live and the fork's claim was the one thing pinning them.
+    _drop_reference_rows(catalog_uuid, child)
+    _age_queued_rows(catalog_uuid, parent_uris)
+    client.sweep_segments(catalog_uuid=catalog_uuid)
+    assert _queued_uris(catalog_uuid, parent_uris) == set(), (
+        "the queue survived a sweep with zero remaining references, so the"
+        " survival above proves nothing about the refcount gate"
     )
 
 
