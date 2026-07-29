@@ -168,8 +168,9 @@ All values are required from environment variables; defaults live in
 
 ## Failure handling
 
-Failure handling has three tiers. Nothing retries in-process — recovery is
-always "the table is still in its dirty set on a later tick".
+Failure handling has three tiers. Nothing retries in-process: recovery always
+waits for a later tick, and whether it is guaranteed to come differs per op — see
+"What gets retried, and when" below.
 
 **Discovery.** A `ListCatalogs` / `ListBranches` error propagates out of the tick
 entirely. Nothing else runs that tick, in either loop.
@@ -179,10 +180,12 @@ entirely. Nothing else runs that tick, in either loop.
 - A *dirty-set listing* error (`ListModifiedTables` / `ListPersistedTables`, in
   the snapshot loop only) returns early from that branch, so its enumeration
   watermarks do not advance and the next tick re-runs the same window.
-- A *branch-op RPC* error (`PersistBranch` / `SnapshotBranch`, in both loops) is
-  logged and the sweep continues. In the snapshot loop that means Purge and
-  tx-log GC still run for that branch and the enumeration watermarks still
-  advance.
+- A *branch-op RPC* error (`PersistBranch` / `SnapshotBranch`, and `PurgeTxLog`
+  which the snapshot loop calls unconditionally per branch) is logged and the
+  sweep continues. In the snapshot loop that means the remaining steps still run
+  for that branch and the enumeration watermarks still advance. `PurgeTxLog`
+  carries no scheduler-side watermark at all — its own empty-set fast path is
+  the no-op gate — so a failure there is simply retried next tick.
 
 Either way the loop moves on to the next branch.
 
@@ -192,12 +195,23 @@ ops swallow their own per-table failures server-side and report it by leaving
 enumeration watermarks, which advance regardless. The scheduler logs the unset
 response; `CreateBranch` treats it as a hard error.
 
+Swallowing per-table failures is load-bearing, not incidental: both dirty sets
+are enumerated oldest-timestamp-first, so a table whose op keeps failing sorts
+first on every subsequent sweep and would starve everything behind it if the
+loop aborted on it.
+
 ### What gets retried, and when
 
 The branch ops enumerate **unwindowed** — `list_all_modified_table_uuids` and
 `list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound,
 and neither set is filtered on failure. A table that failed is simply still in
-the set, so it is retried on the next tick with no dependence on new traffic.
+the set, so it is retried on the next tick with no dependence on new traffic:
+
+- a failed Snapshot keeps its committed persist row with no snapshot past it, so
+  it remains in `ListPersistedTables`;
+- a failed Persist keeps its `tx_table_log` rows, which only `PurgeTxLog` clears
+  and which it cannot reach until Purge advances, so it remains in
+  `ListModifiedTables`.
 
 The two **Purge** passes are windowed, and their windows differ in both bounds:
 the modified pass runs `[last_modified_tick, now)`, the aged-persisted pass runs
