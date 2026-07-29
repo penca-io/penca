@@ -48,6 +48,12 @@ from .integration_helpers import (
 NEVER_BEGUN_TX = "11111111-1111-1111-1111-111111111111"
 
 
+# Serial: `pg_stat_statements_reset()` is instance-global, so under `-n auto` a
+# concurrent worker's reset landing mid-test would zero the counters and read
+# `lookups` as 1 on unfixed code — a false green on the assertion that must stay
+# red. `TestDeadTxCharacterization` below touches no side channel and stays
+# parallel.
+@pytest.mark.serial
 class TestOpenTxResolutionCount:
     def test_open_tx_read_issues_one_begin_tx_log_lookup(self):
         """One open-tx read resolves the tx once, not twice.
