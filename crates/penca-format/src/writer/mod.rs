@@ -43,7 +43,7 @@ pub trait FormatWriter: Send + Sync {
     ///
     /// Returns the number of rows written. The on-disk serialized size
     /// is deliberately not returned: segment `size_bytes` is the
-    /// uncompressed in-memory footprint (CHA-347), sourced from the
+    /// uncompressed in-memory footprint, sourced from the
     /// chunker, not from the writer.
     fn write(
         &self,

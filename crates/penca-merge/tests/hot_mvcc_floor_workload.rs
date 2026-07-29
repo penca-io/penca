@@ -1,6 +1,6 @@
-//! Workload-correctness guard for the hot-MVCC floor bench (CHA-415 #1).
+//! Workload-correctness guard for the hot-MVCC floor bench.
 //!
-//! The `hot_mvcc_floor` criterion bench (CHA-415 I1) times Postgres executing
+//! The `hot_mvcc_floor` criterion bench times Postgres executing
 //! the real `build_merge_resolved::<PgDialect>` dedup over a synthetic upsert/
 //! tx/delete log at increasing depth. A throughput number is only meaningful if
 //! the synthetic workload actually exercises latest-wins MVCC resolution — a
@@ -12,11 +12,8 @@
 //! the production resolver, and asserts it resolves the latest version per
 //! entity and excludes tombstoned rows.
 //!
-//! NOTE (CHA-415): `build_merge_resolved` is existing, correct production code,
-//! so this is a *characterization / guard* test — it passes on first write. It
-//! is not fail-first TDD (there is no new production behavior to drive); its job
-//! is to prove the bench measures a non-degenerate dedup, and to catch a future
-//! regression in either the resolver or the bench's populator.
+//! Its job is to prove the bench measures a non-degenerate dedup, and to catch
+//! a future regression in either the resolver or the bench's populator.
 //!
 //! Requires live Postgres (`PENCA_DB_*` env, e.g. via `just penca-up`); skips
 //! cleanly when that env is absent so a bare `cargo test` doesn't hard-fail.
@@ -131,7 +128,7 @@ async fn hot_mvcc_dedup_resolves_latest_wins_and_excludes_tombstones() {
         clock += 1;
         insert_tx(&driver, &commit_tx_log_q, &tx_uuid, &branch_uuid, clock).await;
         // delete_log columns: (version_uuid, row_uuid, <pk: name>, tx_uuid).
-        // write_seq_num auto-stamps via its DEFAULT nextval (CHA-431).
+        // write_seq_num auto-stamps via its DEFAULT nextval.
         driver
             .execute_no_result_params(
                 &format!(
@@ -160,7 +157,7 @@ async fn hot_mvcc_dedup_resolves_latest_wins_and_excludes_tombstones() {
         None,
     );
 
-    // CHA-368: the resolve now emits a two-arm UNION — visible upserts
+    // The resolve emits a two-arm UNION — visible upserts
     // (is_delete = false) plus winning tombstones (is_delete = true). The live
     // delta is the is_delete = false subset (the consumer applies `WHERE NOT
     // is_delete`); the full row_uuid set is the exclusion set. These
@@ -225,7 +222,7 @@ async fn insert_tx(
     driver
         .execute_no_result_params(
             &format!(
-                // CHA-428/CHA-431: commit_seq_num is the PRIMARY merge order key.
+                // commit_seq_num is the PRIMARY merge order key.
                 // Reuse the monotonic-unique commit_micros ($4) as the
                 // seq so each successive version's commit_seq_num strictly
                 // increases (latest-wins) and the (branch_uuid, commit_seq_num)

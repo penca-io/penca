@@ -3,7 +3,7 @@
 //!
 //! Branch and catalog are captured once at conn-mint
 //! ([`crate::session::ConnSessionFactory::mint`]) and immutable for the
-//! connection's lifetime (CHA-119 / CHA-253). On every subsequent
+//! connection's lifetime. On every subsequent
 //! request, [`validate_branch_header`] / [`validate_catalog_header`]
 //! reject any header drift. The SQL-side mutation surfaces
 //! (`SET branch = …`, `SET catalog = …`) and the Flight SQL
@@ -20,7 +20,7 @@ use crate::session::{
 
 /// Reject requests whose `x-penca-branch` header disagrees with the
 /// session's pinned branch. The branch is captured at session-mint
-/// time and immutable for the connection's lifetime (CHA-119).
+/// time and immutable for the connection's lifetime.
 /// `SET branch = ...` / `SET penca.branch = ...` mid-session is
 /// rejected separately by the `set` module dispatcher; this guard
 /// catches the non-SQL path where a client mutates the header on a
@@ -49,7 +49,7 @@ pub(crate) fn validate_branch_header<T>(
 /// Reject requests whose `x-penca-catalog` header disagrees with the
 /// session's pinned catalog. Symmetric with [`validate_branch_header`]:
 /// catalog is captured at session-mint time and immutable for the
-/// connection's lifetime (CHA-253). The mid-session
+/// connection's lifetime. The mid-session
 /// `SetSessionOptions(catalog: …)` / `SET catalog = '…'` mutation
 /// surfaces are rejected separately by [`crate::set::plan_catalog`];
 /// this guard catches the case where a cookie-reusing client sends a

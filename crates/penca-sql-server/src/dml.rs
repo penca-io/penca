@@ -6,8 +6,7 @@
 //! derives `row_uuid` here for two narrow purposes: building the
 //! strict-INSERT collision-check IN-list, and populating `Change.deletes`
 //! (which is wire-typed as `repeated string row_uuid`). See ADR 0006 for
-//! the rationale (reversal of ADR 0004 decision 3, with decision 2
-//! re-clarified after ship to keep server-side derivation).
+//! the rationale.
 //!
 //! - `INSERT INTO t ...` (strict): SELECT collision check via
 //!   `QueryServiceClient::read_data`, then `WriteData.change.upserts`.
@@ -25,7 +24,7 @@
 //! absent ⇒ auto-commit, present ⇒ append to that open tx. Empty-bytes
 //! `transaction_id` from the Flight SQL wire is normalized to `None` at
 //! the `flight_sql/service.rs` boundary; format validation of non-empty
-//! values is the gRPC servicer's job (CHA-92), not the gateway's.
+//! values is the gRPC servicer's job, not the gateway's.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -59,7 +58,7 @@ use crate::session::SessionSnapshot;
 use crate::tx;
 
 /// Recognition tag prepended to per-call UUID aliases for old-PK SELECT
-/// columns in PK-changing UPDATEs (CHA-237). Collision-freedom comes
+/// columns in PK-changing UPDATEs. Collision-freedom comes
 /// from the UUID portion — this prefix is purely cosmetic, so logs and
 /// DataFusion error messages mentioning the alias are instantly
 /// recognizable as Penca-internal rather than opaque hex.
@@ -107,16 +106,15 @@ impl From<LockErr> for Status {
 /// `snapshot` is the per-request [`SessionSnapshot`] populated by the
 /// session middleware; it carries the connection's pinned catalog (used
 /// as the unqualified-DML default + for `tx::validate_session_catalog`),
-/// the connection's pinned branch (CHA-119 — addresses `WriteData`
-/// and the strict-INSERT collision check) and any open `tx_uuid` (used
+/// the connection's pinned branch (addresses `WriteData` and the
+/// strict-INSERT collision check) and any open `tx_uuid` (used
 /// by `tx::resolve_tx_uuid_for_dml`). All session-state reads in the
-/// DML hot path go through this snapshot — no direct cache lookups
-/// (CHA-169 / one cache hit per request).
+/// DML hot path go through this snapshot — no direct cache lookups.
 ///
 /// The unqualified-DML fallback schema is read from
 /// `ctx.state().config_options().catalog.default_schema` — the same
 /// source DataFusion's SELECT planner consults, so `SET search_path`
-/// (CHA-119) flows into both paths through one shared field.
+/// flows into both paths through one shared field.
 #[tracing::instrument(
     skip_all,
     fields(
@@ -127,9 +125,9 @@ impl From<LockErr> for Status {
     ),
     err,
 )]
-// CHA-333: gateway dispatch threads `params` through alongside the
-// existing 7 inputs. Bundling them into `DmlExecutor` would couple
-// the executor's lifetime to a value only `execute_insert` consumes.
+// `params` stays a loose argument rather than a `DmlExecutor` field: bundling
+// it would couple the executor's lifetime to a value only `execute_insert`
+// consumes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     ctx: &SessionContext,
@@ -142,11 +140,8 @@ pub(crate) async fn execute(
     params: Option<ParamValues>,
 ) -> Result<i64, Status> {
     let default_schema = ctx.state().config_options().catalog.default_schema.clone();
-    // CHA-255: route every wire payload by `branch_uuid` (rename-stable).
-    // The connection's `branch_name` lives on the session snapshot for
-    // diagnostic-logging needs upstream (e.g. error wording in
-    // `validate_branch_header`), but the DML hot path threads only the
-    // uuid.
+    // Every wire payload routes by `branch_uuid` because it is rename-stable;
+    // the connection's `branch_name` is diagnostic-only.
     let executor = DmlExecutor {
         ctx,
         write_channel,
@@ -212,13 +207,10 @@ pub(crate) async fn execute(
             }
             executor.execute_delete(delete, transaction_id).await
         }
-        // CHA-259: every Flight SQL SQL-entry handler routes through
-        // `crate::gateway::classify` *before* this function, and
-        // `classify` returns `Err` for anything that isn't INSERT /
-        // UPDATE / DELETE. Reaching this arm therefore means the
-        // gateway invariant broke — surface it as an internal error
-        // so it doesn't get masked as a CHA-172 / ADR 0010 user
-        // error.
+        // `crate::gateway::classify` runs before this function and returns
+        // `Err` for anything that isn't INSERT / UPDATE / DELETE. Reaching this
+        // arm means the gateway invariant broke, so surface it as an internal
+        // error rather than masking it as a user error.
         other => Err(Status::internal(format!(
             "dml::execute received non-DML statement `{other}`; \
              crate::gateway::classify is the invariant owner"
@@ -226,10 +218,7 @@ pub(crate) async fn execute(
     }
 }
 
-/// Per-call DML orchestrator. Bundles the seven inputs that
-/// `execute_insert` / `execute_update` / `execute_delete` previously
-/// took as 8-arg signatures (with `#[allow(clippy::too_many_arguments)]`
-/// each) into one borrow-only struct constructed by [`execute`].
+/// Per-call DML orchestrator, constructed by [`execute`].
 ///
 /// All fields are borrows because the lifetime is the call —
 /// `DmlExecutor` is constructed inside `execute()`, hands one method
@@ -248,11 +237,9 @@ struct DmlExecutor<'a> {
 /// `split_object_name` → catalog/schema defaulting → cross-catalog
 /// name short-circuit → `fetch_table` → `parse_table_uuid` → cross-
 /// catalog uuid check → `resolve_tx_uuid_for_dml` pipeline materialized
-/// as one struct. Owned-field fields (`catalog`/`schema` as `String`,
-/// `effective_tx_uuid` as `Option<String>`) instead of `&'a str`
-/// because lifetimes here pay no perf back — the path is dominated by
-/// gRPC round-trips — and `String` keeps the call sites lifetime-noise
-/// free.
+/// as one struct. Fields are owned rather than `&'a str` because
+/// lifetimes here pay no perf back — the path is dominated by gRPC
+/// round-trips — and `String` keeps the call sites lifetime-noise free.
 struct ResolvedDmlTarget {
     catalog: String,
     schema: String,
@@ -268,10 +255,10 @@ impl<'a> DmlExecutor<'a> {
     /// shared by [`Self::execute_insert`], [`Self::execute_update`], and
     /// [`Self::execute_delete`].
     ///
-    /// Behavior contract — preserves the pre-extraction sequence exactly:
+    /// The step order is load-bearing:
     /// 1. `split_object_name` parses the 1-/2-/3-part `ObjectName`.
     /// 2. Default missing catalog to `snapshot.catalog_name`.
-    /// 3. **Name-level cross-catalog short-circuit** (CHA-255 / CHA-169):
+    /// 3. **Name-level cross-catalog short-circuit**:
     ///    `validate_session_catalog_name` rejects before the wire
     ///    `get_table` would target a foreign catalog with the conn's
     ///    `branch_uuid`.
@@ -292,9 +279,9 @@ impl<'a> DmlExecutor<'a> {
         let resolved_catalog = catalog_name.unwrap_or_else(|| self.snapshot.catalog_name.clone());
         tx::validate_session_catalog_name(self.snapshot, &resolved_catalog)?;
         let resolved_schema = schema_name.unwrap_or_else(|| self.default_schema.to_string());
-        // CHA-345: resolve the effective tx *before* fetching the target
-        // so an in-tx DML against a table created earlier in the same tx
-        // resolves it (the get_table below threads open_tx_uuid).
+        // Resolve the effective tx *before* fetching the target so an in-tx DML
+        // against a table created earlier in the same tx resolves it (the
+        // get_table below threads open_tx_uuid).
         let effective_tx_uuid = tx::resolve_tx_uuid_for_dml(self.snapshot, transaction_id);
         if let Some(tx_uuid) = effective_tx_uuid.as_deref() {
             tracing::Span::current().record("tx_uuid", tx_uuid);
@@ -344,23 +331,18 @@ impl<'a> DmlExecutor<'a> {
             .source
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("INSERT without VALUES/SELECT source"))?;
-        // CHA-333: rewrite JDBC-style `?` placeholders to
-        // DataFusion's `$N` form before planning. The prepare-time
-        // path in `gateway::parameter_plan_for_dml` uses the same
-        // rewrite, so positional indices line up: `?` at SQL position
-        // N becomes `$N` in both plans, and `ParamValues::List` (1-
-        // indexed) substitutes correctly via `with_param_values`.
+        // The prepare-time path in `gateway::parameter_plan_for_dml` uses this
+        // same rewrite, so positional indices line up: `?` at SQL position N
+        // becomes `$N` in both plans, and `ParamValues::List` (1-indexed)
+        // substitutes correctly via `with_param_values`.
         let source_sql = crate::gateway::rewrite_jdbc_placeholders(&source.to_string());
         let mut df =
             self.ctx.sql(&source_sql).await.map_err(|e| {
                 Status::invalid_argument(format!("failed to plan INSERT source: {e}"))
             })?;
-        // CHA-333: substitute any bound parameters from
-        // `DoPutPreparedStatementQuery` into the planned VALUES /
-        // SELECT source. DataFusion's `with_param_values` resolves
-        // `$N` Placeholder expressions through its type system so a
-        // `setLong(1, X)` over JDBC arrives as the right
-        // `ScalarValue::Int64(Some(X))` rather than a textual cast.
+        // DataFusion's `with_param_values` resolves `$N` Placeholder
+        // expressions through its type system, so a `setLong(1, X)` over JDBC
+        // arrives as `ScalarValue::Int64(Some(X))` rather than a textual cast.
         if let Some(values) = params {
             df = df.with_param_values(values).map_err(|e| {
                 Status::invalid_argument(format!("failed to bind INSERT parameters: {e}"))
@@ -444,28 +426,27 @@ impl<'a> DmlExecutor<'a> {
         // strict-INSERTs on the same PK can both pass the check (each sees
         // an empty result) and both append, defeating the strict semantics.
         //
-        // Pre-ADR-0006 the write microservice owned this guarantee inside a
-        // single Pg transaction. Now the check (QueryService) and the write
-        // (WriteService) are separate gRPC calls, so the SQL server has to
-        // serialise them itself. We use the same per-(branch, table)
-        // Postgres advisory lock pattern as the lifecycle (persist/snapshot)
-        // path — see penca-api/src/lifecycle.rs and CHA-141.
+        // Per ADR 0006 the check (QueryService) and the write (WriteService)
+        // are separate gRPC calls, so the SQL server has to serialise them
+        // itself. Uses the same per-(branch, table) Postgres advisory lock
+        // pattern as the lifecycle (persist/snapshot) path — see
+        // penca-api/src/lifecycle.rs.
         //
         // This adds one Pg roundtrip per strict-INSERT on top of the
         // QueryService + WriteService calls. If profiling shows it dominates
         // small-INSERT latency, the alternatives are (a) push the check
         // back into WriteService with an optimistic-CC precondition on
-        // WriteData (CHA-86 territory), or (b) move to a per-row UNIQUE
-        // index on `upsert_log.row_uuid` and let Pg enforce uniqueness on
-        // commit (ADR 0001 trigger #4).
+        // WriteData, or (b) move to a per-row UNIQUE index on
+        // `upsert_log.row_uuid` and let Pg enforce uniqueness on commit
+        // (ADR 0001 trigger #4).
         let row_uuids =
             derive_row_uuids(&casted, &target.table_uuid, &target.table_meta.primary_keys)?;
 
-        // CHA-242: unified lock key — strict-INSERT and UPDATE-rewrites-PK
-        // both serialize against the same per-(branch, table) key. Without
-        // unification, a concurrent strict-INSERT and an UPDATE-PK both
-        // targeting the same destination PK can each pass their respective
-        // collision probes before the other commits, defeating both checks.
+        // Strict-INSERT and UPDATE-rewrites-PK must serialize against the SAME
+        // per-(branch, table) key. With separate keys, a concurrent
+        // strict-INSERT and an UPDATE-PK both targeting the same destination PK
+        // can each pass their respective collision probes before the other
+        // commits, defeating both checks.
         self.check_collisions_and_send(&target, &row_uuids, change)
             .await?;
         Ok(affected)
@@ -500,7 +481,7 @@ impl<'a> DmlExecutor<'a> {
             }
         }
 
-        // CHA-237: a SET that touches any PK column changes the row's
+        // A SET that touches any PK column changes the row's
         // identity (``row_uuid = hash(PK)``), so the old-PK row must be
         // explicitly deleted — a bare upsert under the new PK leaves the
         // old row visible. When no PK is in the SET, ``row_uuid_old ==
@@ -587,7 +568,7 @@ impl<'a> DmlExecutor<'a> {
 
         let upserts_ipc = encode_batch_ipc(&casted)?;
         // Carry the projected old-PK batch through to the collision-probe
-        // step (CHA-242) instead of rebuilding it from `batches`.
+        // step instead of rebuilding it from `batches`.
         let (deletes_ipc, old_pk_batch) = if let Some(aliases) = &old_pk_aliases {
             let pk_batch = build_old_pk_deletes_batch(
                 &batches,
@@ -605,7 +586,7 @@ impl<'a> DmlExecutor<'a> {
         };
         let affected = casted.num_rows() as i64;
 
-        // CHA-242: when the SET targets a PK column, probe the table for
+        // When the SET targets a PK column, probe the table for
         // new-PK row_uuids that aren't being vacated by this UPDATE — those
         // are the only ones at risk of clobbering a pre-existing row.
         // Subtracting all-old (not just moved) handles mixed batches where
@@ -616,9 +597,8 @@ impl<'a> DmlExecutor<'a> {
         // `pk_collision_lock_key` so a concurrent strict-INSERT or another
         // UPDATE-PK targeting the same destination PK can't race past.
         let Some(old_pk_batch) = old_pk_batch else {
-            // Non-PK-changing UPDATE: every `row_uuid` is unchanged, no
-            // external collision possible. CHA-237's upserts-only fast
-            // path stays untouched.
+            // Non-PK-changing UPDATE: every `row_uuid` is unchanged, so no
+            // external collision is possible — take the upserts-only fast path.
             send_change(
                 self.write_channel,
                 catalog,
@@ -657,7 +637,7 @@ impl<'a> DmlExecutor<'a> {
     /// append in one closure is load-bearing — two concurrent strict-
     /// INSERTs (or a strict-INSERT + UPDATE-PK) on the same destination
     /// PK could otherwise each pass their own probe before the other
-    /// appends, defeating both checks (CHA-242).
+    /// appends, defeating both checks.
     ///
     /// Shared by [`Self::execute_insert`]'s strict path and
     /// [`Self::execute_update`]'s PK-changing path.
@@ -756,9 +736,9 @@ impl<'a> DmlExecutor<'a> {
             .await
             .map_err(|e| Status::internal(format!("failed to execute DELETE select: {e}")))?;
 
-        // CHA-185: ship the SELECT result directly as the Change.deletes PK
-        // batch. Server pulls `primary_keys` from `__penca_system__.tables`
-        // and derives `row_uuid_for_pk` itself; no client-side hashing.
+        // Ship the SELECT result directly as the Change.deletes PK batch: the
+        // server pulls `primary_keys` from `__penca_system__.tables` and
+        // derives `row_uuid_for_pk` itself, so no client-side hashing.
         // `pk_select` already projects columns in the table's declared PK
         // order, so the resulting batch satisfies the server-side
         // column-order invariant in `insert_delete_pk_batches`.
@@ -787,12 +767,11 @@ impl<'a> DmlExecutor<'a> {
 }
 
 /// Per-(branch, table) advisory lock key shared by strict-INSERT and
-/// UPDATE-rewrites-PK collision-probe critical sections. Unifying the
-/// key under `dml:pk-collision:` (was `dml:strict-insert:`) lets a
-/// concurrent INSERT and UPDATE-PK targeting the same destination PK
-/// serialize against each other; without unification, each could pass
-/// its own probe before the other commits and both writes would land
-/// at the same `row_uuid` (last-writer-wins data loss).
+/// UPDATE-rewrites-PK collision-probe critical sections. The two MUST
+/// share one key: otherwise a concurrent INSERT and UPDATE-PK targeting
+/// the same destination PK could each pass its own probe before the
+/// other commits, and both writes would land at the same `row_uuid`
+/// (last-writer-wins data loss).
 fn pk_collision_lock_key(branch_uuid: &str, table_uuid: &Uuid) -> String {
     format!("dml:pk-collision:{branch_uuid}:{table_uuid}")
 }
@@ -857,11 +836,10 @@ async fn check_pk_collisions(
             // second collision.
             open_tx_uuid: open_tx_uuid.map(|s| s.to_string()),
             filter: Some(filter),
-            // The collision check filters by derived row_uuid, not PK
-            // values, so the scan-side ids PK-batch pushdown (CHA-426)
-            // does not apply to this request.
+            // The collision check filters by derived row_uuid, not PK values,
+            // so neither the scan-side ids PK-batch pushdown nor a structured
+            // secondary-index seek applies to this request.
             ids: Vec::new(),
-            // CHA-492: nor a structured secondary-index seek.
             indexes: Vec::new(),
         })
         .await?
@@ -947,15 +925,13 @@ async fn fetch_table(
             catalog_uuid: None,
             schema_uuid: None,
             table_uuid: None,
-            // CHA-345: tx-aware target resolution — a table (and its
-            // parent schema) created earlier in the same tx must resolve
-            // so an in-tx DML against it sees it. The server resolves
-            // schema_uuid/table_uuid against the open tx's read snapshot
-            // (ResolvedScope::resolve_read_snapshot).
+            // Tx-aware target resolution: a table (and its parent schema)
+            // created earlier in the same tx must resolve so an in-tx DML
+            // against it sees it. The server resolves schema_uuid/table_uuid
+            // against the open tx's read snapshot.
             open_tx_uuid: open_tx_uuid.map(|s| s.to_string()),
             as_of_micros: None,
-            // CHA-460: in-tx DML resolves via the open tx (RYOW), never the
-            // seq pin — the seq axis stays unset on this path.
+            // In-tx DML resolves via the open tx (RYOW), never the seq pin.
             as_of_seq: None,
         })
         .await?
@@ -980,17 +956,14 @@ async fn send_change(
     let (author, comment) = if tx_uuid.is_some() {
         (None, None)
     } else {
-        // TODO(CHA-159): once auth lands as gRPC interceptors on the
-        // microservices and penca-sql-server proxies request headers
-        // through, the WriteService will derive `Tx.author` from the
-        // authenticated principal and this caller stops setting
-        // `WriteDataRequest.author` entirely. Empty string until then
-        // — claiming any specific identity (e.g. "penca-sql-server")
-        // would just be wrong audit info.
-        // TODO(CHA-160): replace with a value sourced from Flight SQL
-        // session properties (e.g. `application_name`). Empty string is
-        // a placeholder that satisfies the NOT NULL constraint without
-        // claiming any meaningful audit info.
+        // Empty strings satisfy the NOT NULL constraint without claiming any
+        // meaningful audit info — naming a specific identity (e.g.
+        // "penca-sql-server") would just be wrong.
+        // TODO(CHA-159): once auth lands as gRPC interceptors, the WriteService
+        // derives `Tx.author` from the authenticated principal and this caller
+        // stops setting `WriteDataRequest.author` entirely.
+        // TODO(CHA-160): source the comment from Flight SQL session properties
+        // (e.g. `application_name`).
         (Some(String::new()), Some(String::new()))
     };
     let mut client = WriteServiceClient::new(write_channel.clone());
@@ -1099,8 +1072,8 @@ fn concat_user_batches(
     ))
 }
 
-/// Build the PK batch fed to `Change.deletes` for a PK-changing UPDATE
-/// (CHA-237). Picks the pre-SET PK columns out of the SELECT output
+/// Build the PK batch fed to `Change.deletes` for a PK-changing UPDATE.
+/// Picks the pre-SET PK columns out of the SELECT output
 /// (carried under their per-call UUID aliases), renames them back to
 /// plain PK names in declared order, and casts each to its declared
 /// user_schema type. The resulting batch matches the column-order +
@@ -1247,10 +1220,9 @@ fn combine_batches(batches: &[RecordBatch], columns: &[Ident]) -> Result<RecordB
         .map_err(|e| Status::internal(format!("failed to rename INSERT source columns: {e}")))
 }
 
-/// Status-mapping adapter over the canonical encoder in
-/// `penca-datafusion` (CHA-426 collapsed the duplicated IPC-writer
-/// body); the encoding itself lives in one place for both the write
-/// path and the scan-side `ids` batch.
+/// Status-mapping adapter over the canonical encoder in `penca-datafusion`;
+/// the encoding itself lives in one place for both the write path and the
+/// scan-side `ids` batch.
 fn encode_batch_ipc(batch: &RecordBatch) -> Result<Vec<u8>, Status> {
     penca_datafusion::encode_batch_ipc(batch)
         .map_err(|e| Status::internal(format!("failed to encode Arrow IPC batch: {e}")))

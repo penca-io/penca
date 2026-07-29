@@ -1,4 +1,4 @@
-//! Cross-driver SQL-entry classifier (CHA-259).
+//! Cross-driver SQL-entry classifier.
 //!
 //! Every Flight SQL entry-point that takes raw SQL — `do_put_statement_update`,
 //! `do_action_create_prepared_statement`, `do_put_prepared_statement_update`,
@@ -6,15 +6,12 @@
 //! pattern-match the parsed [`SqlStatement`] against the same dispatch arms
 //! (SET, transaction control, DML, SELECT) and reject unsupported variants
 //! with the same wording. Each handler implementing that match independently
-//! is how the routing drifted enough that JDBC `CREATE TABLE` produced
+//! is how the routing drifts: JDBC `CREATE TABLE` once produced
 //! `Execution("schema provider does not support registering tables")` while
-//! ADBC `CREATE TABLE` produced the actionable CHA-172 rejection — same SQL,
-//! same intent, different per-driver path through the server (see [CHA-257]
-//! for the surface). This module centralizes the classification step so the
-//! per-handler differences collapse to one match, and a future routing-arm or
-//! rejection-wording change touches one site.
-//!
-//! [CHA-257]: https://linear.app/chapala/issue/CHA-257
+//! ADBC `CREATE TABLE` produced the actionable rejection — same SQL, same
+//! intent, different per-driver path through the server. Centralizing the
+//! classification step collapses the per-handler differences to one match, so
+//! a routing-arm or rejection-wording change touches one site.
 //!
 //! ## Driver wire-action audit
 //!
@@ -44,10 +41,10 @@
 //! load-bearing asymmetric helper that accepts DML / BEGIN / COMMIT /
 //! ROLLBACK at prepare time so the driver can route them to
 //! `DoPutPreparedStatementUpdate`). All three call [`classify`] before
-//! dispatch. `crate::dml::execute` matches only `Insert | Update | Delete`
-//! after this commit; reaching its catch-all arm raises `Status::internal`
-//! because that means the gateway invariant broke. The canonical place a
-//! future "what does Penca do with `CREATE INDEX`?" change lives is here.
+//! dispatch. `crate::dml::execute` matches only `Insert | Update | Delete`;
+//! reaching its catch-all arm raises `Status::internal` because that means the
+//! gateway invariant broke. The canonical place a future "what does Penca do
+//! with `CREATE INDEX`?" change lives is here.
 
 use std::sync::Arc;
 
@@ -75,15 +72,14 @@ pub(crate) struct PreparedPlan {
     pub(crate) rewritten_sql: Option<String>,
     pub(crate) dataset_plan: LogicalPlan,
     pub(crate) parameter_plan: LogicalPlan,
-    /// CHA-367: `true` when `dataset_plan` is the same logical plan
+    /// `true` when `dataset_plan` is the same logical plan
     /// `get_flight_info_prepared_statement` would rebuild for this statement —
     /// so `do_action_create_prepared_statement` can cache it and stamp its
     /// `statement_uuid` on the handle, letting GetFlightInfo reuse it instead of
-    /// re-planning (the cross-pass half of the resolution-dedup work). `true`
-    /// for Select / Set, whose `dataset_plan` IS the query / placeholder plan
-    /// that reaches GetFlightInfo + DoGet; `false` for Dml / Ddl / tx control,
-    /// whose `dataset_plan` is an empty steering relation and which route to
-    /// DoPut, never GetFlightInfo.
+    /// re-planning. `true` for Select / Set, whose `dataset_plan` IS the query /
+    /// placeholder plan that reaches GetFlightInfo + DoGet; `false` for Dml /
+    /// Ddl / tx control, whose `dataset_plan` is an empty steering relation and
+    /// which route to DoPut, never GetFlightInfo.
     pub(crate) dataset_plan_reusable_at_getflightinfo: bool,
 }
 
@@ -127,14 +123,13 @@ pub(crate) enum Classified {
     /// the parsed node instead of re-serializing + re-parsing the
     /// original SQL string.
     Select(SqlStatement),
-    /// `CREATE SCHEMA` / `CREATE TABLE`, auto-commit (CHA-172) or
-    /// transactional (CHA-345). Routes to [`crate::ddl::execute`] via the
-    /// dispatcher in [`execute_update`], which threads
-    /// `snapshot.open_tx_uuid` into the WriteService request — `None`
-    /// auto-commits, `Some` writes under the open tx. The carried
-    /// [`DdlKind`] is the typed two-variant subspace built at the
-    /// classifier boundary — no `unreachable!()` branch at the
-    /// dispatcher.
+    /// `CREATE SCHEMA` / `CREATE TABLE`, auto-commit or transactional.
+    /// Routes to [`crate::ddl::execute`] via the dispatcher in
+    /// [`execute_update`], which threads `snapshot.open_tx_uuid` into
+    /// the WriteService request — `None` auto-commits, `Some` writes
+    /// under the open tx. The carried [`DdlKind`] is the typed
+    /// two-variant subspace built at the classifier boundary — no
+    /// `unreachable!()` branch at the dispatcher.
     Ddl(DdlKind),
 }
 
@@ -144,13 +139,11 @@ pub(crate) enum Classified {
 /// Returns `Err(Status::failed_precondition(...))` for statements
 /// outside the supported set, via [`unsupported_statement`]. The
 /// supported set is the same in both auto-commit and transactional
-/// context after CHA-345: `INSERT/UPDATE/DELETE` and `CREATE SCHEMA` /
-/// `CREATE TABLE`. The unsupported variants (`DROP …`, `ALTER …`,
-/// `CREATE INDEX`, `CREATE VIEW`, …) point at the gRPC WriteService;
-/// the in-tx wording differs only in noting which variants are in
-/// scope, not in any architectural claim (ADR 0010's "permanent" in-tx
-/// gating was retired by CHA-345 — the open tx now threads through the
-/// `ConnScope` cell to `PencaSchemaProvider::table`).
+/// context: `INSERT/UPDATE/DELETE` and `CREATE SCHEMA` / `CREATE TABLE`.
+/// The unsupported variants (`DROP …`, `ALTER …`, `CREATE INDEX`,
+/// `CREATE VIEW`, …) point at the gRPC WriteService; the in-tx wording
+/// differs only in noting which variants are in scope, not in any
+/// architectural claim.
 ///
 /// `CREATE SCHEMA` / `CREATE TABLE` route to [`Classified::Ddl`]
 /// regardless of `snapshot.open_tx_uuid`; the dispatcher threads the
@@ -168,13 +161,11 @@ pub(crate) fn classify(
             Ok(Classified::Dml(s))
         }
         s @ SqlStatement::Query(_) => Ok(Classified::Select(s)),
-        // CHA-345: `CREATE TABLE` / `CREATE SCHEMA` route to the DDL
-        // translator whether or not a tx is open. In-tx, `ddl::execute`
-        // threads `snapshot.open_tx_uuid` into the WriteService request
-        // so the metadata row is written under the tx (CHA-164) and
-        // resolves on the tx's own subsequent reads (the ConnScope cell,
-        // IMPL-1). The former `open_tx_uuid.is_none()` guard — and the
-        // ADR-0010 architectural blocker behind it — is gone.
+        // `CREATE TABLE` / `CREATE SCHEMA` route to the DDL translator whether
+        // or not a tx is open. In-tx, `ddl::execute` threads
+        // `snapshot.open_tx_uuid` into the WriteService request so the metadata
+        // row is written under the tx and resolves on the tx's own subsequent
+        // reads via the ConnScope cell.
         SqlStatement::CreateTable(ct) => Ok(Classified::Ddl(DdlKind::CreateTable(Box::new(ct)))),
         SqlStatement::CreateSchema {
             schema_name,
@@ -203,16 +194,12 @@ pub(crate) fn classify(
 /// ALTER / CREATE INDEX / CREATE VIEW / etc. — in both auto-commit and
 /// transactional context (the `CREATE SCHEMA` / `CREATE TABLE` pair is
 /// intercepted by `classify` before reaching here regardless of tx
-/// state, post-CHA-345).
+/// state).
 fn unsupported_statement(snapshot: &SessionSnapshot, other: &SqlStatement) -> Status {
     if snapshot.open_tx_uuid.is_some() {
-        // CHA-345: `CREATE SCHEMA` / `CREATE TABLE` are now supported
-        // in-tx (intercepted by `classify` before reaching here). The
-        // variants that land here — DROP / ALTER / CREATE INDEX /
-        // CREATE VIEW — are simply not yet implemented on the Flight SQL
-        // surface, the same status as their auto-commit forms. No
-        // architectural blocker (ADR 0010's "permanent" framing was
-        // retired by CHA-345); use the gRPC WriteService meanwhile.
+        // The variants that land here are not yet implemented on the Flight SQL
+        // surface, the same status as their auto-commit forms — no
+        // architectural blocker.
         Status::failed_precondition(format!(
             "this Flight SQL endpoint supports transactional `CREATE SCHEMA` / \
              `CREATE TABLE` (CHA-345) plus INSERT / UPDATE / DELETE inside a \
@@ -234,10 +221,7 @@ fn unsupported_statement(snapshot: &SessionSnapshot, other: &SqlStatement) -> St
 /// update handler constructs one on entry from its borrows of
 /// `FlightSqlService` (`write_channel` / `query_channel` / `pool`) and
 /// `FlightSqlSessionContext` (`session_ctx` / `snapshot` / `conn`),
-/// then hands the bundle into the gateway. Lets [`execute_update`]
-/// drop its 8-arg signature (`#[allow(clippy::too_many_arguments)]`)
-/// to three meaningful args — the bundle plus what's unique per
-/// call: `sql` and `transaction_id`. Mirrors the
+/// then hands the bundle into the gateway. Mirrors the
 /// [`crate::dml::DmlExecutor`] shape one layer up.
 pub(crate) struct UpdateCtx<'a> {
     pub(crate) session_ctx: &'a SessionContext,
@@ -264,7 +248,7 @@ pub(crate) struct UpdateCtx<'a> {
 /// * `Select` → `Err(invalid_argument)` — SELECT belongs on
 ///   `GetFlightInfo` + `DoGet`, not the update entry-points.
 /// * DDL / other → propagates the `failed_precondition` Status
-///   [`classify`] minted (CHA-172 / ADR 0010 wording).
+///   [`classify`] minted.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -284,12 +268,10 @@ pub(crate) async fn execute_update(
 ) -> Result<i64, Status> {
     let stmt = crate::parse::parse_one_statement(sql)?;
     let classified = classify(stmt, gctx.snapshot)?;
-    // Parameter binding (CHA-333) is supported only by the DML arm
-    // today — specifically `execute_insert`, which threads the values
-    // through DataFusion's `with_param_values` on the planned VALUES /
-    // SELECT source. SET / BEGIN / COMMIT / ROLLBACK / DDL have no
-    // placeholder surface; UPDATE / DELETE could grow it in a
-    // follow-up but the wire path doesn't yet. Reject non-DML calls
+    // Parameter binding is supported only by the DML arm — specifically
+    // `execute_insert`, which threads the values through DataFusion's
+    // `with_param_values` on the planned VALUES / SELECT source. SET / BEGIN /
+    // COMMIT / ROLLBACK / DDL have no placeholder surface. Reject non-DML calls
     // with parameters rather than silently dropping them.
     if params.is_some() && !matches!(classified, Classified::Dml(_)) {
         return Err(Status::unimplemented(
@@ -372,7 +354,7 @@ pub(crate) async fn execute_update(
 ///   These belong on the update entry-points; surfacing them here
 ///   means a misbehaving client.
 /// * DDL / other unsupported → propagates the `failed_precondition`
-///   Status [`classify`] minted (CHA-172 / ADR 0010 wording).
+///   Status [`classify`] minted.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -448,11 +430,9 @@ pub(crate) async fn plan_for_get_flight_info(
 ///   both `dataset_plan` and `parameter_plan` are the empty
 ///   `EmptyRelation`. Tx control never carries parameters.
 /// * DDL / other → propagates the `failed_precondition` Status
-///   [`classify`] minted (CHA-172 / ADR 0010 wording). This is the
-///   load-bearing fix for the JDBC residual gap from CHA-257 —
-///   `CREATE TABLE` now rejects with the actionable wording *before*
-///   DataFusion's planner sees the statement and bails with
-///   `register_table`.
+///   [`classify`] minted. Rejecting here is load-bearing: it happens
+///   *before* DataFusion's planner sees the statement and bails with
+///   an opaque `register_table` error.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -491,23 +471,11 @@ pub(crate) async fn plan_for_create_prepared_statement(
         }
         Classified::Dml(stmt) => {
             tracing::Span::current().record("arm", "dml");
-            // CHA-333: dataset plan stays empty so the JDBC driver
-            // picks the update path (empty dataset_schema heuristic),
-            // but the parameter plan must reflect the actual `?`
-            // placeholders in the SQL so the driver's prepare-time
-            // parameter_schema is populated and `setXxx(N, value)`
-            // doesn't fail with "ordinal N out of range". For INSERT
-            // we plan the FULL statement (not just the VALUES source)
-            // so DataFusion infers placeholder types from the target
-            // table's column schema — `VALUES (?, ?)` standalone has
-            // no typing context and would error with "unable to
-            // determine type of query parameter ?". For UPDATE /
-            // DELETE the binding path isn't wired through
-            // `execute_update` yet (`dml::execute` rejects params for
-            // non-INSERT), so we keep an empty parameter plan and the
-            // driver will surface "ordinal out of range" if a user
-            // tries to bind — which is the right failure mode until
-            // UPDATE / DELETE binding lands.
+            // The dataset plan stays empty so the JDBC driver picks the update
+            // path (empty dataset_schema heuristic), but the parameter plan
+            // must reflect the actual `?` placeholders so the driver's
+            // prepare-time parameter_schema is populated and `setXxx(N, value)`
+            // doesn't fail with "ordinal N out of range".
             let parameter_plan = parameter_plan_for_dml(ctx, sql, &stmt).await?;
             Ok(PreparedPlan {
                 rewritten_sql: None,
@@ -528,13 +496,10 @@ pub(crate) async fn plan_for_create_prepared_statement(
         }
         Classified::Ddl(_) => {
             tracing::Span::current().record("arm", "ddl");
-            // Auto-commit DDL (CHA-172). Empty dataset_schema steers
-            // the JDBC driver to DoPutPreparedStatementUpdate via the
-            // "empty schema = update path" heuristic (same shape as
-            // Dml / StartTx / Commit / Rollback). DDL carries no `?`
-            // placeholders so parameter_plan is empty too. The
-            // execute leg re-classifies via `execute_update` and
-            // routes the original SQL into `crate::ddl::execute_*`.
+            // Empty dataset_schema steers the JDBC driver to
+            // DoPutPreparedStatementUpdate via the "empty schema = update path"
+            // heuristic (same shape as Dml / StartTx / Commit / Rollback). DDL
+            // carries no `?` placeholders so parameter_plan is empty too.
             Ok(PreparedPlan {
                 rewritten_sql: None,
                 dataset_plan: empty_update_plan(),
@@ -575,17 +540,12 @@ async fn parameter_plan_for_dml(
         match ctx.sql(&rewritten).await {
             Ok(df) => return Ok(df.into_unoptimized_plan()),
             Err(e) => {
-                // Soft-fall-back. ON CONFLICT, RETURNING, and other
-                // surfaces DataFusion's planner rejects still need
-                // to walk DoPutPreparedStatementUpdate successfully
-                // for the non-parameterized case; the actual SQL
-                // executes via Penca's own dispatch in
-                // `dml::execute`, not via DataFusion.
-                //
-                // Log the swallowed error at debug so a future
-                // surface (typo'd table, syntax error, new
-                // DataFusion rejection class) is observable without
-                // changing the wire-level fall-back semantics.
+                // Soft-fall-back. ON CONFLICT, RETURNING, and other surfaces
+                // DataFusion's planner rejects still need to walk
+                // DoPutPreparedStatementUpdate successfully for the
+                // non-parameterized case; the actual SQL executes via Penca's
+                // own dispatch in `dml::execute`, not via DataFusion. Log the
+                // swallowed error so a new rejection class stays observable.
                 tracing::debug!(
                     error = %e,
                     "parameter_plan_for_dml: ctx.sql failed; falling back to empty parameter plan",
@@ -612,9 +572,8 @@ async fn parameter_plan_for_dml(
 /// resolution), but a future caller that uses the rewritten string
 /// for anything else needs to add comment-skip handling.
 pub(crate) fn rewrite_jdbc_placeholders(sql: &str) -> String {
-    // Fast path: non-prepared ADBC writes never carry `?`. Skip the
-    // full string scan + per-char branching for the common case.
-    // (`memchr` under the hood; cheap.)
+    // Fast path: non-prepared ADBC writes never carry `?`. Skips the full
+    // per-char scan for the common case (`contains` is memchr under the hood).
     if !sql.contains('?') {
         return sql.to_string();
     }
@@ -667,10 +626,8 @@ fn empty_update_plan() -> LogicalPlan {
 }
 
 /// Plan a SQL string via DataFusion's full parser+planner. Used for
-/// the `SET` arm's placeholder. Mirrors the body of the
-/// `FlightSqlSessionContext::sql_to_logical_plan` helper deleted in
-/// this commit; lifted here so the gateway is the single source of
-/// the planning shape Flight SQL uses.
+/// the `SET` arm's placeholder. Lives here so the gateway is the single
+/// source of the planning shape Flight SQL uses.
 async fn plan_sql(
     ctx: &SessionContext,
     sql_options: Option<SQLOptions>,
@@ -792,9 +749,6 @@ mod tests {
         assert!(matches!(out, Classified::Select(SqlStatement::Query(_))));
     }
 
-    /// CHA-172 — auto-commit `CREATE TABLE` now routes to the
-    /// `Classified::Ddl` arm; the dispatcher in `execute_update`
-    /// destructures + calls `crate::ddl::execute_create_table`.
     #[test]
     fn create_table_auto_commit_routes_to_ddl_arm() {
         let out = classify_sql("CREATE TABLE t (id BIGINT, PRIMARY KEY(id))", None).unwrap();
@@ -804,8 +758,6 @@ mod tests {
         );
     }
 
-    /// CHA-172 — auto-commit `CREATE SCHEMA` mirrors the table side
-    /// and routes to the same `Classified::Ddl` arm.
     #[test]
     fn create_schema_auto_commit_routes_to_ddl_arm() {
         let out = classify_sql("CREATE SCHEMA s", None).unwrap();
@@ -815,11 +767,8 @@ mod tests {
         );
     }
 
-    /// CHA-345 — transactional `CREATE TABLE` now routes to the DDL
-    /// translator, same as the auto-commit case. CHA-255 paid Option
-    /// A's per-conn catalog-tree cost, so the `open_tx_uuid` guard the
-    /// classifier used to apply is gone: in-tx CREATE threads the open
-    /// tx_uuid into `WriteService::CreateTable` (see IMPL-2 / ddl.rs).
+    /// In-tx CREATE routes to the DDL translator, same as the auto-commit
+    /// case, threading the open tx_uuid into `WriteService::CreateTable`.
     #[test]
     fn create_table_in_tx_routes_to_ddl_arm() {
         let out = classify_sql(
@@ -833,8 +782,6 @@ mod tests {
         );
     }
 
-    /// CHA-345 — transactional `CREATE SCHEMA` mirrors the table side:
-    /// routes to the DDL translator inside an open tx.
     #[test]
     fn create_schema_in_tx_routes_to_ddl_arm() {
         let out = classify_sql("CREATE SCHEMA s", Some("tx-abc")).unwrap();
@@ -844,22 +791,16 @@ mod tests {
         );
     }
 
-    /// CHA-345 — in-tx DDL *outside* the supported CREATE pair (`DROP`,
-    /// `ALTER`, `CREATE INDEX`, `CREATE VIEW`) still rejects, but the
-    /// wording no longer claims transactional DDL is architecturally
-    /// unsupported per ADR 0010 (that premise is false post-CHA-345).
-    /// It points at the gRPC WriteService, parallel to the auto-commit
-    /// framing for the same variants.
+    /// In-tx DDL *outside* the supported CREATE pair (`DROP`, `ALTER`,
+    /// `CREATE INDEX`, `CREATE VIEW`) still rejects, but the wording must not
+    /// claim transactional DDL is architecturally unsupported — those variants
+    /// are merely not-yet-implemented, like their auto-commit forms. It points
+    /// at the gRPC WriteService, parallel to the auto-commit framing.
     #[test]
     fn drop_table_in_tx_rejects_without_architectural_wording() {
         let err = classify_sql("DROP TABLE t", Some("tx-abc")).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         let msg = err.message();
-        // Post-CHA-345 the in-tx rejection for the still-unsupported
-        // variants no longer frames transactional DDL as an architectural
-        // blocker — it's just not-yet-implemented, like its auto-commit
-        // form. So no "ADR 0010", no "architecturally", no "intentionally
-        // unsupported", no "permanently".
         assert!(
             !msg.contains("ADR 0010")
                 && !msg.contains("architecturally")
@@ -877,10 +818,7 @@ mod tests {
     /// `DROP TABLE` and the other auto-commit DDL variants outside the
     /// supported `CREATE SCHEMA` / `CREATE TABLE` pair still reject, with
     /// wording that names the supported set and points users at the gRPC
-    /// WriteService for the unsupported half. CHA-345 dropped the
-    /// ticket-number citation from the supported-set phrasing (it now
-    /// reads "auto-commit or transactional"), so the assertion pins the
-    /// supported variants + WriteService + the offending statement.
+    /// WriteService for the unsupported half.
     #[test]
     fn drop_table_auto_commit_uses_the_generic_wording() {
         let err = classify_sql("DROP TABLE t", None).unwrap_err();
@@ -912,10 +850,7 @@ mod tests {
     /// `DoPutPreparedStatementUpdate`; if the prepare step errors,
     /// the JDBC client never gets to run the BEGIN. The execute leg
     /// re-routes the SQL through [`execute_update`] which actually
-    /// dispatches to `tx::handle_begin`. Pins the regression that
-    /// surfaced this — pre-fix, `[jdbc] test_create_table_inside_begin_rejects_with_adr_0010`
-    /// failed at step 0 (BEGIN) because the prepare path rejected
-    /// it as "update routed to GetFlightInfo".
+    /// dispatches to `tx::handle_begin`.
     #[tokio::test]
     async fn plan_for_create_prepared_statement_accepts_tx_control() {
         let ctx = Arc::new(SessionContext::new_with_state(
@@ -950,13 +885,10 @@ mod tests {
         }
     }
 
-    /// CHA-172 — auto-commit `CREATE SCHEMA` / `CREATE TABLE` must
-    /// prepare successfully now. JDBC's `Statement.execute("CREATE
-    /// TABLE …")` walks ActionCreatePreparedStatement →
-    /// DoPutPreparedStatementUpdate; if the prepare leg errored the
-    /// driver wouldn't get to execute. Mirrors the same empty
-    /// dataset-schema invariant as the tx-control test above so the
-    /// JDBC routing heuristic stays satisfied.
+    /// Auto-commit `CREATE SCHEMA` / `CREATE TABLE` must prepare
+    /// successfully: JDBC's `Statement.execute("CREATE TABLE …")` walks
+    /// ActionCreatePreparedStatement → DoPutPreparedStatementUpdate, so if
+    /// the prepare leg errored the driver would never get to execute.
     #[tokio::test]
     async fn plan_for_create_prepared_statement_accepts_ddl() {
         let ctx = Arc::new(SessionContext::new_with_state(
@@ -987,11 +919,9 @@ mod tests {
         }
     }
 
-    /// CHA-345 — transactional DDL prepares successfully now (JDBC
-    /// walks ActionCreatePreparedStatement → DoPutPreparedStatementUpdate
-    /// for in-tx `CREATE TABLE`; if prepare errored the driver couldn't
-    /// execute the CREATE). Mirrors the auto-commit DDL prepare test:
-    /// empty dataset_schema so the driver routes to the update path.
+    /// Transactional DDL must prepare successfully for the same reason as
+    /// the auto-commit case: empty dataset_schema so the driver routes to
+    /// the update path.
     #[tokio::test]
     async fn plan_for_create_prepared_statement_accepts_in_tx_ddl() {
         let ctx = Arc::new(SessionContext::new_with_state(
@@ -1037,11 +967,9 @@ mod tests {
         );
     }
 
-    /// CHA-172 — auto-commit DDL on the read entry-point is a
-    /// misbehaving client (DDL belongs on update entry-points,
-    /// same as DML). Pins the asymmetry between the prep helper
-    /// (accepts DDL — JDBC routes through prepare) and the read
-    /// helper (rejects DDL — it's never a read).
+    /// DDL on the read entry-point is a misbehaving client. Pins the
+    /// asymmetry between the prep helper (accepts DDL — JDBC routes through
+    /// prepare) and the read helper (rejects DDL — it's never a read).
     #[tokio::test]
     async fn plan_for_get_flight_info_rejects_ddl_as_misroute() {
         let ctx = Arc::new(SessionContext::new_with_state(

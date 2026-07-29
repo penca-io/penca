@@ -1,4 +1,4 @@
-//! `SET` statement dispatcher (CHA-119).
+//! `SET` statement dispatcher.
 //!
 //! Three Penca-specific knobs that DataFusion's planner doesn't know
 //! about plus a fall-through for the planner's own
@@ -11,7 +11,7 @@
 //!   and the unqualified-DML path in [`crate::dml`] (one source of
 //!   truth — no shadow field).
 //! - **`SET (penca.)branch = '<name>'`** — rejected with
-//!   `FAILED_PRECONDITION`. Branch is connection-scoped (CHA-119); a
+//!   `FAILED_PRECONDITION`. Branch is connection-scoped; a
 //!   client that wants a different branch reconnects. The bare and
 //!   namespaced forms are both intercepted because both refer to the
 //!   same knob.
@@ -36,8 +36,8 @@
 //! entry points rewrite the wire-level SQL to `SELECT 1 WHERE FALSE`
 //! after applying the SET, so the DoGet leg returns an empty result
 //! set instead of re-applying — matching the response shape ADBC /
-//! DataGrip expect for SET (per the 2026-05-06 ticket comment on the
-//! retry-loop the empty-FlightInfo response triggers).
+//! DataGrip expect for SET. An empty FlightInfo instead triggers
+//! DataGrip's retry loop.
 //!
 //! The per-key mutation logic lives in [`handle_set_option`], which
 //! is the canonical dispatcher both this SQL path and the Flight SQL
@@ -54,13 +54,12 @@ use crate::session::SessionSnapshot;
 /// applying a `SET`, so the subsequent DoGet returns a benign empty
 /// result rather than re-running the SET (which would be wasted work
 /// for an idempotent op) or returning an empty FlightInfo (which
-/// triggers DataGrip's 5-attempt retry loop — see the 2026-05-06
-/// ticket comment).
+/// triggers DataGrip's 5-attempt retry loop).
 pub const SET_PLACEHOLDER_SQL: &str = "SELECT 1 WHERE FALSE";
 
 /// Which surface invoked the dispatcher. The dispatcher's result
 /// genuinely depends on protocol for one case: SQL `SET branch = …`
-/// returns [`SetOptionError::Rejected`] (CHA-119 connection-scoped
+/// returns [`SetOptionError::Rejected`] (connection-scoped
 /// wording → `FAILED_PRECONDITION`); wire-level
 /// `SetSessionOptions(branch: …)` returns [`SetOptionError::InvalidName`]
 /// (→ Flight SQL `INVALID_NAME`) because branch has no wire analog —
@@ -138,7 +137,7 @@ pub(crate) enum SetOptionPlan {
 ///   knob names the Flight SQL `SetSessionOptions` action carries.
 ///   Surface-independent.
 /// - `branch` — surface-dependent. On `Sql`,
-///   [`SetOptionError::Rejected`] (CHA-119 connection-scoped wording).
+///   [`SetOptionError::Rejected`] (connection-scoped wording).
 ///   On `Wire`, [`SetOptionError::InvalidName`] (no wire-level analog).
 /// - `catalog` — Postgres `setCatalog`-as-no-op semantics.
 ///   [`SetOptionPlan::NoOp`] if the value matches the handshake pin;
@@ -169,8 +168,8 @@ pub(crate) fn plan_set_option(
 /// has already been validated against the session's state; apply is
 /// infallible. Sync because the only remaining mutation is the
 /// `default_schema` write on the cached `SessionContext` — no
-/// `catalog_store` round-trip on this path now that catalog binding
-/// is handshake-only (CHA-253).
+/// `catalog_store` round-trip on this path, because catalog binding
+/// is handshake-only.
 pub(crate) fn apply_plan(ctx: &SessionContext, plan: SetOptionPlan) {
     match plan {
         SetOptionPlan::NoOp => {}
@@ -195,9 +194,9 @@ pub(crate) fn handle_set_option(
     Ok(())
 }
 
-/// Apply the surface-dependent branch outcome. SQL preserves CHA-119
-/// (connection-scoped reject); Wire emits `INVALID_NAME` because
-/// branch has no wire-level analog.
+/// Apply the surface-dependent branch outcome. SQL rejects as
+/// connection-scoped; Wire emits `INVALID_NAME` because branch has no
+/// wire-level analog.
 fn handle_branch(surface: SetOptionSurface) -> SetOptionError {
     match surface {
         SetOptionSurface::Sql => SetOptionError::Rejected(connection_scoped_message("branch")),
@@ -205,8 +204,8 @@ fn handle_branch(surface: SetOptionSurface) -> SetOptionError {
     }
 }
 
-/// Plan a catalog setter against the session's pinned catalog
-/// (CHA-253). Postgres `Connection.setCatalog`-as-no-op semantics:
+/// Plan a catalog setter against the session's pinned catalog.
+/// Postgres `Connection.setCatalog`-as-no-op semantics:
 /// match → `NoOp`; mismatch → `Rejected` with the handshake-pinned
 /// wording. Reads from the per-request snapshot — the cached catalog
 /// is immutable after mint, so the snapshot is authoritative.
@@ -234,10 +233,9 @@ fn plan_catalog(
 /// The write borrows DataFusion's internal `Arc<RwLock<SessionState>>`
 /// briefly. Concurrent `ctx.sql(...)` callers block on the read lock
 /// during this window; in practice ADBC serialises statement execution
-/// per connection, so the window is never contended. (`default_schema`
-/// still lives on `SessionConfig`; the open tx moved to the `ConnScope`
-/// cell in CHA-345, so this is now the only runtime mutation of the
-/// cached `SessionState`.)
+/// per connection, so the window is never contended. This is the only
+/// runtime mutation of the cached `SessionState` — the open tx lives on
+/// the `ConnScope` cell, not here.
 fn write_default_schema(ctx: &SessionContext, schema: String) {
     let state_lock = ctx.state_ref();
     let mut state = state_lock.write();
@@ -303,11 +301,10 @@ fn single_assignment_names(set: &Set) -> Option<Vec<String>> {
     }
 }
 
-/// MS-SQL-style `SET <name> <value>` — included for parity in case a
-/// future dialect lands one of our targets here. DFParser doesn't
-/// currently emit this for the Postgres `SET search_path = 'sales'`
-/// form, but the plan calls out matching both shapes so a dialect
-/// change doesn't silently slip a SET through unchecked.
+/// MS-SQL-style `SET <name> <value>`. DFParser doesn't currently emit this
+/// shape for the Postgres `SET search_path = 'sales'` form, but both shapes
+/// are matched so a dialect change can't silently slip a SET through
+/// unchecked.
 fn generic_session_param_names(set: &Set) -> Option<Vec<String>> {
     use datafusion::sql::sqlparser::ast::SetSessionParamKind;
     match set {
@@ -355,8 +352,7 @@ async fn dispatch_recognised(
 /// namespace. The set of recognized SQL-side keys is deliberately
 /// narrower than [`handle_set_option`]'s vocabulary — the SQL path
 /// only accepts `search_path` (Postgres-style), not `db_schema` /
-/// `schema` (ADBC/JDBC wire names), preserving exact CHA-119 surface
-/// for SQL clients.
+/// `schema` (ADBC/JDBC wire names).
 fn normalize_set_key(names: &[String]) -> Option<String> {
     let lower: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
     match lower.as_slice() {
@@ -560,8 +556,6 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.state().config_options().catalog.default_schema, "sales");
     }
-
-    // -- Direct tests of handle_set_option ----------------------------
 
     /// Schema aliases (`db_schema` / `schema`) are wire-side knob names
     /// the ADBC/JDBC `Connection.setSchema` path emits; the SQL surface

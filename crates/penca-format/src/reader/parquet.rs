@@ -26,7 +26,7 @@ use crate::uri::uri_to_object_path;
 
 /// A [`RowSelection`] that picks the physical row range `[offset, offset + length)`.
 ///
-/// A sliced compacted segment (CHA-168) is read by skipping the rows before
+/// A sliced compacted segment is read by skipping the rows before
 /// the slice and selecting exactly `length` rows.
 fn slice_selection(offset: usize, length: usize) -> RowSelection {
     let mut selectors = Vec::with_capacity(2);
@@ -54,8 +54,8 @@ impl FormatReader for ParquetFormatReader {
     ///
     /// `compact_persist_segments` merges N small files into one and
     /// re-points each input metadata row at a `(merged_uri, offset, length)`
-    /// slice of the merged file (CHA-168), and packed snapshot files address
-    /// one row range per partition (CHA-404), so the slice is expressed as a
+    /// slice of the merged file, and packed snapshot files address
+    /// one row range per partition, so the slice is expressed as a
     /// [`RowSelection`]. No predicate is pushed into the read — DataFusion
     /// filters the returned rows (ADR 0023).
     #[tracing::instrument(
@@ -88,7 +88,7 @@ impl FormatReader for ParquetFormatReader {
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
 
         let parquet_schema = builder.parquet_schema().clone();
-        // CHA-252: project only the requested columns that physically exist in
+        // Project only the requested columns that physically exist in
         // this segment file. A column added by a later `ALTER TABLE ADD COLUMN`
         // is absent from an older segment; it is null-filled to `output_schema`
         // after the read rather than erroring the projection. `present_names`

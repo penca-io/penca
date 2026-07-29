@@ -1,6 +1,6 @@
-//! Shared harness for the CHA-415 #3 merge fan-in floor.
+//! Shared harness for the merge fan-in floor bench.
 //!
-//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the CHA-411
+//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the
 //! `SnapshotTableProvider` path) over an in-memory cold base, so the bench
 //! measures the actual DataFusion exclusion anti-join + snapshot scan as hot
 //! churn (the exclusion-set size) grows. An in-memory `FormatReader` serves the
@@ -34,8 +34,8 @@ pub fn base_schema() -> SchemaRef {
 }
 
 /// Cold-base row counts the floor benches sweep: the 100k base by default, plus
-/// the 1M base when `PERF_FLOOR_MAX=1m`. Shared by the #2b point-lookup and #3
-/// merge fan-in benches (both `#[path]`-include this harness).
+/// the 1M base when `PERF_FLOOR_MAX=1m`. Shared by the point-lookup and merge
+/// fan-in benches (both `#[path]`-include this harness).
 pub fn bases() -> Vec<u64> {
     if matches!(
         std::env::var("PERF_FLOOR_MAX").as_deref(),
@@ -110,14 +110,15 @@ pub fn base_segment(size_bytes: i64) -> SnapshotSegment {
     }
 }
 
-/// The #3 snapshot-scan SQL: project the user cols, anti-join the exclusion set.
+/// The merge fan-in snapshot-scan SQL: project the user cols, anti-join the
+/// exclusion set.
 /// Mirrors the (crate-private) `build_cold_snapshot_scan` shape, as the penca-dl
 /// `scan_snapshot` tests do — the provider registers the segment under `l` and
 /// the exclusion `row_uuid`s under `exclusion`.
 pub const SCAN_SQL: &str = "SELECT l.row_uuid, l.\"name\", l.\"value\" FROM l \
      WHERE l.row_uuid NOT IN (SELECT row_uuid FROM exclusion)";
 
-/// The #2b cold point-lookup SQL: the production point-lookup plan — the
+/// The cold point-lookup SQL: the production point-lookup plan — the
 /// exclusion anti-join **plus** a PK equality residual, the exact shape
 /// `build_cold_snapshot_scan` always emits (`NOT IN (SELECT row_uuid FROM
 /// exclusion) AND (<residual>)`; the residual is never short-circuited, even for
@@ -125,8 +126,9 @@ pub const SCAN_SQL: &str = "SELECT l.row_uuid, l.\"name\", l.\"value\" FROM l \
 /// an EMPTY exclusion, so the anti-join runs over an empty set — the plan a point
 /// lookup with no hot overlay actually executes. DataFusion scans the full
 /// segment and applies the anti-semi-join + the residual `FilterExec` (ADR 0023 —
-/// no predicate pushdown); that O(rows) scan-and-filter is what CHA-410 /
-/// CHA-412 turn into O(log n). `target` selects the existing `row_uuid`
+/// no predicate pushdown); that O(rows) scan-and-filter is what the sort-order
+/// and secondary-index work turns into O(log n). `target` selects the existing
+/// `row_uuid`
 /// `r{target}`; a `target` past the base size selects no rows.
 pub fn point_lookup_sql(target: u64) -> String {
     format!(

@@ -1,9 +1,9 @@
-//! CHA-243 composite-tiebreaker merge resolution kernel.
+//! Composite-tiebreaker merge resolution kernel.
 //!
 //! The kernel is [`lex_compare_predicate`] — the lex-compare-as-OR/AND
 //! form of `(a, b) >= (c, d)`. Written out rather than SQL row-value
 //! comparison because DataFusion 52's executor schema for the row-value
-//! form doesn't match its planner schema (CHA-244). Built on top of
+//! form doesn't match its planner schema. Built on top of
 //! that, [`build_composite_merge_resolution`] produces the latest +
 //! deletes CTE pair and both tombstone-shadow predicates for the
 //! read-path callers.
@@ -33,8 +33,7 @@ pub fn lex_compare_predicate(
     )
 }
 
-/// CTE bodies + tombstone-shadow predicates for the CHA-243 composite
-/// tiebreaker. Returned by [`build_composite_merge_resolution`].
+/// CTE bodies + tombstone-shadow predicates for the composite tiebreaker. Returned by [`build_composite_merge_resolution`].
 ///
 /// Aliases used in the predicates are fixed: `l.` for the latest CTE,
 /// `d.` for the deletes CTE. Callers MUST alias their JOINed CTEs as
@@ -61,7 +60,7 @@ pub struct CompositeMergeResolution {
 }
 
 /// Build the latest + deletes CTEs and both tombstone-shadow predicates
-/// for the CHA-243 composite tiebreaker.
+/// for the composite tiebreaker.
 ///
 /// `upsert_source_sql` — a FROM-clause fragment (bare table/CTE name or
 /// parenthesized aliased subquery) producing rows of shape
@@ -74,21 +73,21 @@ pub struct CompositeMergeResolution {
 /// source SQLs — hot tier JOINs to commit_tx_log, cold tier reads inline,
 /// branch merge JOINs to source_committed_tx) and step 3 (splicing the
 /// returned CTEs + predicates into the final statement). The shared
-/// CHA-243 semantic — composite ordering key + lex tombstone-shadow —
-/// lives here, in one place.
+/// semantic — composite ordering key + lex tombstone-shadow — lives here,
+/// in one place.
 pub fn build_composite_merge_resolution<D: Dialect>(
     upsert_source_sql: &str,
     delete_source_sql: &str,
     user_cols: &[&str],
     order_primary: &str,
 ) -> CompositeMergeResolution {
-    // CHA-429: `order_primary` is the primary latest-wins ordering /
+    // `order_primary` is the primary latest-wins ordering /
     // tombstone-shadow key — `commit_seq_num` for read merge (the authoritative
     // commit order; `commit_micros` can tie under concurrency),
     // `commit_micros` for branch-merge (which discards source tx
-    // identities, so no per-tx seq is available). CHA-431: `write_seq_num`
-    // (the intra-tx mutation ordinal) is the within-tx secondary, replacing
-    // CHA-243's wall-clock secondary. The CTEs always carry `commit_micros`
+    // identities, so no per-tx seq is available). `write_seq_num` (the
+    // intra-tx mutation ordinal) is the within-tx secondary. The CTEs always
+    // carry `commit_micros`
     // (the final SELECT / cross-tier dedup output) even when it is not the
     // order key.
     let order_cols: [&str; 2] = [order_primary, "write_seq_num"];
@@ -152,11 +151,9 @@ pub fn build_composite_merge_resolution<D: Dialect>(
 mod tests {
     use super::*;
 
-    // -- lex_compare_predicate ----------------------------------------------
-
     #[test]
     fn lex_compare_predicate_non_strict_uses_geq_on_tiebreak() {
-        // The non-strict form is the canonical CHA-243 upsert-wins-on-tie
+        // The non-strict form is the canonical upsert-wins-on-tie
         // shape: `a > c OR (a = c AND b >= d)`. Tied `(a, c)` flows into
         // the AND branch and `>=` lets the visible side win.
         let p = lex_compare_predicate(
@@ -195,8 +192,6 @@ mod tests {
         );
     }
 
-    // -- build_composite_merge_resolution -----------------------------------
-
     /// Minimal `Dialect` stub for testing — produces deterministic
     /// strings so the assertions don't have to mirror PG or DF's
     /// `latest_per_partition` quirks.
@@ -217,7 +212,7 @@ mod tests {
 
     #[test]
     fn composite_merge_resolution_latest_cte_carries_user_cols_and_composite_order() {
-        // CHA-429: read merge orders on the commit-order serial; committed_at
+        // Read merge orders on the commit-order serial; committed_at
         // is still carried (final SELECT / cross-tier dedup output).
         let r = build_composite_merge_resolution::<StubDialect>(
             "upsert_src",

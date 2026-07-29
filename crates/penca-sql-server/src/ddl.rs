@@ -1,6 +1,6 @@
 //! SQL DDL → `WriteService::Create{Schema,Table}` translator for the
-//! `CREATE SCHEMA` / `CREATE TABLE` slice of the Flight SQL DDL surface
-//! (CHA-172 auto-commit; CHA-345 transactional).
+//! `CREATE SCHEMA` / `CREATE TABLE` slice of the Flight SQL DDL surface,
+//! both auto-commit and transactional.
 //!
 //! Counterpart to [`crate::dml`]: `dml` translates INSERT/UPDATE/DELETE
 //! into `WriteData{,AndCommitTx}` against the data path; `ddl`
@@ -9,19 +9,13 @@
 //! the two CREATE variants that unblock first-time SQL-client UX);
 //! everything else stays rejected by [`crate::gateway::classify`].
 //!
-//! CHA-345: the same two CREATE variants now work inside a Flight SQL
-//! `BEGIN`/`COMMIT` block. [`ddl_tx_identity`] threads the snapshot's
-//! `open_tx_uuid` into the request — `None` auto-commits, `Some` writes
-//! the metadata row under the open tx (the server honors it via
-//! `resolve_or_auto_commit_tx`, CHA-164). The architectural blocker
-//! ADR 0010 cited was retired once the open tx became reachable from
-//! `PencaSchemaProvider::table` via the `ConnScope` cell.
+//! [`ddl_tx_identity`] threads the snapshot's `open_tx_uuid` into the
+//! request — `None` auto-commits, `Some` writes the metadata row under
+//! the open tx (the server honors it via `resolve_or_auto_commit_tx`).
 //!
 //! Author/comment are carried (empty-string placeholder) only on the
 //! auto-commit path; in-tx they are omitted (the open tx carries its
-//! identity, recorded at `BeginTx`). The audit-identity follow-up is
-//! tracked in CHA-159 (gRPC interceptors) and CHA-160 (Flight SQL
-//! session properties). See [`ddl_tx_identity`].
+//! identity, recorded at `BeginTx`). See [`ddl_tx_identity`].
 
 use std::sync::Arc;
 
@@ -84,8 +78,7 @@ pub(crate) enum DdlKind {
 /// `"create_schema"` — analogous to `dml`'s `"insert"`/`"update"`/`"delete"`).
 /// `schema` / `table` record the target identifier when known; both
 /// stay `Empty` until the per-variant arm runs. `tx_uuid` records the
-/// open transaction (`<none>` for auto-commit) — CHA-345 made in-tx DDL
-/// reachable here, so it's a meaningful discriminator now.
+/// open transaction (`<none>` for auto-commit).
 #[tracing::instrument(
     skip_all,
     fields(
@@ -211,8 +204,8 @@ fn build_create_schema_request(
     })
 }
 
-/// CHA-345: resolve the `(tx_uuid, author, comment)` triple a
-/// WriteService DDL request carries, from the session snapshot.
+/// Resolve the `(tx_uuid, author, comment)` triple a WriteService DDL
+/// request carries, from the session snapshot.
 ///
 /// The server's `resolve_or_auto_commit_tx` couples the three: it
 /// *requires* author + comment for an auto-commit DDL (tx_uuid unset)
@@ -221,9 +214,10 @@ fn build_create_schema_request(
 /// * in-tx → `(Some(tx), None, None)`
 /// * auto-commit → `(None, Some(""), Some(""))`
 ///
-/// Empty author/comment are the CHA-159 / CHA-160 placeholder until
-/// audit identity is wired through; they satisfy the auto-commit
-/// NOT-NULL requirement without claiming an identity.
+/// Empty author/comment are a placeholder until audit identity is wired
+/// through (TODO(CHA-159) gRPC auth interceptors, TODO(CHA-160) Flight SQL
+/// session properties); they satisfy the auto-commit NOT-NULL requirement
+/// without claiming an identity.
 fn ddl_tx_identity(snapshot: &SessionSnapshot) -> (Option<String>, Option<String>, Option<String>) {
     match snapshot.open_tx_uuid.clone() {
         Some(tx) => (Some(tx), None, None),
@@ -270,8 +264,8 @@ fn extract_simple_schema_name(name: &ObjectName) -> Result<String, Status> {
 ///
 /// `default_schema` is consulted when the parsed name is a bare table
 /// identifier with no schema qualifier — matches DataFusion's
-/// `catalog.default_schema` resolution that the DML path also uses
-/// (CHA-119 search_path).
+/// `catalog.default_schema` resolution (search_path) that the DML path
+/// also uses.
 async fn execute_create_table(
     write_channel: &Channel,
     snapshot: &SessionSnapshot,
@@ -318,8 +312,8 @@ fn build_create_table_request(
         tx_uuid,
         author,
         comment,
-        // CHA-455: SQL-level CREATE INDEX is out of scope; the SQL DDL
-        // path defines no inline indexes.
+        // SQL-level CREATE INDEX is out of scope; the SQL DDL path defines
+        // no inline indexes.
         indexes: Vec::new(),
     })
 }
@@ -536,8 +530,8 @@ fn split_create_table_name(
 /// This is the extraction half only — empty / duplicate / undeclared
 /// PK validation lives one layer down at the API boundary in
 /// `penca-api::write::validate_create_table_primary_keys`, so both
-/// Flight SQL and direct gRPC callers see identical rejection wording
-/// (see CHA-172). Returns `Ok(vec![])` when no PK is declared and
+/// Flight SQL and direct gRPC callers see identical rejection wording.
+/// Returns `Ok(vec![])` when no PK is declared and
 /// `Ok(["id", "id"])` for duplicates — both surface clean errors at
 /// the API-layer validator, not here.
 ///
@@ -656,9 +650,9 @@ mod tests {
     }
 
     /// In-transaction variant of [`snapshot`] — same identifiers, but
-    /// `open_tx_uuid = Some(tx)`. CHA-345: transactional DDL via Flight
-    /// SQL threads the open tx into the WriteService request so the
-    /// metadata row is written under the tx (invisible until COMMIT).
+    /// `open_tx_uuid = Some(tx)`. Transactional DDL via Flight SQL threads
+    /// the open tx into the WriteService request so the metadata row is
+    /// written under the tx (invisible until COMMIT).
     fn snapshot_in_tx(tx_uuid: &str) -> SessionSnapshot {
         SessionSnapshot::for_test(
             "public",
@@ -716,8 +710,7 @@ mod tests {
         // create_schema_in_tx_threads_tx_uuid).
         assert!(req.tx_uuid.is_none());
         // Empty author/comment satisfy the NOT NULL constraint without
-        // claiming a specific identity; the audit identity TODO is
-        // tracked separately (CHA-159 / CHA-160).
+        // claiming a specific identity.
         assert_eq!(req.author.as_deref(), Some(""));
         assert_eq!(req.comment.as_deref(), Some(""));
     }

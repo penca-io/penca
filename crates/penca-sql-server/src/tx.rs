@@ -8,16 +8,15 @@
 //! atomically take the cached `(catalog_uuid, tx_uuid)` pair via
 //! [`ConnSession::take_open_tx`] and dispatch to `CommitTx` / `AbortTx`.
 //!
-//! Per [CHA-163](https://linear.app/chapala/issue/CHA-163), Penca
-//! transactions are catalog-scoped — a single tx spans every schema in its
+//! Penca transactions are catalog-scoped — a single tx spans every schema in its
 //! catalog. Cross-catalog atomicity is **not** supported (and would force
 //! 2PC across per-catalog commit_tx_logs); a DML against a different catalog is
 //! rejected by [`validate_session_catalog`] (used at the dml.rs entry
 //! point) with `FAILED_PRECONDITION`. The check fires whether or not a
-//! tx is open — catalog is a connection-level invariant (CHA-169), so a
+//! tx is open — catalog is a connection-level invariant, so a
 //! mismatch is an error in either mode.
 //!
-//! Wire payloads route by `branch_uuid` (rename-stable per CHA-255);
+//! Wire payloads route by `branch_uuid` (rename-stable);
 //! `branch_name` stays only on the [`SessionSnapshot`] for the
 //! `validate_branch_header` / `SET branch` rejection paths.
 //!
@@ -47,7 +46,7 @@ use crate::session::{ConnSession, SessionSnapshot};
 /// Rejected shapes:
 ///
 /// - `BEGIN ISOLATION LEVEL …` — no isolation-level knob; one mode (snapshot
-///   in an open Penca tx, with RYOW per CHA-165).
+///   in an open Penca tx, with RYOW).
 /// - `BEGIN READ ONLY` / `BEGIN READ WRITE` — Penca has no read-only tx
 ///   mode; accepting `READ ONLY` would mean later DML inside the tx
 ///   *should* fail and doesn't.
@@ -117,12 +116,12 @@ pub fn validate_start_transaction(stmt: &SqlStatement) -> Result<(), Status> {
 /// `tx_uuid` to the client.
 ///
 /// `snapshot` is the per-request [`SessionSnapshot`] taken at request
-/// entry. Used to address the `BeginTx` payload by `branch_uuid` (CHA-255
-/// — rename-stable) and to thread the `catalog_uuid` back to the caller.
+/// entry. Used to address the `BeginTx` payload by `branch_uuid`
+/// (rename-stable) and to thread the `catalog_uuid` back to the caller.
 /// `conn` is the per-TCP-connection [`ConnSession`]; `set_open_tx`
 /// records the new `tx_uuid` on the authoritative `open_tx_uuid` mutex
 /// and flips the `Arc`-shared `ConnScope.open_tx_cell` in one critical
-/// section (CHA-345 — the provider tree reads the cell; see
+/// section (the provider tree reads the cell; see
 /// [`ConnSession::set_open_tx`]).
 ///
 /// Rejects `FAILED_PRECONDITION` if the conn already has an open
@@ -201,9 +200,9 @@ pub async fn handle_commit(
     };
     tracing::Span::current().record("tx_uuid", tx_uuid.as_str());
     let mut client = WriteServiceClient::new(write_channel.clone());
-    // CommitTx is catalog-scoped (CHA-163) — schema is not part of
-    // the addressing. The branch is read from the session snapshot
-    // by uuid (CHA-255 — rename-stable); the WriteService uses
+    // CommitTx is catalog-scoped — schema is not part of the addressing.
+    // The branch is read from the session snapshot
+    // by uuid (rename-stable); the WriteService uses
     // it to target the leaf `commit_tx_log` / `begin_tx_log` /
     // `abort_tx_log` partitions directly.
     let req = CommitTxRequest {
@@ -220,8 +219,8 @@ pub async fn handle_commit(
         .map(|_| ())
 }
 
-/// Abort the session's open Penca transaction. Uses [`AbortTxRequest`] from
-/// CHA-162 to insert an `abort_tx_log` row, blocking any later `CommitTx` on
+/// Abort the session's open Penca transaction. Uses [`AbortTxRequest`]
+/// to insert an `abort_tx_log` row, blocking any later `CommitTx` on
 /// the same `tx_uuid` and letting the lifecycle sweeper eagerly purge orphan
 /// upsert/delete log rows.
 ///
@@ -292,7 +291,7 @@ pub fn validate_session_catalog(
 
 /// Name-level cross-catalog check fired by [`crate::dml::execute`] *before*
 /// the per-DML `get_table` round-trip. Necessary because the wire
-/// `get_table` routes by `branch_uuid` (CHA-255 — rename-stable), which
+/// `get_table` routes by `branch_uuid` (rename-stable), which
 /// is the conn's branch in the conn's catalog — addressing a different
 /// catalog with that uuid hits a missing partition on the server side
 /// (the partition table name hashes `(catalog_uuid, branch_uuid)`, so a
@@ -341,10 +340,9 @@ pub fn validate_session_catalog_name(
 /// 3. **No open tx** — return `None`. `WriteData` auto-commits its own
 ///    one-shot tx.
 ///
-/// The cross-catalog rejection that used to live here (CHA-163) moved up
-/// to [`validate_session_catalog`] (CHA-169). The session's catalog is a
-/// connection-level invariant, so the check fires before this function
-/// runs and applies in auto-commit mode too.
+/// The cross-catalog rejection lives in [`validate_session_catalog`], not
+/// here: the session's catalog is a connection-level invariant, so the check
+/// fires before this function runs and applies in auto-commit mode too.
 ///
 /// Pure function — operates on the snapshot, no cache hit. Per-session
 /// serialisation contract documented on [`handle_begin`] still holds:
@@ -371,10 +369,10 @@ async fn call_begin_tx(
     let req = BeginTxRequest {
         catalog_uuid: Some(catalog_uuid.to_string()),
         catalog_name: Some(catalog_name.to_string()),
-        // CHA-255: route by branch_uuid (rename-stable).
+        // Route by branch_uuid (rename-stable).
         branch_uuid: Some(branch_uuid.to_string()),
         branch_name: None,
-        // Empty until CHA-159 wires the auth interceptor in.
+        // TODO(CHA-159): populate from the auth interceptor's principal.
         author: String::new(),
         // BeginTx invoked by SQL `BEGIN` — no user-supplied comment.
         comment: String::new(),
@@ -402,9 +400,8 @@ fn map_write_service_status(s: Status) -> Status {
 mod tests {
     use super::*;
 
-    // CHA-236: namespace UUIDs are server-minted random values; tests
-    // use stable fixtures keyed by catalog name so the
-    // session-catalog-validation tests remain deterministic.
+    // Namespace UUIDs are server-minted random values, so tests use stable
+    // fixtures keyed by catalog name to stay deterministic.
     fn fixture_uuid_for(catalog_name: &str) -> String {
         penca_core::naming::deterministic_uuid_from(&[catalog_name, "test-fixture"]).to_string()
     }

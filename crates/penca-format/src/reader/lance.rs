@@ -91,7 +91,7 @@ impl LanceFormatReader {
         // is owned by DataFusion (ADR 0023). `read_stream`/`read_stream_projected`
         // still require a `FilterExpression` argument, so we always pass
         // `no_filter()`. (lance-file 4.0.0's core decoders ignore it regardless;
-        // CHA-339 tracks any future filter-aware decoding, which would still
+        // Any future filter-aware decoding would still
         // plug in through DataFusion rather than this argument.)
         let mut stream = match projection {
             Some(p) => reader.read_stream_projected(
@@ -126,7 +126,7 @@ impl FormatReader for LanceFormatReader {
     ///
     /// `compact_persist_segments` merges N small files into one and
     /// re-points each input metadata row at a `(merged_uri, offset,
-    /// length)` slice of the merged file (CHA-168); packed snapshot
+    /// length)` slice of the merged file; packed snapshot
     /// files address one row range per partition the same way
     /// (CHA-404).
     ///
@@ -153,7 +153,7 @@ impl FormatReader for LanceFormatReader {
     ) -> Result<RecordBatch, FormatError> {
         let output_schema = project_schema(schema, projection)?;
         let reader = self.open_file(uri).await?;
-        // CHA-252: project only the requested columns physically present in this
+        // Project only the requested columns physically present in this
         // segment file, then null-fill the rest to `output_schema`. A column
         // added by a later `ALTER TABLE ADD COLUMN` is absent from an older
         // segment; `ReaderProjection::from_column_names` would otherwise reject

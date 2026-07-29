@@ -3,8 +3,8 @@
 //! Per [ADR 0007](../../docs/decisions/0007-session-entity.md), a Penca SQL
 //! session is owned by one TCP connection. When the TCP conn closes
 //! (cleanly or via network drop), the session is gone — no cross-conn
-//! cookie reuse, no idle-eviction sweeper, no `SessionCache` DashMap
-//! (all removed in CHA-255). This matches how PostgreSQL scopes
+//! cookie reuse, no idle-eviction sweeper, no `SessionCache` DashMap.
+//! This matches how PostgreSQL scopes
 //! databases to a TCP connection: `psql` to a database, run statements,
 //! close the connection, state is gone.
 //!
@@ -13,14 +13,14 @@
 //! [`ConnSession`] holds everything the conn carries for its lifetime:
 //!
 //! - `catalog_uuid` / `catalog_name` — frozen at mint from the
-//!   `x-penca-catalog` header (CHA-253), falling back to
+//!   `x-penca-catalog` header, falling back to
 //!   `SQL_SERVER_DEFAULT_CATALOG`. Routing identity is by `catalog_uuid`;
 //!   `catalog_name` is the connection's self-described label, used for
 //!   `SET catalog` / `SetSessionOptions(catalog: …)` name comparisons
 //!   and for the `validate_catalog_header` per-request check.
 //! - `branch_uuid` / `branch_name` — frozen at mint from the
-//!   `x-penca-branch` header (CHA-119) and resolved to `branch_uuid`
-//!   via [`LifecycleManager::get_branch_by_name`] (CHA-255 — rename-stable
+//!   `x-penca-branch` header and resolved to `branch_uuid`
+//!   via [`LifecycleManager::get_branch_by_name`] (rename-stable
 //!   routing). `branch_uuid` flows into every wire payload that
 //!   addresses a branch; `branch_name` is the user-facing handle used
 //!   for header validation and the `SET branch` rejection text.
@@ -41,8 +41,7 @@
 //!   so the mutex is rarely contended but cheap insurance.
 //! - `default_schema_name` is **not** a field on `ConnSession` — it
 //!   lives on `SessionConfig.options.catalog.default_schema` inside
-//!   `ctx`. The schema write path (`crate::set::write_default_schema`)
-//!   is unchanged from CHA-119.
+//!   `ctx`; see `crate::set::write_default_schema` for the write path.
 //!
 //! [`ConnSessionFactory`] holds the deployment-level defaults (catalog,
 //! branch, schema, channels, template `SessionState`) and the entry
@@ -69,8 +68,8 @@ use penca_datafusion::{PinnedAsOfSeqGuard, PlanResolutionMemoCell, PlanResolutio
 
 /// The `Arc`-shared mutable cells `mint` threads from the owning
 /// [`ConnSession`] into the per-conn provider tree's [`ConnScope`]: the
-/// open-transaction projection (CHA-345) read during planning/scan, and the
-/// per-plan-build resolution memo (CHA-367). Bundled so [`ConnSessionFactory::build_ctx`]
+/// open-transaction projection read during planning/scan, and the
+/// per-plan-build resolution memo. Bundled so [`ConnSessionFactory::build_ctx`]
 /// takes one parameter for both instead of growing an argument per cell.
 struct SharedConnCells {
     open_tx_cell: Arc<RwLock<Option<String>>>,
@@ -87,7 +86,7 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 /// gRPC metadata header clients use to choose the connection's branch at
-/// handshake time (CHA-119). Branch is Penca-specific (no JDBC/ADBC
+/// handshake time. Branch is Penca-specific (no JDBC/ADBC
 /// analog). Pinned at conn-mint, immutable for the connection's lifetime,
 /// re-validated against [`ConnSession::branch_name`] on every request via
 /// [`crate::flight_sql::headers::validate_branch_header`].
@@ -96,7 +95,7 @@ use tonic::{Request, Status};
 pub const BRANCH_HEADER_NAME: &str = "x-penca-branch";
 
 /// gRPC metadata header clients use to choose the connection's catalog
-/// at handshake time (CHA-253). Catalog *does* have a JDBC analog
+/// at handshake time. Catalog *does* have a JDBC analog
 /// (`Connection.setCatalog`) but Penca models a connection as bound
 /// to one catalog (Postgres-shaped), so the binding is established at
 /// handshake — same shape as [`BRANCH_HEADER_NAME`] — rather than via
@@ -127,8 +126,8 @@ pub struct ConnSession {
     /// factory. Borrowed by per-request handlers (`ctx.sql(...)`). The
     /// catalog tree registered on it shares the `open_tx_cell` below, so
     /// no per-request `SessionContext` mutation is needed on
-    /// BEGIN/COMMIT/ROLLBACK (CHA-345 — the cell flip is the sole
-    /// per-request transaction signal to the provider tree). See ADR 0010.
+    /// BEGIN/COMMIT/ROLLBACK — the cell flip is the sole per-request
+    /// transaction signal to the provider tree. See ADR 0010.
     pub ctx: Arc<SessionContext>,
     /// `Some(tx_uuid)` while the connection has an open Penca
     /// transaction — the **authoritative** store (the `open_tx_cell`
@@ -141,20 +140,19 @@ pub struct ConnSession {
     /// [`Self::take_open_tx`] / [`Self::snapshot`] / `Drop`.** The
     /// two-place write under this `Mutex` (this field + the `open_tx_cell`
     /// shared with the provider tree) is load-bearing for RYOW + tx-aware
-    /// metadata correctness (CHA-345). A caller grabbing
+    /// metadata correctness. A caller grabbing
     /// `conn.open_tx_uuid.lock().await` and mutating inside the guard
     /// would bypass the cell write — the encapsulation is the structural
-    /// guarantee CHA-255 introduces.
+    /// guarantee.
     open_tx_uuid: Mutex<Option<String>>,
-    /// CHA-345: the read-side projection of `open_tx_uuid`, `Arc`-shared
+    /// The read-side projection of `open_tx_uuid`, `Arc`-shared
     /// with the per-conn provider tree via [`ConnScope::open_tx_cell`].
     /// `PencaSchemaProvider` / `PencaTableProvider` read it during
     /// planning (they can't take the conn's `Mutex`); `set_open_tx` /
     /// `take_open_tx` flip it in the same critical section that flips the
-    /// `Mutex` above, so the two never drift. See ADR 0010's CHA-345
-    /// addendum.
+    /// `Mutex` above, so the two never drift. See ADR 0010.
     open_tx_cell: Arc<RwLock<Option<String>>>,
-    /// CHA-374 / CHA-460: per-statement pinned auto-commit snapshot cell (a
+    /// Per-statement pinned auto-commit snapshot cell (a
     /// `commit_seq_num` frontier), `Arc`-shared with the provider tree via
     /// [`ConnScope::as_of_seq_cell`]. Installed for one statement's
     /// GetFlightInfo plan build / DoGet execute via
@@ -164,12 +162,12 @@ pub struct ConnSession {
     /// Cloned from the factory at mint and used by [`Drop`] to spawn
     /// the `AbortTx` call when the conn closes mid-tx.
     write_channel: Channel,
-    /// Per-connection logical-plan cache (CHA-355). `GetFlightInfo` stashes the
+    /// Per-connection logical-plan cache. `GetFlightInfo` stashes the
     /// statement-query plan here under a server-minted handle; `DoGet` reuses
     /// it instead of re-planning. Shared (by `Arc`) across the conn's HTTP/2
     /// streams; the cache's own `Mutex` serialises concurrent access.
     statement_cache: Arc<StatementCache>,
-    /// CHA-367: per-plan-build metadata-resolution memo cell, `Arc`-shared with
+    /// Per-plan-build metadata-resolution memo cell, `Arc`-shared with
     /// the provider tree via [`ConnScope::resolution_memo_cell`]. Installed for
     /// the duration of one plan build via [`Self::install_plan_resolution_memo`]
     /// so repeated `CatalogProvider::schema` / `SchemaProvider::table` calls
@@ -212,7 +210,7 @@ impl ConnSession {
     /// per-conn `open_tx_uuid` field and the `ConnScope` cell read by the
     /// provider tree (`PencaTableProvider::scan` for RYOW data reads,
     /// `PencaSchemaProvider::{table,table_names,table_exist}` for
-    /// tx-aware metadata reads — CHA-345). The two-place write under one
+    /// tx-aware metadata reads). The two-place write under one
     /// lock is load-bearing: skipping the cell write would make a table
     /// created mid-tx invisible to the same tx's reads.
     ///
@@ -233,8 +231,7 @@ impl ConnSession {
     /// Atomically clear the conn's open transaction and return its
     /// `(catalog_uuid, tx_uuid)` together. Returns `None` if no tx is
     /// open (bare COMMIT/ROLLBACK case). Clears the `ConnScope` cell in
-    /// the same critical section so the provider tree stops pinning the
-    /// tx (CHA-345).
+    /// the same critical section so the provider tree stops pinning the tx.
     pub async fn take_open_tx(&self) -> Option<(String, String)> {
         let mut guard = self.open_tx_uuid.lock().await;
         let tx_uuid = guard.take()?;
@@ -248,7 +245,7 @@ impl ConnSession {
         self.ctx.clone()
     }
 
-    /// Borrow the per-conn logical-plan cache (CHA-355). The Flight SQL
+    /// Borrow the per-conn logical-plan cache. The Flight SQL
     /// `GetFlightInfo` / `DoGet` handlers register and reuse statement-query
     /// plans through it. `pub(crate)` to match `StatementCache`'s visibility — the
     /// cache is an internal Flight SQL detail, not part of the crate's surface.
@@ -257,21 +254,21 @@ impl ConnSession {
     }
 
     /// Install a fresh per-plan-build resolution memo for the duration of one
-    /// `create_logical_plan` (CHA-367), returning an RAII guard that clears it
+    /// `create_logical_plan`, returning an RAII guard that clears it
     /// on drop. Bind the guard for the whole plan build; while it is alive the
     /// provider tree memoizes `get_schema`/`get_table` resolutions on the
     /// shared [`ConnScope`] cell, collapsing the repeated lookups DataFusion
     /// makes within one build to one gRPC each. Clearing on drop is what keeps
-    /// a resolution from leaking into a later statement (RYOW / mid-tx DDL —
-    /// CHA-345). Every Flight SQL planning entry point wraps its build in this
-    /// guard; a path that forgets to simply resolves live (no memo installed).
+    /// a resolution from leaking into a later statement (RYOW / mid-tx DDL).
+    /// Every Flight SQL planning entry point wraps its build in this guard;
+    /// a path that forgets to simply resolves live (no memo installed).
     #[must_use = "the memo is cleared when the guard drops; hold it across the plan build"]
     pub(crate) fn install_plan_resolution_memo(&self) -> PlanResolutionMemoGuard {
         PlanResolutionMemoGuard::install(self.resolution_memo_cell.clone())
     }
 
-    /// Pin the auto-commit read snapshot — a `commit_seq_num` frontier (CHA-374 /
-    /// CHA-460) — for the duration of one statement's GetFlightInfo plan build
+    /// Pin the auto-commit read snapshot — a `commit_seq_num` frontier — for
+    /// the duration of one statement's GetFlightInfo plan build
     /// or DoGet execute. Cleared on guard drop so a prior auto-commit
     /// statement's pin never leaks into a later one. Caller skips this entirely
     /// when a tx is open (the open tx carries the snapshot; the cell stays
@@ -409,12 +406,11 @@ pub fn catalog_header_from_request<T>(req: &Request<T>) -> Option<CatalogHeader>
 /// Deployment-level defaults — **names only**. Per-catalog identifiers
 /// (`catalog_uuid` / `branch_uuid`) are *not* cached here:
 ///
-/// - `catalog_uuid` is server-minted per CHA-236 and stable across
-///   renames, but caching it at server startup would be wrong if the
-///   default catalog itself is renamed / re-created out-of-band. We
-///   pay one `LifecycleManager::get_catalog` per conn at mint to
-///   resolve afresh.
-/// - `branch_uuid` is **catalog-scoped** (CHA-163): the `main` branch
+/// - `catalog_uuid` is server-minted and stable across renames, but
+///   caching it at server startup would be wrong if the default catalog
+///   itself is renamed / re-created out-of-band. We pay one
+///   `LifecycleManager::get_catalog` per conn at mint to resolve afresh.
+/// - `branch_uuid` is **catalog-scoped**: the `main` branch
 ///   in catalog `public` has a different uuid than the `main` branch
 ///   in catalog `sql_cat_foo`. Caching one uuid at startup would be
 ///   actively wrong for any conn pinning a non-default catalog via
@@ -435,7 +431,7 @@ pub struct ConnSessionFactory {
     write_channel: Channel,
     pool: PgDriver,
     template: SessionState,
-    /// Capacity for each connection's [`StatementCache`] (CHA-355), sourced once
+    /// Capacity for each connection's [`StatementCache`], sourced once
     /// from `SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY` at server start.
     flight_statement_cache_capacity: usize,
 }
@@ -471,8 +467,7 @@ impl ConnSessionFactory {
     /// `Arc<SessionContext>`, and returns the wrapped `Arc<ConnSession>`.
     ///
     /// Catalog/branch fail-fast at mint means the client sees the
-    /// error on the first request — no half-baked session lingers
-    /// (CHA-253).
+    /// error on the first request — no half-baked session lingers.
     #[tracing::instrument(
         skip_all,
         fields(
@@ -494,18 +489,13 @@ impl ConnSessionFactory {
         tracing::Span::current().record("branch_uuid", branch_uuid.as_str());
         let catalog_list = self.fetch_catalog_list().await?;
         tracing::Span::current().record("catalog_count", catalog_list.len());
-        // CHA-345: the open-tx cell is created here and shared, by
-        // `Arc::clone`, between the `ConnSession` (authoritative flips on
-        // BEGIN/COMMIT/ROLLBACK) and the per-conn provider tree built
-        // inside `build_ctx` (read-side, via `ConnScope`).
+        // These three cells are created here and `Arc`-shared between the
+        // `ConnSession` (which owns the authoritative writes: tx flips on
+        // BEGIN/COMMIT/ROLLBACK, the per-build memo guard, the per-statement
+        // pin guard) and the per-conn provider tree built inside `build_ctx`,
+        // which reads them through `ConnScope`.
         let open_tx_cell = Arc::new(RwLock::new(None));
-        // CHA-367: created here and `Arc`-shared, like `open_tx_cell`, between
-        // the `ConnSession` (which installs the per-build memo guard) and the
-        // provider tree built inside `build_ctx` (which reads/populates it).
         let resolution_memo_cell = Arc::new(RwLock::new(None));
-        // CHA-374 / CHA-460: per-statement pinned-as_of_seq cell, Arc-shared
-        // like the others between the ConnSession (installs the pin guard) and
-        // the provider tree (reads it via ConnScope::pinned_as_of_seq).
         let as_of_seq_cell = Arc::new(RwLock::new(None));
         let ctx = self.build_ctx(
             &catalog_name,
@@ -539,9 +529,9 @@ impl ConnSessionFactory {
         catalog_override: Option<String>,
     ) -> Result<(String, String), Status> {
         // Always re-resolve via `get_catalog` against the live
-        // `catalog_store` — names are durable but uuids are
-        // server-minted per CHA-236 and the deployment may have been
-        // re-bootstrapped or renamed since startup.
+        // `catalog_store` — names are durable but uuids are server-minted,
+        // and the deployment may have been re-bootstrapped or renamed since
+        // startup.
         let name = catalog_override.unwrap_or_else(|| self.default_catalog_name.clone());
         match LifecycleManager::get_catalog(&self.pool, None, Some(&name)).await {
             Ok(Some(catalog)) => Ok((name, catalog.catalog_uuid)),
@@ -559,7 +549,7 @@ impl ConnSessionFactory {
         catalog_uuid: &str,
     ) -> Result<(String, String), Status> {
         // Always resolve via `get_branch_by_name` against the conn's
-        // pinned `catalog_uuid`. Branches are catalog-scoped (CHA-163),
+        // pinned `catalog_uuid`. Branches are catalog-scoped,
         // so `(catalog_uuid="public", branch_name="main")` and
         // `(catalog_uuid="sql_cat_X", branch_name="main")` resolve to
         // distinct `branch_uuid`s. See the `ConnSessionFactory` struct
@@ -616,12 +606,11 @@ impl ConnSessionFactory {
     /// [`PencaCatalogProviderList`] (frozen `(name, uuid)` snapshot +
     /// the conn's pinned `catalog_uuid` + `branch_uuid` + the shared
     /// `open_tx_cell`) over it. The conn's catalog lives on the provider
-    /// tree's `ConnScope`; there is no scan-time cross-catalog check
-    /// (CHA-346).
+    /// tree's `ConnScope`; there is no scan-time cross-catalog check.
     ///
-    /// CHA-345: `open_tx_cell` is `Arc`-shared with the owning
-    /// `ConnSession`, which flips it on BEGIN/COMMIT/ROLLBACK; the
-    /// provider tree reads it during planning.
+    /// `open_tx_cell` is `Arc`-shared with the owning `ConnSession`, which
+    /// flips it on BEGIN/COMMIT/ROLLBACK; the provider tree reads it during
+    /// planning.
     fn build_ctx(
         &self,
         catalog_name: &str,
