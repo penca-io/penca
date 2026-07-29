@@ -961,8 +961,11 @@ impl PgDialect {
         // `segment_delete_set` row against
         // `table_snapshot_segment_metadata` on `object_uri` (delete
         // only at snapshot reference count zero, ADR 0024 §4). This
-        // index serves that per-candidate probe; partition pruning on
-        // `branch_uuid` happens first, so the URI alone suffices.
+        // index serves that per-candidate probe. Since CHA-531 the
+        // probe is catalog-wide — carry-forward crosses fork edges, so
+        // a reference can live in any branch's leaf — which makes the
+        // `object_uri` index the whole access path, not a refinement
+        // on top of a `branch_uuid` prune.
         //
         // Stale-catalog note (pre-release, in-place DDL): this CREATE
         // only runs at CreateCatalog, so catalogs created before
@@ -1000,8 +1003,8 @@ impl PgDialect {
         // (`eligible_segment_delete_set_rows`) anti-joins the child sidecar
         // table on `object_uri` to pin shared carried-sidecar files, mirroring
         // the base-segment `idx_..._tssm_uri` probe. Index `(object_uri)` so
-        // that per-candidate probe is served after the `branch_uuid` partition
-        // prune instead of a leaf seq-scan.
+        // that per-candidate probe is served across every branch leaf
+        // (catalog-wide since CHA-531) instead of a seq-scan.
         let idx_tssim_uri = format!("idx_{cat_u}_tssim_uri");
         driver
             .execute_no_result(&format!(
@@ -1009,6 +1012,24 @@ impl PgDialect {
                 ON {qi_tbl} (object_uri)"#,
                 qi_idx = Self::quote_identifier(&idx_tssim_uri),
                 qi_tbl = Self::quote_identifier(&table_snapshot_segment_index_metadata),
+            ))
+            .await?;
+
+        // CHA-531: the sweep's grace gate probes `segment_delete_set`
+        // against itself on `object_uri` to find any sibling branch's
+        // still-within-grace enqueue of the same file. `segment_delete_uuid`
+        // is branch-keyed, so the retirement that drops the last reference
+        // refreshes only its own branch's row; this probe is what keeps the
+        // grace window honest across a fork edge. `idx_..._sds_age` is
+        // `(branch_uuid, written_at_micros)`-leading and cannot serve a
+        // branch-agnostic `object_uri` lookup.
+        let idx_sds_uri = format!("idx_{cat_u}_sds_uri");
+        driver
+            .execute_no_result(&format!(
+                r#"CREATE INDEX IF NOT EXISTS {qi_idx}
+                ON {qi_tbl} (object_uri)"#,
+                qi_idx = Self::quote_identifier(&idx_sds_uri),
+                qi_tbl = Self::quote_identifier(&segment_delete_set),
             ))
             .await?;
 

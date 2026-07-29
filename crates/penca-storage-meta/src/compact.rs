@@ -275,11 +275,15 @@ impl LifecycleManager {
     /// URIs never appear in the snapshot segment table, so the gate is
     /// a structural no-op for them.
     ///
-    /// Partition-pruned by `branch_uuid`; the `(branch_uuid,
-    /// written_at_micros)` index serves the eligibility scan and the
-    /// per-leaf `object_uri` indexes serve the two refcount probes (base
-    /// segments via `idx_..._tssm_uri`, cold-index sidecars via
-    /// `idx_..._sim_uri`, CHA-455).
+    /// The candidate scan is partition-pruned by `branch_uuid`, but the
+    /// three reference probes are **catalog-wide**: carry-forward
+    /// crosses fork edges, so a child branch's snapshot can reference a
+    /// file the parent wrote, and a branch-scoped probe would not see
+    /// it. The `(branch_uuid, written_at_micros)` index serves the
+    /// eligibility scan; the per-leaf `object_uri` indexes serve the
+    /// refcount probes (base segments via `idx_..._tssm_uri`,
+    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455) and the
+    /// delete-set's own `idx_..._sds_uri` serves the grace probe.
     ///
     /// 1 SQL query.
     pub async fn eligible_segment_delete_set_rows(
@@ -298,8 +302,22 @@ impl LifecycleManager {
         // queued URI while ANY base segment OR sidecar row still
         // references it — otherwise an older segment's retirement would
         // make a file eligible while a younger carried sidecar still
-        // points at it. Two NOT EXISTS arms, one per referencing table.
+        // points at it. One NOT EXISTS arm per referencing table.
         let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        // CHA-531: neither referencing arm filters on `branch_uuid`.
+        // Carry-forward crosses fork edges, so a child's snapshot rows
+        // reference a file the parent wrote while living in the CHILD's
+        // partition; a branch-scoped probe cannot see them and the
+        // parent's sweep would delete a file the child still reads.
+        //
+        // The third arm makes the grace clock cross-branch for the same
+        // reason. `naming::segment_delete_uuid` is branch-keyed, so the
+        // retirement that drops the last reference refreshes only the
+        // RETIRING branch's row. Without this arm the parent's own
+        // already-expired row would go eligible the instant a child
+        // dropped that last reference, deleting the file inside the
+        // grace window a concurrent reader relies on.
+        //
         // `written_at_micros < $2` keeps the column on the LHS so the
         // `(branch_uuid, written_at_micros)` index leg is reliably
         // used for the range scan after partition pruning. The `$2 -
@@ -311,13 +329,16 @@ impl LifecycleManager {
                AND sds.written_at_micros < $2 \
                AND NOT EXISTS (\
                  SELECT 1 FROM {seg_table} seg \
-                 WHERE seg.branch_uuid = $1 \
-                   AND seg.object_uri = sds.object_uri\
+                 WHERE seg.object_uri = sds.object_uri\
                ) \
                AND NOT EXISTS (\
                  SELECT 1 FROM {seg_index_table} six \
-                 WHERE six.branch_uuid = $1 \
-                   AND six.object_uri = sds.object_uri\
+                 WHERE six.object_uri = sds.object_uri\
+               ) \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {table} other \
+                 WHERE other.object_uri = sds.object_uri \
+                   AND other.written_at_micros >= $2\
                )",
             table = qi(&table),
             seg_table = qi(&seg_table),
