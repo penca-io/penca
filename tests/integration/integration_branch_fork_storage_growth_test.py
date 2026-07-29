@@ -21,7 +21,10 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client.naming import TABLE_SNAPSHOT_SEGMENT_METADATA
+from penca_client.naming import (
+    TABLE_PERSIST_SEGMENT_METADATA,
+    TABLE_SNAPSHOT_SEGMENT_METADATA,
+)
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
@@ -131,4 +134,92 @@ def test_fork_storage_growth_is_o_delta():
         f" {baseline_files} -> {final_files}. Each fork's first snapshot is"
         " re-materializing the whole table instead of carrying untouched"
         " partitions by reference."
+    )
+
+
+def _reference_row_counts(catalog_uuid, branch_uuid):
+    """``(persist_rows, snapshot_rows)`` — the branch's own committed cold
+    reference rows.
+
+    Rows, not distinct uris: the metadata cost CHA-539 accepts is one row per
+    referenced cold segment, and several rows legitimately share one file.
+    """
+    counts = []
+    for table_name in (TABLE_PERSIST_SEGMENT_METADATA, TABLE_SNAPSHOT_SEGMENT_METADATA):
+        rows = get_pg_driver().execute(
+            SQL(
+                "SELECT count(*) FROM {tbl}"
+                " WHERE branch_uuid = %s AND commit_micros IS NOT NULL"
+            ).format(tbl=Identifier(f"{catalog_uuid}_{table_name}")),
+            (branch_uuid,),
+        )
+        counts.append(int(rows[0][0]))
+
+    return tuple(counts)
+
+
+def test_fork_materializes_metadata_reference_rows_per_cold_segment():
+    """CHA-539: a fork's cost becomes O(cold segments) in METADATA rows, while
+    object count and bytes stay bounded.
+
+    That trade is the ticket's accepted risk ("Fork cost goes O(1) ->
+    O(cold segments) in metadata rows written. Still no data copy"). Pinning the
+    row growth explicitly is what stops a later change from quietly turning it
+    into byte growth: `test_fork_storage_growth_is_o_delta` above bounds the
+    bytes, and this bounds what the fork is allowed to spend instead.
+
+    Fail-first: a fork writes no cold reference rows at all today, so the child's
+    counts are (0, 0) immediately after CreateBranch — before it has written or
+    snapshotted anything of its own.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fsgref")
+    )
+
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": _PARTITIONS, "value": list(range(len(_PARTITIONS)))},
+            schema=USER_SCHEMA,
+        ),
+    )
+    parent_persist, parent_snapshot = _reference_row_counts(catalog_uuid, main_branch)
+    assert parent_persist > 0 and parent_snapshot > 0, (
+        "the parent must hold committed rows in both cold tiers before the fork"
+    )
+    baseline_files, baseline_bytes = _distinct_slice_bytes(catalog_uuid)
+
+    # Fork only — no write, no snapshot on the child. Isolates what the FORK
+    # materializes from what a later child snapshot would produce.
+    children = [
+        client.create_branch(
+            f"fsgref_child{i}_{uuid4().hex[:6]}",
+            catalog_uuid=catalog_uuid,
+            author="test",
+            comment="cha-539",
+        ).branch_uuid
+        for i in range(_FORKS)
+    ]
+
+    for i, child in enumerate(children):
+        child_persist, child_snapshot = _reference_row_counts(catalog_uuid, child)
+        assert child_persist >= parent_persist, (
+            f"fork {i} must materialize a persist reference row per inherited cold"
+            f" segment; parent has {parent_persist}, child has {child_persist}"
+        )
+        assert child_snapshot >= parent_snapshot, (
+            f"fork {i} must materialize a snapshot reference row per inherited cold"
+            f" segment; parent has {parent_snapshot}, child has {child_snapshot}"
+        )
+
+    # ...and the rows must be references, not copies: same slices, same bytes.
+    final_files, final_bytes = _distinct_slice_bytes(catalog_uuid)
+    assert (final_files, final_bytes) == (baseline_files, baseline_bytes), (
+        f"{_FORKS} forks changed cold storage from {baseline_files} files /"
+        f" {baseline_bytes} bytes to {final_files} / {final_bytes}. The fork copies"
+        " METADATA only; a change here means it started copying data."
     )
