@@ -751,6 +751,14 @@ impl LifecycleManager {
                     snapshotted_at_micros,
                 )
                 .await?;
+            // Counted before the plan moves into the resolve. Whether the fork
+            // tail was folded is invisible in the counts below — a fork whose
+            // parent had no tail and a same-branch carry-forward log
+            // identically — so the acceptance seam needs its own field.
+            let fork_tail_segments = base_cold
+                .as_ref()
+                .and_then(|b| b.cold.persist.as_ref())
+                .map_or(0, |p| p.upsert_segments.len() + p.delete_segments.len());
             let (delta_groups, delete_segments, exclusion_set) = self
                 .resolve_windowed_delta(
                     pool,
@@ -831,6 +839,7 @@ impl LifecycleManager {
                 touched_partitions = touched_segments.len(),
                 carried_partitions = carried.len(),
                 delta_rows = delta_groups.iter().map(|(_, b)| b.num_rows()).sum::<usize>(),
+                fork_tail_segments,
                 "carry-forward engaged"
             );
 
