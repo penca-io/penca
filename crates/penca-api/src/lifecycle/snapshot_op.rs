@@ -22,8 +22,8 @@ use penca_core::naming::{
     table_snapshot_uuid,
 };
 use penca_core::{
-    BaseColdStorage, ColdStoragePlan, CommittedAtBounds, Format, PersistPlan, PersistSegment, Plan,
-    SnapshotPlan, SnapshotSegment,
+    BaseColdStorage, ColdStoragePlan, CommitSeqBounds, CommittedAtBounds, Format, PersistPlan,
+    PersistSegment, Plan, SnapshotPlan, SnapshotSegment,
 };
 use penca_db::driver::pg::PgDriver;
 use penca_dl::driver::DlDriver;
@@ -465,9 +465,11 @@ impl LifecycleManager {
         // the parent's baseline at the fork edge and carry from that instead.
         //
         // The pick bound is the same `(snapshotted_at_micros,
-        // fork_commit_seq_num)` pair `enumerate_base_cold_source` uses, so the
-        // carry path and the full-rewrite fallback inherit the same parent state
-        // by construction rather than by coincidence.
+        // fork_commit_seq_num)` pair `enumerate_base_cold_source` uses on the
+        // full-rewrite fallback, so both paths inherit the same parent state by
+        // construction rather than by coincidence. This is also the ONLY pick
+        // the carry path makes: the parent's persist tail is windowed off the
+        // watermark it yields, never off a second read (see `base_cold` below).
         //
         // Single-level only: `read_branch_lineage` returns one immediate parent
         // (CHA-509 tracks recursion, CHA-515 guards main-only forks).
@@ -664,26 +666,62 @@ impl LifecycleManager {
             // `delta_groups`, get marked touched, and are rewritten, while
             // untouched ones stay carried.
             //
-            // The parent's SNAPSHOT is dropped from that base source: it is the
-            // carried baseline here, not a merge input. Leaving it in would
-            // materialize the whole parent table into `delta_groups`, mark
-            // every partition touched, and defeat the ticket.
+            // The parent's SNAPSHOT is deliberately absent from that base
+            // source: it is the carried baseline here, not a merge input.
+            // Including it would materialize the whole parent table into
+            // `delta_groups`, mark every partition touched, and defeat the
+            // ticket.
+            //
+            // The window floor is `baseline_watermark` — the watermark of the
+            // very snapshot whose segments are being carried — rather than a
+            // fresh pick via `enumerate_base_cold_source`. That helper re-picks
+            // the parent's baseline to derive its own floor, and a second pick
+            // is not guaranteed to land on the first one's snapshot: a parent
+            // snapshot whose seq sits under the fork ceiling can still finish
+            // its two-phase commit between the two reads (they are separate
+            // transactions). The carried segments would then be the older
+            // snapshot's while the floor came from the newer one, and every
+            // parent row committed between the two watermarks would belong to
+            // neither the carried baseline nor the folded tail — silently
+            // dropped. Deriving both from one read makes that unrepresentable.
             let base_cold = match &fork_edge {
-                Some((parent_branch_uuid, fork_commit_seq_num)) => self
-                    .query_manager
-                    .enumerate_base_cold_source(
-                        pool,
-                        &catalog_str,
-                        parent_branch_uuid,
-                        &table_str,
-                        snapshotted_at_micros,
-                        *fork_commit_seq_num,
-                    )
-                    .await?
-                    .and_then(|mut base| {
-                        base.cold.snapshot = None;
-                        base.cold.persist.is_some().then_some(base)
-                    }),
+                Some((parent_branch_uuid, fork_commit_seq_num)) => {
+                    let from_micros = baseline_watermark.map(|ts| ts.saturating_add(1));
+                    let (upsert_segments, delete_segments) = self
+                        .query_manager
+                        .read_persist_segments_for_window(
+                            pool,
+                            &catalog_str,
+                            parent_branch_uuid,
+                            &table_str,
+                            from_micros,
+                            // Inert on the read: the fork ceiling already
+                            // excludes everything committed after the fork.
+                            None,
+                            Some(*fork_commit_seq_num),
+                        )
+                        .await?;
+                    (!upsert_segments.is_empty() || !delete_segments.is_empty()).then(|| {
+                        BaseColdStorage {
+                            cold: ColdStoragePlan {
+                                snapshot: None,
+                                persist: Some(PersistPlan {
+                                    upsert_segments,
+                                    delete_segments,
+                                    committed_at: Some(CommittedAtBounds {
+                                        min_micros: from_micros,
+                                        max_micros: Some(snapshotted_at_micros.saturating_add(1)),
+                                    }),
+                                    commit_seq: Some(CommitSeqBounds {
+                                        min_seq: None,
+                                        max_seq: Some(*fork_commit_seq_num),
+                                    }),
+                                }),
+                            },
+                            commit_seq_ceiling: *fork_commit_seq_num,
+                        }
+                    })
+                }
                 None => None,
             };
             let (delta_groups, delete_segments, exclusion_set) = self
