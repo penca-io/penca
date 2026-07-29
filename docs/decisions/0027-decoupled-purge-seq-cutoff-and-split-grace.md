@@ -215,8 +215,10 @@ enumerated via `tx_table_log` until its ledger drops).
 Concretely the grace is **`max(purge_sweep_interval, hot_grace_window)`** —
 the **hot-purge grace window** (`HOT_PURGE_GRACE_SECONDS`, the same knob CHA-466
 will use for the `Pu ≤ P − hot_grace` ceiling; default 60s), floored at the
-Purge sweep cadence (`SCHEDULER_TICK_INTERVAL_SECONDS`, shared with the
-lifecycle service like `QUERY_TIMEOUT_SECONDS`). It is **not** `query_timeout`:
+Purge sweep cadence. Purge rides the snapshot loop, so that is
+`SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS`; the floor is taken over both
+scheduler cadences as a conservative bound, shared with the lifecycle service
+like `QUERY_TIMEOUT_SECONDS`. It is **not** `query_timeout`:
 that is the query-service cap, with no relation to the Purge cadence, so wiring
 the ledger GC to it left a leak when the tick interval exceeded the timeout (a
 slow/lagging table while the branch-wide `PurgeTxLog` proceeded). This is the

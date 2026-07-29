@@ -167,13 +167,17 @@ pub struct LifecycleServiceConfig {
     /// uses it as its grace; CHA-466's memory-shedding `Pu <= P - hot_grace`
     /// ceiling reuses the same knob.
     pub hot_purge_grace_seconds: i64,
-    /// Purge sweep cadence, in seconds — MUST equal the scheduler's
-    /// `SCHEDULER_TICK_INTERVAL_SECONDS` (shared env, like
-    /// `QUERY_TIMEOUT_SECONDS`). Floors the expired-begin ledger-GC grace so it
-    /// never drops a tx's bookkeeping before Purge has re-swept the tx's hot
-    /// rows (ADR 0027 §5). Negative ⇒ scheduler disabled ⇒ contributes no
-    /// floor (the hot-grace window stands alone).
-    pub scheduler_tick_interval_seconds: i64,
+    /// Persist-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` (shared env, like
+    /// `QUERY_TIMEOUT_SECONDS`). Floors the expired-begin ledger-GC grace
+    /// together with the snapshot cadence — see
+    /// [`Self::purge_sweep_interval_seconds`]. Non-positive ⇒ that loop is
+    /// disabled and contributes no floor.
+    pub persist_tick_interval_seconds: i64,
+    /// Snapshot-loop cadence, in seconds — MUST equal the scheduler's
+    /// `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS`. Non-positive ⇒ that loop is
+    /// disabled and contributes no floor.
+    pub snapshot_tick_interval_seconds: i64,
 }
 
 impl LifecycleServiceConfig {
@@ -187,8 +191,55 @@ impl LifecycleServiceConfig {
             segment_read_concurrency: required_env_parsed("LIFECYCLE_SEGMENT_READ_CONCURRENCY"),
             query_timeout_seconds: required_env_parsed("QUERY_TIMEOUT_SECONDS"),
             hot_purge_grace_seconds: required_env_parsed("HOT_PURGE_GRACE_SECONDS"),
-            scheduler_tick_interval_seconds: required_env_parsed("SCHEDULER_TICK_INTERVAL_SECONDS"),
+            persist_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS",
+            ),
+            snapshot_tick_interval_seconds: required_env_parsed(
+                "SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS",
+            ),
         }
+    }
+
+    /// Worst-case gap between consecutive Purge sweeps, in seconds — the
+    /// scheduler-cadence half of the expired-begin ledger-GC grace floor
+    /// (ADR 0027 §5); `purge_tx_log` supplies the `hot_purge_grace_seconds`
+    /// half, so the effective floor is the max of all three.
+    ///
+    /// Takes the max of BOTH loop cadences as a **conservative bound**, not
+    /// because either alone would be wrong today. Purge currently rides the
+    /// snapshot loop, so the snapshot cadence alone is the exact worst-case gap;
+    /// the max is chosen because the loop-to-op assignment is not an invariant —
+    /// CHA-502 moves Purge server-side behind `PurgeBranch`/`PurgeCatalog`, and a
+    /// floor that encoded "snapshot owns Purge" would have to be re-pointed by
+    /// hand, silently under-waiting if anyone forgot. Over-waiting is the safe
+    /// direction: under-waiting strands a timed-out tx's hot rows forever.
+    ///
+    /// Retention consequence, deliberate: once the split env vars land the
+    /// ledger-GC grace floors at whichever cadence is slower — in practice the
+    /// snapshot loop, which wants to be long — rather than at one shared knob,
+    /// so timed-out txs' `commit_tx_log` bookkeeping is held correspondingly
+    /// longer. That is the cost of decoupling the cadences.
+    ///
+    /// Clamped at 0: a disabled loop (non-positive) contributes no floor.
+    ///
+    /// **Limitation.** This bounds the gap between sweeps; it does not know
+    /// whether Purge runs at all. A deployment with a positive persist cadence
+    /// and a disabled snapshot cadence gets a finite floor from persist even
+    /// though Purge — which rides the snapshot loop — never fires, so the
+    /// expired-begin ledger GC could drop bookkeeping for hot rows nothing will
+    /// clear. No shipped profile does this; the scheduler warns at startup if it
+    /// sees that combination.
+    pub fn purge_sweep_interval_seconds(&self) -> i64 {
+        self.persist_tick_interval_seconds
+            .max(self.snapshot_tick_interval_seconds)
+            .max(0)
+    }
+
+    /// [`Self::purge_sweep_interval_seconds`] in micros — the exact value
+    /// `LifecycleManager::purge_sweep_interval_micros` takes, so the binary's
+    /// wiring is one field assignment with no arithmetic of its own.
+    pub fn purge_sweep_interval_micros(&self) -> i64 {
+        self.purge_sweep_interval_seconds() * 1_000_000
     }
 }
 
@@ -356,5 +407,75 @@ impl ObjectStorageConfig {
             StorageBackend::S3(s3) => format!("s3://{}", s3.bucket),
             StorageBackend::Local { path } => format!("file://{}", path),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle_config(persist: i64, snapshot: i64) -> LifecycleServiceConfig {
+        LifecycleServiceConfig {
+            database_url: String::new(),
+            bind_addr: String::new(),
+            pg_pool_min: 1,
+            pg_pool_max: 1,
+            default_max_segment_bytes: 1,
+            segment_read_concurrency: NonZeroU32::new(1).unwrap(),
+            query_timeout_seconds: 900,
+            hot_purge_grace_seconds: 60,
+            persist_tick_interval_seconds: persist,
+            snapshot_tick_interval_seconds: snapshot,
+        }
+    }
+
+    /// The ledger-GC floor must not assume `snapshot > persist`. Both cadences
+    /// are independently env-controlled, so the floor takes their max —
+    /// under-waiting strands a timed-out tx's hot rows forever (ADR 0027 §5).
+    #[test]
+    fn purge_sweep_interval_is_order_independent() {
+        // The load-bearing case: persist configured LONGER than snapshot.
+        assert_eq!(
+            lifecycle_config(10, 5).purge_sweep_interval_seconds(),
+            10,
+            "floor must follow the slower loop even when persist dominates"
+        );
+        assert_eq!(lifecycle_config(5, 30).purge_sweep_interval_seconds(), 30);
+        assert_eq!(lifecycle_config(5, 5).purge_sweep_interval_seconds(), 5);
+    }
+
+    /// A disabled loop (non-positive cadence) contributes no floor; the hot-grace
+    /// window then stands alone. Both disabled is the integration-test profile.
+    ///
+    /// The `(5, -1)` case floors on the persist cadence even though Purge, which
+    /// rides the snapshot loop, would never run in that configuration — the
+    /// floor bounds sweep cadence, not whether Purge fires at all. The scheduler
+    /// warns at startup on that combination; see
+    /// [`Self::purge_sweep_interval_seconds`].
+    #[test]
+    fn disabled_loops_contribute_no_floor() {
+        assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_seconds(), 0);
+        assert_eq!(lifecycle_config(-1, 30).purge_sweep_interval_seconds(), 30);
+        assert_eq!(lifecycle_config(5, -1).purge_sweep_interval_seconds(), 5);
+        // Zero is "disabled" here too — the two crates must agree on that, or
+        // the floor would credit a loop the scheduler never runs.
+        assert_eq!(lifecycle_config(0, -1).purge_sweep_interval_seconds(), 0);
+        assert_eq!(lifecycle_config(0, 30).purge_sweep_interval_seconds(), 30);
+    }
+
+    /// The binary assigns this straight to
+    /// `LifecycleManager::purge_sweep_interval_micros`, so the seconds→micros
+    /// conversion is pinned here rather than living unwatched in `main`.
+    #[test]
+    fn purge_sweep_micros_tracks_both_cadences() {
+        assert_eq!(
+            lifecycle_config(10, 5).purge_sweep_interval_micros(),
+            10_000_000
+        );
+        assert_eq!(
+            lifecycle_config(5, 30).purge_sweep_interval_micros(),
+            30_000_000
+        );
+        assert_eq!(lifecycle_config(-1, -1).purge_sweep_interval_micros(), 0);
     }
 }

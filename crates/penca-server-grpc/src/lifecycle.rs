@@ -222,9 +222,7 @@ where
             )
             .await
             .map_err(api_error_to_status)?;
-        Ok(Response::new(BranchOpResponse {
-            watermark: Some(watermark),
-        }))
+        Ok(Response::new(BranchOpResponse { watermark }))
     }
 
     #[tracing::instrument(
@@ -251,9 +249,7 @@ where
             )
             .await
             .map_err(api_error_to_status)?;
-        Ok(Response::new(BranchOpResponse {
-            watermark: Some(watermark),
-        }))
+        Ok(Response::new(BranchOpResponse { watermark }))
     }
 
     #[tracing::instrument(
@@ -281,9 +277,7 @@ where
             )
             .await
             .map_err(api_error_to_status)?;
-        Ok(Response::new(BranchOpResponse {
-            watermark: Some(watermark),
-        }))
+        Ok(Response::new(BranchOpResponse { watermark }))
     }
 
     #[tracing::instrument(

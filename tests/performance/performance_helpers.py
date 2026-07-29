@@ -62,7 +62,8 @@ def _drive_system_tables_cold(client, context: dict[str, str]) -> None:
     paths.
 
     The test/perf profile disables the lifecycle scheduler
-    (``SCHEDULER_TICK_INTERVAL_SECONDS=-1``), so without this the system tables
+    (``SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS=-1``), so without this
+    the system tables
     stay HOT (``hot_min == 0`` => the resolve reads ``__penca_system__.tables``
     straight from Postgres and the snapshot-list cache is never consulted),
     making the OLTP perf numbers blind to the CHA-472 cache. Production's

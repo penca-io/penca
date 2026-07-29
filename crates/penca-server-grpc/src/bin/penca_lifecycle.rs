@@ -45,8 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         segment_read_concurrency: config.segment_read_concurrency.get() as usize,
         query_timeout_micros: config.query_timeout_seconds * 1_000_000,
         hot_purge_grace_micros: config.hot_purge_grace_seconds * 1_000_000,
-        // A disabled scheduler (negative tick) contributes no sweep floor.
-        purge_sweep_interval_micros: config.scheduler_tick_interval_seconds.max(0) * 1_000_000,
+        purge_sweep_interval_micros: config.purge_sweep_interval_micros(),
         // CHA-472: the rehomed by-branch metadata reads are QueryManager methods
         // now; lifecycle reaches them through a metadata-reader handle (disabled
         // caches — lifecycle always reads fresh).

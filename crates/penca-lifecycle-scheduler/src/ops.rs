@@ -1,32 +1,29 @@
 //! Per-table lifecycle op: Purge.
 //!
-//! Persist + Snapshot moved to the server-side `PersistAndSnapshotBranch` RPC
-//! (CHA-273); Purge stays a per-table client call. It logs and swallows
-//! `tonic::Status` errors — the scheduler's per-branch watermark advances
-//! regardless; retry happens implicitly when the table re-enters a future
-//! enumeration window. See the "Failure semantics" section on `crate`'s module
-//! doc.
+//! Persist and Snapshot are server-side per-branch RPCs; Purge stays a per-table
+//! client call, driven from both of the snapshot loop's purge passes. It logs
+//! and swallows `tonic::Status` errors — the caller's per-branch watermark
+//! advances regardless. Retry timing depends on which sweep called it, so it is
+//! documented once in `docs/services/lifecycle-scheduler.md` ("Failure
+//! handling") rather than restated here.
 
 use penca_proto::external::v1::PurgeRequest;
 use penca_proto::external::v1::lifecycle_service_client::LifecycleServiceClient;
 use tonic::transport::Channel;
 
 /// Call Purge on a single table. Errors are logged and swallowed and the
-/// purge watermark in the caller advances regardless. A table that
-/// fails here is retried only when it re-enters a future
-/// `ListPersistedTables` window — i.e., when its next committed
-/// persist clears the universal grace gate.
+/// caller's enumeration watermark advances regardless.
 ///
-/// CHA-273 rework: Persist + Snapshot are no longer a per-table client chain
-/// here — the scheduler drives `PersistAndSnapshotBranch` once per branch (the
-/// loop moved server-side into `LifecycleManager`). Purge stays per-table.
+/// Called from BOTH of the snapshot loop's purge passes, which window on
+/// different listings, so when a failed table comes back depends on the caller —
+/// see `docs/services/lifecycle-scheduler.md` ("Failure handling").
+///
+/// Persist and Snapshot are not per-table client chains — each is one
+/// server-side RPC per branch (the loop lives in `LifecycleManager`). Purge
+/// stays per-table until CHA-502 moves it too.
 #[tracing::instrument(
     skip_all,
-    fields(
-        catalog = %catalog_uuid,
-        branch = %branch_uuid,
-        table = %table_uuid,
-    ),
+    fields(table = %table_uuid),
 )]
 pub(crate) async fn purge_one(
     lifecycle: &mut LifecycleServiceClient<Channel>,

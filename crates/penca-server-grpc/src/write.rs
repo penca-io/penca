@@ -131,9 +131,15 @@ where
         // Resolve the fork position (the request's fork_point → Watermark) in
         // the write pod — a position that names no committed tx is a hard
         // INVALID_ARGUMENT — then synchronously flush the SOURCE branch hot→cold
-        // up to that position via
-        // PersistBranch (the persist loop runs in the lifecycle pod), then record
-        // the fork. The returned watermark is the position we passed, so ignored.
+        // up to that position via PersistBranch (the persist loop runs in the
+        // lifecycle pod), then record the fork.
+        //
+        // PersistBranch is continue-on-error per table for the scheduler's sake,
+        // and signals a partial flush by withholding the watermark. CreateBranch
+        // needs all-or-nothing: the child reads the parent's COLD tier, so a fork
+        // recorded over a partial flush would silently serve a child that is
+        // missing the unflushed tables' rows. An absent watermark must fail the
+        // fork.
         let fork = self
             .manager
             .resolve_fork_watermark(&self.pool, self.readers.as_ref(), req)
@@ -148,7 +154,30 @@ where
                 branch_name: req.source_branch_name.clone(),
                 target: Some(fork),
             })
-            .await?;
+            .await?
+            .into_inner()
+            .watermark
+            .ok_or_else(|| {
+                // Echo whichever identification the caller supplied — CreateBranch
+                // accepts either UUIDs or names, and a placeholder would be
+                // useless in exactly the name-based case.
+                let branch = req
+                    .source_branch_uuid
+                    .as_deref()
+                    .or(req.source_branch_name.as_deref())
+                    .unwrap_or("<unidentified>");
+                let catalog = req
+                    .catalog_uuid
+                    .as_deref()
+                    .or(req.catalog_name.as_deref())
+                    .unwrap_or("<unidentified>");
+                Status::internal(format!(
+                    "CreateBranch aborted: source branch {branch} in catalog \
+                     {catalog} could not be fully flushed hot→cold. The lifecycle \
+                     service logged one warn per failing table, keyed by the \
+                     resolved catalog and branch UUIDs."
+                ))
+            })?;
         let resp = self
             .manager
             .create_branch(&self.pool, self.dl_driver.as_ref(), req, &fork)

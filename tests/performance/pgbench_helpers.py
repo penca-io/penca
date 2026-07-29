@@ -328,7 +328,8 @@ def _drain_pgbench_tables(client, context: dict) -> None:
     production lifecycle scheduler's continuous cadence.
 
     Driven from the TPC-B harness because the perf profile pins
-    ``SCHEDULER_TICK_INTERVAL_SECONDS=-1`` (``docker/test.env``); without a drain
+    ``SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS=-1`` (``docker/test.env``);
+    without a drain
     the hot upsert log grows unbounded across the run — at scale 1 the 1-row
     ``pgbench_branches`` / 10-row ``pgbench_tellers`` accumulate one hot version
     per transaction, so every arithmetic ``UPDATE``'s read-modify-write merges a

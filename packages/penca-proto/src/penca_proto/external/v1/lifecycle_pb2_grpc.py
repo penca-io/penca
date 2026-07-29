@@ -177,14 +177,20 @@ class LifecycleServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def PersistBranch(self, request, context):
-        """CHA-273: catalog-wide persist/snapshot over every table on a branch,
-        returning the fork Watermark T (the caller-supplied `target` position, else
-        the branch head).
-        PersistBranch/SnapshotBranch are the persist-only / snapshot-only variants;
-        PersistAndSnapshotBranch loops both per table (non-atomic). The scheduler
-        drives PersistAndSnapshotBranch; CreateBranch (and merge, CHA-493) drive
-        PersistBranch. Enumerate MODIFIED tables — already-persisted tables are
-        already durable.
+        """Catalog-wide persist/snapshot over a branch's dirty set, returning the fork
+        Watermark T (the caller-supplied `target` position, else the branch head).
+
+        PersistBranch and SnapshotBranch each run one phase;
+        PersistAndSnapshotBranch loops both per table (non-atomic).
+
+        Persist enumerates MODIFIED tables (already-persisted ones are already
+        durable); Snapshot enumerates PERSISTED ones, so a table persisted then
+        dropped from hot is still re-snapshotted.
+
+        All three are continue-on-error per table: a failure is logged, the loop
+        proceeds, and `watermark` is left UNSET on the response. An absent watermark
+        therefore means "some table failed" — callers needing all-or-nothing
+        (CreateBranch) must treat it as an error.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

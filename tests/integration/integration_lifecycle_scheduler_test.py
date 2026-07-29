@@ -19,7 +19,8 @@ What's worth pinning is the data plane the scheduler reads from:
   tables.
 
 The integration test profile disables the scheduler binary's tick
-loop (`SCHEDULER_TICK_INTERVAL_SECONDS=-1`) so the suite asserts RPC
+loops (`SCHEDULER_{PERSIST,SNAPSHOT}_TICK_INTERVAL_SECONDS=-1`) so the suite
+asserts RPC
 behavior without the loop racing manual lifecycle calls in sibling
 test files. Run via ``just integration-test lifecycle_scheduler``.
 """

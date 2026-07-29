@@ -5,8 +5,8 @@
 
 ## Purpose
 
-Drives the per-table `Persist → Snapshot → Purge` chain on a periodic
-timer so the hot → cold → snapshotted → purged pipeline runs
+Drives `Persist → Snapshot → Purge` across every branch on two periodic timers
+so the hot → cold → snapshotted → purged pipeline runs
 autonomously. Without the scheduler, Penca only advances lifecycle
 state when an operator (or embedded-mode caller) invokes the RPCs
 directly. With it, the happy-path unattended deployment moves data
@@ -16,21 +16,41 @@ This is the v0 implementation per [CHA-154](https://linear.app/chapala/issue/CHA
 single replica, no leader election, no compaction, no operator-facing
 admin RPCs. Multi-replica safety and compaction are future work.
 
-## Tick loop
+## Tick loops
 
-Every `SCHEDULER_TICK_INTERVAL_SECONDS`:
+Two independently-paced loops. Persist is the hot→cold memory-relief sweep and
+must not fall behind; Snapshot, Purge and tx-log GC are compaction and cleanup,
+cheaper to amortize over a longer cadence. A single interval forced one
+compromise between the two.
+
+The loops share no mutable state: the persist loop is stateless because
+`PersistBranch` resolves its own dirty set server-side, and the snapshot loop
+owns the entire per-branch watermark map.
 
 ```text
+// Persist loop — every SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS
+for each catalog (QueryService::ListCatalogs):
+  for each branch in catalog (QueryService::ListBranches):
+    LifecycleService::PersistBranch(catalog, branch)
+sleep(SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS)
+```
+
+```text
+// Snapshot loop — every SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS
 for each catalog (QueryService::ListCatalogs):
   for each branch in catalog (QueryService::ListBranches):
     now = system clock micros
 
-    // Tables with new committed writes since the last tick
+    // Enumerates the PERSISTED set server-side (CHA-509), not the
+    // hot-modified set, so a table persisted-then-purged is still
+    // re-snapshotted.
+    LifecycleService::SnapshotBranch(catalog, branch)
+
+    // Tables with new committed OR aborted writes since the last sweep
     modified = paginate LifecycleService::ListModifiedTables(
                  catalog, branch, modified_at=[last_modified_tick, now))
     for T in modified:
-      LifecycleService::Persist(catalog, branch, T)
-      LifecycleService::Snapshot(catalog, branch, T)
+      LifecycleService::Purge(catalog, branch, T)
     last_modified_tick[catalog, branch] = now
 
     // Tables whose latest persist has cleared the universal grace
@@ -47,9 +67,21 @@ for each catalog (QueryService::ListCatalogs):
     // (CHA-221). Unconditional per tick — the RPC's own empty-set
     // fast-path is the no-op gate, no scheduler watermark needed.
     LifecycleService::PurgeTxLog(catalog, branch)
-
-sleep(SCHEDULER_TICK_INTERVAL_SECONDS)
+sleep(SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS)
 ```
+
+### Why Purge rides the snapshot loop
+
+Purge's committed axis targets `Pu = W_snap`, read from the latest committed
+snapshot watermark behind a strict-advance gate, so it cannot advance unless a
+Snapshot has run — on a fast persist tick it would compute no advance and
+early-return, costing an RPC and buying nothing.
+
+Accepted trade-off: Purge's other two axes (expired-begin cleanup and abort
+cleanup) have no dependence on `W_snap` and so now reclaim at the snapshot
+cadence rather than the persist one. Both reclaim invisible garbage — aborted
+rows and timed-out open txs serve no reads — and ADR 0027 §5 already gives
+expired-begin ledger GC a wall-clock grace.
 
 ### Dual enumeration
 
@@ -62,13 +94,18 @@ change aborted-only tables (no committed writes ever) would never
 have Persist called, leaving their hot rows + tx-log family
 metadata to leak indefinitely.
 
-Snapshot is chained directly off each Persist on the same `(catalog,
-branch, T)` within the same tick — Snapshot's input is the cold data
-that Persist just wrote, so no separate enumeration is needed. For
-aborted-only tables, Persist writes a `table_persist_metadata` row
-with no segments; Snapshot then writes a placeholder via the
-existing CHA-228 empty-merge path. Bounded overhead per
-aborted-only table per tick.
+Snapshot is **not** chained off Persist. It runs on its own loop, on its
+own cadence, and enumerates the PERSISTED set — tables carrying a
+committed `table_persist_metadata` row — so its input is whatever an
+earlier persist tick already made durable. That decoupling is the point
+of the cadence split: a table persisted then dropped from hot is still
+re-snapshotted, because Snapshot keys on persisted state rather than on
+hot-modified state.
+
+For aborted-only tables, Persist writes a `table_persist_metadata` row
+with no segments; Snapshot then writes a placeholder via the existing
+CHA-228 empty-merge path. Bounded overhead per aborted-only table per
+snapshot tick.
 
 Purge is driven by `ListPersistedTables` instead. The reason is the
 universal grace window in [ADR 0019](../decisions/0019-plan-time-pinning-and-universal-grace-window.md):
@@ -101,14 +138,18 @@ The scheduler is a pure gRPC client. It does NOT:
 - Import `LifecycleManager` or any other in-process metadata helper.
 - Hold a Postgres connection pool.
 - Read or write Postgres tables directly.
-- Wrap the per-table lifecycle ops behind a new `run_full_chain` RPC.
+- Wrap the branch-scoped lifecycle ops behind a new `run_full_chain` RPC.
 
 All data access flows through `QueryServiceClient` and
 `LifecycleServiceClient` (CHA-445 rehomed the `ListModifiedTables` /
 `ListPersistedTables` dirty-set discovery RPCs onto `LifecycleService`,
-dropping the StorageMetadataService client). The per-table chain is the
-existing per-table RPCs (`Persist`, `Snapshot`, `Purge` from
-[CHA-220](https://linear.app/chapala/issue/CHA-220)) invoked individually.
+dropping the StorageMetadataService client). Persist and Snapshot are
+branch-scoped server-side RPCs — `PersistBranch` and `SnapshotBranch`,
+whose per-table loops live in `LifecycleManager` — so the scheduler makes
+one call per branch per loop. `Purge` is still the per-table RPC from
+[CHA-220](https://linear.app/chapala/issue/CHA-220), invoked in a
+client-side loop over the enumerated set (TODO(CHA-502) moves it
+server-side too).
 
 ## Configuration
 
@@ -119,20 +160,78 @@ All values are required from environment variables; defaults live in
 | Variable | Purpose |
 |---|---|
 | `QUERY_SERVICE_ADDR` | gRPC URL of the `query` service (catalog/branch discovery) |
-| `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service (per-table `Persist`/`Snapshot`/`Purge`) |
-| `SCHEDULER_TICK_INTERVAL_SECONDS` | Time between the end of one tick and the start of the next. Compose default `5s`; the `dev` profile pins `1s` (CHA-517 — an interactive stack should not accumulate unpersisted hot data) and the `test` profile pins `-1`, i.e. boot and idle, so the tick loop cannot race a suite's manual lifecycle calls. |
+| `LIFECYCLE_SERVICE_ADDR` | gRPC URL of the `lifecycle` service — the branch ops, `Purge`, `PurgeTxLog`, and the `ListModifiedTables`/`ListPersistedTables` dirty-set RPCs |
+| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | Time between the end of one persist tick and the start of the next. Compose default `1s` — an interactive stack should not accumulate unpersisted hot data, and a fork should not have to flush a backlog first. **Non-positive** disables the persist loop alone: boot and idle. |
+| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | Same, for the snapshot loop (Snapshot + Purge + PurgeTxLog). Compose default `5s` — long enough not to rewrite baselines every second. **Non-positive** disables the snapshot loop alone. The `test` profile pins **both** to `-1` so neither loop can race a suite's manual lifecycle calls. |
 | `SCHEDULER_LIST_PAGE_SIZE` | Max `table_uuid`s requested per list-tables page. The scheduler drains every page before moving on. |
 | `QUERY_TIMEOUT_SECONDS` | Universal grace window in seconds. MUST equal the value the `query` + `lifecycle` services read from the same env var (ADR 0019). The scheduler uses it to bound the `ListPersistedTables` upper edge at `now - QUERY_TIMEOUT_SECONDS`. |
 
 ## Failure handling
 
-Errors inside a single `(catalog, branch)` tick are logged at `warn` and
-the loop continues. Errors on a single table within a branch are also
-logged and skipped. Every lifecycle op is idempotent, so transient
-failures self-heal on the next sweep that re-enumerates the table.
+Failure handling has three tiers. Nothing retries in-process: recovery waits for
+a later tick, and whether that tick is guaranteed to *retry the failed table*
+differs per op — see "What gets retried, and when" below.
+
+**Discovery.** A `ListCatalogs` / `ListBranches` error propagates out of the tick
+entirely. Nothing else runs that tick, in either loop.
+
+**Per-branch.** Two distinct kinds, and they differ:
+
+- A *dirty-set listing* error (`ListModifiedTables` / `ListPersistedTables`, in
+  the snapshot loop only) returns early from that branch, so its enumeration
+  watermarks do not advance and the next tick re-runs the same window.
+- A *branch-op RPC* error (`PersistBranch` / `SnapshotBranch`, and `PurgeTxLog`
+  which the snapshot loop calls unconditionally per branch) is logged and the
+  sweep continues. In the snapshot loop that means the remaining steps still run
+  for that branch and the enumeration watermarks still advance. `PurgeTxLog`
+  carries no scheduler-side watermark at all — its own empty-set fast path is
+  the no-op gate — so a failure there is simply retried next tick.
+
+Either way the loop moves on to the next branch.
+
+**Per-table.** Purge failures are swallowed inside `ops::purge_one`.
+`PersistBranch` and `SnapshotBranch` swallow their own per-table failures
+server-side and report them by leaving `BranchOpResponse.watermark` unset — a
+*different* watermark from the scheduler's enumeration watermarks, which advance
+regardless. The scheduler logs the unset response; `CreateBranch` treats it as a
+hard error.
+
+Swallowing is load-bearing for the **branch ops** specifically, not incidental:
+their enumerations are unwindowed and ordered oldest-timestamp-first, so a table
+whose op keeps failing sorts first on every subsequent sweep and would starve
+everything behind it if the server-side loop aborted on it. (`ops::purge_one`
+runs under windowed enumerations, where a poison table ages out of the window
+rather than pinning the head.)
+
+### What gets retried, and when
+
+The branch ops enumerate **unwindowed** — `list_all_modified_table_uuids` and
+`list_all_persisted_table_uuids` pass no `modified_at` / `persisted_at` bound,
+and neither set is filtered on failure — or, for the persisted set, on snapshot
+state at all. `ListPersistedTables` selects every table with a committed
+`table_persist_metadata` row (`branch_uuid` plus `commit_micros IS NOT NULL`);
+there is no "and not yet snapshotted" predicate, so `SnapshotBranch` re-visits
+every persisted table each tick and the per-table `Snapshot` no-ops when its own
+watermark already covers the range. `ListModifiedTables` is the union of
+committed and aborted writers via `tx_table_log`, whose rows only `PurgeTxLog`
+clears and which it cannot reach until Purge advances.
+
+So a table that failed is retried not because its failure kept it in the set, but
+because the set never excluded it: membership tracks persist and write state, not
+success.
+
+The two **Purge** passes are windowed, and their windows differ in both bounds:
+the modified pass runs `[last_modified_tick, now)`, the aged-persisted pass runs
+`[last_purge_tick, now - grace)`. A one-off failure on a table that then goes
+quiet is not retried until it re-enters that pass's window — a further committed
+or aborted write for the modified pass, a further committed persist for the
+aged-persisted one. That is the v0 gap durable per-table retry queues would
+close.
 
 The scheduler does NOT use gRPC retries or backoff. The tick cadence
-(`SCHEDULER_TICK_INTERVAL_SECONDS`) is the natural retry interval —
+(`SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` for Persist,
+`SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` for Snapshot, Purge and tx-log GC)
+is the natural retry interval —
 adding intra-tick retries would interfere with the tick loop's
 single-replica progress guarantee.
 

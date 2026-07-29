@@ -302,6 +302,9 @@ def test_persist_branch_returns_watermark():
 
     # Head follows the DDL + data commits, so its seq/micros are strictly
     # positive — guards against a zeroed/default watermark.
+    assert response.HasField("watermark"), (
+        "an unset watermark is the partial-flush signal, not a zero value"
+    )
     assert response.watermark.commit_seq_num > 0
     assert response.watermark.commit_micros > 0
     # The source's modified user tables are now durable in cold.
@@ -333,6 +336,9 @@ def test_persist_and_snapshot_branch_returns_watermark():
         branch_uuid=main_branch_uuid,
     )
 
+    assert response.HasField("watermark"), (
+        "an unset watermark is the partial-flush signal, not a zero value"
+    )
     assert response.watermark.commit_seq_num > 0
     assert response.watermark.commit_micros > 0
     assert _committed_seg_count(catalog_uuid, main_branch_uuid, table_uuid) > 0
