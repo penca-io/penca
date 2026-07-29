@@ -873,12 +873,21 @@ integration-test *services:
     # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
     # Runs even if phase 1 failed, so one invocation reports both.
     #
-    # Worker count is bounded by the servicers' PG pools, not by cores. At 4
-    # workers against the default pool of 4, 28 tests failed — every one of
-    # them with "pool timed out while waiting for an open connection" and
-    # nothing else. docker/test.env raises PG_POOL_MAX for the test profile so
-    # the pool is no longer the binding constraint; if that override is ever
-    # dropped, lower this cap to match or the parallel phase goes red.
+    # The cap is 4 because that is what CI has, not because of a measured
+    # ceiling. Worker count WAS bounded by the servicers' PG pools — at 4
+    # workers against the default pool of 4, 28 tests failed, every one with
+    # "pool timed out while waiting for an open connection" and nothing else —
+    # but docker/test.env now raises PG_POOL_MAX for the test profile, so that
+    # is no longer what binds. If that override is ever dropped, lower this cap
+    # to match or the parallel phase goes red again.
+    #
+    # What binds now is CPU against the deliberately small
+    # QUERY_TIMEOUT_SECONDS=2. At 4 workers on a 2-core box, two heavy
+    # compaction tests time out:
+    # test_cascade_seal_when_active_full_and_next_uncompacted_breaches and
+    # test_persist_chunked_segments_compact_normally. They pass at 1 worker per
+    # core, which is CI's ratio, so they are not marked — but if the queue ever
+    # flakes on those two, marking them `serial` is the remedy.
     #
     # PENCA_TEST_JOBS sets `-n` directly so it can raise as well as lower —
     # without that, a 2-core box could never reach CI's 4 workers and the queue
