@@ -27,17 +27,17 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pyarrow as pa
-from penca_client import Mutation
 from penca_client.naming import (
     TABLE_SNAPSHOT_SEGMENT_METADATA,
-    table_snapshot_uuid,
 )
 from psycopg.sql import SQL, Identifier
 
 from .integration_helpers import (
     USER_SCHEMA,
     get_pg_driver,
-    make_client,
+    setup_partitioned_table,
+    write_and_persist,
+    write_cycle,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -92,86 +92,6 @@ def _segment_row_count(catalog_uuid, branch_uuid, snapshot_uuid):
     return int(rows[0][0])
 
 
-def _make_env():
-    """Catalog + schema + partitioned table on ``main``."""
-    client = make_client()
-    catalog_uuid, main_branch_uuid = client.create_catalog(
-        f"fcf_cat_{uuid4().hex[:8]}", "owner"
-    )
-    schema_uuid = client.create_schema(
-        "fcf_schema",
-        catalog_uuid=catalog_uuid,
-        author="test",
-        comment="cha-531",
-    )
-    table_uuid = client.create_table(
-        "fcf_table",
-        USER_SCHEMA,
-        primary_keys=["name"],
-        partition_keys=["name"],
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        author="test",
-        comment="cha-531",
-    )
-    return client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid
-
-
-def _write_and_persist(
-    client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts
-):
-    """mutate → commit → persist, stopping short of a snapshot.
-
-    Split out of ``_cycle`` so a test can leave a branch with a persist
-    tail its last snapshot does not cover — the state a fork must still
-    inherit (CHA-531).
-    """
-    tx = client.begin_tx(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.write_data(
-        tx.tx_uuid,
-        Mutation(table_uuid=table_uuid, upserts=upserts),
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-    )
-    client.commit_tx(tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid)
-    client.persist(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        branch_uuid=branch_uuid,
-        table_uuid=table_uuid,
-    )
-
-
-def _cycle(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid, upserts):
-    """One write cycle on a branch: mutate → commit → persist → snapshot.
-
-    Returns the resulting snapshot uuid.
-    """
-    _write_and_persist(
-        client,
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        table_uuid=table_uuid,
-        branch_uuid=branch_uuid,
-        upserts=upserts,
-    )
-    response = client.snapshot(
-        catalog_uuid=catalog_uuid,
-        schema_uuid=schema_uuid,
-        table_uuid=table_uuid,
-        branch_uuid=branch_uuid,
-    )
-    assert response.HasField("snapshotted_at_micros")
-    return table_snapshot_uuid(
-        catalog_uuid, branch_uuid, table_uuid, response.snapshotted_at_micros
-    )
-
-
 def _read_pairs(client, *, catalog_uuid, schema_uuid, table_uuid, branch_uuid):
     """Sorted ``[(name, value), ...]`` visible on a branch.
 
@@ -205,9 +125,11 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
     parent's files, and a carry-and-also-rewrite child shares the files
     while still paying O(table) bytes. Only both together exclude both.
     """
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fcf")
+    )
 
-    snap_main = _cycle(
+    snap_main = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -239,7 +161,7 @@ def test_fork_first_snapshot_carries_untouched_partitions_by_reference():
         comment="cha-531",
     ).branch_uuid
 
-    snap_child = _cycle(
+    snap_child = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -319,9 +241,11 @@ def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
     baseline opens: before the change the child took the full-rewrite
     path, whose ``base_cold_storage`` fold picked the tail up for free.
     """
-    client, catalog_uuid, schema_uuid, table_uuid, main_branch = _make_env()
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fcf")
+    )
 
-    _cycle(
+    snap_main = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
@@ -332,14 +256,20 @@ def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
             schema=USER_SCHEMA,
         ),
     )
+    parent_tuples = _storage_tuples(catalog_uuid, main_branch, snap_main)
     # The tail: committed and persisted on the parent, never snapshotted.
-    _write_and_persist(
+    # `dave` is a new partition; `bob` is an update to one the parent's
+    # snapshot already holds, so the two together cover both ways a tail
+    # can interact with the carried baseline.
+    write_and_persist(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=main_branch,
-        upserts=pa.table({"name": ["dave"], "value": [4]}, schema=USER_SCHEMA),
+        upserts=pa.table(
+            {"name": ["dave", "bob"], "value": [4, 20]}, schema=USER_SCHEMA
+        ),
     )
 
     child_branch = client.create_branch(
@@ -349,13 +279,33 @@ def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
         comment="cha-531",
     ).branch_uuid
 
-    _cycle(
+    snap_child = write_cycle(
         client,
         catalog_uuid=catalog_uuid,
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=child_branch,
         upserts=pa.table({"name": ["alice"], "value": [99]}, schema=USER_SCHEMA),
+    )
+    child_tuples = _storage_tuples(catalog_uuid, child_branch, snap_child)
+
+    # The carry contract still holds with a tail present, and this is the
+    # only arm that pins it: the read assertions below pass just as well
+    # if the tail fold drags the WHOLE parent table into `delta_groups`
+    # and every partition is rewritten (which is what dropping
+    # `base.cold.snapshot = None` in `snapshot_op` would do). `carol` is
+    # the one partition neither branch touched, so it alone stays
+    # carried; `alice` (child write) and `bob` (tail update) are
+    # rewritten even though `bob` is only touched via the parent.
+    carried = parent_tuples & child_tuples
+    assert carried == {t for t in parent_tuples if t[1] == 2}, (
+        "only the partition untouched by both the child and the parent's"
+        f" tail may stay carried; parent {sorted(parent_tuples)} vs child"
+        f" {sorted(child_tuples)}"
+    )
+    assert _segment_row_count(catalog_uuid, child_branch, snap_child) == 4, (
+        "the child's snapshot must hold one row per partition: carol"
+        " carried, alice/bob/dave rewritten"
     )
 
     # Read AFTER the child's own snapshot: the child's baseline now covers
@@ -369,7 +319,7 @@ def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=child_branch,
-    ) == [("alice", 99), ("bob", 2), ("carol", 3), ("dave", 4)], (
+    ) == [("alice", 99), ("bob", 20), ("carol", 3), ("dave", 4)], (
         "the child's first snapshot dropped the parent's persisted-but-not-"
         "snapshotted rows: they are in neither the carried baseline nor the"
         " child's own persist log, so the fork's delta must fold the parent's"
@@ -384,4 +334,91 @@ def test_fork_first_snapshot_folds_parents_unsnapshotted_persist_tail():
         schema_uuid=schema_uuid,
         table_uuid=table_uuid,
         branch_uuid=main_branch,
-    ) == [("alice", 1), ("bob", 2), ("carol", 3), ("dave", 4)]
+    ) == [("alice", 1), ("bob", 20), ("carol", 3), ("dave", 4)]
+
+
+def test_fork_first_snapshot_applies_parents_tail_delete():
+    """A row the parent DELETES in its post-snapshot tail must not
+    resurrect through a partition the child carries by reference.
+
+    The delete half of the tail fold, and it fails for a different reason
+    than the upsert half. Folding the parent's tail in as a base cold
+    source runs ``filter_live_rows`` over it, so the parent's tombstone
+    never reaches the resolved delta and never marks ``bob``'s partition
+    touched. The partition is then carried verbatim from the parent's
+    snapshot — which still holds the live ``bob`` — and the delete is
+    undone. The tombstone reaches ``exclusion_set``, but that set is only
+    applied to segments the writer restreams, never to a carried one.
+
+    So the writer has to read the base's delete segments directly for
+    touched-set attribution. This test is what pins that.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fcf")
+    )
+
+    snap_main = write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    parent_tuples = _storage_tuples(catalog_uuid, main_branch, snap_main)
+
+    # The tail: a delete only, committed and persisted, never snapshotted.
+    write_and_persist(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        deletes=pa.table({"name": ["bob"]}, schema=pa.schema([("name", pa.utf8())])),
+    )
+
+    child_branch = client.create_branch(
+        f"fcf_del_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-531",
+    ).branch_uuid
+
+    snap_child = write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+        upserts=pa.table({"name": ["alice"], "value": [99]}, schema=USER_SCHEMA),
+    )
+    child_tuples = _storage_tuples(catalog_uuid, child_branch, snap_child)
+
+    # bob's partition (offset 1) must NOT be carried: the parent's tail
+    # deleted the only row in it, so it has to be rewritten (or dropped).
+    # Only carol (offset 2) is untouched by both branches.
+    carried = parent_tuples & child_tuples
+    assert carried == {t for t in parent_tuples if t[1] == 2}, (
+        "a partition whose only row the parent's tail deleted was carried by"
+        " reference from a snapshot that still holds that row; parent"
+        f" {sorted(parent_tuples)} vs child {sorted(child_tuples)}"
+    )
+
+    assert _read_pairs(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child_branch,
+    ) == [("alice", 99), ("carol", 3)], "the parent's tail delete resurrected"
+
+    assert _read_pairs(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+    ) == [("alice", 1), ("carol", 3)]

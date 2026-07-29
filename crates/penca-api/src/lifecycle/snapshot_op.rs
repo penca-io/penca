@@ -898,6 +898,11 @@ impl LifecycleManager {
     /// `resolve_log_tiers`. Returns `(delta_groups, delete_segments,
     /// exclusion_set)`: `delete_segments` flow out for touched-set
     /// attribution; `exclusion_set` applies to the touched prior stream.
+    ///
+    /// On a fork's first snapshot the returned `delete_segments` are the
+    /// child's **plus the base's** (CHA-531). The base fold contributes its
+    /// live rows to `delta_groups` but filters its tombstones out, so its
+    /// deletes would otherwise never mark a partition touched.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_windowed_delta<L>(
         &self,
@@ -960,6 +965,28 @@ impl LifecycleManager {
                 commit_seq: None,
             })
         };
+        // CHA-531: the base's tombstones must reach the caller's touched-set
+        // attribution, and the fold cannot deliver them. The fold applies
+        // `filter_live_rows` to the base, so a parent tombstone never lands in
+        // `tiers.resolved` and therefore never lands in `delta_groups` — it
+        // survives only as an `exclusion_set` entry, and the exclusion set is
+        // applied to the touched prior stream, never to a partition carried by
+        // reference. Without this a row the parent deleted in its tail sits in
+        // an otherwise-untouched partition, that partition is carried from the
+        // parent's snapshot (which still holds the row), and the delete is
+        // undone. Returned for attribution only, deliberately NOT added to
+        // `persist_plan` above: the fold already reads the base's delete log
+        // as part of `base_cold_storage`, and replaying it as the CHILD's
+        // tombstones would apply the parent's deletes a second time over the
+        // child's own tier. Over-inclusion in the touched set is safe — an
+        // extra partition rewrite is byte-correct.
+        let attributable_deletes = match base_cold.as_ref().and_then(|b| b.cold.persist.as_ref()) {
+            None => delete_segments,
+            Some(base_persist) => delete_segments
+                .into_iter()
+                .chain(base_persist.delete_segments.iter().cloned())
+                .collect(),
+        };
         let delta_plan = Plan {
             hot_storage: None,
             cold_storage: Some(ColdStoragePlan {
@@ -984,7 +1011,7 @@ impl LifecycleManager {
         .await
         .map_err(ApiError::Merge)?;
         let delta_groups = partition_record_batch(&tiers.resolved, partition_keys)?;
-        Ok((delta_groups, delete_segments, tiers.exclusion_set))
+        Ok((delta_groups, attributable_deletes, tiers.exclusion_set))
     }
 
     /// Distinct partition labels a window's cold delete-log attributes
