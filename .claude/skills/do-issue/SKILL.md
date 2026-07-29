@@ -96,11 +96,13 @@ Cheat sheet for the kata calls this skill makes:
 - `kata edit <ref> --body "$(cat /tmp/body.md)"` — `kata edit` has **no** `--body-file` / `--body-stdin`; those are `kata create`-only flags.
 - `kata delete --force --confirm "DELETE <qualified_id>"` — the help text says `"DELETE <short_id>"` but the daemon checks against `<qualified_id>` (`DELETE penca#p6yp`). Same shape for `kata purge --confirm "PURGE <qualified_id>"`.
 
-## Step 1: Mark In Progress and digest the ticket
+## Step 1: Mark In Progress, pull main, and digest the ticket
 
 **First action, before anything else:** move the ticket to "In Progress" via the Linear MCP tool with `id="$ARGUMENTS"` and `state="In Progress"`. This signals to the rest of the team that work has started and prevents another contributor from picking up the same ticket. Do this even before reading the description — if the ticket turns out to be trivial / not skill-appropriate, you can move it back, but the cost of an accidental status flip is far lower than the cost of duplicated work.
 
 Immediately after the status flip, run `hostname -f` and post a comment on the ticket via the Linear MCP `save_comment` tool with `issueId="$ARGUMENTS"` and `body="Picked up by <hostname>"` (substitute the actual `hostname -f` output). This records which VM/agent claimed the ticket, so a human can find the running session.
+
+Then, pull main to ensure that the local code checkout is up to date.
 
 Aside from the plan-visualization comment at the Step-3 gate, these are **the only Linear writes** until the `orch:open-pr` task runs in Step 5.
 
