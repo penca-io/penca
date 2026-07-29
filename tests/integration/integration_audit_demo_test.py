@@ -19,7 +19,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from .integration_helpers import demo_catalog_names, make_client, reaped_demo_catalogs
+
+# Serial for reason (c) — see the `serial` marker in pyproject.toml. The
+# demo_ catalog prefix has more than one producer and the reap deletes every
+# match, so two of these running concurrently reap each other.
+pytestmark = pytest.mark.serial
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_PATH = _REPO_ROOT / "examples" / "audit_demo.py"
