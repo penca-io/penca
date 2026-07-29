@@ -1,7 +1,5 @@
 //! Lance format writer using `lance-file` crate + `object_store`.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/writer/lance_writer.py`.
-//!
 //! Uses `lance_file::writer::FileWriter::create_file_with_batches` — the same
 //! API that Python's `lance.file.LanceFileWriter` wraps via PyO3.
 

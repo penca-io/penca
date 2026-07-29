@@ -75,8 +75,6 @@ def find_violations(source: str, tree: ast.Module) -> list[int]:
             if end_line is None or next_start is None:
                 continue
 
-            # Check whether there is at least one blank line between
-            # end of compound statement and start of next statement.
             has_blank = False
             for line_number in range(end_line, next_start - 1):
                 line_content = lines[line_number]  # 0-indexed: end_line is 1-indexed
@@ -87,7 +85,6 @@ def find_violations(source: str, tree: ast.Module) -> list[int]:
             if not has_blank:
                 violations.append(end_line)
 
-        # Recurse into nested bodies.
         for statement in body:
             for attr in ("body", "orelse", "finalbody", "handlers"):
                 nested_body = getattr(statement, attr, None)

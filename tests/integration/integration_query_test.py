@@ -42,8 +42,6 @@ _PK_SCHEMA_NAME = pa.schema([pa.field("name", pa.utf8())])
 
 
 class TestQueryService:
-    # -- Table reads -------------------------------------------------------
-
     def test_get_table(self):
         client = make_client()
         catalog_uuid, main_branch_uuid = client.create_catalog("table_get_cat", "owner")
@@ -135,6 +133,9 @@ class TestQueryService:
         assert response.table_uuid == table_uuid
         assert response.table_name == "name_resolve_table"
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_get_table_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_table by-name must issue the same number of
         ``__penca_system__.tables`` merge SELECTs as a get_table by-uuid.
@@ -202,6 +203,9 @@ class TestQueryService:
             f"table row (CHA-365 Layer A: carry it on ReadRequestScope and reuse)"
         )
 
+    # Serial: reads a process-global side channel; see the `serial` marker in
+    # pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+    @pytest.mark.serial
     def test_get_schema_resolves_metadata_once(self):
         """CHA-365 Layer A: a get_schema by-name must issue the same number of
         ``__penca_system__.schemas`` merge SELECTs as a get_schema by-uuid.
@@ -274,8 +278,6 @@ class TestQueryService:
             catalog_uuid=catalog_uuid, schema_uuid=schema_uuid, table_uuid=table_uuid
         )
         assert response.table_name == "created_by_name"
-
-    # -- By-uuid resolution needs no schema (CHA-381, Design X) ------------
 
     def test_read_data_by_table_uuid_without_schema_resolves(self):
         """CHA-381: read_data by table_uuid needs NO schema identifier.
@@ -425,8 +427,6 @@ class TestQueryService:
         )
         assert result.num_rows == 1
 
-    # -- Branch reads ------------------------------------------------------
-
     def test_get_branch(self):
         client = make_client()
         schema_uuid, _table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
@@ -496,7 +496,6 @@ class TestQueryService:
         client = make_client()
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
 
-        # Branch A with data
         branch_a = client.create_branch(
             "data_a",
             catalog_uuid=catalog_uuid,
@@ -530,7 +529,6 @@ class TestQueryService:
             branch_uuid=branch_a.branch_uuid,
         )
 
-        # Branch B with different data — table inherits via CreateBranch fork.
         branch_b = client.create_branch(
             "data_b",
             catalog_uuid=catalog_uuid,
@@ -562,7 +560,6 @@ class TestQueryService:
             branch_uuid=branch_b.branch_uuid,
         )
 
-        # Read branch A — should only see alice
         result_a = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -572,7 +569,6 @@ class TestQueryService:
         assert result_a.num_rows == 1
         assert result_a.column("name").to_pylist() == ["alice"]
 
-        # Read branch B — should only see charlie
         result_b = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -637,7 +633,6 @@ class TestQueryService:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # First tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -663,7 +658,6 @@ class TestQueryService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Second tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -689,7 +683,6 @@ class TestQueryService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Read as_of the first commit — should only see alice
         from penca_client._time import micros_to_datetime
 
         as_of = micros_to_datetime(committed1.commit_micros)
@@ -702,8 +695,6 @@ class TestQueryService:
         )
         assert result.num_rows == 1
         assert result.column("name").to_pylist() == ["alice"]
-
-    # -- RYOW (read-your-own-writes via open_tx_uuid) -----------------
 
     def test_read_data_ryow_basic(self):
         """Open tx + insert: ReadData(open_tx_uuid=tx) sees the row;
@@ -729,7 +720,6 @@ class TestQueryService:
             branch_uuid=main_branch_uuid,
         )
 
-        # Open tx sees its own write.
         ryow = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -739,7 +729,6 @@ class TestQueryService:
         )
         assert ryow.column("name").to_pylist() == ["ryow_alice"]
 
-        # Concurrent reader without open_tx_uuid does not.
         committed_view = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -748,7 +737,6 @@ class TestQueryService:
         )
         assert committed_view.num_rows == 0
 
-        # After commit both views see the row.
         client.commit_tx(
             tx.tx_uuid,
             catalog_uuid=catalog_uuid,
@@ -917,7 +905,6 @@ class TestQueryService:
             schema_uuid=schema_uuid,
             branch_uuid=main_branch_uuid,
         )
-        # Concurrent tx_b commits.
         tx_b = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1185,7 +1172,6 @@ class TestQueryService:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # First tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1211,7 +1197,6 @@ class TestQueryService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Second tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1237,7 +1222,6 @@ class TestQueryService:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Audit with after filter — only the second tx
         from penca_client._time import micros_to_datetime
 
         after = micros_to_datetime(committed1.commit_micros + 1)
@@ -1396,7 +1380,6 @@ class TestBranchMaterialization:
         client = make_client()
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
 
-        # Create a branch from main — table should be automatically visible.
         branch = client.create_branch(
             "materialized",
             catalog_uuid=catalog_uuid,
@@ -1413,7 +1396,6 @@ class TestBranchMaterialization:
         )
         assert table_info.table_uuid == table_uuid
 
-        # Write data on the new branch.
         tx = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1439,7 +1421,6 @@ class TestBranchMaterialization:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Read data back from the new branch.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1449,7 +1430,6 @@ class TestBranchMaterialization:
         assert result.num_rows == 2
         assert set(result.column("name").to_pylist()) == {"alice", "bob"}
 
-        # Main branch should have no data (write was only on the new branch).
         main_result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1458,9 +1438,7 @@ class TestBranchMaterialization:
         assert main_result.num_rows == 0
 
 
-# ---------------------------------------------------------------------------
 # CHA-142 — filter pushdown on the read path
-# ---------------------------------------------------------------------------
 
 
 _FILTER_STATES = [
@@ -1948,9 +1926,7 @@ class TestReadDataFilterPushdown:
         assert unfiltered.column("value").to_pylist() == [100]
 
 
-# ---------------------------------------------------------------------------
 # CHA-361: GetPlan without committed_at pins to pg_now (no unbounded plan)
-# ---------------------------------------------------------------------------
 
 
 class TestTimeTravelCatalogReadRespectsAsOfOnColdTier:
@@ -2074,13 +2050,11 @@ class TestTimeTravelCatalogReadRespectsAsOfOnColdTier:
             )
 
 
-# ---------------------------------------------------------------------------
 # The CHA-215 time-travel segment-selection tests (TestTimeTravelSegmentFilters)
 # were removed with the StorageMetadataService Plan RPC they dialed (CHA-445).
 # Their DB-bound coverage — persist-segment interval-overlap straddle behavior
 # and snapshot-picker watermark (not commit-time) ordering — is tracked for
 # restoration in CHA-456.
-# ---------------------------------------------------------------------------
 
 
 def _commit_one_row(
@@ -2114,9 +2088,7 @@ def _micros_to_dt(micros: int):
     return micros_to_datetime(micros)
 
 
-# ---------------------------------------------------------------------------
 # CHA-218: cold reads/audit after pre-joining commit_tx_log into persist segments
-# ---------------------------------------------------------------------------
 #
 # These tests pin the read-path consequences of CHA-218: cold merge-read
 # collapses to a pure scan (no JOIN against cold ``commit_tx_log``); ``audit_data``
@@ -2224,7 +2196,6 @@ class TestColdRowsPreserveTxMetadataAfterHotPurge:
             branch_uuid=main_uuid,
             include_tx_metadata=True,
         )
-        # Both versions surface from cold with their denormalized metadata.
         # Index by name so the assertions are independent of row order.
         names = upserts.column("name").to_pylist()
         committed_at = upserts.column("commit_micros").to_pylist()
@@ -2322,7 +2293,6 @@ class TestPostPersistReadParity:
             branch_uuid=main_uuid,
         )
 
-        # Pre-persist latest view.
         pre = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -2338,7 +2308,6 @@ class TestPostPersistReadParity:
         )
         assert pre_rows == [("alice", 99), ("bob", 2)]
 
-        # Persist + post-persist latest view — identical content.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -2604,16 +2573,13 @@ class TestAuditCoversPureColdData:
             include_tx_metadata=True,
         )
 
-        # Two upsert versions (alice + bob) survive in audit.
         assert upserts.num_rows == 2, (
             f"expected 2 cold upsert versions in audit, got {upserts.num_rows}"
         )
-        # One tombstone (alice's delete).
         assert deletes.num_rows == 1, (
             f"expected 1 cold tombstone in audit, got {deletes.num_rows}"
         )
 
-        # The four tx metadata fields are populated for every row.
         for col in ("began_at_micros", "commit_micros", "comment", "author"):
             assert col in upserts.schema.names
             assert col in deletes.schema.names
@@ -2626,7 +2592,6 @@ class TestAuditCoversPureColdData:
                 " carry the denormalized tx metadata"
             )
 
-        # Schema does not include tx_uuid.
         assert "tx_uuid" not in upserts.schema.names
         assert "tx_uuid" not in deletes.schema.names
 
@@ -3078,9 +3043,7 @@ class TestAuditAppliesPurgeCutoff:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-227: strict hot/cold partition + plan-time threading in plan()
-# ---------------------------------------------------------------------------
 #
 # Pins the planner reshape: pre-Purge ``plan()`` returns
 # ``cold_storage = None`` (hot serves everything); post-Purge the cold
@@ -3309,7 +3272,6 @@ class TestCHA227PlanStrictPartition:
             client, catalog_uuid, schema_uuid, table_uuid, main_uuid, "bob", 2
         )
 
-        # Drive both rows into cold and clear hot.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,

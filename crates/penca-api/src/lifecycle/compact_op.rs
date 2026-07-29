@@ -1,11 +1,6 @@
-//! Compact: per-scope active+sealed merge for persist segments
-//! (CHA-202, CHA-220).
+//! Compact: per-scope active+sealed merge for persist segments.
 //!
-//! [`LifecycleManager::compact_persist_segments`] runs over the
-//! per-`(table, log_kind)` scopes on a single table, delegating to
-//! `compact_one_scope` with a [`super::compact::PersistScope`] carrying
-//! the per-scope state. Snapshot segments are immutable and never
-//! compact (ADR 0024, CHA-407).
+//! Snapshot segments are immutable and never compact (ADR 0024).
 
 use std::collections::HashMap;
 
@@ -21,7 +16,7 @@ use crate::lifecycle::compact::{PersistScope, compact_one_scope};
 use crate::pagination::timestamp_bounds;
 
 impl LifecycleManager {
-    /// Compact persist-log segments for a single table (CHA-202, CHA-220).
+    /// Compact persist-log segments for a single table.
     ///
     /// Per-scope active+sealed algorithm. Each `(table_uuid, log_kind)`
     /// scope on the branch maintains at most one "active" merged file
@@ -95,8 +90,8 @@ impl LifecycleManager {
         let branch_str = branch_uuid.to_string();
         let (min_persisted, max_persisted) = timestamp_bounds(request.persisted_at.as_ref());
 
-        // CHA-220: SQL-level filter on table_uuid so a per-tick
-        // scheduler over N tables stays O(N), not O(N²).
+        // Filter table_uuid in SQL so a per-tick scheduler over N tables
+        // stays O(N), not O(N²).
         let table_str = table_uuid.to_string();
         let scopes = penca_storage_meta::LifecycleManager::list_unsealed_persist_scopes_on_table(
             pool,

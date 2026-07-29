@@ -1,11 +1,6 @@
 //! `ListModifiedTables` / `ListPersistedTables` — scheduler dirty-set
-//! discovery, rehomed onto `LifecycleService` (CHA-445).
-//!
-//! "What's dirty / what's persisted" is lifecycle enumeration, and the
-//! scheduler already holds a `LifecycleServiceClient`. The SQL lives in
-//! [`LifecycleManager`]; this is the thin orchestration wrapper (UUID
-//! validation + pagination) that was formerly the `StorageMetadataManager`
-//! methods of the deleted storage-metadata service.
+//! discovery. The SQL lives in [`LifecycleManager`]; this is the thin
+//! orchestration wrapper (UUID validation + pagination).
 
 use penca_db::driver::DbDriver;
 use penca_proto::external::v1::{
@@ -19,16 +14,12 @@ use crate::error::ApiError;
 use crate::lifecycle::LifecycleManager;
 use crate::pagination::{pagination_from_request, take_page_and_next_token, timestamp_bounds};
 
-/// Server-side default/cap for a single page on the two list-tables RPCs.
-/// The scheduler is the only caller and pages explicitly; this just keeps
-/// a page small enough to cap response size if a debug client omits
-/// `page_size`.
+/// Only bounds response size for a debug client that omits `page_size` — the
+/// scheduler, the real caller, always pages explicitly.
 const LIST_TABLES_DEFAULT_PAGE_SIZE: i64 = 100;
 
-/// Parse the `(catalog_uuid, branch_uuid)` the list RPCs scope to, failing
-/// fast at the boundary on a malformed UUID. `LifecycleManager` re-parses
-/// internally to keep its reads pure-typed; this surfaces a uniform
-/// `InvalidRequest` shape.
+/// Fail fast at the request boundary on a malformed UUID, so every list RPC
+/// surfaces the same `InvalidRequest` shape.
 fn parse_catalog_branch(catalog: &str, branch: &str) -> Result<(Uuid, Uuid), ApiError> {
     let catalog_uuid = Uuid::parse_str(catalog)
         .map_err(|_| ApiError::InvalidRequest(format!("malformed catalog_uuid: {catalog}")))?;
@@ -58,7 +49,6 @@ impl LifecycleManager {
             pagination_from_request(request.pagination.as_ref(), LIST_TABLES_DEFAULT_PAGE_SIZE);
         let (min_micros, max_micros) = timestamp_bounds(request.modified_at.as_ref());
 
-        // Fetch `page_size + 1` to detect a next page without a count query.
         let rows = penca_storage_meta::LifecycleManager::list_modified_table_uuids_paginated(
             driver,
             &catalog_uuid,

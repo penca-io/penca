@@ -248,6 +248,24 @@ init-agent-tools: init-build-tools
     kata init --project penca
     roborev init --agent claude-code
 
+    # Review calibration (CHA-531 retro). `roborev init` regenerates
+    # `.roborev.toml` from defaults, so these must be (re)applied after it —
+    # they are `config set` calls rather than a hand-edited file so the tool
+    # owns the serialization. Both are idempotent.
+    #
+    # `review_min_severity`: the kata bridge below turns every emitted finding
+    # into a task that blocks PR open, so a Low costs the same to clear as a
+    # High. Lows dominated volume (25 of 39 findings on 2026-07-28) and were
+    # closed by judgement rather than fixed.
+    #
+    # `review_guidelines`: injected into every review prompt. Roborev reviews
+    # ONE commit's diff with no view of the branch plan and no memory of prior
+    # reviews, so without this it re-raises concerns a later commit already
+    # addresses. Refresh the text from `roborev insights`, which mines the
+    # review history for findings consistently dismissed without a code change.
+    roborev config set review_min_severity medium
+    roborev config set review_guidelines "$(cat scripts/roborev-review-guidelines.md)"
+
     # Optional shared issue-graph client (CHA-447). When a shared kata instance
     # is provisioned via PENCA_KATA_GRAPH_URL, probe it so the operator knows
     # the scoped read-only client (scripts/kata-issue-graph.sh) can reach it.
@@ -276,62 +294,115 @@ init-agent-tools: init-build-tools
 clean-agent-tools cha branch:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Both list commands cap their output — `roborev list --limit` defaults to
-    # 50 and `kata list --limit` to 200 — so listing once and iterating leaves
-    # everything past the cap behind while still exiting 0. CHA-517 hit this:
-    # 69 open roborev jobs, 50 closed, 19 silently stranded. Loop until the
-    # list comes back empty rather than passing a bigger --limit, so there is
-    # no magic constant to drift from the tool's default.
+    # Both list commands cap their output — `roborev list` at 50, `kata list` at
+    # 200 — so listing once and iterating leaves everything past the cap behind
+    # while still exiting 0. CHA-517 hit this: 69 open roborev jobs, 50 closed,
+    # 19 silently stranded. So page until a pass has nothing new to try, taking
+    # each tool's own default page size rather than naming a constant here that
+    # would drift from it.
     #
-    # Failures are counted and reported rather than aborting: `set -e` plus a
-    # loop body would drop the rest of the batch on one bad id, which is the
-    # same silent under-clean by another route. The pass-made-no-progress guard
-    # is what stops an unclosable job spinning forever.
+    # Three properties this has to hold, each learned by getting it wrong:
+    #
+    #   Liveness — two independent ways a pass can make no progress, and both
+    #   must stop it. An id that keeps failing is remembered and skipped, so a
+    #   pass eventually attempts nothing and returns. An id the tool reports it
+    #   *succeeded* on but that is still listed next pass (stale daemon, an id
+    #   resolving to another scope, a soft-delete the listing does not reflect)
+    #   is caught by the listing, since exit status says it worked. Guarding on
+    #   only one of these hangs on the other; comparing listing text instead
+    #   fails on a mere reorder.
+    #
+    #   A listing failure is a failure — never an empty worklist. Swallowing it
+    #   would exit 0 having cleaned nothing, which is the exact silent
+    #   under-clean this recipe exists to prevent.
+    #
+    #   Honest counts — a failing id is re-listed every pass, so counting
+    #   attempts reports one stranded item several times. Failed ids are
+    #   recorded per drain and skipped, so the count is of distinct items.
     failures=0
 
-    while :; do
-        ids="$(roborev list --branch "{{branch}}" --open --limit 200 --json 2>/dev/null \
-            | jq -r '.[]?.id')"
-        [ -z "$ids" ] && break
+    list_roborev_jobs() {
+        roborev list --branch "{{branch}}" --open --json | jq -r '.[]?.id'
+    }
 
-        closed_this_pass=0
-        for job in $ids; do
-            if roborev close "$job" >/dev/null 2>&1; then
-                closed_this_pass=$((closed_this_pass + 1))
-            else
-                echo "  (could not close roborev job $job)" >&2
+    close_roborev_job() {
+        roborev close "$1"
+    }
+
+    list_kata_tasks() {
+        kata list --label "{{cha}}" --status closed --json | jq -r '.issues[]?.qualified_id'
+    }
+
+    delete_kata_task() {
+        kata delete "$1" --force --confirm "DELETE $1"
+    }
+
+    # Function names rather than eval'd command strings, so tool output is never
+    # re-parsed as shell source. The `for id in $ids` split below is deliberate
+    # and is the one place ids are word-split: both tools emit one bare id per
+    # line with no whitespace or globbing characters, which is what makes the
+    # split safe and the quoting everywhere else load-bearing.
+    drain() {
+        local kind="$1" list_fn="$2" act_fn="$3"
+        local failed="" acted="" ids id err attempted
+
+        while :; do
+            if ! ids="$("$list_fn")"; then
+                # Not "nothing cleaned": the listing runs every pass, so this
+                # can land after several successful ones. What is certain is
+                # that the remainder is unknown and untouched.
+                echo "  (could not list remaining items to $kind — some may be left)" >&2
                 failures=$((failures + 1))
+                return
             fi
+
+            [ -z "$ids" ] && return
+
+            attempted=0
+            for id in $ids; do
+                case " $failed " in *" $id "*) continue ;; esac
+
+                # Acted on successfully last pass and still listed: the action
+                # is a no-op for this item, so retrying it forever is the one
+                # way this loop can fail to terminate. Exit status cannot detect
+                # it — the tool said it worked — so the listing is the evidence.
+                case " $acted " in
+                    *" $id "*)
+                        echo "  (could not $kind $id: reported success but it is still listed)" >&2
+                        failed="$failed $id"
+                        failures=$((failures + 1))
+                        continue
+                        ;;
+                esac
+
+                attempted=1
+                if err="$("$act_fn" "$id" 2>&1 >/dev/null)"; then
+                    acted="$acted $id"
+                else
+                    # Keep the tool's own explanation — "daemon unreachable",
+                    # "unknown id" — which is the whole diagnostic value here.
+                    echo "  (could not $kind $id: $err)" >&2
+                    failed="$failed $id"
+                    failures=$((failures + 1))
+                fi
+            done
+
+            # Every remaining id has already failed, so another pass is futile.
+            [ "$attempted" -eq 0 ] && return
         done
+    }
 
-        [ "$closed_this_pass" -eq 0 ] && break
-    done
+    drain "close roborev job" list_roborev_jobs close_roborev_job
+    drain "delete kata task" list_kata_tasks delete_kata_task
 
-    while :; do
-        refs="$(kata list --label "{{cha}}" --status closed --limit 200 --json \
-            | jq -r '.issues[]?.qualified_id')"
-        [ -z "$refs" ] && break
-
-        deleted_this_pass=0
-        for ref in $refs; do
-            if kata delete "$ref" --force --confirm "DELETE $ref" >/dev/null 2>&1; then
-                deleted_this_pass=$((deleted_this_pass + 1))
-            else
-                echo "  (could not delete kata task $ref)" >&2
-                failures=$((failures + 1))
-            fi
-        done
-
-        [ "$deleted_this_pass" -eq 0 ] && break
-    done
-
-    # Exit non-zero on any failure: the whole point of this recipe is that state
-    # does not accumulate, and reporting success while leaving some behind is
-    # the bug this fixes.
+    # Exit non-zero on any failure: the point of this recipe is that state does
+    # not accumulate, and reporting success while leaving some behind is the bug
+    # it exists to prevent.
     if [ "$failures" -gt 0 ]; then
         echo "clean-agent-tools: $failures item(s) could not be cleaned" >&2
         exit 1
     fi
+
 
 # Launch the Headroom context-compression proxy (CHA-465). Opt-in: run
 # this in a separate shell, then start Claude Code with
@@ -712,6 +783,16 @@ fetch-jdbc-driver:
 # Requires Docker daemon. Uses the test profile (random ports) by default,
 # safe for parallel worktrees. Pass service names to run specific tests:
 #   just integration-test lifecycle query
+# Set the parallel phase's worker count. Unset means `auto`, capped by
+# PENCA_TEST_JOBS_MAX (default 4); an explicit value is used as-is, uncapped,
+# so a box with fewer cores than CI can still reproduce its worker count:
+#   PENCA_TEST_JOBS=4 just integration-test
+# Note that oversubscribing cores this way slows the servicers, which is what
+# the pinned 2s QUERY_TIMEOUT_SECONDS measures against — so timeouts seen this
+# way may be the oversubscription rather than a real defect.
+# Note a named subset now runs its non-serial tests under xdist too, so it is
+# representative of CI — but that means output is captured and breakpoint()/pdb
+# won't attach. For an interactive debug loop, call pytest directly.
 integration-test *services:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -724,7 +805,16 @@ integration-test *services:
     # `penca-down` dumps per-service logs to /tmp before teardown; trap
     # guarantees teardown whether pytest passes, fails, or the shell is
     # interrupted, while preserving pytest's exit code for CI.
-    trap 'just penca-down --profile=test' EXIT
+    #
+    # ONE trap for the whole recipe. bash does not stack EXIT handlers — a
+    # second `trap ... EXIT` silently replaces this one, which would leave the
+    # stack up, skip the volume wipe that makes the next run a fresh one, and
+    # drop the /tmp/penca-logs-* that CI uploads on failure. So the collection
+    # scratch file is created here and cleaned up here rather than by a trap of
+    # its own.
+    collect_out=$(mktemp)
+    collect_err=$(mktemp)
+    trap 'just penca-down --profile=test; rm -f "$collect_out" "$collect_err"' EXIT
 
     # `.client.env` — the 6 PENCA_*_URL values for PencaClient.
     # `.baseline.env` — PENCA_DB_* for white-box tests that open a direct
@@ -735,15 +825,165 @@ integration-test *services:
     # ``os.environ`` see the same caps the containers run under.
     set -a && source docker/test.env && source docker/.client.env && source docker/.baseline.env && set +a
 
+    # Both the full suite and a named subset run the same two phases; only the
+    # file list differs. A subset run is the dev loop, so it should be fast AND
+    # representative — running it un-split would let a test that is not
+    # xdist-safe pass locally and fail only in the merge queue.
     if [ -z "{{services}}" ]; then
-        uv run pytest tests/integration/integration_*.py -s
+        files=(tests/integration/integration_*.py)
     else
-        files=""
+        files=()
         for svc in {{services}}; do
-            files="$files tests/integration/integration_${svc}_test.py"
+            files+=("tests/integration/integration_${svc}_test.py")
         done
-        uv run pytest $files -s
     fi
+
+    # Two disjoint phases against the one stack. The `serial` tests must run
+    # alone for one of two reasons: they read process-global state (container
+    # stdout log windows, pg_stat_statements counters) that a concurrent worker
+    # pollutes, or they deliberately park a servicer PG connection while
+    # asserting a bounded time. Either way alone means alone — `--dist
+    # loadgroup` only serializes the group internally and would still run it
+    # concurrently with the parallel phase.
+    #
+    # CHA-519 retires the first reason, not the second, so it shrinks this
+    # phase rather than deleting it.
+    #
+    # Count each selection up front, so the phases don't have to infer intent
+    # from an exit code later and a bad selector fails in seconds rather than
+    # after a 30-minute run.
+    #
+    # The sum check is narrower than it looks: `-m X` and `-m "not X"` are
+    # exact complements for ANY well-formed X, so it is a tautology except in
+    # the one case where the two literals here stop being negations of each
+    # other — i.e. a one-sided typo like `-m "seriall"`, which drops the serial
+    # tests from both phases. That is the realistic mistake, so it earns its
+    # place, but it does NOT check that the marks themselves are right; the
+    # static check does that.
+    #
+    # Counts collected node ids rather than parsing pytest's summary line,
+    # whose wording differs between the deselected and non-deselected cases.
+    # Exit 5 (nothing collected) is a legitimate answer of zero; anything else
+    # non-zero is a real collection failure — a bad service name gives exit 4 —
+    # and must not be silently counted as zero.
+    count_tests() {
+        # stdout and stderr to separate files: a warning or traceback line
+        # containing "::" would otherwise inflate the node-id count.
+        uv run pytest "$@" --collect-only -q >"$collect_out" 2>"$collect_err"
+        collect_rc=$?
+        if [ "$collect_rc" -ne 0 ] && [ "$collect_rc" -ne 5 ]; then
+            cat "$collect_out" "$collect_err" >&2
+            echo "collection failed (pytest exit $collect_rc)" >&2
+            return 1
+        fi
+
+        # Anchored: a collected node id is the whole line and starts with the
+        # file path. pytest's reporter writes its warnings-summary and
+        # deselection text to stdout as well, so an unanchored "::" would
+        # count that noise as tests.
+        grep -cE '^[^ ]+::' "$collect_out" || true
+    }
+    # One definition of each selector, shared by the counts below and by the
+    # phase invocations. Previously the literals appeared in five places and
+    # the guard compared only its own two, so a typo in a PHASE (-m "not
+    # seriall") passed the guard untouched and ran every serial test under
+    # -n auto, exiting 0 — the same one-sided-typo class the guard exists for,
+    # failing in the direction that hides.
+    SERIAL_SELECTOR='serial'
+    PARALLEL_SELECTOR='not serial'
+
+    total_n=$(count_tests "${files[@]}") || exit 1
+    serial_n=$(count_tests "${files[@]}" -m "$SERIAL_SELECTOR") || exit 1
+    parallel_n=$(count_tests "${files[@]}" -m "$PARALLEL_SELECTOR") || exit 1
+
+    # Selecting nothing at all is never right: without this both phases would
+    # exit 5, both tolerances would fire, and the recipe would report success
+    # having run no tests. Reached when the selected files collect cleanly but
+    # hold no tests — a mistyped service name does NOT land here, since that is
+    # a pytest usage error caught by count_tests above.
+    if [ "$total_n" -eq 0 ]; then
+        echo "selection matched no tests" >&2
+        exit 1
+    fi
+
+    if [ "$((serial_n + parallel_n))" -ne "$total_n" ]; then
+        echo "phase selectors do not partition the suite:" >&2
+        echo "  serial=$serial_n + parallel=$parallel_n != total=$total_n" >&2
+        echo "  a test in neither phase would silently never run" >&2
+        exit 1
+    fi
+
+    # Serial first, and the order is load-bearing. `container_log` buffers and
+    # ANSI-strips the container's whole stdout on EVERY call, and `poll_log_for`
+    # repeats that every 100ms for up to 5s per assertion. The services log at
+    # debug with no size cap, so scraping after the parallel phase means paying
+    # a worst-case buffer each time: measured 19m for 56 tests that way, against
+    # ~11m for the same files' work back when the suite was fully serial. The
+    # gap is buffer cost, not what these tests inherently take.
+    serial_rc=0
+    uv run pytest "${files[@]}" -m "$SERIAL_SELECTOR" -s || serial_rc=$?
+
+    # No `-s`: N workers interleave into noise, and nothing here needs it — the
+    # scrapers read `docker logs`, not pytest's capture, and all ran in phase 1.
+    # Runs even if phase 1 failed, so one invocation reports both.
+    #
+    # `--dist loadgroup` honours `xdist_group`, which pins mutually-conflicting
+    # tests to ONE worker while leaving them parallel with everything else.
+    # Ungrouped tests distribute exactly as under the default `load`. Note this
+    # is not a substitute for the serial phase: loadgroup still runs the group
+    # concurrently with other tests, which is fine for tests that conflict only
+    # with each other and useless for ones that need the stack quiet.
+    #
+    # The cap is 4 because that is what CI has, not because of a measured
+    # ceiling. Worker count WAS bounded by the servicers' PG pools — at 4
+    # workers against a pool of 4, 28 tests failed, every one with "pool timed
+    # out while waiting for an open connection" and nothing else — which is why
+    # docker/compose.yml now defaults that pool to 12. Keep workers at or under
+    # the pool depth if either number moves.
+    #
+    # What binds now is CPU against the deliberately small
+    # QUERY_TIMEOUT_SECONDS=2: at 4 workers on a 2-core box, two heavy
+    # compaction tests timed out. Both are now marked `serial` (reason (b)), so
+    # they no longer run in this phase — but the shape is worth remembering,
+    # since a server-side deadline that small is sensitive to how much CPU the
+    # servicers get, not just to how many workers there are.
+    #
+    # PENCA_TEST_JOBS sets `-n` directly so it can raise as well as lower —
+    # without that, a 2-core box could never reach CI's 4 workers and the queue
+    # was the only place contention showed up. The cap applies ONLY to `auto`:
+    # xdist clamps `min(numprocesses, maxprocesses)` for an explicit `-n` too,
+    # so passing both would silently cap a deliberate request.
+    parallel_rc=0
+    if [ -n "${PENCA_TEST_JOBS:-}" ]; then
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" --dist loadgroup \
+            -n "$PENCA_TEST_JOBS" || parallel_rc=$?
+    else
+        uv run pytest "${files[@]}" -m "$PARALLEL_SELECTOR" --dist loadgroup \
+            -n auto --maxprocesses "${PENCA_TEST_JOBS_MAX:-4}" || parallel_rc=$?
+    fi
+
+    # pytest exits 5 (NO_TESTS_COLLECTED) when a phase selects nothing. The
+    # counts taken up front say whether that was expected, so neither phase has
+    # to infer it from an exit code — an empty phase is fine exactly when its
+    # count was zero. That covers a fully-serial named subset, and the
+    # post-CHA-519 world where no serial tests remain, without special-casing
+    # either.
+    if [ "$serial_rc" -eq 5 ] && [ "$serial_n" -eq 0 ]; then
+        serial_rc=0
+    fi
+
+    if [ "$parallel_rc" -eq 5 ] && [ "$parallel_n" -eq 0 ]; then
+        parallel_rc=0
+    fi
+
+    # Surface the first non-zero. Written as a full `if` rather than
+    # `[ ... ] && rc=...`, whose non-zero test would trip `set -e`.
+    rc="$serial_rc"
+    if [ "$rc" -eq 0 ]; then
+        rc="$parallel_rc"
+    fi
+
+    exit "$rc"
 
 # Run performance tests: brings up infra + servicers, runs tests, tears
 # down. Requires Docker daemon. Uses random ports by default (safe for

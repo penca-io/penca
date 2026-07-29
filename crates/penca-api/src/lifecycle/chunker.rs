@@ -1,4 +1,4 @@
-//! Per-row byte-width chunker for CHA-215 segment writes.
+//! Per-row byte-width chunker for segment writes.
 //!
 //! Splits a `RecordBatch` into chunks whose standalone in-memory
 //! footprint is at most `max_bytes`, by walking each row's contribution
@@ -18,22 +18,14 @@ use crate::error::ApiError;
 /// Per-row standalone in-memory byte footprint for a fixed-width
 /// `DataType`. Returns `None` for variable-width or unsupported types.
 ///
-/// CHA-215: the chunker pre-computes the fixed-width sum once per
-/// batch and only walks variable-width columns per row — the dispatch
-/// would otherwise re-cost the same constant on every (row, col) pair
-/// (see review on PR #79).
-///
 /// The `+1` trailing byte is the per-column-per-row share of the
 /// validity bitmap rounded up from 0.125 — overcounts slightly; the
 /// cap is a ceiling so a small overshoot is fine.
 fn fixed_width_byte_width(dtype: &DataType) -> Option<i64> {
-    // CHA-386: width classification is owned by the canonical type
-    // registry, so the chunker and the row codec agree on the supported
-    // set by construction. `None` covers both variable-width types (walked
-    // per row by `variable_width_row_bytes`) and types outside the
-    // canonical set. Byte arithmetic is unchanged for every type the
-    // chunker handled before; Float16/Decimal128/Decimal256 are newly
-    // sized rather than erroring.
+    // Width classification is owned by the canonical type registry, so the
+    // chunker and the row codec agree on the supported set by construction.
+    // `None` covers both variable-width types (walked per row by
+    // `variable_width_row_bytes`) and types outside the canonical set.
     CanonicalType::from_arrow(dtype)
         .ok()
         .and_then(|ct| ct.fixed_width_bytes())
@@ -44,12 +36,10 @@ fn fixed_width_byte_width(dtype: &DataType) -> Option<i64> {
 /// downcast failures as `ApiError::InvalidRequest` rather than
 /// panicking the lifecycle service.
 ///
-/// CHA-215: paired with [`fixed_width_byte_width`] inside
-/// [`chunk_row_ranges`]. The number is the per-row cost a fresh
-/// cold-tier reader would pay after re-materializing the array from a
-/// single segment file — not the shared-buffer cost
-/// `Array::get_array_memory_size` returns for a `RecordBatch::slice`,
-/// which underreports the post-serialize footprint.
+/// The number is the per-row cost a fresh cold-tier reader would pay
+/// after re-materializing the array from a single segment file — NOT
+/// the shared-buffer cost `Array::get_array_memory_size` returns for a
+/// `RecordBatch::slice`, which underreports the post-serialize footprint.
 fn variable_width_row_bytes(col: &ArrayRef, idx: usize) -> Result<i64, ApiError> {
     match col.data_type() {
         DataType::Utf8 => {
@@ -184,7 +174,7 @@ fn variable_width_row_bytes(col: &ArrayRef, idx: usize) -> Result<i64, ApiError>
 /// ([`fixed_width_byte_width`]); only the variable-width columns are
 /// walked per row ([`variable_width_row_bytes`]).
 ///
-/// CHA-215: pre-computing the fixed sum once avoids re-costing the same
+/// Pre-computing the fixed sum once avoids re-costing the same
 /// constant on every (row, col) pair. Shared by [`chunk_row_ranges`]
 /// (which accumulates per chunk) and [`batch_in_memory_bytes`] (which
 /// sums over the whole batch), so the two agree on every row's cost by
@@ -245,8 +235,6 @@ pub(super) fn chunk_row_ranges(
     for i in 0..n_rows {
         let row_bytes = model.row_bytes(i)?;
         if running + row_bytes > max_bytes && i > chunk_start {
-            // `running` is the closed chunk's footprint: the sum of
-            // row costs for `[chunk_start, i)`.
             ranges.push((chunk_start, i - chunk_start, running));
             chunk_start = i;
             running = 0;
@@ -264,10 +252,8 @@ pub(super) fn chunk_row_ranges(
 /// compaction re-point path, where the merged batch never goes
 /// through the chunker).
 ///
-/// `Result` (not the bare `i64` the ticket sketches) because it
-/// reuses the fallible [`variable_width_row_bytes`] primitive — an
-/// unsupported `DataType` fails fast rather than being silently
-/// undercounted.
+/// Fallible so an unsupported `DataType` fails fast rather than being
+/// silently undercounted.
 pub(super) fn batch_in_memory_bytes(batch: &RecordBatch) -> Result<i64, ApiError> {
     let model = RowCostModel::build(batch);
     let mut total: i64 = 0;
@@ -302,8 +288,6 @@ mod tests {
         let arrays: Vec<ArrayRef> = cols.into_iter().map(|(_, a)| a).collect();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
     }
-
-    // --- Fixed-width scalars: payload width + 1 validity byte. ---
 
     #[test]
     fn int8_bool_uint8_are_two_bytes_per_row() {
@@ -357,8 +341,6 @@ mod tests {
         assert_eq!(batch_in_memory_bytes(&b).unwrap(), 2 * 9);
     }
 
-    // --- Variable-width: payload + 4 (offset) + 1 (validity). ---
-
     #[test]
     fn utf8_is_payload_plus_five_per_row() {
         // "a"=1+5, "bb"=2+5, "ccc"=3+5 → 6+7+8 = 21.
@@ -401,8 +383,6 @@ mod tests {
         let b = batch_of(vec![("c", Arc::new(lb.finish()) as ArrayRef)]);
         assert_eq!(batch_in_memory_bytes(&b).unwrap(), 18);
     }
-
-    // --- Cross-column + edge cases. ---
 
     #[test]
     fn multi_column_sums_fixed_and_variable_per_row() {
@@ -491,10 +471,9 @@ mod tests {
 
     #[test]
     fn unsupported_dtype_fails_fast() {
-        // A type outside the canonical set (Duration — CHA-386 widened
-        // LargeUtf8 into the supported set, so it no longer fails) is
-        // matched by neither `fixed_width_byte_width` nor
-        // `variable_width_row_bytes` → InvalidRequest, not a silent 0.
+        // Duration is outside the canonical set, so neither
+        // `fixed_width_byte_width` nor `variable_width_row_bytes` matches it
+        // → InvalidRequest, not a silent 0.
         let b = batch_of(vec![(
             "c",
             Arc::new(DurationSecondArray::from(vec![1i64])) as ArrayRef,

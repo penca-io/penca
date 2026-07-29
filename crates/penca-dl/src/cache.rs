@@ -1,10 +1,10 @@
-//! Process-lifetime, zero-copy cache of decoded cold segments (CHA-252, CHA-474).
+//! Process-lifetime, zero-copy cache of decoded cold segments.
 //!
 //! A repeat read of the same cold segment within the process lifetime is served
 //! as an `Arc::clone` of the already-decoded Arrow batches, skipping the S3 GET +
 //! Parquet/Lance decode. It holds both snapshot segments (keyed by
 //! `table_snapshot_segment_uuid`) and persist data segments (keyed by
-//! `segment_uuid`, CHA-474) under one byte budget. Each per-uuid segment file is
+//! `segment_uuid`) under one byte budget. Each per-uuid segment file is
 //! immutable, so the key→value mapping is stable and needs no invalidation: a
 //! snapshot uuid resolves to identical bytes for the life of the process, and
 //! although a *resolved persist tier* is mutable under retention compaction, an
@@ -14,8 +14,7 @@
 //!
 //! Eviction is W-TinyLFU (frequency-based, scan-resistant, aged) via `moka`,
 //! bounded by a byte budget: each entry is weighed by its segment's
-//! `size_bytes` — the in-memory Arrow footprint Penca records at write time
-//! (CHA-347 for snapshot segments; the persist write path records the same).
+//! `size_bytes`, the in-memory Arrow footprint Penca records at write time.
 //! Eviction and misses degrade gracefully to an S3 re-read, which is the
 //! OOM-safety story since this is heap memory, not reclaimable OS page cache.
 //! The budget is env-configured by the hosting service; this type takes it as a
@@ -88,8 +87,8 @@ impl SegmentCache {
     /// max-entry count), so a zero-weight entry contributes nothing to
     /// `weighted_size` and is never evicted under budget pressure — it would
     /// pin forever and escape the RAM bound. `size_bytes` is `DEFAULT 0` and is
-    /// backfilled by a post-write UPDATE, so a 0 is plausible for empty /
-    /// legacy / pre-CHA-347 segments; those fall to the pushdown branch.
+    /// backfilled by a post-write UPDATE, so a 0 is plausible for empty or
+    /// legacy segments; those fall to the pushdown branch.
     ///
     /// Also rejects `weight_bytes > u32::MAX`: moka's weigher is `-> u32`, so an
     /// entry's charge is stored as `u32`. With a multi-GB budget a >4 GiB

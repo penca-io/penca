@@ -18,6 +18,7 @@ Scoped run::
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 from penca_client._time import micros_to_datetime
 
 from .integration_helpers import (
@@ -26,6 +27,10 @@ from .integration_helpers import (
     poll_log_for,
     setup_with_data,
 )
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 # ``ids`` carries only the table's primary-key column(s) (CHA-398); the server
 # derives ``row_uuid`` from ``(table_uuid || pk_values)``. USER_SCHEMA's PK is

@@ -12,13 +12,13 @@ pub type Result<T, E = FlightError> = std::result::Result<T, E>;
 #[derive(Debug, PartialEq, Clone)]
 pub struct CommandTicket {
     pub command: sql::Command,
-    /// Server-minted UUID keying the cached `GetFlightInfo` logical plan
-    /// (CHA-355). `Some` when `get_flight_info_statement` registered a plan and
+    /// Server-minted UUID keying the cached `GetFlightInfo` logical plan.
+    /// `Some` when `get_flight_info_statement` registered a plan and
     /// stamped its UUID on the ticket; `DoGet` looks it up to reuse the plan.
     /// `None` for tickets that carry only the SQL string (older clients, or any
     /// path that did not register a plan) — `DoGet` then re-plans.
     pub statement_uuid: Option<String>,
-    /// CHA-374 / CHA-460: the auto-commit statement's pinned read snapshot as a
+    /// The auto-commit statement's pinned read snapshot as a
     /// `commit_seq_num` frontier (the branch's max committed seq, captured once at
     /// `GetFlightInfo`). `Some` for an auto-commit statement; `None` in-tx (the
     /// open tx carries the snapshot) or for older clients. `DoGet` decodes it
@@ -36,13 +36,13 @@ impl CommandTicket {
         }
     }
 
-    /// Stamp a cached-plan UUID on the ticket (CHA-355).
+    /// Stamp a cached-plan UUID on the ticket.
     pub fn with_statement_uuid(mut self, statement_uuid: String) -> Self {
         self.statement_uuid = Some(statement_uuid);
         self
     }
 
-    /// Stamp the pinned auto-commit read snapshot on the ticket (CHA-374).
+    /// Stamp the pinned auto-commit read snapshot on the ticket.
     pub fn with_as_of(mut self, as_of_seq: i64) -> Self {
         self.as_of_seq = Some(as_of_seq);
         self
@@ -81,12 +81,12 @@ impl CommandTicket {
 struct CommandTicketMessage {
     #[prost(bytes = "bytes", tag = "2")]
     command: Bytes,
-    /// CHA-355 cached-plan UUID. `optional` so an absent field (old client,
+    /// Cached-plan UUID. `optional` so an absent field (old client,
     /// or any path that registered no plan) decodes to `None` — `DoGet` then
     /// re-plans. Tag 3; tag 2 (`command`) is unchanged for wire compatibility.
     #[prost(string, optional, tag = "3")]
     statement_uuid: Option<String>,
-    /// CHA-374 pinned auto-commit snapshot. `optional` tag 4; tags 2/3 are
+    /// Pinned auto-commit snapshot. `optional` tag 4; tags 2/3 are
     /// unchanged so older tickets decode with `as_of_seq = None`.
     #[prost(int64, optional, tag = "4")]
     as_of_seq: Option<i64>,
@@ -103,12 +103,12 @@ fn decode_error_flight_error(err: prost::DecodeError) -> FlightError {
 pub struct QueryHandle {
     query: String,
     parameters: Option<Bytes>,
-    /// CHA-367: server-minted UUID keying the plan `do_action_create_prepared_statement`
+    /// Server-minted UUID keying the plan `do_action_create_prepared_statement`
     /// already built and cached, so `get_flight_info_prepared_statement` reuses
     /// it instead of re-planning the same statement at the same snapshot. `Some`
     /// only for the Select / Set arms (which reach GetFlightInfo + DoGet);
-    /// `None` otherwise and for handles minted before this field existed — a
-    /// `None` simply re-plans, identical to the pre-CHA-367 behavior.
+    /// `None` otherwise, and for older handles that lack the field — a `None`
+    /// simply re-plans.
     statement_uuid: Option<String>,
 }
 
@@ -121,7 +121,7 @@ impl QueryHandle {
         }
     }
 
-    /// Stamp the CHA-367 cross-pass plan-cache UUID on the handle so
+    /// Stamp the cross-pass plan-cache UUID on the handle so
     /// `get_flight_info_prepared_statement` can reuse the PREPARE-built plan.
     pub fn with_statement_uuid(mut self, statement_uuid: String) -> Self {
         self.statement_uuid = Some(statement_uuid);
@@ -136,7 +136,7 @@ impl QueryHandle {
         self.parameters.as_deref()
     }
 
-    /// The CHA-367 cached-plan UUID, if PREPARE stamped one. `None` → the
+    /// The cached-plan UUID, if PREPARE stamped one. `None` → the
     /// GetFlightInfo leg re-plans from `query()`.
     pub fn statement_uuid(&self) -> Option<&str> {
         self.statement_uuid.as_deref()
@@ -183,7 +183,7 @@ pub struct QueryHandleMessage {
     query: String,
     #[prost(bytes = "bytes", optional, tag = "2")]
     parameters: Option<Bytes>,
-    /// CHA-367 cross-pass cached-plan UUID. `optional` tag 3; tags 1/2 are
+    /// Cross-pass cached-plan UUID. `optional` tag 3; tags 1/2 are
     /// unchanged so handles minted before this field decode with
     /// `statement_uuid = None` and re-plan, preserving wire compatibility.
     #[prost(string, optional, tag = "3")]
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn query_handle_without_statement_uuid_decodes_to_none() {
-        // A handle minted before CHA-367 (no statement_uuid) must decode as None so
+        // A handle minted without a statement_uuid must decode as None so
         // get_flight_info_prepared_statement re-plans (back-compat).
         let decoded =
             QueryHandle::try_decode(QueryHandle::new("SELECT 1".to_string(), None).encode())
@@ -245,8 +245,8 @@ mod tests {
         assert_eq!(decoded.statement_uuid(), None);
     }
 
-    // CHA-374: the pinned auto-commit snapshot rides the ticket / handle
-    // beside `statement_uuid` (server->client->server relay). Round-trip parity.
+    // The pinned auto-commit snapshot rides the ticket / handle beside
+    // `statement_uuid` (server->client->server relay). Round-trip parity.
     #[test]
     fn as_of_seq_survives_command_ticket_roundtrip() {
         let encoded = CommandTicket::new(statement_command("SELECT 1"))

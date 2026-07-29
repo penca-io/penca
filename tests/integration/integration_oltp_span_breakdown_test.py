@@ -33,12 +33,18 @@ from __future__ import annotations
 import re
 import time
 
+import pytest
+
 from .integration_helpers import (
     container_log,
     make_client,
     setup_with_data,
     setup_with_data_named,
 )
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 # FmtSpan::CLOSE renders the closing span's timing on a `close
 # time.busy=..` event line; requiring the span name on the same line is

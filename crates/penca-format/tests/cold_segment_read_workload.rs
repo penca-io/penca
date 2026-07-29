@@ -1,8 +1,8 @@
-//! Workload-correctness guard for the cold-segment read floor (CHA-415 #2a).
+//! Workload-correctness guard for the cold-segment read floor.
 //!
-//! The `cold_segment_read_floor` bench (CHA-415 I2a) times the two CHA-348 read
-//! arms against a Lance/Parquet segment: (a) whole-segment read + client-side
-//! filter, (b) `(offset, length)` range read (the pushdown). A throughput
+//! The `cold_segment_read_floor` bench times the two read arms against a
+//! Lance/Parquet segment: (a) whole-segment read + client-side filter,
+//! (b) `(offset, length)` range read (the pushdown). A throughput
 //! number is only meaningful if both arms actually return the intended row, so
 //! this test locks that: it writes a segment, reads the target row each way,
 //! and asserts the two arms agree.
@@ -10,11 +10,9 @@
 //! This pins `FormatReader::read_segment` read *semantics* directly (whole vs
 //! range), over an in-memory object store — so it locks arm-agreement, not
 //! cold-tier I/O latency (the real GET+decode floor is the bench's concern).
-//! Runs over both formats so the optional Parquet arm (CHA-61) is covered.
-//! Characterization guard:
-//! `read_segment` is existing correct production code, so this passes on first
-//! write (not fail-first TDD); its job is to keep the bench measuring a real
-//! point lookup and to catch a future read-contract regression.
+//! Runs over both formats so the optional Parquet arm is covered. Its job is
+//! to keep the bench measuring a real point lookup and to catch a future
+//! read-contract regression.
 
 use std::sync::Arc;
 
@@ -124,7 +122,7 @@ fn ruuid_of(batch: &RecordBatch, row: usize) -> String {
         .to_string()
 }
 
-/// Both CHA-348 read arms return the same target row from a cold segment.
+/// Both read arms return the same target row from a cold segment.
 #[tokio::test]
 async fn cold_point_lookup_arms_agree() {
     const N: i64 = 100;

@@ -1,15 +1,15 @@
-//! CHA-418 primitive #2b — DataFusion-bound cold point-lookup execution floor.
+//! DataFusion-bound cold point-lookup execution floor.
 //!
-//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the CHA-411
+//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the
 //! `SnapshotTableProvider` path) over a fixed in-memory cold base, measuring the
 //! **production cold point-lookup plan** — the exclusion anti-join over an empty
 //! exclusion plus a PK residual (`build_cold_snapshot_scan`'s shape) — as the cold
 //! segment grows. An in-memory `FormatReader` serves the decoded base, so no PG and
 //! no Lance/S3 read are in the path — only the DataFusion scan + anti-join + filter.
-//! Today the cold provider does an O(rows) full-scan-and-filter (no pushdown,
-//! ADR 0023); re-running after CHA-410 (sort order) / CHA-412 (secondary index)
-//! should show the O(rows)→O(log n) improvement. The merge fan-in floor is #3
-//! (`merge_fanin_floor`); the cold *read* floor is #2a (`cold_segment_read_floor`).
+//! Without a sidecar index the cold provider does an O(rows)
+//! full-scan-and-filter (no pushdown, ADR 0023); the seek group below shows the
+//! O(rows)→O(log n) improvement. See also `merge_fanin_floor` and
+//! `cold_segment_read_floor`.
 //!
 //! Env: PERF_FLOOR_MAX=1m adds the 1M-row cold base (default 100k). The shared
 //! harness lives in `floor_support.rs` (also used by the guard test).
@@ -64,7 +64,7 @@ fn cold_point_lookup_floor(c: &mut Criterion) {
     g.finish();
 }
 
-/// CHA-454 seek variant of the #2b floor: the SAME cold base + point predicate,
+/// Seek variant of the point-lookup floor: the SAME cold base + point predicate,
 /// but the segment carries its internal `row_uuid` index sidecar and the read
 /// passes `seek_keys`, so the provider binary-searches the sidecar and `take`s
 /// the single matched row instead of the O(rows) full scan above. Run both

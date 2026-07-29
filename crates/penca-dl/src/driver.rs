@@ -8,13 +8,7 @@
 //! The trait is intentionally generic — it takes a raw SQL string and
 //! returns a [`RecordBatch`]. The caller builds SQL via the shared
 //! `penca-merge::sql` builders (or any other SQL source) and hands it
-//! here for execution. This mirrors the hot tier: `stream_merged` builds
-//! `build_merge_resolved::<PgDialect>(...)` inline and hands the string
-//! to the generic `DbDriver`.
-//!
-//! The production impl, [`DatafusionDlDriver`], builds a per-query
-//! DataFusion [`SessionContext`] via [`crate::provider`], runs the
-//! query, and collects results.
+//! here for execution.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,11 +50,11 @@ pub enum DlError {
 #[async_trait]
 pub trait DlDriver: Send + Sync {
     /// Derive a fresh cold-tier [`SessionContext`] from the driver's
-    /// process-wide session template (CHA-421) — a microsecond clone of the
-    /// function registry + analyzer/optimizer rules with a fresh, isolated
-    /// catalog. The merge layer uses this for the snapshot-pruning predicate
-    /// plan (`penca_merge::output::full_plan_predicate`) so it shares the
-    /// driver's template instead of building a fresh `SessionContext::new()`.
+    /// process-wide session template — a microsecond clone of the function
+    /// registry + analyzer/optimizer rules with a fresh, isolated catalog.
+    /// Cold-read paths must obtain sessions this way rather than through
+    /// `SessionContext::new()`, which reassembles the registry map and the
+    /// rule lists on every call.
     fn derive_session(&self) -> SessionContext;
 
     /// Execute `sql` against the cold tier's log tables for this plan.
@@ -69,7 +63,7 @@ pub trait DlDriver: Send + Sync {
     /// (`upsert_log` / `delete_log`) under their well-known names before
     /// running the query.
     ///
-    /// CHA-218: commit_tx_log is hot-only — cold rows carry tx metadata inline.
+    /// commit_tx_log is hot-only — cold rows carry tx metadata inline.
     async fn execute_sql(
         &self,
         plan: &ColdStoragePlan,
@@ -84,14 +78,9 @@ pub trait DlDriver: Send + Sync {
     ///
     /// The impl registers the provider under `l` and a single-column
     /// `row_uuid` exclusion `MemTable` under `exclusion`, then runs `sql`
-    /// (built by the caller, e.g. `penca_merge::sql::build_cold_snapshot_scan`)
-    /// — mirroring how `execute_sql` takes a caller-built string. `full_schema`
-    /// is the unprojected decode schema (cache, CHA-252); `out_schema` is the
-    /// declared output. Pruning happens upstream (snapshot-tier only, ADR 0022);
-    /// the surviving `segments` are passed here.
-    /// `order` selects segment delivery: `ByCompletion` (the default
-    /// read path — overlapping IO, completion order) or `ByPlan`
-    /// (CHA-404 snapshot writer — plan order with bounded readahead).
+    /// (built by the caller, e.g. `penca_merge::sql::build_cold_snapshot_scan`).
+    /// `full_schema` is the unprojected decode schema; `out_schema` is the
+    /// declared output. `segments` are already pruned upstream (ADR 0022).
     ///
     /// A wide seam by design: this is the one crossing from penca-merge
     /// into the provider; bundling into a request struct would force
@@ -107,30 +96,26 @@ pub trait DlDriver: Send + Sync {
         sql: &str,
         segment_read_concurrency: usize,
         order: SegmentOrder,
-        // CHA-454/CHA-485: seek entries. Per scanned segment the provider
-        // resolves each entry to its sidecar (identity → `row_uuid_index_sidecar`,
-        // keyed → `index_sidecars`), seeks, and INTERSECTS the offsets
-        // before decoding; unresolved entries are skipped and a fully
-        // unresolved set falls back to the full scan — always correct, the
-        // `sql`'s residual (`row_uuid IN (..)` / user filter) re-applies
+        // Seek entries: per scanned segment the provider resolves each entry to
+        // its sidecar, seeks, and INTERSECTS the offsets before decoding.
+        // Unresolved entries are skipped and a fully unresolved set falls back
+        // to the full scan — always correct, because `sql`'s residual re-applies
         // exactness (ADR 0023).
         seeks: Option<Arc<Vec<SeekSpec>>>,
     ) -> Result<SendableRecordBatchStream, DlError>;
 
-    /// DataFusion-free snapshot point seek (CHA-476/CHA-484/CHA-492): serve an
-    /// exact index-seek selection straight from the snapshot segments' sidecars,
-    /// with no merge plan. `index_uuid` selects the sidecar (`None` = internal
-    /// `row_uuid` identity, `Some` = a name or user index); `key_columns` names
-    /// that index's key columns so the sidecar key types are read from the table
-    /// schema (empty = the all-Utf8 identity/name shape), letting a typed
-    /// non-Utf8 user index decode on the bypass too.
+    /// DataFusion-free snapshot point seek: serve an exact index-seek selection
+    /// straight from the snapshot segments' sidecars, with no merge plan.
+    /// `index_uuid` selects the sidecar (`None` = internal `row_uuid` identity,
+    /// `Some` = a name or user index); `key_columns` names that index's key
+    /// columns so the sidecar key types are read from the table schema (empty =
+    /// the all-Utf8 identity/name shape), letting a typed non-Utf8 user index
+    /// decode on the bypass too.
     ///
-    /// Returns `Ok(None)` when the seek cannot be served — the default for any
-    /// driver without the seek kernel, the production driver's answer when an
-    /// in-scope segment lacks the selected sidecar, and (CHA-492) when a key
-    /// column is absent from the schema. The caller falls back to the merge
-    /// pipeline either way, so overriding is purely an optimization, never a
-    /// correctness requirement.
+    /// Returns `Ok(None)` when the seek cannot be served — no seek kernel, an
+    /// in-scope segment lacking the selected sidecar, or a key column absent
+    /// from the schema. The caller falls back to the merge pipeline either way,
+    /// so overriding is purely an optimization, never a correctness requirement.
     async fn seek_snapshot_point(
         &self,
         _segments: &[SnapshotSegment],
@@ -148,23 +133,22 @@ pub trait DlDriver: Send + Sync {
 ///
 /// `ByCompletion` overlaps reads and yields as each segment finishes —
 /// the query path's default (segment order is not client-observable).
-/// `ByPlan` preserves the planned segment order with bounded readahead
-/// (`futures::stream::buffered`), still capped by
-/// `segment_read_concurrency`; the CHA-404 snapshot writer depends on
-/// it for label-sorted partition runs.
+/// `ByPlan` preserves the planned segment order with bounded readahead,
+/// still capped by `segment_read_concurrency`; the snapshot writer depends
+/// on it for label-sorted partition runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentOrder {
     ByCompletion,
     ByPlan,
 }
 
-/// CHA-485: one seek entry at the penca-merge → provider boundary — the
-/// mirror of `penca_merge::IndexSeek` (the dependency direction forbids
-/// sharing the type). `index_uuid: None` is the internal identity index
-/// (resolved against the segment's dedicated `row_uuid_index_sidecar`);
-/// `Some` is a keyed index (resolved against the segment's `index_sidecars`).
-/// Within an entry the tuples are a union (IN-list of composite keys);
-/// across entries the per-segment offsets INTERSECT before the base decode.
+/// One seek entry at the penca-merge → provider boundary — the mirror of
+/// `penca_merge::IndexSeek` (the dependency direction forbids sharing the
+/// type). `index_uuid: None` is the internal identity index (resolved against
+/// the segment's dedicated `row_uuid_index_sidecar`); `Some` is a keyed index
+/// (resolved against the segment's `index_sidecars`). Within an entry the
+/// tuples are a union (IN-list of composite keys); across entries the
+/// per-segment offsets INTERSECT before the base decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeekSpec {
     pub index_uuid: Option<String>,
@@ -175,20 +159,17 @@ pub struct SeekSpec {
     pub tuples: Vec<Vec<String>>,
 }
 
-/// Resolve a seek's requested index to a segment's sidecar by `index_uuid`
-/// (CHA-484/CHA-485) — `None` = the internal `row_uuid` identity index
-/// (dedicated `row_uuid_index_sidecar` slot), `Some(uuid)` = a keyed index
-/// (user secondary index or the built-in system name index) looked up in
+/// Resolve a seek's requested index to a segment's sidecar by `index_uuid` —
+/// `None` = the internal `row_uuid` identity index (dedicated
+/// `row_uuid_index_sidecar` slot), `Some(uuid)` = a keyed index looked up in
 /// `index_sidecars`. A requested index no sidecar records resolves to `None`
-/// → the caller's fallback, never a mis-seek. Mirrors
-/// `provider::resolve_seek_entries` for the DataFusion-free aggregate seek.
+/// → the caller's fallback, never a mis-seek.
 fn selected_sidecar<'s>(
     segment: &'s SnapshotSegment,
     index_uuid: Option<&Uuid>,
 ) -> Option<&'s IndexSidecar> {
-    // Adapt the seek entry's `Uuid` to the shared `&str`-keyed resolver — the
-    // one source of truth for identity-vs-keyed selection (`index_sidecars` is
-    // keyed by the uuid's string form, the DB `parent_index_uuid`).
+    // `index_sidecars` is keyed by the uuid's string form (the DB
+    // `parent_index_uuid`).
     let uuid_str = index_uuid.map(Uuid::to_string);
     crate::provider::sidecar_for_index(segment, uuid_str.as_deref())
 }
@@ -197,15 +178,14 @@ fn selected_sidecar<'s>(
 /// [`FormatReader`] map keyed by format discriminant.
 pub struct DatafusionDlDriver<R: FormatReader + 'static> {
     readers: Arc<HashMap<i32, R>>,
-    /// Process-lifetime cache of decoded snapshot segments (CHA-252). Shared
-    /// across all per-query drivers; `SegmentCache::disabled()` for
-    /// services that never serve cached snapshot reads.
+    /// Process-lifetime cache of decoded snapshot segments. Shared across all
+    /// per-query drivers; `SegmentCache::disabled()` for services that never
+    /// serve cached snapshot reads.
     cache: Arc<SegmentCache>,
-    /// Process-wide cold-session template (CHA-421): the default function
-    /// registry + analyzer/optimizer rules, built once per service and injected
-    /// here. Every per-unit cold `SessionContext` is a ~71 µs clone of it
-    /// (`derive_cold_session`) with a fresh, isolated catalog — trimming the
-    /// warm `SessionContext::new()` cost (~128 µs/call in release) by ~45%.
+    /// Process-wide cold-session template: the default function registry +
+    /// analyzer/optimizer rules, built once per service and injected here.
+    /// Every per-unit cold `SessionContext` is a ~71 µs clone of it against
+    /// ~128 µs for `SessionContext::new()` (release measurements).
     template: Arc<SessionState>,
 }
 
@@ -292,12 +272,10 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
-/// Cache-aware read of a single snapshot segment (CHA-252), called by the
-/// `SnapshotTableProvider` partition stream (CHA-411). Records the cache
-/// outcome (`hit` | `miss-cached` | `miss-uncached`) on the current span.
-/// Returns the full decoded superset on hit / miss-cached, or the projected
-/// `out_schema` batch on the non-cacheable (oversized) path. No predicate is
-/// pushed (ADR 0023); the caller projects / null-fills downstream.
+/// Cache-aware read of a single snapshot segment. Returns the full decoded
+/// superset on hit / miss-cached, or the projected `out_schema` batch on the
+/// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
+/// caller projects / null-fills downstream.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -317,9 +295,6 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     let span = tracing::Span::current();
     let uuid = segment.table_snapshot_segment_uuid.as_str();
 
-    // Branch 1 — cache hit: Arc-clone the whole decoded segment. The returned
-    // batch is the full, all-column, unfiltered superset; the caller projects
-    // and null-fills to its output schema.
     if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
@@ -330,13 +305,10 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
-    // size_bytes is the in-memory Arrow footprint (CHA-347), the cache's
-    // budget weight.
+    // size_bytes is the in-memory Arrow footprint, not the encoded file size —
+    // the same units as the cache's byte budget.
     let weight = segment.size_bytes.max(0) as u64;
 
-    // Miss: cacheable segments are decoded whole and cached (so one entry
-    // serves any projection); an oversized segment is read projected and not
-    // cached. The dispatcher records the outcome; the helpers do the work.
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
         read_and_cache_full(reader, cache, segment, full_schema, weight).await
@@ -348,9 +320,7 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
 
 /// Cacheable persist miss: decode the WHOLE persist segment (all columns) so the
 /// cached entry serves any projection, insert it under `weight`, and return the
-/// full superset. The persist sibling of [`read_and_cache_full`] (CHA-474); the
-/// only differences are the `segment_uuid` key and that a persist segment's
-/// `offset`/`length` are already `Option<i64>`.
+/// full superset.
 async fn read_and_cache_full_persist<R: FormatReader>(
     reader: &R,
     cache: &SegmentCache,
@@ -383,8 +353,8 @@ async fn read_and_cache_full_persist<R: FormatReader>(
 }
 
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
-/// The persist sibling of [`read_projected_uncached`] — an oversized persist
-/// segment is read narrow rather than widened only to be discarded.
+/// An oversized persist segment is read narrow rather than widened only to be
+/// discarded.
 async fn read_projected_uncached_persist<R: FormatReader>(
     reader: &R,
     segment: &PersistSegment,
@@ -412,18 +382,16 @@ async fn read_projected_uncached_persist<R: FormatReader>(
     Ok(batch)
 }
 
-/// Cache-aware read of a single persist segment (CHA-474), called by the
-/// `PersistTableProvider` partition stream. A persist segment file is immutable
-/// once written and keyed by its globally-unique `segment_uuid`, so it shares
-/// the process-lifetime [`SegmentCache`] with snapshot segments under
-/// one byte budget — with NO TTL: W-TinyLFU eviction plus the `admits` budget
-/// gate is the whole mechanism, identical to the snapshot path. (The *resolved*
-/// persist tier is mutable under retention compaction, which is why the tier is
-/// re-resolved live on every read; the per-uuid *file bytes* this caches are
-/// not.) Records the cache outcome (`hit` | `miss-cached` | `miss-uncached`) on
-/// the current span. Returns the full decoded superset on hit / miss-cached, or
-/// the projected `out_schema` batch on the non-cacheable (oversized) path; the
-/// caller projects / null-fills downstream.
+/// Cache-aware read of a single persist segment. A persist segment file is
+/// immutable once written and keyed by its globally-unique `segment_uuid`, so it
+/// shares the process-lifetime [`SegmentCache`] with snapshot segments under one
+/// byte budget, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate
+/// is the whole mechanism. (The *resolved* persist tier is mutable under
+/// retention compaction, which is why the tier is re-resolved live on every
+/// read; the per-uuid *file bytes* this caches are not.) Returns the full
+/// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
+/// the non-cacheable (oversized) path; the caller projects / null-fills
+/// downstream.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -443,7 +411,6 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     let span = tracing::Span::current();
     let uuid = segment.segment_uuid.as_str();
 
-    // Branch 1 — cache hit: Arc-clone the whole decoded segment (zero-copy).
     if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
@@ -455,8 +422,8 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
     // size_bytes is the in-memory Arrow footprint the persist write path records
-    // (`in_memory_bytes`), the cache's budget weight — the same units as the
-    // snapshot weigher, so both tiers share one consistent byte budget.
+    // (`in_memory_bytes`) — the same units as the snapshot weigher, so both
+    // tiers share one consistent byte budget.
     let weight = segment.size_bytes.max(0) as u64;
 
     if cache.admits(weight) {
@@ -469,9 +436,8 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache (CHA-252), keyed by its own `segment_index_uuid` — a distinct
-/// deterministic-UUID namespace from the base segment uuid, so the two never
-/// collide in one cache. Miss → read the sidecar file whole and cache it.
+/// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
+/// namespace from the base segment uuid, so the two never collide in one cache.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -496,9 +462,8 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
-    // CHA-485: the sidecar's key schema is the indexed columns' native types
-    // (the CHA-483 build writes them typed). Identity/name sidecars are the
-    // all-Utf8 special case the callers construct.
+    // The sidecar's key schema is the indexed columns' native types; the
+    // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
     let batch = reader
         .read_segment(
@@ -511,9 +476,8 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar
-    // (e.g. a future large CHA-463 user-column index) is decoded-but-not-cached
-    // — graceful degradation to a re-decode, mirroring the base-segment path.
+    // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
+    // decoded-but-not-cached rather than evicting the whole budget.
     cache.insert(
         sidecar.segment_index_uuid.clone(),
         Arc::clone(&batch),
@@ -522,13 +486,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     Ok((*batch).clone())
 }
 
-/// Index-driven selective read (CHA-454): binary-search the segment's internal
-/// `row_uuid` sidecar for `probe_keys`, then `take` exactly the matching rows
-/// from the base segment (cached or full-decoded via
-/// [`read_cached_snapshot_segment`]) — so the provider emits O(matches) rows
-/// instead of streaming the whole segment. The cold-MISS path still full-decodes
-/// the base (selective row-group decode is TODO(CHA-469)); the win here is the
-/// bounded row emission plus the cache-HIT zero-I/O `take`.
+/// Index-driven selective read: binary-search the segment's index sidecar for
+/// `probe_tuples`, then `take` exactly the matching rows from the base segment
+/// — so the provider emits O(matches) rows instead of streaming the whole
+/// segment. The cold-MISS path still full-decodes the base (selective row-group
+/// decode is TODO(CHA-469)).
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -538,25 +500,23 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         matched = tracing::field::Empty,
     ),
 )]
-// One low-level seek-kernel helper: readers/cache/segment/sidecar + the key
-// types, schemas, and probes. Bundling into a struct buys nothing for an
-// internal fn threaded from a single caller.
+// Bundling into a struct buys nothing for an internal fn threaded from a
+// single caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_seeked_snapshot_segment<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
     segment: &SnapshotSegment,
     sidecar: &IndexSidecar,
-    // The sidecar's key column types (CHA-492: derived from the table schema by
-    // the caller via `key_column_types`, so a typed non-Utf8 index decodes
-    // against its real schema — identity/name sidecars are the all-Utf8 case).
+    // The sidecar's key column types, derived from the table schema by the
+    // caller via `key_column_types` (identity/name sidecars are all-Utf8).
     key_types: &[arrow::datatypes::DataType],
     full_schema: &SchemaRef,
     out_schema: &SchemaRef,
     probe_tuples: &[&[&str]],
 ) -> Result<RecordBatch, DlError> {
-    // CHA-482: an empty probe set seeks nothing — skip the sidecar decode
-    // entirely (its composite key arity is undefined with no probe tuple).
+    // An empty probe set seeks nothing — skip the sidecar decode entirely, as
+    // its composite key arity is undefined with no probe tuple.
     if probe_tuples.is_empty() {
         return Ok(RecordBatch::new_empty(full_schema.clone()));
     }
@@ -566,7 +526,7 @@ pub(crate) async fn read_seeked_snapshot_segment<R: FormatReader + 'static>(
 }
 
 /// Seek one entry's sidecar for its probe tuples → the matching sorted,
-/// deduped segment-relative offsets (the CHA-480 kernel's contract).
+/// deduped segment-relative offsets.
 async fn seek_entry_offsets<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
@@ -583,8 +543,6 @@ async fn seek_entry_offsets<R: FormatReader + 'static>(
 /// decode entirely on zero matches. A candidate segment that passes coarse
 /// pruning but doesn't contain the probed key must not pay a full base
 /// decode just to `take` zero rows (the common cross-segment-lookup miss).
-/// Distinct from TODO(CHA-469)'s selective row-group decode of the
-/// matched-but-uncached case.
 async fn take_matched_rows<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
@@ -603,7 +561,7 @@ async fn take_matched_rows<R: FormatReader + 'static>(
     Ok(taken)
 }
 
-/// CHA-485: seek SEVERAL resolved entries against one segment and decode the
+/// Seek SEVERAL resolved entries against one segment and decode the
 /// INTERSECTION of their offsets — AND across the covering indexes the
 /// planner selected. Each entry's offsets are sorted + deduped (kernel
 /// contract), so the intersection is a two-pointer merge; an entry with an
@@ -669,10 +627,9 @@ pub(crate) async fn read_intersect_seeked_snapshot_segment<R: FormatReader + 'st
 
 /// The sidecar key schema one seek entry decodes against: the identity
 /// entry (no key columns) is the all-Utf8 shape (arity from the probes); a
-/// user entry maps its key column names through the table schema to the
-/// native types the CHA-483 build wrote. `None` when a name is missing from
-/// the schema — the caller skips the entry (over-selection is safe under
-/// the residual).
+/// user entry maps its key column names through the table schema to their
+/// native types. `None` when a name is missing from the schema — the caller
+/// skips the entry (over-selection is safe under the residual).
 ///
 /// Precondition: `spec.tuples` is non-empty — the intersect loop
 /// short-circuits an empty probe set to the empty intersection BEFORE
@@ -689,14 +646,11 @@ fn entry_key_types(
 }
 
 /// The sidecar key types for a seek's key columns, read straight from the
-/// table's Arrow schema — no round-trip: the CHA-483 index build baked the
-/// native types into the schema, so a lookup by name recovers them. Empty
+/// table's Arrow schema — the index build writes sidecar keys in the columns'
+/// native types, so a lookup by name recovers them with no round-trip. Empty
 /// `key_columns` is the identity/name shape (all-Utf8, `arity` from the probe
 /// tuple). `None` when a key column is absent from the schema — the caller
 /// falls back to the full merge (over-selection is safe under the residual).
-/// Shared by both the multi-entry merge ([`entry_key_types`]) and the
-/// single-entry bypass ([`DatafusionDlDriver::seek_snapshot_point`]) so a typed
-/// (non-Utf8) index decodes against its real schema on either path (CHA-492).
 fn key_column_types(
     key_columns: &[String],
     arity: usize,
@@ -736,37 +690,25 @@ fn intersect_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
 
 #[async_trait]
 impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
-    /// CHA-476: DataFusion-free aggregate cold seek for a default-current-time,
-    /// snapshot-only `ids` point read. For each in-scope segment, binary-search
-    /// its index sidecar and `take` only the matched rows
-    /// via the shared CHA-454 kernel [`read_seeked_snapshot_segment`] — the same
-    /// per-segment seek the [`crate::provider::SnapshotTableProvider`] partition
-    /// stream calls — normalize each result to `out_schema` with the same
-    /// [`crate::provider::project_batch_to_schema`] null-fill (CHA-252), and
-    /// concatenate. The result is the same row set as `stream_all_cold` for this
-    /// plan shape (snapshot-only, no persist band ⇒ empty exclusion set, and the
-    /// seek key is an exact selection) without building a
-    /// DataFusion plan. Row *order* is unspecified in both paths (neither
-    /// advertises an `output_ordering`), so the equivalence is over the row set.
+    /// DataFusion-free aggregate cold seek for a default-current-time,
+    /// snapshot-only point read. Yields the same ROW SET as `stream_all_cold`
+    /// for this plan shape (snapshot-only ⇒ empty exclusion set, and the seek
+    /// key is an exact selection) without building a DataFusion plan. Row
+    /// *order* is unspecified in both paths (neither advertises an
+    /// `output_ordering`), so the equivalence is over the row set only.
     ///
     /// `index_uuid` is the seek entry's index selector: `None` seeks the
-    /// internal `row_uuid` identity sidecar (`row_uuid_index_sidecar`);
-    /// `Some(uuid)` seeks the keyed sidecar with that uuid in `index_sidecars`
-    /// — the built-in composite name index (CHA-484), whose deterministic
-    /// `system_name_index_uuid` both build and read sides derive, or a user
-    /// secondary index (CHA-485). Resolution goes through
-    /// [`crate::provider::sidecar_for_index`]; multi-entry intersection is the
-    /// scan path (CHA-485), not this aggregate seek.
+    /// internal `row_uuid` identity sidecar; `Some(uuid)` seeks the keyed
+    /// sidecar with that uuid in `index_sidecars`. Multi-entry intersection is
+    /// the scan path's job, not this aggregate seek's.
     ///
     /// Returns `Ok(None)` when any in-scope segment has not materialized the
-    /// selected sidecar; the caller then
-    /// falls back to the merge pipeline. This is a hard-resolution fallback (the
-    /// snapshot did not build the index), **never** a residency one — residency
-    /// is handled entirely inside the kernel (cached `take`; evicted sidecar
-    /// re-GET; uncached full-decode-then-`take` + cache populate; true selective
-    /// row-group decode is TODO(CHA-469)). `out_schema` / `full_decode_schema`
-    /// are the `snapshot_read_schema`-shaped (`row_uuid` + user cols) projected /
-    /// full-decode schemas, exactly as [`DlDriver::scan_snapshot`].
+    /// selected sidecar; the caller then falls back to the merge pipeline. This
+    /// is a hard-resolution fallback (the snapshot did not build the index),
+    /// **never** a residency one — residency is handled entirely inside the
+    /// kernel. `out_schema` / `full_decode_schema` are the
+    /// `snapshot_read_schema`-shaped projected / full-decode schemas, exactly as
+    /// [`DlDriver::scan_snapshot`].
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -785,30 +727,20 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
         full_decode_schema: &SchemaRef,
         out_schema: &SchemaRef,
     ) -> Result<Option<RecordBatch>, DlError> {
-        // Detect a fully-indexed snapshot up front: if any in-scope segment
-        // lacks the selected materialized index, bail to the merge-pipeline
-        // fallback BEFORE any seeking, so the fallback pays no partial-seek cost
-        // — otherwise the sidecar GETs / base decodes / cache population on the
-        // leading indexed segments are wasted work the full re-run repeats.
+        // Bail to the merge-pipeline fallback BEFORE any seeking, so the
+        // fallback pays no partial-seek cost — otherwise the sidecar GETs /
+        // base decodes on the leading indexed segments are wasted work that
+        // the full re-run repeats.
         if segments
             .iter()
             .any(|seg| selected_sidecar(seg, index_uuid).is_none())
         {
             return Ok(None);
         }
-        // CHA-492: the sidecar key types, read from the table's Arrow schema
-        // (no round-trip). Identity/name seeks (empty `key_columns`) are the
-        // all-Utf8 case; a user index maps its columns to their native types so
-        // a typed (non-Utf8) sidecar decodes correctly on the bypass too. A key
-        // column missing from the schema → merge fallback (safe under the
-        // residual), same as the multi-entry path.
         let arity = probe_tuples.first().map_or(0, Vec::len);
         let Some(key_types) = key_column_types(key_columns, arity, full_decode_schema) else {
             return Ok(None);
         };
-        // CHA-482: composite tuple probes. Borrow each owned tuple down to the
-        // `&[&[&str]]` shape `seek_row_offsets` takes; the identity (row_uuid)
-        // index is just the arity-1 case.
         let probe_refs: Vec<Vec<&str>> = probe_tuples
             .iter()
             .map(|tuple| tuple.iter().map(String::as_str).collect())
@@ -816,8 +748,8 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
         let probes: Vec<&[&str]> = probe_refs.iter().map(Vec::as_slice).collect();
         let mut per_segment: Vec<RecordBatch> = Vec::with_capacity(segments.len());
         for segment in segments {
-            // The pre-scan above guarantees a sidecar; bind defensively without
-            // a panic — a missing one here falls back to the merge pipeline.
+            // The pre-scan above guarantees a sidecar; bind defensively rather
+            // than panicking if that ever stops holding.
             let Some(sidecar) = selected_sidecar(segment, index_uuid) else {
                 return Ok(None);
             };
@@ -832,16 +764,15 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
                 &probes,
             )
             .await?;
-            // Normalize each per-segment result to `out_schema` (the kernel can
-            // return the full-decode superset, the projected out schema, or an
-            // empty full-schema batch) — the same null-fill the provider's
-            // partition stream applies before yielding.
+            // The kernel can return the full-decode superset, the projected out
+            // schema, or an empty full-schema batch, so every result needs the
+            // same null-fill normalization the provider's partition stream does.
             per_segment.push(crate::provider::project_batch_to_schema(
                 &batch, out_schema,
             )?);
         }
-        // Degenerate empty-snapshot case (no segments): an empty out-schema
-        // batch, matching what stream_all_cold yields.
+        // No segments ⇒ an empty out-schema batch, matching what
+        // `stream_all_cold` yields.
         if per_segment.is_empty() {
             return Ok(Some(RecordBatch::new_empty(out_schema.clone())));
         }
@@ -902,10 +833,6 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
         order: SegmentOrder,
         seeks: Option<Arc<Vec<SeekSpec>>>,
     ) -> Result<SendableRecordBatchStream, DlError> {
-        // CHA-472 diagnostics: split the cold-scan setup into its three costs —
-        // `ss_build_session` (CHA-421 template derive + provider registration),
-        // `ss_ctx_sql` (parse + logical plan + optimize), `ss_execute_stream`
-        // (physical plan). All trace-level, so off at the default verbosity.
         let ctx = tracing::trace_span!("ss_build_session").in_scope(|| {
             build_snapshot_session(
                 &self.template,
@@ -920,10 +847,6 @@ impl<R: FormatReader + 'static> DlDriver for DatafusionDlDriver<R> {
                 seeks,
             )
         })?;
-        // The caller's `sql` (build_cold_snapshot_scan) anti-joins the `l`
-        // provider against the `exclusion` table and applies the residual; we
-        // just plan + stream it. Bounded-concurrency segment reads live inside
-        // the provider's partition stream.
         let df = ctx
             .sql(sql)
             .instrument(tracing::trace_span!("ss_ctx_sql"))
@@ -1033,9 +956,6 @@ mod tests {
         )
     }
 
-    /// Cache-aware single-segment read through the free fn. CHA-411 removed the
-    /// `DlDriver::read_snapshot_segment` trait method; the `SnapshotTableProvider`
-    /// and these cache tests use `read_cached_snapshot_segment` directly.
     async fn read_seg(
         dl: &DatafusionDlDriver<CountingFormatReader>,
         seg: &SnapshotSegment,
@@ -1046,8 +966,7 @@ mod tests {
     }
 
     /// A `FormatReader` that routes `read_segment` by URI, so one reader serves
-    /// both a base segment file and its `row_uuid` index sidecar file — the
-    /// fixture the CHA-476 `seek_snapshot_point` aggregate exercises.
+    /// both a base segment file and its index sidecar file.
     struct RoutingReader {
         by_uri: HashMap<String, RecordBatch>,
     }
@@ -1083,8 +1002,7 @@ mod tests {
     }
 
     /// Build a base snapshot segment over `(keys, vals)` plus its canonical
-    /// `row_uuid` index sidecar (via `build_segment_index`), registering both
-    /// files in `by_uri`. Returns the segment carrying the sidecar.
+    /// `row_uuid` index sidecar, registering both files in `by_uri`.
     fn indexed_segment(
         by_uri: &mut HashMap<String, RecordBatch>,
         schema: &SchemaRef,
@@ -1125,9 +1043,6 @@ mod tests {
         }
     }
 
-    /// CHA-476: a segment without a materialized `row_uuid` index sidecar makes
-    /// `seek_snapshot_point` return `Ok(None)` — the signal `read_data` uses to
-    /// fall back to `stream_all_cold`. Storage is never touched on the fallback.
     #[tokio::test]
     async fn seek_snapshot_point_falls_back_when_sidecar_missing() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1156,9 +1071,6 @@ mod tests {
         );
     }
 
-    /// CHA-476: a probe spanning two indexed segments seeks each sidecar, takes
-    /// only the matched rows, and concatenates them in `out_schema` — the
-    /// DataFusion-free equivalent of a snapshot-only `ids` point read.
     #[tokio::test]
     async fn seek_snapshot_point_seeks_and_concats_across_segments() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1192,8 +1104,6 @@ mod tests {
         assert_eq!(res, expected);
     }
 
-    /// CHA-476: an empty snapshot (no segments) yields an empty out-schema batch
-    /// — `Some`, not a fallback `None` — matching what stream_all_cold produces.
     #[tokio::test]
     async fn seek_snapshot_point_empty_segments_yields_empty_batch() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1208,10 +1118,8 @@ mod tests {
         assert_eq!(res.schema(), schema);
     }
 
-    /// CHA-476: a probe matching no row in an indexed segment returns an empty
-    /// batch normalized to `out_schema` — pins the full-decode → out-schema
-    /// projection the aggregate owns (here `out_schema` strictly projects
-    /// `full_decode_schema`, dropping `v`).
+    /// Here `out_schema` strictly projects `full_decode_schema`, dropping `v`,
+    /// so this pins the full-decode → out-schema projection the aggregate owns.
     #[tokio::test]
     async fn seek_snapshot_point_zero_match_normalizes_to_out_schema() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1247,16 +1155,11 @@ mod tests {
         assert_eq!(res.schema(), out_schema, "result normalized to out_schema");
     }
 
-    // ----- CHA-482 (RT1): composite-key seek_snapshot_point -----------------
-    // CHA-480 shipped the composite build+seek kernel; these pin the dl seek
-    // path (sidecar decode at the right arity, tuple probes passed straight
-    // through, multi-segment concat) for a 2-column `(key0, key1)` index. The
-    // expected row sets ARE the residual-equivalent selection (a
-    // `key0 = 's1' AND key1 = 't1'` scan returns the same rows), DataFusion-free.
+    // The composite-key tests below assert against the residual-equivalent
+    // selection: a `key0 = 's1' AND key1 = 't1'` scan returns the same rows.
 
     /// A 3-column base `(key0, key1, v)` segment plus its 2-column composite
-    /// `(key0, key1)` index sidecar (CHA-480 `build_segment_index`), both
-    /// registered in `by_uri`. Mirrors `indexed_segment` for the composite case.
+    /// `(key0, key1)` index sidecar, both registered in `by_uri`.
     fn composite_indexed_segment(
         by_uri: &mut HashMap<String, RecordBatch>,
         schema: &SchemaRef,
@@ -1312,10 +1215,8 @@ mod tests {
         ]))
     }
 
-    /// CHA-492: the bypass derives a seek's sidecar key types straight from the
-    /// table schema (no round-trip), so a typed non-Utf8 index decodes correctly
-    /// — the fix that retired the Utf8-only bypass gate. This pins the pure
-    /// derivation; end-to-end typed decode is `integration_user_index_seek`.
+    /// Pins the pure derivation only; end-to-end typed decode is covered by
+    /// `integration_user_index_seek`.
     #[test]
     fn key_column_types_reads_native_types_from_schema() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -1363,8 +1264,6 @@ mod tests {
             .collect()
     }
 
-    /// A single composite probe `(s1, t1)` returns exactly the matching base
-    /// rows, DataFusion-free — the arity-2 analogue of the row_uuid seek.
     #[tokio::test]
     async fn seek_snapshot_point_composite_2col_hit() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1394,7 +1293,6 @@ mod tests {
         );
     }
 
-    /// An IN-list of composite tuples unions their matched rows.
     #[tokio::test]
     async fn seek_snapshot_point_composite_in_list_unions() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1428,8 +1326,6 @@ mod tests {
         );
     }
 
-    /// A probe spanning two composite-indexed segments seeks each sidecar and
-    /// concatenates the matched rows.
     #[tokio::test]
     async fn seek_snapshot_point_composite_multi_segment_concats() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1472,8 +1368,7 @@ mod tests {
         );
     }
 
-    /// A composite tuple absent from every segment yields Some(empty), not a
-    /// fallback (the sidecars exist).
+    /// Some(empty), not a fallback — the sidecars exist, the key just misses.
     #[tokio::test]
     async fn seek_snapshot_point_composite_miss_returns_empty() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1499,8 +1394,6 @@ mod tests {
         assert_eq!(res.num_rows(), 0);
     }
 
-    /// The single-column (arity-1) identity case still returns the right rows
-    /// after the composite generalization — `row_uuids` subsumed unchanged.
     #[tokio::test]
     async fn seek_snapshot_point_identity_arity1_preserved() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1524,11 +1417,8 @@ mod tests {
         assert_eq!(k.value(0), "r1");
     }
 
-    /// An empty probe set seeks nothing: `Some(empty)` without ever decoding the
-    /// sidecar (its key arity is undefined with no probe tuple). Uses a reader
-    /// that panics on ANY read, so the storage-free short-circuit is the
-    /// assertion — guards the `probe_tuples.is_empty()` early return that also
-    /// makes the later `probe_tuples[0]` arity index panic-free.
+    /// Guards the `probe_tuples.is_empty()` early return that also makes the
+    /// later `probe_tuples[0]` arity index panic-free.
     #[tokio::test]
     async fn seek_snapshot_point_empty_probe_skips_sidecar_decode() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1548,13 +1438,9 @@ mod tests {
         assert_eq!(res.num_rows(), 0);
     }
 
-    // ----- CHA-484/CHA-485: sidecar selection by the seek entry's index_uuid --
-
-    /// CHA-484 fold-in: `Some(index_uuid)` resolves the keyed `index_sidecars`
-    /// entry with that uuid (the built-in name index lands here, CHA-485), not
-    /// the identity slot. The identity slot deliberately points at an
-    /// unregistered URI — reading it would panic the routing reader — so a
-    /// correct result proves the keyed sidecar served the seek.
+    /// The identity slot deliberately points at an unregistered URI — reading
+    /// it would panic the routing reader — so a correct result proves the keyed
+    /// sidecar served the seek.
     #[tokio::test]
     async fn seek_snapshot_point_some_index_uuid_seeks_keyed_sidecar() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1601,9 +1487,6 @@ mod tests {
         );
     }
 
-    /// CHA-484 fold-in: `Some(index_uuid)` with a segment whose `index_sidecars`
-    /// has no entry for it — even with the identity sidecar present — signals
-    /// fallback (`Ok(None)`) without touching storage.
     #[tokio::test]
     async fn seek_snapshot_point_missing_keyed_sidecar_falls_back() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1641,10 +1524,8 @@ mod tests {
         );
     }
 
-    /// CHA-484 fold-in: the seek resolves the REQUESTED index against the
-    /// segment's keyed `index_sidecars` — a `Some(uuid)` naming an index absent
-    /// from that map must signal fallback (`Ok(None)`), zero reads, never a
-    /// mis-seek of some other keyed sidecar.
+    /// A `Some(uuid)` naming an index absent from `index_sidecars` must fall
+    /// back, never mis-seek some OTHER keyed sidecar that happens to be there.
     #[tokio::test]
     async fn seek_snapshot_point_unrecorded_index_uuid_falls_back() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1685,12 +1566,10 @@ mod tests {
         );
     }
 
-    /// CHA-484 fold-in: the production system-table shape — a segment carrying
-    /// BOTH the identity sidecar and a keyed `index_sidecars` entry — seeked
-    /// with `index_uuid = None` reads the IDENTITY sidecar. The keyed sidecar
-    /// deliberately points at an unregistered URI, so a keyed-sidecar
-    /// preference sneaking into the `None` arm would panic the routing reader
-    /// instead of silently mis-seeking.
+    /// The production system-table shape: a segment carrying BOTH sidecars. The
+    /// keyed sidecar deliberately points at an unregistered URI, so a
+    /// keyed-sidecar preference sneaking into the `None` arm would panic the
+    /// routing reader instead of silently mis-seeking.
     #[tokio::test]
     async fn seek_snapshot_point_none_seeks_identity_when_both_sidecars_present() {
         let cache = Arc::new(SegmentCache::new(1 << 20));
@@ -1733,15 +1612,9 @@ mod tests {
         assert_eq!(res, expected);
     }
 
-    // RT2 (CHA-421): the driver's `derive_session()` and the provider session
-    // builders (`build_persist_session` / `build_snapshot_session`) derive their
-    // `SessionContext` from the INJECTED template, not a fresh
-    // `SessionContext::new()`. Discriminator: a sentinel `SessionConfig` value
-    // the default registry never carries (a default-UDF `ptr_eq` can't tell them
-    // apart — DataFusion's defaults are process-global `OnceLock` singletons).
-    //
-    // Red against the RT2 stubs (all three call `SessionContext::new()`, losing
-    // the sentinel); green once I2 routes them through `derive_cold_session`.
+    // Discriminator: a sentinel `SessionConfig` value the default registry never
+    // carries. A default-UDF `ptr_eq` can't tell a derived session from a fresh
+    // one — DataFusion's defaults are process-global `OnceLock` singletons.
     #[tokio::test]
     async fn driver_and_providers_derive_from_injected_template() {
         const SENTINEL: usize = 4242;
@@ -1761,7 +1634,6 @@ mod tests {
         let cache = Arc::new(SegmentCache::new(1 << 20));
         let schema = test_schema();
 
-        // (a) DlDriver::derive_session clones the driver's injected template.
         let dl =
             DatafusionDlDriver::new(readers.clone(), cache.clone(), Arc::new(template.clone()));
         assert_eq!(
@@ -1770,7 +1642,6 @@ mod tests {
             "DlDriver::derive_session must clone the injected template, not SessionContext::new()",
         );
 
-        // (b) build_persist_session derives its session from the template.
         let log_schemas = crate::schema::LogSchemas {
             upsert: schema.clone(),
             delete: schema.clone(),
@@ -1793,7 +1664,6 @@ mod tests {
             "build_persist_session must derive its session from the template",
         );
 
-        // (c) build_snapshot_session derives its session from the template.
         let snapshot_ctx = crate::provider::build_snapshot_session(
             &template,
             &[],
@@ -1814,8 +1684,6 @@ mod tests {
         );
     }
 
-    // AC1: a second read of the same snapshot segment is served from cache
-    // (no second storage read) and shares buffers with the first (zero-copy).
     #[tokio::test]
     async fn second_read_of_same_segment_is_cache_hit_and_arc_shared() {
         let schema = test_schema();
@@ -1838,8 +1706,6 @@ mod tests {
         );
     }
 
-    // AC3 (oversized): a segment larger than the whole budget is never cached
-    // and falls to the projected, uncached read branch — every access re-reads.
     #[tokio::test]
     async fn oversized_segment_not_cached_uses_uncached_read() {
         let schema = test_schema();
@@ -1858,8 +1724,6 @@ mod tests {
         assert!(cache.get("big").is_none(), "oversized segment not stored");
     }
 
-    // AC3 (eviction): inserting past the budget evicts, and the evicted
-    // segment re-reads from storage on next access.
     #[tokio::test]
     async fn evicted_segment_re_reads_from_storage() {
         let schema = test_schema();
@@ -1888,11 +1752,10 @@ mod tests {
         );
     }
 
-    // CHA-474: the RAW `ColdStorageClient::read_persist_segments` path — used by
-    // lifecycle compaction / snapshot building and the AuditData read path —
-    // stays cacheless: it never consults the `SegmentCache`, so repeat
-    // reads always hit storage. (The merge-on-read QUERY path now DOES cache, via
-    // the provider; see `persist_query_read_is_cached_within_process`.)
+    // The RAW `ColdStorageClient::read_persist_segments` path — lifecycle
+    // compaction / snapshot building / AuditData reads — stays cacheless by
+    // design. Only the merge-on-read QUERY path caches, via the provider; see
+    // `persist_query_read_is_cached_within_process`.
     #[tokio::test]
     async fn raw_read_persist_segments_is_uncached() {
         use futures::StreamExt;
@@ -1931,11 +1794,6 @@ mod tests {
         );
     }
 
-    // CHA-474 (AC1): the persist QUERY path (`execute_sql` -> `PersistTableProvider`)
-    // serves a repeat read of the same persist segment from the shared
-    // `SegmentCache` within the process lifetime, instead of re-reading it
-    // from storage on every query. Fails today (the persist provider path takes no
-    // cache); goes green when `read_cached_persist_segment` lands.
     #[tokio::test]
     async fn persist_query_read_is_cached_within_process() {
         use penca_core::{PersistPlan, PersistSegment};
@@ -1962,7 +1820,6 @@ mod tests {
             delete: schema.clone(),
         };
 
-        // Two identical persist queries on the SAME driver (shared `self.cache`).
         let first = dl
             .execute_sql(&plan, "SELECT row_uuid, v FROM upsert_log", &log_schemas)
             .await
@@ -1983,9 +1840,6 @@ mod tests {
         );
     }
 
-    // CHA-474 (AC3): a persist segment larger than the whole cache budget is not
-    // cached — the shared `admits` gate rejects it — so it re-reads storage on
-    // every query, mirroring the snapshot oversized path.
     #[tokio::test]
     async fn oversized_persist_segment_not_cached() {
         use penca_core::{PersistPlan, PersistSegment};
@@ -2026,12 +1880,8 @@ mod tests {
         );
     }
 
-    // CHA-474: one cached persist entry (decoded whole on the miss) serves
-    // queries with DIFFERENT projections — the projection-independence property
-    // mirrored from the snapshot tier (CHA-252). The first query populates the
-    // cache via one projection; a second query with a different projection is
-    // served from that cached superset (read count stays 1) and yields the
-    // correct columns/values via `project_batch_to_schema`.
+    // Projection-independence: one cached persist entry (decoded whole on the
+    // miss) serves queries with DIFFERENT projections.
     #[tokio::test]
     async fn persist_cache_entry_serves_different_projections() {
         use penca_core::{PersistPlan, PersistSegment};
@@ -2058,14 +1908,12 @@ mod tests {
             delete: schema.clone(),
         };
 
-        // First query projects only `row_uuid` — a miss that decodes the whole
-        // segment and caches the (row_uuid, v) superset.
+        // A miss that decodes the whole segment and caches the (row_uuid, v)
+        // superset.
         let narrow = dl
             .execute_sql(&plan, "SELECT row_uuid FROM upsert_log", &log_schemas)
             .await
             .unwrap();
-        // Second query projects only `v` — a DIFFERENT projection served from the
-        // same cached superset.
         let wide = dl
             .execute_sql(&plan, "SELECT v FROM upsert_log", &log_schemas)
             .await
@@ -2104,9 +1952,8 @@ mod tests {
         );
     }
 
-    // CHA-252: one entry decoded against full_schema serves queries with
-    // different projections. The driver returns the full superset (merge
-    // narrows downstream via project_to_output) and re-reads nothing.
+    // The driver returns the full superset; merge narrows downstream via
+    // project_to_output.
     #[tokio::test]
     async fn one_entry_serves_different_projections() {
         let full_schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -2131,7 +1978,6 @@ mod tests {
         let (dl, reads) = driver_with(cache, full_batch);
         let seg = segment("p", 256);
 
-        // Projected query (narrow out): caches the FULL superset.
         let first = read_seg(&dl, &seg, &full_schema, &narrow_out)
             .await
             .unwrap();
@@ -2140,7 +1986,6 @@ mod tests {
             3,
             "driver returns the full superset; merge narrows downstream"
         );
-        // A different projection (full out) is served from the same entry.
         let second = read_seg(&dl, &seg, &full_schema, &full_schema)
             .await
             .unwrap();
@@ -2152,12 +1997,9 @@ mod tests {
         assert_eq!(second.num_columns(), 3);
     }
 
-    // ----- CHA-411 R-D: scan_snapshot end-to-end ------------------------
-    //
-    // penca-dl cannot depend on penca-merge, so these build the snapshot-scan
-    // SQL inline (the shape `penca_merge::sql::build_cold_snapshot_scan` emits)
-    // and assert scan_snapshot streams rows identical to the old Arrow
-    // filter_snapshot_batch + apply_physical_filter path.
+    // penca-dl cannot depend on penca-merge, so the scan_snapshot tests below
+    // build the snapshot-scan SQL inline — the shape
+    // `penca_merge::sql::build_cold_snapshot_scan` emits.
 
     fn rd_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2259,7 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn scan_snapshot_schema_tolerance() {
         // Segment decoded against the OLDER narrow schema {row_uuid, name};
-        // out schema carries a nullable `value` to null-fill (CHA-252).
+        // out schema carries a nullable `value` to null-fill.
         let narrow_schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("row_uuid", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
@@ -2305,7 +2147,6 @@ mod tests {
 
     #[test]
     fn intersect_sorted_edges() {
-        // Two-pointer intersection over the kernel's sorted+deduped output.
         assert_eq!(intersect_sorted(&[1, 3, 5], &[3, 4, 5]), vec![3, 5]);
         assert_eq!(intersect_sorted(&[1, 2], &[3, 4]), Vec::<i64>::new());
         assert_eq!(intersect_sorted(&[], &[1]), Vec::<i64>::new());

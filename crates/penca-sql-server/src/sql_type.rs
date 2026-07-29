@@ -1,5 +1,5 @@
 //! SQL parsed-type → Arrow data-type translator for the auto-commit DDL
-//! path (CHA-172).
+//! path.
 //!
 //! Called from `crate::ddl::execute_create_table` once per `ColumnDef`.
 //! This is a pure *translation* layer: it maps each SQL type token onto a
@@ -7,7 +7,7 @@
 //! SQL-aware error rather than DataFusion's internal "no coercion
 //! possible" wording), then materializes the canonical Arrow type. It is
 //! NOT the supported-set gate — that lives once at the gRPC
-//! `WriteService::create_table` boundary (CHA-386), so the two layers
+//! `WriteService::create_table` boundary, so the two layers
 //! reject at different points (token-translation vs. schema-gate) by
 //! design.
 
@@ -35,7 +35,7 @@ pub(crate) fn sql_type_to_arrow(sql: &SqlDataType) -> Result<DataType, Status> {
         // TIMESTAMP WITH TIME ZONE -> tz-aware microsecond Timestamp. PG
         // stores TIMESTAMPTZ as a UTC instant, so the declared tz is
         // normalized to UTC; read-back restores the tz from the stored
-        // schema (CHA-386).
+        // schema.
         SqlDataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
             CanonicalType::Timestamp {
                 unit: TimeUnit::Microsecond,
@@ -173,9 +173,9 @@ mod tests {
 
     #[test]
     fn timestamp_with_timezone_maps_to_utc_microsecond() {
-        // CHA-386 lifted the prior rejection: tz-aware TIMESTAMP maps to a
-        // UTC-normalized microsecond Timestamp (PG TIMESTAMPTZ stores a UTC
-        // instant; read-back restores the tz from the stored schema).
+        // Tz-aware TIMESTAMP maps to a UTC-normalized microsecond Timestamp:
+        // PG TIMESTAMPTZ stores a UTC instant, and read-back restores the tz
+        // from the stored schema.
         assert_maps(
             "TIMESTAMP WITH TIME ZONE",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),

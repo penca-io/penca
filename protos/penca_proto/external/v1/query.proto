@@ -17,10 +17,6 @@ import "penca_proto/external/v1/common.proto";
 // __penca_system__ rows. See common.proto for the full resolution
 // rules.
 
-// ===========================================================================
-// Catalog (read-only)
-// ===========================================================================
-
 // Retrieves a single catalog by UUID or name.
 message GetCatalogRequest {
   optional string catalog_uuid = 1;
@@ -46,10 +42,6 @@ message ListCatalogsResponse {
   optional string next_page_token = 2;
 }
 
-// ===========================================================================
-// Branch (read-only)
-// ===========================================================================
-
 // Retrieves a branch by UUID or name.
 //
 // Sufficient identifier combinations:
@@ -60,7 +52,6 @@ message ListCatalogsResponse {
 //   - catalog_name + schema_name + branch_uuid
 //   - catalog_name + schema_name + branch_name
 message GetBranchRequest {
-  // --- Identifier block (schema + branch) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -80,7 +71,6 @@ message GetBranchResponse {
 //   - catalog_uuid + schema_name
 //   - catalog_name + schema_name
 message ListBranchesRequest {
-  // --- Identifier block (schema) ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -97,10 +87,6 @@ message ListBranchesResponse {
   optional string next_page_token = 2;
 }
 
-// ===========================================================================
-// Schema (read-only)
-// ===========================================================================
-//
 // CHA-177: schemas are branch-scoped — `__penca_system__.schemas` is a
 // regular Penca Table partitioned per branch. Identify the target
 // branch by uuid OR name (defaults to "main" when both omitted).
@@ -176,10 +162,6 @@ message ListSchemasResponse {
   optional string next_page_token = 2;
 }
 
-// ===========================================================================
-// Table (read-only)
-// ===========================================================================
-//
 // Each branch maintains independent per-branch physical data tables
 // (CHA-177), so the same table name can have different schemas on
 // different branches without conflict.
@@ -193,7 +175,6 @@ message ListSchemasResponse {
 //   - catalog_name + schema_name + table_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message GetTableRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -228,7 +209,6 @@ message GetTableResponse {
 //   - catalog_name + schema_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message ListTablesRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -259,16 +239,11 @@ message ListTablesResponse {
   optional string next_page_token = 2;
 }
 
-// ===========================================================================
-// Index metadata — CHA-455
-// ===========================================================================
-//
 // Reads against the auditable `index_metadata` store, time-travelling via
 // the same open_tx_uuid / as_of_micros pin pair as the other auditable
 // stores. Index DDL (Create/Update/Delete) lives in write.proto.
 
 message GetIndexRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -294,7 +269,6 @@ message GetIndexResponse {
 }
 
 message ListIndexesRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -313,10 +287,6 @@ message ListIndexesResponse {
   repeated Index indexes = 1;
 }
 
-// ===========================================================================
-// ReadData
-// ===========================================================================
-
 // Column projection for `ReadDataRequest`. See the field-level comment
 // on `ReadDataRequest.projection` for the three-state semantics.
 message Projection {
@@ -333,7 +303,6 @@ message Projection {
 //   - catalog_name + schema_name + table_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message ReadDataRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -343,7 +312,7 @@ message ReadDataRequest {
   optional string table_uuid = 7;
   optional string table_name = 8;
 
-  // --- Visibility (mutually exclusive within the block) ---
+  // Visibility (mutually exclusive within the block)
 
   // Point-in-time read on either commit axis (mutually exclusive arms).
   // If the whole oneof is omitted, returns the latest committed state.
@@ -377,8 +346,6 @@ message ReadDataRequest {
   // different point-in-time would let writes layer onto a snapshot
   // where the table or schema may not even exist.
   optional string open_tx_uuid = 10;
-
-  // --- Projection / pushdown ---
 
   // Column projection. Three states:
   //   - Unset: return all user columns (the default).
@@ -435,10 +402,6 @@ message ReadDataResponse {
   bytes data = 1;
 }
 
-// ===========================================================================
-// AuditData
-// ===========================================================================
-
 // Reads the audit trail for a table: every committed version of every
 // row, annotated with transaction metadata (begin/commit timestamps,
 // comment, author). Useful for compliance, debugging, and change tracking.
@@ -450,7 +413,6 @@ message ReadDataResponse {
 //   - catalog_name + schema_name + table_name (+ optional branch)
 // Branch defaults to "main" when omitted.
 message AuditDataRequest {
-  // --- Identifier block ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
@@ -524,10 +486,6 @@ message GetMaxCommitSeqNumResponse {
   // the next-to-allocate counter. `-1` on a branch with no committed tx.
   int64 max_commit_seq_num = 1;
 }
-
-// ===========================================================================
-// Service
-// ===========================================================================
 
 // QueryService exposes every Penca read: catalog/schema/table metadata,
 // branches, transactions, ReadData, AuditData. Mutations are on

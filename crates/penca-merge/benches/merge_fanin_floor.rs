@@ -1,12 +1,12 @@
-//! CHA-415 primitive #3 — DataFusion-bound hot+cold merge fan-in floor.
+//! DataFusion-bound hot+cold merge fan-in floor.
 //!
-//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the CHA-411
+//! Drives the REAL `penca_dl::DatafusionDlDriver::scan_snapshot` (the
 //! `SnapshotTableProvider` path) over a fixed in-memory cold base, measuring the
 //! DataFusion **exclusion anti-join** + snapshot scan as hot churn (the
 //! exclusion-set size) grows. An in-memory `FormatReader` serves the decoded
 //! base, so no PG and no Lance/S3 read are in the path — only the DataFusion
-//! merge compute (the cold *read* floor is #2a; the point-lookup *execution*
-//! floor is #2b/CHA-418).
+//! merge compute — see `cold_segment_read_floor` for the cold *read* floor and
+//! `cold_point_lookup_floor` for the point-lookup *execution* floor.
 //!
 //! Env: PERF_FLOOR_MAX=1m adds the 1M-row cold base (default 100k). The shared
 //! harness lives in `floor_support.rs` (also used by the guard test).

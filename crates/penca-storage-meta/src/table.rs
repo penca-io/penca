@@ -2,7 +2,7 @@
 //! plus the `penca_api::QueryManager::resolve_read_snapshot` dispatcher that
 //! threads `(open_tx_uuid, as_of_micros, as_of_seq)` into the
 //! [`ReadSnapshot`] every read path consumes — defaulting to the
-//! per-branch seq frontier (CHA-443) when none is set.
+//! per-branch seq frontier when none is set.
 
 use penca_core::naming;
 use penca_db::driver::{DbDriver, SqlValue};
@@ -17,9 +17,9 @@ impl LifecycleManager {
     /// Insert a table metadata entry into the upsert_log partition.
     ///
     /// Used by both create_table and update_table; the create-vs-update
-    /// distinction is resolved at read time. CHA-164: rows carry
-    /// `tx_uuid` (no `commit_micros`); visibility resolves via
-    /// JOIN against `commit_tx_log_partition(catalog, branch)`.
+    /// distinction is resolved at read time. Rows carry `tx_uuid` (no
+    /// `commit_micros`); visibility resolves via a JOIN against
+    /// `commit_tx_log_partition(catalog, branch)`.
     ///
     /// 1 SQL query.
     #[allow(clippy::too_many_arguments)]
@@ -44,9 +44,8 @@ impl LifecycleManager {
         let sys_tables_table_uuid = naming::system_tables_table_uuid(&catalog);
         let table = naming::upsert_log_table(&sys_tables_table_uuid, &branch);
 
-        // CHA-380: table_uuid is a first-class PK column; derive row_uuid
-        // canonically (`row_uuid_for_pk`) like every other Penca table.
-        // schema_uuid stays a distinct foreign key (the row's schema parent).
+        // `schema_uuid` stays a distinct foreign key (the row's schema
+        // parent), NOT the row's own identity — `table_uuid` is the PK.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_tables_table_uuid,
             &[parse_uuid(table_uuid).to_string().as_str()],
@@ -121,8 +120,8 @@ impl LifecycleManager {
         let sys_tables_table_uuid = naming::system_tables_table_uuid(&catalog);
         let table = naming::delete_log_table(&sys_tables_table_uuid, &branch);
 
-        // CHA-380: derive row_uuid canonically; table_uuid is the widened
-        // delete-log PK column (CHA-185), populated to match the upsert row.
+        // `table_uuid` is the widened delete-log PK column, populated to match
+        // the upsert row.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_tables_table_uuid,
             &[parse_uuid(table_uuid).to_string().as_str()],
@@ -174,9 +173,8 @@ impl LifecycleManager {
         let delete_part = naming::delete_log_table(&sys_tables_table_uuid, &branch);
         let commit_tx_log_part = naming::commit_tx_log_partition(&catalog, &branch);
 
-        // CHA-380: derive row_uuid canonically; the resolve filter
-        // (`u.row_uuid = $1`) matches the derived row_uuid now stored, and
-        // table_uuid is the widened delete-log PK column (CHA-185).
+        // `table_uuid` is the widened delete-log PK column, populated to match
+        // the upsert row.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_tables_table_uuid,
             &[parse_uuid(table_uuid).to_string().as_str()],
@@ -260,9 +258,8 @@ impl LifecycleManager {
         let sys_tables_table_uuid = naming::system_tables_table_uuid(&catalog);
         let table = naming::upsert_log_table(&sys_tables_table_uuid, &branch);
 
-        // CHA-380: table_uuid is a first-class PK column; derive row_uuid
-        // canonically (`row_uuid_for_pk`) so the CreateBranch materialize
-        // yields the same row_uuid as the parent's `insert_table_metadata`.
+        // Derive row_uuid canonically so CreateBranch materialize yields the
+        // same row_uuid as the parent's `insert_table_metadata`.
         let row_uuid = naming::row_uuid_for_pk(
             &sys_tables_table_uuid,
             &[parse_uuid(table_uuid).to_string().as_str()],

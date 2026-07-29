@@ -17,15 +17,35 @@ pub fn snapshot_read_schema(user_schema: &SchemaRef) -> SchemaRef {
 /// Schema of a resolved row (Query A output):
 /// `row_uuid, <user_cols>, commit_micros, is_delete`.
 ///
-/// CHA-368: the resolve now returns the latest committed version per
+/// The resolve returns the latest committed version per
 /// `row_uuid` across BOTH logs — visible upserts (`is_delete = false`, user
 /// cols carry values) and winning tombstones (`is_delete = true`, user cols
 /// NULL). The full `row_uuid` set of this batch IS the exclusion set (it
 /// replaces the retired Query-B probe); the `is_delete = false` subset is the
 /// live rows the merge emits.
+///
+/// The user columns are declared NULLABLE regardless of what the table
+/// declared, because the tombstone arm has no values to put in them: the delete
+/// log stores no user columns, so `two_arm_resolve_select` sources them from a
+/// LEFT-JOINed `latest` purely to type-match the UNION. Once a Snapshot advances
+/// the hot fence `max(Pu, W_snap)` past a row's original upsert that join misses
+/// and the arm emits NULLs, which `RecordBatch::try_new` rejects against a
+/// non-nullable declaration — wedging every later read of the table.
+///
+/// This does NOT weaken the user-data contract: that lives on
+/// [`snapshot_read_schema`], which stays strict and is applied by
+/// `output::project_to_output` *after* `resolve::filter_live_rows` has dropped
+/// every tombstone, so a genuine NULL in a live row still fails loudly.
+/// `row_uuid` / `commit_micros` / `is_delete` stay non-nullable: both arms
+/// always populate all three.
 pub(crate) fn resolved_schema(user_schema: &SchemaRef) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("row_uuid", DataType::Utf8, false))];
-    fields.extend(user_schema.fields().iter().cloned());
+    fields.extend(
+        user_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true))),
+    );
     fields.push(Arc::new(Field::new(
         "commit_micros",
         DataType::Int64,
@@ -35,20 +55,20 @@ pub(crate) fn resolved_schema(user_schema: &SchemaRef) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// On-disk schemas for the two cold log tables (CHA-218).
+/// On-disk schemas for the two cold log tables.
 ///
 /// Must match what persist writes to cold storage — declaring extra
 /// fields here makes DataFusion fail with "Field X not found" when it
 /// tries to project them off the on-disk files.
 ///
 /// `upsert` carries `(row_uuid, <user_cols>, <tx-metadata tail>)`; `delete`
-/// carries `(row_uuid, <pk_cols>, <tx-metadata tail>)` (CHA-185), where the tail
+/// carries `(row_uuid, <pk_cols>, <tx-metadata tail>)`, where the tail
 /// is [`cold_tx_metadata_fields`].
 ///
 /// Per-tx framing (tx_uuid, begin/abort/commit_tx_log) is hot-only. Cold rows
 /// pre-join the timestamp/seq tx-metadata columns from `commit_tx_log` at
-/// persist time so the cold side reads as a near-pure scan. CHA-507 stopped
-/// denormalizing `author`/`comment` onto cold rows — they live once in the
+/// persist time so the cold side reads as a near-pure scan. `author`/`comment`
+/// are NOT denormalized onto cold rows — they live once in the
 /// durable cold `tx_log` and are reattached on demand by `audit_data`. See
 /// `docs/decisions/0017-cold-data-segments-pre-joined-tx-metadata.md` and
 /// `docs/decisions/0030-cold-commit-tx-log-and-audit-join.md`.
@@ -80,8 +100,8 @@ pub(crate) fn cold_upsert_schema_for_merge(user_schema: &SchemaRef) -> SchemaRef
         DataType::Int64,
         false,
     )));
-    // CHA-431: the merge orders by `(commit_seq_num, write_seq_num)`; both are
-    // declared so DataFusion projects them off the wider cold file.
+    // The merge orders by `(commit_seq_num, write_seq_num)`; both are declared
+    // so DataFusion projects them off the wider cold file.
     fields.push(Arc::new(Field::new(
         "write_seq_num",
         DataType::Int64,
@@ -95,10 +115,10 @@ pub(crate) fn cold_upsert_schema_for_merge(user_schema: &SchemaRef) -> SchemaRef
     Arc::new(Schema::new(fields))
 }
 
-/// Cold on-disk upsert log schema (CHA-218, CHA-431), audit-path view:
+/// Cold on-disk upsert log schema, audit-path view:
 /// `row_uuid + <user_cols> + write_seq_num + (committed_at, began_at, comment, author)`.
 ///
-/// CHA-431 carries `write_seq_num` (the within-tx mutation ordinal) in the
+/// Carries `write_seq_num` (the within-tx mutation ordinal) in the
 /// slot between `user_cols` and the tx metadata block. Persist's
 /// `project_to_cold_layout` keeps the matching column from
 /// `hot_upsert_read_schema` in the same position.
@@ -110,7 +130,7 @@ pub(crate) fn cold_upsert_schema_for_merge(user_schema: &SchemaRef) -> SchemaRef
 pub fn cold_upsert_schema(user_schema: &SchemaRef) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("row_uuid", DataType::Utf8, false))];
     fields.extend(user_schema.fields().iter().cloned());
-    // CHA-431: write_seq_num trails the user cols on the on-disk row; same
+    // write_seq_num trails the user cols on the on-disk row; same
     // slot order as hot_upsert_read_schema.
     fields.push(Arc::new(Field::new(
         "write_seq_num",
@@ -127,7 +147,7 @@ pub fn cold_upsert_schema(user_schema: &SchemaRef) -> SchemaRef {
 /// the latest/deletes CTEs
 /// ([`crate::sql::build_cold_merge_resolved`]).
 ///
-/// `write_seq_num` / `commit_seq_num` (CHA-431) are required because the merge
+/// `write_seq_num` / `commit_seq_num` are required because the merge
 /// SQL selects them directly; DataFusion would fail to project a column
 /// the declared schema doesn't include.
 ///
@@ -146,13 +166,13 @@ pub(crate) fn cold_delete_schema_for_merge() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("row_uuid", DataType::Utf8, false),
         Field::new("commit_micros", DataType::Int64, false),
-        // CHA-431: merge orders by (commit_seq_num, write_seq_num).
+        // Merge orders by (commit_seq_num, write_seq_num).
         Field::new("write_seq_num", DataType::Int64, false),
         Field::new("commit_seq_num", DataType::Int64, false),
     ]))
 }
 
-/// Cold on-disk delete log schema (CHA-185, CHA-431), audit-path view:
+/// Cold on-disk delete log schema, audit-path view:
 /// `row_uuid + <pk_cols> + write_seq_num + (committed_at, began_at, comment, author)`.
 /// PK columns interleave between `row_uuid` and `write_seq_num` in
 /// table-declared order; types are resolved from `user_schema` so the
@@ -180,7 +200,7 @@ pub fn cold_delete_schema(
             .clone();
         fields.push(Arc::new(field));
     }
-    // CHA-431: write_seq_num trails the pk cols on the on-disk row.
+    // write_seq_num trails the pk cols on the on-disk row.
     fields.push(Arc::new(Field::new(
         "write_seq_num",
         DataType::Int64,
@@ -191,12 +211,12 @@ pub fn cold_delete_schema(
 }
 
 /// Denormalized tx metadata columns appended to every cold upsert/delete row
-/// at persist time (CHA-218), minus `author`/`comment`.
+/// at persist time, minus `author`/`comment`.
 ///
-/// CHA-507: `author`/`comment` are no longer denormalized onto cold data rows.
+/// `author`/`comment` are deliberately NOT denormalized onto cold data rows.
 /// They live once per tx in the cold `tx_log` and are reattached on demand by
 /// `audit_data`'s `commit_seq_num` join (pay-for-what-you-use), so only the
-/// commit-order + wall-clock axes stay inline. `commit_seq_num` (CHA-430) still
+/// commit-order + wall-clock axes stay inline. `commit_seq_num` still
 /// trails; its trailing position must match the hot-side JOIN tail
 /// ([`penca_storage_hot`]'s `joined_tx_metadata_fields`) exactly — projected
 /// position-for-position, so a divergence fails DataFusion projection. Only the
@@ -209,19 +229,72 @@ fn cold_tx_metadata_fields() -> Vec<Arc<Field>> {
     ]
 }
 
-/// The canonical denormalized tx-metadata tail (CHA-218 + CHA-430 + CHA-507),
-/// `(name, type, nullable)` per column. The persist-side JOIN result tail
+/// The canonical denormalized tx-metadata tail, `(name, type, nullable)` per
+/// column. The persist-side JOIN result tail
 /// (`penca_storage_hot`'s `joined_tx_metadata_fields`) and the cold on-disk
 /// tail ([`cold_tx_metadata_fields`]) must BOTH equal this — they are projected
 /// position-for-position across the crate boundary, so any silent drift would
-/// only surface as a runtime DataFusion projection error. CHA-507 dropped
-/// `author`/`comment` from this tail (now joined from the cold tx_log).
+/// only surface as a runtime DataFusion projection error. `author`/`comment`
+/// are not in this tail — they are joined from the cold tx_log.
 #[cfg(test)]
 pub(crate) const CANONICAL_TX_METADATA_TAIL: &[(&str, DataType, bool)] = &[
     ("commit_micros", DataType::Int64, false),
     ("began_at_micros", DataType::Int64, false),
     ("commit_seq_num", DataType::Int64, false),
 ];
+
+/// Carrier-shaped fixtures shared by this crate's test modules.
+///
+/// [`test_fixtures::resolved_batch_nullable`] lives beside [`resolved_schema`]
+/// because it is positionally coupled to that schema's column order — a new
+/// carrier column is then one edit, not a set of per-module copies that drift
+/// into opaque `try_new` arity errors. [`test_fixtures::test_user_schema`]
+/// follows it because it is the user schema that builder hardcodes.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    /// Both user columns are NON-nullable on purpose: that is the condition
+    /// under which the tombstone arm's NULLs used to abort the read (CHA-524),
+    /// so relaxing it here would silently retire the regression locks.
+    pub(crate) fn test_user_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]))
+    }
+
+    /// A resolved batch whose user columns may be NULL — the shape the tombstone
+    /// arm actually produces: the delete log carries no user columns, so once a
+    /// Snapshot fences the row's upsert out of the hot `latest` CTE the arm
+    /// emits NULLs.
+    ///
+    /// Constructing against [`super::resolved_schema`] is itself the regression
+    /// lock: re-tightening the carrier's user columns makes `try_new` fail here.
+    pub(crate) fn resolved_batch_nullable(
+        row_uuids: &[&str],
+        names: &[Option<&str>],
+        values: &[Option<i32>],
+        commit_micros: &[i64],
+        is_deletes: &[bool],
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            super::resolved_schema(&test_user_schema()),
+            vec![
+                Arc::new(StringArray::from(row_uuids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(commit_micros.to_vec())),
+                Arc::new(BooleanArray::from(is_deletes.to_vec())),
+            ],
+        )
+        .expect("the resolve carrier must accept NULL user columns")
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -237,6 +310,36 @@ mod tests {
             .map(|(n, t, nul)| (*n, t.clone(), *nul))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// CHA-524: the two-arm resolve emits tombstone rows whose user columns are
+    /// NULL by construction, so the carrier must declare them nullable — while
+    /// the OUTPUT schema stays strict, since `filter_live_rows` drops those rows
+    /// before `project_to_output` applies it. Locking both halves together is
+    /// the point: relaxing the output schema too would turn the wedged read this
+    /// fixes into silent corruption.
+    #[test]
+    fn resolved_schema_relaxes_user_columns_but_output_schema_stays_strict() {
+        let user: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+
+        let resolved = resolved_schema(&user);
+        assert!(resolved.field_with_name("name").unwrap().is_nullable());
+        assert!(resolved.field_with_name("note").unwrap().is_nullable());
+        for required in ["row_uuid", "commit_micros", "is_delete"] {
+            assert!(
+                !resolved.field_with_name(required).unwrap().is_nullable(),
+                "{required} is populated by both arms and must stay non-nullable"
+            );
+        }
+
+        let output = snapshot_read_schema(&user);
+        assert!(
+            !output.field_with_name("name").unwrap().is_nullable(),
+            "the output contract must keep the table's declared non-nullability"
+        );
     }
 
     #[test]
@@ -260,7 +363,7 @@ mod tests {
         assert_tail_matches(tail);
     }
 
-    /// CHA-507 (RED): author/comment move off cold data segments into the
+    /// author/comment live off the cold data segments, in the
     /// joined cold tx_log, so the audit-path cold schemas must no longer carry
     /// them — while the columns the cold audit + merge paths still need remain.
     /// Fails on `main` (the tail still carries author/comment); GREEN after

@@ -1,7 +1,5 @@
 //! Hot storage client for the Postgres-backed transactional tier.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/storage/hot.py`.
-//!
 //! [`HotStorageClient`] provides typed methods for reading and writing recent,
 //! unpersisted data in Postgres. All methods accept `&impl DbDriver<Row = PgRow>`,
 //! supporting both pool and transaction drivers with true server-side cursor
@@ -9,7 +7,7 @@
 //!
 //! **Note:** This client is currently coupled to Postgres — it generates
 //! Postgres-specific SQL (`PgDialect`, `unnest`, `ARRAY[]::uuid[]`) and
-//! constrains `Row = PgRow`. See CHA-117 for abstracting the dialect.
+//! constrains `Row = PgRow`. TODO(CHA-117): abstract the dialect.
 
 use arrow::datatypes::DataType;
 

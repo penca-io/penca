@@ -26,11 +26,7 @@ if _version_not_supported:
 
 
 class QueryServiceStub(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    QueryService exposes every Penca read: catalog/schema/table metadata,
+    """QueryService exposes every Penca read: catalog/schema/table metadata,
     branches, transactions, ReadData, AuditData. Mutations are on
     WriteService.
 
@@ -112,11 +108,7 @@ class QueryServiceStub(object):
 
 
 class QueryServiceServicer(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    QueryService exposes every Penca read: catalog/schema/table metadata,
+    """QueryService exposes every Penca read: catalog/schema/table metadata,
     branches, transactions, ReadData, AuditData. Mutations are on
     WriteService.
 
@@ -289,11 +281,7 @@ def add_QueryServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class QueryService(object):
-    """===========================================================================
-    Service
-    ===========================================================================
-
-    QueryService exposes every Penca read: catalog/schema/table metadata,
+    """QueryService exposes every Penca read: catalog/schema/table metadata,
     branches, transactions, ReadData, AuditData. Mutations are on
     WriteService.
 

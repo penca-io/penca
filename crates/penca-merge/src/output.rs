@@ -28,7 +28,7 @@ use crate::MergeError;
 
 /// Project `batch` to `out_schema`'s columns, in order.
 ///
-/// CHA-252: a column in `out_schema` absent from `batch` is null-filled (if
+/// A column in `out_schema` absent from `batch` is null-filled (if
 /// nullable). This covers a snapshot-segment cache hit whose entry was decoded
 /// against an older table schema (before an `ALTER TABLE ADD COLUMN`): the
 /// cached batch lacks the newer column, whose value for those rows is NULL. A
@@ -55,11 +55,10 @@ pub(crate) fn project_to_output(
 /// filter through DataFusion's **full planner once** and extracting the
 /// `FilterExec` predicate to reuse per batch.
 ///
-/// This is exactly the plan the old per-batch `SELECT * FROM l WHERE {filter}`
-/// produced — analyzer (incl. TypeCoercion) + optimizer — so the cold-side
-/// result is **identical to that path by construction**; we just stop
+/// The plan runs the full analyzer (incl. TypeCoercion) + optimizer, matching
+/// what a per-batch `SELECT * FROM l WHERE {filter}` would produce, without
 /// re-planning per batch. The same predicate is also handed to segment
-/// pruning, so the two filtering layers cannot diverge. CHA-353.
+/// pruning, so the two filtering layers cannot diverge.
 ///
 /// `schema` is what the predicate binds against *and* the schema of the
 /// batches it later evaluates on (residual: `out_schema`; pruning:
@@ -86,12 +85,10 @@ pub(crate) async fn full_plan_predicate(
             .map(|f| new_null_array(f.data_type(), 1))
             .collect(),
     )?;
-    // CHA-421: plan on the session the caller passes (the driver's
-    // template-derived session) instead of a fresh `SessionContext::new()`, so
-    // the pruning predicate shares the same function registry + analyzer/
-    // optimizer rules as the rest of the cold read. Registering `l` into this
-    // throwaway pruning session is harmless — it is used once for this plan and
-    // dropped.
+    // Plan on the session the caller passes (the driver's template-derived
+    // session), never a fresh `SessionContext::new()`, so the predicate shares
+    // the same function registry + analyzer/optimizer rules as the rest of the
+    // cold read.
     let mem = MemTable::try_new(plan_schema.clone(), vec![vec![dummy]])?;
     session.register_table("l", Arc::new(mem))?;
     let plan = session
@@ -106,9 +103,8 @@ pub(crate) async fn full_plan_predicate(
     // an always-true filter (`1=1`) leaves just the scan → keep every row; an
     // always-false filter (`1=2`) folds to an `EmptyExec` → drop every row.
     // Return the matching constant boolean predicate so per-batch evaluation
-    // still matches the old `SELECT * FROM l WHERE {filter}` (which returned
-    // all / no rows rather than erroring). The 1-row dummy table rules out a
-    // scan that is empty for unrelated reasons.
+    // keeps all / drops all rather than erroring. The 1-row dummy table rules
+    // out a scan that is empty for unrelated reasons.
     //
     // INVARIANT (load-bearing): the planning table is a `MemTable`, which
     // reports `TableProviderFilterPushDown::Unsupported`, so a *non-constant*
@@ -124,21 +120,21 @@ pub(crate) async fn full_plan_predicate(
 /// Apply the user filter to a materialized batch as a residual, evaluated
 /// through DataFusion's full-plan physical predicate.
 ///
-/// CHA-368: DataFusion is the single user-filter engine. The hot/cold resolve
-/// SQL no longer splices the user `WHERE`, so the resolved log-tier batch is
-/// filtered here instead — with the exact `full_plan_predicate` the snapshot
-/// tier applies inside its scan, so the two tiers can never disagree. The
-/// caller derives the exclusion set from the *unfiltered* resolved batch before
-/// this runs (CHA-142), so the residual only trims the emitted rows.
+/// DataFusion is the single user-filter engine. The hot/cold resolve SQL does
+/// not splice the user `WHERE`, so the resolved log-tier batch is filtered
+/// here instead — with the exact `full_plan_predicate` the snapshot tier
+/// applies inside its scan, so the two tiers can never disagree. The caller
+/// derives the exclusion set from the *unfiltered* resolved batch before this
+/// runs, so the residual only trims the emitted rows.
 ///
 /// Column references resolve against the batch's own schema (registered as
 /// `l`), which must carry every column the filter names — the caller's read
 /// projection guarantees this (`output ∪ filter` columns, ADR 0023). Reading the
 /// schema off `batch` here keeps the "derive schema → apply residual" sequence in
-/// one place, so the three residual sites (all-hot, mixed, all-cold) can't drift
-/// (CHA-368 review). No-op when the filter is absent/empty or the batch is empty.
+/// one place, so the three residual sites (all-hot, mixed, all-cold) can't
+/// drift. No-op when the filter is absent/empty or the batch is empty.
 ///
-/// Fail-fast invariant (CHA-368 / ADR 0023, IMPL-5): if the projection ever
+/// Fail-fast invariant (ADR 0023): if the projection ever
 /// dropped a column the filter references, `full_plan_predicate` cannot bind it
 /// and returns a hard planning error here — no sentinel, no keep-all/drop-all
 /// fallback that would silently change results. A missing filter column is thus
@@ -167,7 +163,7 @@ pub async fn apply_resolved_residual(
         .apply(batch)
 }
 
-/// A user-filter residual compiled once and applied to many batches (CHA-368).
+/// A user-filter residual compiled once and applied to many batches.
 ///
 /// `full_plan_predicate` runs the filter through DataFusion's full planner and
 /// registers a throwaway planning table `l` on the session. That is a per-read
@@ -250,7 +246,7 @@ fn find_filter_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Physic
     plan.children().into_iter().find_map(find_filter_predicate)
 }
 
-/// CHA-485: per-column equality binding sets extracted from a filter
+/// Per-column equality binding sets extracted from a filter
 /// fragment — `col = lit` (both orientations) and non-negated single-column
 /// `col IN (lit, …)` conjuncts, unioned per column. Only columns whose Arrow
 /// type is in the seek kernel's strict-cast allowlist bind (their literal
@@ -514,8 +510,8 @@ mod binding_tests {
         assert_eq!(got["city"], vec!["paris".to_string(), "oslo".to_string()]);
     }
 
-    /// CHA-368 IMPL-4 regression: a compiled `ResidualFilter` applies to MANY
-    /// batches on ONE session. `full_plan_predicate` registers a planning table
+    /// A compiled `ResidualFilter` applies to MANY batches on ONE
+    /// session. `full_plan_predicate` registers a planning table
     /// `l`; the all-hot read streams the delta as several batches, so re-planning
     /// per batch would re-register `l` and error ("table l already exists") on the
     /// second batch. `compile` once + `apply` per batch must filter every batch.
@@ -545,7 +541,7 @@ mod binding_tests {
         assert_eq!(b.num_rows(), 1, "batch B keeps 6");
     }
 
-    /// ADR 0023 / CHA-368 IMPL-5: the residual must FAIL FAST when the filter
+    /// Per ADR 0023 the residual must FAIL FAST when the filter
     /// references a column absent from the read projection — never silently keep
     /// or drop rows (which would change results). The read projection includes
     /// the filter's columns by construction (filters push Inexact, so DataFusion

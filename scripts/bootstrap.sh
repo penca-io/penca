@@ -274,12 +274,17 @@ log "Wiring memory symlink"
 just memory-symlink-bootstrap
 
 # 10. kata daemon + project binding + roborev + optional issue-graph client --
-# `just init-agent-tools` also wires the OPTIONAL scoped shared issue-graph
+# `just init-agent-tools` also applies the roborev review calibration
+# (`review_min_severity`, `review_guidelines`) AFTER `roborev init`, which would
+# otherwise regenerate `.roborev.toml` from defaults and drop it — see the
+# recipe for why each is set.
+#
+# It also wires the OPTIONAL scoped shared issue-graph
 # client (CHA-447): when PENCA_KATA_GRAPH_URL is set it probes the shared kata
 # instance that scripts/kata-issue-graph.sh reads; unset leaves the VM
 # local-only (the default). No global KATA_SERVER is exported — that stays
 # scoped to the wrapper so the local task-queue daemon remains authoritative.
-log "Wiring agent tools (kata daemon, project binding, roborev hook, optional issue-graph client)"
+log "Wiring agent tools (kata daemon, project binding, roborev hook + review calibration, optional issue-graph client)"
 just init-agent-tools
 
 # 11. pre-commit hooks -------------------------------------------------

@@ -1,9 +1,4 @@
 //! API orchestration layer composing storage clients and merge.
-//!
-//! Provides business-logic managers (Write, Query, Lifecycle) that
-//! implement the Penca external API by composing storage clients
-//! (`LifecycleManager`, `HotStorageClient`, `ColdStorageClient`) and the
-//! merge algorithm.
 
 pub mod error;
 pub mod lifecycle;

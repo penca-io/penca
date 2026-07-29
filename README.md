@@ -97,6 +97,21 @@ Postgres and the object store write there, and it survives `just penca-down`:
 just penca-up --db ~/.penca/data
 ```
 
+## Examples
+
+Everything under `examples/` runs against a `just penca-up` stack with the
+client env sourced, and nothing else. One composite story, then a family of
+single-feature scripts you can read end to end in a minute:
+
+| Script | Shows |
+|---|---|
+| `examples/sandbox_demo.py` | The flagship. Fork a branch per agent, transact on each in place, compare them, throw them away — prod untouched. |
+| `examples/oltp_demo.py` | Fetching one row out of a large table on cold columnar storage, timed over the gRPC client and over Flight SQL — both of which resolve to the same keyed read. |
+| `examples/audit_demo.py` | Version history and time travel on one table: `read_data`, `audit_data`, and reading the table as it was at an earlier commit. |
+
+Each is standalone and copy-pasteable — they deliberately repeat their setup
+rather than sharing a helper module, so you can lift one file and run it.
+
 ### `examples/sandbox_demo.py` — a disposable sandbox per agent
 
 **Give each agent its own copy of production, then throw it away.**
@@ -197,6 +212,34 @@ mechanic is the point, not the bandit. And at this scale the fork itself is the
 hook: reading your transactional writes back *analytically* only outruns a
 row-store at real volume or on a query shape a row-store chokes on, which is not
 what a 3000-impression demo shows.
+
+### `examples/oltp_demo.py` — a point lookup that stays a point lookup
+
+**One row out of a hundred thousand, straight out of columnar files.**
+
+```bash
+uv run python examples/oltp_demo.py    # same sourced env, no extra setup
+```
+
+A columnar layout is built for scans, so the fair question to ask of a lakehouse
+is what happens to a single-row primary-key lookup once the data has left the
+hot tier. The script seeds a table, drives it all the way cold — persist,
+snapshot, **and purge**, because persist leaves the rows physically in hot and
+the plan attaches a hot arm while any remain; purge is the delete that makes the
+read all-cold — and only then times the lookup.
+
+It fetches the row two ways, and they converge. The gRPC arm sends `ids=`, a
+primary-key restriction the engine resolves to a row identity. The SQL arm sends
+`WHERE account_id = …` over Flight SQL, and the gateway extracts that
+primary-key equality into the **same** `ids` restriction — the `WHERE` fragment
+is then not pushed with the read, so nothing evaluates it over the columnar
+files — so both arms land on the same keyed read. Neither scans. What the SQL
+arm pays on top is parsing and planning on each execution, plus the driver's
+extra round trips.
+
+**No figures are printed here on purpose.** Every number the demo shows is
+measured on your machine when you run it — hardware, container limits and object
+store all move it. Run it and read your own.
 
 ### `examples/audit_demo.py` — time travel and the audit trail
 

@@ -33,7 +33,7 @@ def _load_generator():
 kph = _load_generator()
 
 
-# --- fixtures: canned kata JSON (the shapes verified against live kata) ------
+# fixtures: canned kata JSON (the shapes verified against live kata)
 
 
 def _list_payload(*shorts: str) -> dict:

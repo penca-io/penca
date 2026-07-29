@@ -1,21 +1,16 @@
-//! CHA-507: `persist_tx_log` — flush the slim per-branch commit map to cold.
+//! `persist_tx_log` — flush the slim per-branch commit map to cold, so a fork
+//! position and the audit tx-metadata survive hot `commit_tx_log` GC.
 //!
-//! [`LifecycleManager::persist_tx_log`] appends the `(W_txlog, target]` slice
-//! of hot `commit_tx_log` — projected to `(commit_seq_num, commit_micros,
-//! author, comment)` — to a cold `tx_log` segment, so a fork position and the
-//! audit tx-metadata survive hot `commit_tx_log` GC.
-//!
-//! It runs **first** in `persist_branch` (before any data-table persist): a
+//! MUST run **first** in `persist_branch`, before any data-table persist: a
 //! cold data segment drops author/comment and leans on the cold tx_log join
 //! for them, so the tx_log covering `<= target` must be durable before any
 //! data segment referencing those seqs can become visible.
 //!
-//! Incremental + idempotent: `W_txlog` (the committed-segment watermark) is the
-//! lower bound, and the segment uuid is deterministic on `max_commit_seq_num`,
-//! so a re-run of the same range upserts the same row. Two-phase durable write
-//! (insert uncommitted → write file → commit) mirrors the persist path; a crash
-//! before the commit leaves the segment invisible to reads and the watermark,
-//! and the next run redoes the range.
+//! Incremental + idempotent: the segment uuid is deterministic on
+//! `max_commit_seq_num`, so a re-run of the same range upserts the same row.
+//! Two-phase durable write (insert uncommitted → write file → commit) leaves a
+//! crashed run's segment invisible to both reads and the watermark, and the
+//! next run redoes the range.
 
 use std::sync::Arc;
 
@@ -56,13 +51,10 @@ impl LifecycleManager {
         branch_uuid: &Uuid,
         target_commit_seq_num: i64,
     ) -> Result<(), ApiError> {
-        // Fast path: if the cold tx_log already covers `target`, skip the lock
-        // and the orphan sweep entirely. `W_txlog` only ever grows, so an
-        // unlocked read that already covers `target` is authoritative — a
-        // concurrent flush can only push it higher. This lets the per-table
-        // Persist path (persist.rs) call persist_tx_log unconditionally: the
-        // branch flush's single upfront call covers the whole range, so every
-        // nested per-table call no-ops here without contending on the lock. The
+        // `W_txlog` only ever grows, so an unlocked read that already covers
+        // `target` is authoritative — a concurrent flush can only push it
+        // higher. That lets per-table Persist call `persist_tx_log`
+        // unconditionally and no-op here without contending on the lock. The
         // locked path re-checks the watermark, so this is a pure optimization,
         // not the correctness boundary.
         let w_txlog = penca_storage_meta::LifecycleManager::tx_log_persist_watermark(
@@ -144,7 +136,6 @@ impl LifecycleManager {
             return Ok(());
         }
 
-        // Read the (w_txlog, target] slice of hot commit_tx_log, seq-ordered.
         let tx_q = PgDialect::quote_identifier(&commit_tx_log_partition(catalog_uuid, branch_uuid));
         let sql = format!(
             "SELECT commit_seq_num, commit_micros, author, comment FROM {tx_q} \
@@ -164,7 +155,7 @@ impl LifecycleManager {
             return Ok(());
         }
 
-        // Project to the cold batch. commit_tx_log's author/comment are NOT NULL.
+        // The non-Option gets are safe: commit_tx_log's author/comment are NOT NULL.
         let mut seqs = Vec::with_capacity(rows.len());
         let mut micros = Vec::with_capacity(rows.len());
         let mut authors = Vec::with_capacity(rows.len());

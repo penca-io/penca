@@ -1,7 +1,7 @@
-//! Workload-correctness guard for the cold point-lookup execution floor (CHA-418 #2b).
+//! Workload-correctness guard for the cold point-lookup execution floor.
 //!
-//! The `cold_point_lookup_floor` bench (#2b) times the real `scan_snapshot` (CHA-411
-//! `SnapshotTableProvider`) running the production cold point-lookup plan — the
+//! The `cold_point_lookup_floor` bench times the real `scan_snapshot`
+//! (`SnapshotTableProvider`) running the production cold point-lookup plan — the
 //! exclusion anti-join (over an empty exclusion) plus a PK residual — over a fixed
 //! in-memory cold base, as segment size grows. A throughput number is only meaningful
 //! if the residual actually selects the *intended* row, so this guard pins both count
@@ -9,9 +9,9 @@
 //! row (the target present, its neighbour absent), and a miss predicate returns zero
 //! rows.
 //!
-//! Characterization guard — `scan_snapshot` is existing correct production code (its
-//! semantics are owned by penca-dl's own tests); this just confirms the bench measures
-//! a real residual point-lookup over the right row, not a passthrough.
+//! `scan_snapshot`'s own semantics are owned by penca-dl's tests; this just
+//! confirms the bench measures a real residual point-lookup over the right row,
+//! not a passthrough.
 
 #[path = "../benches/floor_support.rs"]
 mod floor_support;

@@ -4,9 +4,7 @@ package penca_proto.external.v1;
 
 // Shared messages used across external Penca services.
 //
-// ===========================================================================
 // Identifier resolution rules
-// ===========================================================================
 //
 // All request messages accept flexible identifiers: callers may provide
 // UUIDs or human-readable names (or a mix). The server resolves names
@@ -26,10 +24,6 @@ package penca_proto.external.v1;
 // Names are human convenience scoped to the current state (or to
 // the `as_of_micros` snapshot on read RPCs that support it).
 
-// ===========================================================================
-// Pagination
-// ===========================================================================
-
 // Standard pagination parameters used by all List RPCs.
 message PaginationRequest {
   // Maximum number of results to return per page. The server may return
@@ -40,10 +34,6 @@ message PaginationRequest {
   // page. Omit for the first request.
   string page_token = 2;
 }
-
-// ===========================================================================
-// IntegerRange
-// ===========================================================================
 
 // Half-open int64 interval [min, max) — a generic coordinate range. The
 // carrying field names the unit/axis: a `commit_micros` field is
@@ -63,17 +53,14 @@ message IntegerRange {
   optional int64 max = 2;
 }
 
-// ===========================================================================
-// RetentionConfig
-// ===========================================================================
-
-// Retention policy for a table's history. Defined at catalog (required),
-// schema (optional), and table (optional) levels; the effective policy for
-// a table is coalesce(table, schema, catalog), each field resolved
-// independently. Both knobs are coarse, human-set durations in seconds.
+// Retention policy for a table's history. Defined at schema (optional) and
+// table (optional) levels; the effective policy for a table is
+// coalesce(table, schema), each field resolved independently. Schema is the
+// broadest scope — a catalog carries no retention policy. Both knobs are
+// coarse, human-set durations in seconds.
 message RetentionConfig {
   // Retention window span, in seconds — how far back history is kept.
-  // Absent = inherit from parent; at the catalog level, absent = retain
+  // Absent = inherit from the schema; absent at the schema too = retain
   // indefinitely.
   optional int64 retention_duration_seconds = 1;
 
@@ -82,10 +69,6 @@ message RetentionConfig {
   // retention_duration_seconds (at least one rung per window).
   optional int64 snapshot_density_seconds = 2;
 }
-
-// ===========================================================================
-// Catalog
-// ===========================================================================
 
 // A Catalog is the top-level container for schemas and tables. It serves
 // as the boundary for billing, access control, and resource isolation.
@@ -100,10 +83,6 @@ message Catalog {
   reserved "default_retention_config";
 }
 
-// ===========================================================================
-// Schema
-// ===========================================================================
-
 // A Schema is a logical grouping of tables within a catalog. It provides
 // a namespace so that table names only need to be unique within their
 // schema, not across the entire catalog.
@@ -114,10 +93,6 @@ message Schema {
   string description = 4;
   RetentionConfig default_retention_config = 5;
 }
-
-// ===========================================================================
-// Table
-// ===========================================================================
 
 // A Table holds data defined by an Arrow schema. table_uuid is the
 // server-minted random identity of the table; stable across rename
@@ -148,10 +123,6 @@ message Table {
   repeated Index indexes = 11;
 }
 
-// ===========================================================================
-// Index
-// ===========================================================================
-
 // Physical layout of a cold-tier index artifact (CHA-455 / ADR 0026 §6).
 // Honored-or-ignored per storage format (the hand-rolled sorted table is
 // the Parquet path; Lance leans on its native scalar indexes).
@@ -178,10 +149,6 @@ message Index {
   IndexType index_type = 5;
 }
 
-// ===========================================================================
-// Branch
-// ===========================================================================
-
 // A branch within a catalog. Branches are catalog-scope versioning axes
 // (CHA-163): a single branch_uuid spans every schema in its catalog,
 // matching git's "a repo branch covers all directories" model.
@@ -197,4 +164,3 @@ message Branch {
   // point-in-time view of the source branch's data.
   int64 fork_commit_seq_num = 4;
 }
-

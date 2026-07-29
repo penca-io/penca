@@ -1,4 +1,4 @@
-//! Catalog-wide branch persist / snapshot (CHA-273).
+//! Catalog-wide branch persist / snapshot.
 //!
 //! [`LifecycleManager::persist_branch`], [`LifecycleManager::snapshot_branch`],
 //! and [`LifecycleManager::persist_and_snapshot_branch`] loop the per-table
@@ -18,7 +18,7 @@
 //! an uncommitted tx) or, when absent, the branch head (`MAX(commit_seq_num)`
 //! row, `resolve_head_watermark` — the scheduler's per-tick sweep). Returning the
 //! position is what lets CreateBranch seed the child from the exact fork seq
-//! (CHA-487) instead of a racy `MAX` re-read.
+//! instead of a racy `MAX` re-read.
 //!
 //! The Persist side enumerates only MODIFIED tables (via
 //! [`LifecycleManager::list_modified_tables`], as the scheduler does) — an
@@ -109,7 +109,7 @@ impl LifecycleManager {
     {
         let (catalog_uuid, branch_uuid, watermark) = self.resolve_branch_op(pool, request).await?;
 
-        // CHA-507: flush the cold tx_log FIRST — before any data-table persist
+        // Flush the cold tx_log FIRST — before any data-table persist
         // can flip a segment visible. Cold data segments drop author/comment
         // and depend on the cold tx_log join to reattach them, so the tx_log
         // covering `<= T` must be durable before any data segment referencing
@@ -257,14 +257,11 @@ impl LifecycleManager {
     {
         let (catalog_uuid, branch_uuid, watermark) = self.resolve_branch_op(pool, request).await?;
 
-        // CHA-507: flush the cold tx_log FIRST, before any data-table persist
-        // (see `persist_branch` for the visibility invariant). Fail the whole
-        // persist phase if it errors — a data segment must never flip visible
-        // without its tx metadata durable in cold; the scheduler retries next
-        // tick. This is a deliberate exception to this function's otherwise
-        // continue-on-error philosophy: the tx_log flush is a correctness
-        // prerequisite for every table, not a per-table best-effort step, so a
-        // persistent failure correctly stalls the whole branch until resolved.
+        // See `persist_branch` for the tx_log-before-data visibility invariant.
+        // Deliberate exception to this function's continue-on-error philosophy:
+        // the tx_log flush is a correctness prerequisite for EVERY table, not a
+        // per-table best-effort step, so a persistent failure should stall the
+        // whole branch until resolved (the scheduler retries next tick).
         self.persist_tx_log(
             pool,
             writer,
@@ -274,12 +271,11 @@ impl LifecycleManager {
         )
         .await?;
 
-        // CHA-509: two phases with distinct dirty-sets. Persist enumerates
-        // hot-modified tables; Snapshot enumerates persisted tables (the
-        // post-persist superset — see `list_all_persisted_table_uuids`). A table
-        // whose Persist fails gets no `table_persist_metadata` row, so it never
-        // enters the persisted set and is not snapshotted — preserving the old
-        // "Persist failed → skip Snapshot" continue-on-error semantics.
+        // The two phases enumerate distinct dirty-sets: Persist over
+        // hot-modified tables, Snapshot over persisted ones. That is what
+        // implements "Persist failed → skip Snapshot" — a table whose Persist
+        // fails gets no `table_persist_metadata` row, so it never enters the
+        // persisted set.
         let modified = self
             .list_all_modified_table_uuids(pool, &catalog_uuid, &branch_uuid)
             .await?;
@@ -439,10 +435,6 @@ impl LifecycleManager {
         )
         .await?;
         let branch_uuid = parse_resolved_uuid(&branch_obj.branch_uuid, "branch_uuid")?;
-        // The fork position is either supplied by the caller (a resolved
-        // `Watermark` — CreateBranch's write path resolves its fork tx to a
-        // position first, which structurally can't reference an uncommitted tx)
-        // or, when unset, the branch head (the scheduler's per-tick sweep).
         let watermark = match &request.target {
             Some(target) => *target,
             None => {
@@ -518,11 +510,11 @@ impl LifecycleManager {
     /// Every table on `(catalog, branch)` with committed cold persist data,
     /// paginated to exhaustion (unbounded window). The snapshot sweep enumerates
     /// on **persisted** rather than **modified** so a table whose hot rows were
-    /// purged past its snapshot still gets re-snapshotted — the load-shed
-    /// recovery path (CHA-509). Today `persisted ⊆ modified` (Purge is
-    /// snapshot-gated, `Pu = W_snap`), so this is behavior-equivalent; it
-    /// becomes load-bearing once a purge-past-snapshot valve (`Pu > W_snap`)
-    /// drops a still-unsnapshotted table out of the modified set.
+    /// purged past its snapshot still gets re-snapshotted (the load-shed
+    /// recovery path). While Purge stays snapshot-gated (`Pu = W_snap`),
+    /// `persisted ⊆ modified` and the choice is behavior-equivalent; it becomes
+    /// load-bearing once a purge-past-snapshot valve (`Pu > W_snap`) can drop a
+    /// still-unsnapshotted table out of the modified set.
     async fn list_all_persisted_table_uuids(
         &self,
         pool: &PgDriver,
@@ -592,10 +584,10 @@ fn branch_op_watermark(
 /// a `commit_seq_num` — and `watermark.commit_seq_num` is already resolved and
 /// in hand here. `commit_micros` is only *non-strictly* monotonic, so a
 /// same-micros/higher-seq source commit can leak into the source cold tier
-/// (harmless for the flush — idempotent — but see the CHA-178 read-side fence in
+/// (harmless for the flush — idempotent — but see the read-side fence in
 /// `WriteManager::create_branch`). Once CHA-500 gives Persist a `target_seq`,
-/// switch this line to `target_seq: Some(watermark.commit_seq_num)` and the
-/// flush becomes seq-exact.
+/// switch this to `target_seq: Some(watermark.commit_seq_num)` and the flush
+/// becomes seq-exact.
 fn persist_request(
     catalog_uuid: &Uuid,
     branch_uuid: &Uuid,

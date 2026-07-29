@@ -48,11 +48,6 @@ _QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
 _GRACE_WAIT_SECONDS = _QUERY_TIMEOUT_SECONDS + 1.0
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _setup_branch_with_committed_data(
     client, catalog_uuid, schema_uuid, table_uuid, branch_name
 ):
@@ -92,11 +87,6 @@ def _setup_branch_with_committed_data(
         branch_uuid=branch.branch_uuid,
     )
     return branch, committed_tx
-
-
-# ---------------------------------------------------------------------------
-# Persist — existing tests
-# ---------------------------------------------------------------------------
 
 
 class TestPersistBasic:
@@ -144,11 +134,6 @@ class TestPersistBasic:
         names = result.column("name").to_pylist()
         assert "alice" in names
         assert "bob" in names
-
-
-# ---------------------------------------------------------------------------
-# Persist — identifier resolution paths
-# ---------------------------------------------------------------------------
 
 
 class TestPersistIdentifierResolution:
@@ -234,11 +219,6 @@ class TestPersistIdentifierResolution:
         assert response.persisted_at_micros > 0
 
 
-# ---------------------------------------------------------------------------
-# Persist — correctness
-# ---------------------------------------------------------------------------
-
-
 class TestPersistCorrectness:
     def test_purge_clears_hot_data(self):
         """After Persist(T) → Snapshot(T) → Purge(T), hot upsert rows are gone.
@@ -286,7 +266,6 @@ class TestPersistCorrectness:
             table_uuid=table_uuid,
         )
 
-        # Purge is what empties hot.
         rows_after = get_pg_driver().execute(
             SQL("SELECT count(*) FROM {}").format(Identifier(hot_upsert_table)),
         )
@@ -304,7 +283,6 @@ class TestPersistCorrectness:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # First tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -330,7 +308,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Second tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -386,7 +363,6 @@ class TestPersistCorrectness:
         )
         create_table_on_branch(client, catalog_uuid, schema_uuid, branch.branch_uuid)
 
-        # Committed tx
         tx1 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -412,7 +388,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Uncommitted tx
         tx2 = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -525,7 +500,6 @@ class TestPersistCorrectness:
             branch_uuid=branch.branch_uuid,
         )
 
-        # Delete alice
         client.write_data(
             tx.tx_uuid,
             Mutation(
@@ -550,7 +524,6 @@ class TestPersistCorrectness:
         )
         assert response.persisted_at_micros > 0
 
-        # After persist, only bob should be visible (alice was deleted).
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -601,7 +574,6 @@ class TestPersistCorrectness:
             branch_uuid=branch_b.branch_uuid,
         )
 
-        # Persist only branch A's table.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -609,7 +581,6 @@ class TestPersistCorrectness:
             table_uuid=table_uuid,
         )
 
-        # Branch B hot data should still be readable
         result_b = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -618,11 +589,6 @@ class TestPersistCorrectness:
         )
         assert result_b.num_rows == 1
         assert result_b.column("name").to_pylist() == ["charlie"]
-
-
-# ---------------------------------------------------------------------------
-# Two-phase persist — commit_micros tracking
-# ---------------------------------------------------------------------------
 
 
 class TestPersistTwoPhase:
@@ -640,7 +606,6 @@ class TestPersistTwoPhase:
             table_uuid=table_uuid,
         )
 
-        # Check upsert log segment has commit_micros set.
         # CHA-203: classification flows through the parent's `log_kind`
         # column; segments JOIN up to find their kind.
         seg_parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
@@ -727,11 +692,6 @@ class TestPersistTwoPhase:
         assert result.num_rows == 2
 
 
-# ---------------------------------------------------------------------------
-# Branch deletion — cold storage metadata cleanup
-# ---------------------------------------------------------------------------
-
-
 class TestBranchDeletionColdStorageCleanup:
     def test_branch_delete_cleans_segment_metadata(self):
         """After deleting a branch, table_persist_segment_metadata rows for
@@ -741,7 +701,6 @@ class TestBranchDeletionColdStorageCleanup:
         branch, _tx = _setup_branch_with_committed_data(
             client, catalog_uuid, schema_uuid, table_uuid, "delete_cold_branch"
         )
-        # Persist to create segment metadata.
         client.persist(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -761,7 +720,6 @@ class TestBranchDeletionColdStorageCleanup:
         )
         assert rows_before[0][0] > 0
 
-        # Delete the branch
         client.delete_branch(
             catalog_uuid=catalog_uuid,
             branch_uuid=branch.branch_uuid,
@@ -777,11 +735,6 @@ class TestBranchDeletionColdStorageCleanup:
             (branch.branch_uuid, table_uuid),
         )
         assert rows_after[0][0] == 0
-
-
-# ---------------------------------------------------------------------------
-# Compact
-# ---------------------------------------------------------------------------
 
 
 def _insert_and_commit(
@@ -1083,7 +1036,6 @@ class TestCompactPersistSegments:
         # deleted post-commit; the metadata rows point at the new one).
         assert post_wave2[0][0] != wave1_active_uri
 
-        # Data still queryable.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1217,7 +1169,6 @@ class TestCompactPersistSegments:
         # The sealed and new-active files must be distinct cold files.
         assert sealed[0][0] != unsealed[0][0]
 
-        # Data still queryable across sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1326,6 +1277,11 @@ class TestCompactPersistSegments:
         assert seal_states_after == seal_states_before
         assert csm_total_after == csm_total_before
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Heavy compaction against the pinned 2s QUERY_TIMEOUT_SECONDS: this
+    # timed out under more workers than cores. Cheap to serialize, and a
+    # queue flake costs a failed merge that only the queue can surface.
+    @pytest.mark.serial
     def test_cascade_seal_when_active_full_and_next_uncompacted_breaches(self):
         """Stall regression: with an active at ``max_segment_bytes`` and
         a near-max uncompacted segment leading input order, the wave
@@ -1434,7 +1390,6 @@ class TestCompactPersistSegments:
         )
         assert list(response.merged_object_uris) == []
 
-        # Data still queryable across sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1529,7 +1484,6 @@ class TestCompactPersistSegments:
         assert len({u for (u, _) in unsealed}) == 1
         assert sealed[0][0] != unsealed[0][0]
 
-        # Data still queryable across the sealed + active.
         result = client.read_data(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -1541,9 +1495,7 @@ class TestCompactPersistSegments:
         assert {"alice", "bob", "carol"} <= set(names)
 
 
-# ---------------------------------------------------------------------------
 # CHA-202: compact_segment_metadata in-flight tracking
-# ---------------------------------------------------------------------------
 #
 # The `compact_segment_metadata` table tracks merged compact files: a
 # row INSERTs (commit_micros NULL) before the merged file is
@@ -1654,7 +1606,6 @@ class TestCompactSegmentMetadata:
             table_uuid=table_uuid,
         )
 
-        # Pre-compact: no compact_segment_metadata rows for this scope.
         assert (
             _count_compact_segment_rows(
                 catalog_uuid, branch_uuid=branch_uuid, table_uuid=table_uuid
@@ -1670,7 +1621,6 @@ class TestCompactSegmentMetadata:
         )
         assert len(response.merged_object_uris) >= 1
 
-        # Post-compact: at least one committed row in scope, zero NULL.
         in_scope_total = _count_compact_segment_rows(
             catalog_uuid, branch_uuid=branch_uuid, table_uuid=table_uuid
         )
@@ -1738,7 +1688,6 @@ class TestCompactSegmentMetadata:
             table_uuid=table_uuid,
         )
 
-        # Post-persist snapshot — all segments committed.
         post_persist = _select_segment_commit_micros(
             catalog_uuid, branch_uuid, table_uuid
         )
@@ -1760,11 +1709,6 @@ class TestCompactSegmentMetadata:
         )
         assert len(post_compact) == len(post_persist)
         assert all(v is not None for v in post_compact)
-
-
-# ---------------------------------------------------------------------------
-# Snapshot
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshot:
@@ -2020,7 +1964,6 @@ class TestSnapshot:
         assert partition_keys == [], partition_keys
         assert clustering_keys == ["name"], clustering_keys
 
-        # Check child table_snapshot_segment_metadata rows.
         seg_rows = get_pg_driver().execute(
             SQL(
                 "SELECT commit_micros, row_count"
@@ -2035,9 +1978,7 @@ class TestSnapshot:
             assert row_count > 0
 
 
-# ---------------------------------------------------------------------------
 # CHA-406 — delta-partition carry-forward onto immutable segments
-# ---------------------------------------------------------------------------
 
 
 def _select_snapshot_segment_storage_tuples(catalog_uuid, branch_uuid, snapshot_uuid):
@@ -2335,7 +2276,6 @@ class TestCarryForwardSnapshot:
             "layout-key mismatch must force a full rewrite (zero shared"
             f" tuples); shared: {sorted(tuples3 & tuples2)}"
         )
-        # ...and the content is correct through the rewrite.
         client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = env
         by_name = client.read_data(
             catalog_uuid=catalog_uuid,
@@ -2499,9 +2439,7 @@ class TestCarryForwardSnapshot:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-215 — persist + snapshot chunk writes to cap segment size
-# ---------------------------------------------------------------------------
 #
 # Pre-CHA-215, persist and snapshot each emitted exactly one cold
 # segment per ``(table_uuid, log_kind)`` (persist) / per cycle (snapshot),
@@ -2669,6 +2607,11 @@ class TestChunkedPersistAndSnapshot:
             "chunk row_counts must sum to the input row count"
         )
 
+    # Serial for reason (b) — see the `serial` marker in pyproject.toml.
+    # Heavy compaction against the pinned 2s QUERY_TIMEOUT_SECONDS: this
+    # timed out under more workers than cores. Cheap to serialize, and a
+    # queue flake costs a failed merge that only the queue can surface.
+    @pytest.mark.serial
     def test_persist_chunked_segments_compact_normally(self):
         """``compact_persist_segments`` over the chunk siblings produced
         by an oversized persist must NOT stall: the call returns, every
@@ -2863,9 +2806,7 @@ class TestChunkedPersistAndSnapshot:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-347 — recorded ``size_bytes`` is the in-memory Arrow footprint
-# ---------------------------------------------------------------------------
 #
 # ``size_bytes`` on persist/snapshot segment rows must be the standalone
 # uncompressed in-memory Arrow footprint — the unit every consumer
@@ -3143,9 +3084,7 @@ class TestCompactedSegmentSizeBytesIsInMemoryFootprint:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-198 — catalog-scoped persist + snapshot metadata tables
-# ---------------------------------------------------------------------------
 #
 # Tests below pin the per-catalog physical isolation of the five
 # persist/purge/snapshot metadata tables, their per-branch LIST
@@ -3774,9 +3713,7 @@ class TestBootstrapOnlyCatalogStoreGlobal:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-203: log_kind CHECK constraint
-# ---------------------------------------------------------------------------
 
 
 class TestLogKindCheckConstraintRejectsInvalid:
@@ -3822,9 +3759,7 @@ class TestLogKindCheckConstraintRejectsInvalid:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-203: cold object_uri path layout
-# ---------------------------------------------------------------------------
 
 
 class TestColdSegmentPathsUnderCatalogBranchPrefix:
@@ -3897,8 +3832,6 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
                 table_uuid=table,
             )
 
-        # Pull every persisted (catalog, branch, uri) tuple across both
-        # segment metadata parents for both catalogs.
         def _segment_uris(catalog_uuid: str) -> list[tuple[str, str, str]]:
             tfsm = _per_catalog_metadata_table(
                 catalog_uuid, TABLE_PERSIST_SEGMENT_METADATA
@@ -3931,7 +3864,6 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
                 f"object_uri {uri!r} must contain catalog+branch prefix"
                 f" /{catalog_uuid}/{branch_uuid}/ (CHA-203 layout)"
             )
-            # The next path component must be one of persist / snapshot.
             tail_re = re.compile(
                 rf"/{re.escape(catalog_uuid)}/{re.escape(branch_uuid)}/(persist|snapshot)/"
             )
@@ -3975,9 +3907,7 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
             )
 
 
-# ---------------------------------------------------------------------------
 # CHA-218: snapshot watermark sourced from cold persist segments, not commit_tx_log
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshotWatermarkFromColdPersistSegments:
@@ -3999,7 +3929,6 @@ class TestSnapshotWatermarkFromColdPersistSegments:
         schema_uuid, table_uuid, catalog_uuid, main_branch_uuid = setup_schema(client)
         main_uuid = main_branch_uuid
 
-        # tx_upsert: seed two rows. Then tx_delete: delete one.
         tx_upsert = client.begin_tx(
             catalog_uuid=catalog_uuid,
             schema_uuid=schema_uuid,
@@ -4102,9 +4031,7 @@ class TestSnapshotWatermarkFromColdPersistSegments:
         )
 
 
-# ---------------------------------------------------------------------------
 # CHA-407: snapshot-compaction machinery removed (ADR 0024)
-# ---------------------------------------------------------------------------
 
 
 class TestSnapshotCompactionRemoved:

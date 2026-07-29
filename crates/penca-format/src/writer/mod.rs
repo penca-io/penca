@@ -2,8 +2,6 @@
 //!
 //! [`FormatWriter`] defines the interface for writing columnar segment files
 //! to object storage. Implementations handle format-specific serialization.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/format/writer/__init__.py`.
 
 pub mod lance;
 pub mod parquet;
@@ -43,7 +41,7 @@ pub trait FormatWriter: Send + Sync {
     ///
     /// Returns the number of rows written. The on-disk serialized size
     /// is deliberately not returned: segment `size_bytes` is the
-    /// uncompressed in-memory footprint (CHA-347), sourced from the
+    /// uncompressed in-memory footprint, sourced from the
     /// chunker, not from the writer.
     fn write(
         &self,

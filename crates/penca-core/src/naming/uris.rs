@@ -1,5 +1,3 @@
-// -- Segment URIs ---------------------------------------------------------
-//
 // CHA-203: cold URIs live under
 // `{base_uri}/{catalog_uuid}/{branch_uuid}/{persist|snapshot}/{parent_uuid}/{segment_uuid}/data.{ext}`
 // — catalog/branch isolation is visible at the filesystem layout and

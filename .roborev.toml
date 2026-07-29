@@ -9,9 +9,13 @@ backup_model = ''
 # Number of related reviews to include as context for this repo.
 review_context_count = 0
 # Extra review instructions added to prompts for this repo.
-review_guidelines = ''
+review_guidelines = "This is a per-commit review of one commit on a feature branch. The commit is an\nintermediate state, not the shipped state, and a holistic branch-level review\nruns separately at PR time (/review-pr).\n\nDo not raise:\n- Work the commit message explicitly defers to a named follow-up commit or\n  ticket. Deferral is a plan, not a defect. Flag it only if the deferral leaves\n  the tree broken: data loss, a failing build, or a wrong result that no later\n  commit in the stated plan reaches.\n- Comment, docstring, or commit-message wording, unless the text states\n  something factually false about the code it documents.\n- Test naming, test file organization, or extract-a-shared-helper suggestions,\n  unless the duplication is load-bearing for correctness.\n- Anything in pre-existing code the diff did not touch.\n\nPrefer few, high-confidence findings over exhaustive coverage. A commit with no\ncorrectness, safety, or contract problem should review clean."
+# Use repo review_guidelines instead of appending global review_guidelines.
+review_guidelines_supersede_global = false
 # Override the review job timeout in minutes for this repo.
 job_timeout_minutes = 0
+# Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default.
+hook_timeout_seconds = 0
 # Branches that should be skipped for automatic review in this repo.
 excluded_branches = []
 # Commit message substrings that should skip review for this repo.
@@ -29,7 +33,7 @@ fix_min_severity = ''
 # Minimum severity for refine in this repo: critical, high, medium, low.
 refine_min_severity = ''
 # Minimum severity for reviews in this repo: critical, high, medium, low.
-review_min_severity = ''
+review_min_severity = 'medium'
 # Filenames or glob patterns to exclude from review diffs for this repo.
 exclude_patterns = []
 # Repo-local directory for temporary oversized diff snapshots.
@@ -187,12 +191,6 @@ fix_backup_model = ''
 security_backup_model = ''
 # Backup model for design review in this repo.
 design_backup_model = ''
-# Per-event hooks. Each fires on a daemon event with command invoked as a
-# shell process. The bridge below enqueues each review finding as a kata
-# task labelled with the branch's cha-NNN.
-[[hooks]]
-event = 'review.completed'
-command = 'scripts/roborev-kata-hook.sh'
 # Maximum prompt size for this repo before falling back to file paths.
 max_prompt_size = 0
 
@@ -201,6 +199,8 @@ max_prompt_size = 0
 agents = []
 # Override the review types used by CI for this repo.
 review_types = []
+# Named [review.panels.X] panel for CI.
+panel = ''
 # Override the CI reasoning level for this repo: fast, standard, medium, thorough, or maximum.
 reasoning = ''
 # Override the minimum CI severity included in synthesized output.
@@ -216,3 +216,22 @@ trigger_message_patterns = []
 skip_message_patterns = []
 classifier_timeout_seconds = 0
 classifier_max_prompt_size = 0
+
+[review]
+default_panel = ''
+hook_review_panel = ''
+
+[[hooks]]
+event = 'review.completed'
+branches = []
+command = 'scripts/roborev-kata-hook.sh'
+type = ''
+url = ''
+project = ''
+labels = []
+
+[kata_context]
+# Kata task context in review prompts: off | current | open (default off).
+mode = ''
+# Max bytes of kata context to include (default 50000).
+max_chars = 0

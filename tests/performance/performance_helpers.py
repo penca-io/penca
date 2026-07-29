@@ -19,15 +19,8 @@ from penca_client.config import ClientSettings, DbSettings
 from penca_client.naming import system_schemas_table_uuid, system_tables_table_uuid
 from penca_client.types import Mutation
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 ROW_COUNT = 100_000
 
-# ---------------------------------------------------------------------------
-# Schema & batch helpers
-# ---------------------------------------------------------------------------
 
 PERF_SCHEMA = pa.schema(
     [
@@ -50,11 +43,6 @@ def make_batch(offset: int, count: int) -> pa.RecordBatch:
     )
 
 
-# ---------------------------------------------------------------------------
-# Client & serialization
-# ---------------------------------------------------------------------------
-
-
 def make_client(
     storage_format: int | None = None,  # noqa: ARG001
 ):
@@ -65,11 +53,6 @@ def make_client(
     startup.
     """
     return PencaClient.from_settings(ClientSettings())  # ty: ignore[missing-argument]
-
-
-# ---------------------------------------------------------------------------
-# Schema setup
-# ---------------------------------------------------------------------------
 
 
 def _drive_system_tables_cold(client, context: dict[str, str]) -> None:
@@ -172,11 +155,6 @@ def insert_and_commit(client, context: dict[str, str], offset: int, count: int):
     )
 
 
-# ---------------------------------------------------------------------------
-# System state enum & dataclass
-# ---------------------------------------------------------------------------
-
-
 class SystemState(enum.Enum):
     """Represents where data lives in the tiered storage architecture."""
 
@@ -199,11 +177,6 @@ class SystemStateInfo:
     cold_unsnapshotted_rows: int
     cold_snapshotted_rows: int
     committed_txs: list
-
-
-# ---------------------------------------------------------------------------
-# State preparation
-# ---------------------------------------------------------------------------
 
 
 def _persist(client, context: dict[str, str]):
@@ -364,11 +337,6 @@ def prepare_system_state(
     raise ValueError(f"Unknown system state: {state}")
 
 
-# ---------------------------------------------------------------------------
-# Postgres baseline helpers
-# ---------------------------------------------------------------------------
-
-
 def create_postgres_baseline_table(conn) -> None:
     """Create a baseline Postgres table matching PERF_SCHEMA."""
     conn.execute("DROP TABLE IF EXISTS perf_baseline")
@@ -404,11 +372,6 @@ def insert_postgres_baseline(conn, row_count: int, offset: int = 0) -> None:
 def drop_postgres_baseline_table(conn) -> None:
     """Drop the baseline Postgres table."""
     conn.execute("DROP TABLE IF EXISTS perf_baseline")
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -455,11 +418,6 @@ class PerfResult:
             return 0.0
 
         return self.row_count / self.elapsed_seconds
-
-
-# ---------------------------------------------------------------------------
-# Internal config helpers
-# ---------------------------------------------------------------------------
 
 
 def pg_conninfo() -> str:

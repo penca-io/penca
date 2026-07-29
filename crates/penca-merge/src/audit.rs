@@ -1,4 +1,4 @@
-//! CHA-507: cold-tier `audit_data` filter/project + optional tx_log join, on
+//! Cold-tier `audit_data` filter/project + optional tx_log join, on
 //! DataFusion.
 //!
 //! Unifies the cold audit path onto DataFusion (replacing the hand-rolled Arrow
@@ -23,7 +23,7 @@ use crate::MergeError;
 /// `include_tx_metadata`.
 ///
 /// `ctx` is the caller's session — the driver's template-derived cold session
-/// (CHA-421), not a fresh `SessionContext::new()` — so the join shares the same
+/// not a fresh `SessionContext::new()` — so the join shares the same
 /// function registry + optimizer rules as the rest of the cold read. The `d` /
 /// `t` MemTables are registered into it and it is used once.
 ///

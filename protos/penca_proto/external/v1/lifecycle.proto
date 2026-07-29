@@ -16,10 +16,6 @@ import "penca_proto/external/v1/common.proto";
 //     per-table — one physical user table per call. Schedulers compose
 //     per-table operations across a branch.
 
-// ===========================================================================
-// Persist
-// ===========================================================================
-
 // Persists a single table's committed hot data into cold storage.
 //
 // Internally:
@@ -35,19 +31,15 @@ import "penca_proto/external/v1/common.proto";
 // the data — no data is lost. This guarantees that data exists in at
 // least one tier at all times.
 message PersistRequest {
-  // --- Schema identifier ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
 
-  // --- Table on branch ---
   optional string branch_uuid = 5;
   optional string branch_name = 6;
   optional string table_uuid = 7;
   optional string table_name = 8;
-
-  // --- Domain fields ---
 
   // Optional upper bound for the persist watermark. The server clamps to
   // min(target_micros ?? now, oldest_open_began_at(branch) - 1); the
@@ -63,10 +55,6 @@ message PersistResponse {
   // Unset when the persist was a no-op.
   optional int64 persisted_at_micros = 1;
 }
-
-// ===========================================================================
-// Catalog-wide branch persist / snapshot (CHA-273)
-// ===========================================================================
 
 // A commit-order position: the fork commit T a *Branch op bounded itself at, or
 // a persist/snapshot watermark. It is a POSITION, not a tx identity —
@@ -103,10 +91,6 @@ message BranchOpResponse {
   optional Watermark watermark = 1;
 }
 
-// ===========================================================================
-// Purge
-// ===========================================================================
-
 // Clears a single table's hot upsert/delete log rows up to the purge
 // fence Pu = W_snap (committed) and the abort frontier Pa (aborted), and
 // reclaims expired-begin garbage (CHA-444 / ADR 0027).
@@ -117,13 +101,11 @@ message BranchOpResponse {
 // (the Pu seq) is unset. Abort and expired-begin cleanup are orthogonal
 // and not reflected in the response.
 message PurgeRequest {
-  // --- Schema identifier ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
 
-  // --- Table on branch ---
   optional string branch_uuid = 5;
   optional string branch_name = 6;
   optional string table_uuid = 7;
@@ -131,19 +113,15 @@ message PurgeRequest {
 }
 
 message PurgeResponse {
-  // CHA-444 (ADR 0027): the committed purge watermark Pu this purge advanced
-  // to. NOTE: despite the legacy field name, this now carries a commit_seq_num
-  // (the seq-axis purge fence), not micros. All committed mutations on T with
+  // The committed purge watermark Pu this purge advanced to. NOTE: despite the
+  // field name, this carries a commit_seq_num (the seq-axis purge fence), not
+  // micros — see ADR 0027. All committed mutations on T with
   // commit_seq_num <= Pu have been cleared from hot and are served from the
   // snapshot/cold-persist tiers by plan() (Pu is the hot<->cold read fence).
   // Unset when Purge did not advance Pu (no new snapshot past the last purge).
   // Abort/expired-begin cleanup is orthogonal and not reflected here.
   optional int64 purged_at_micros = 1;
 }
-
-// ===========================================================================
-// Compact
-// ===========================================================================
 
 // Compacts log segments for a single table. Purely mechanical file
 // reorganization:
@@ -157,19 +135,15 @@ message PurgeResponse {
 // Compaction is cheap and safe to run frequently. Idempotent — calling
 // it when there are no uncompacted segments is a no-op.
 message CompactPersistSegmentsRequest {
-  // --- Schema identifier ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
 
-  // --- Table on branch ---
   optional string branch_uuid = 5;
   optional string branch_name = 6;
   optional string table_uuid = 7;
   optional string table_name = 8;
-
-  // --- Domain fields ---
 
   // Optional: restrict compaction to segments whose
   // `commit_micros` falls within this range. If omitted, every
@@ -184,10 +158,6 @@ message CompactPersistSegmentsResponse {
   repeated string merged_object_uris = 1;
 }
 
-// ===========================================================================
-// Snapshot
-// ===========================================================================
-
 // Creates a read-optimized, point-in-time snapshot of a table in cold
 // storage. Unlike compaction (which is purely mechanical), snapshotting
 // is the semantic operation that reasons about row identity:
@@ -201,19 +171,15 @@ message CompactPersistSegmentsResponse {
 // frequently. They are idempotent — re-snapshotting at the same
 // point in time produces the same result.
 message SnapshotRequest {
-  // --- Schema identifier ---
   optional string catalog_uuid = 1;
   optional string catalog_name = 2;
   optional string schema_uuid = 3;
   optional string schema_name = 4;
 
-  // --- Table on branch ---
   optional string branch_uuid = 5;
   optional string branch_name = 6;
   optional string table_uuid = 7;
   optional string table_name = 8;
-
-  // --- Domain fields ---
 
   // Point-in-time for the snapshot, as a microsecond-precision Unix
   // timestamp. The snapshot reflects all mutations with committed_at <=
@@ -231,10 +197,6 @@ message SnapshotResponse {
   // row for T.
   optional int64 snapshotted_at_micros = 1;
 }
-
-// ===========================================================================
-// PurgeTxLog
-// ===========================================================================
 
 // PurgeTxLog GCs the four hot tx-log family tables for a branch
 // (commit_tx_log / tx_table_log / abort_tx_log / begin_tx_log). Branch-
@@ -292,10 +254,6 @@ message PurgeTxLogRequest {
 // tx-log-family row counts, not the response.
 message PurgeTxLogResponse {}
 
-// ===========================================================================
-// SweepSegments
-// ===========================================================================
-
 // SweepSegments physically deletes cold segment files queued for
 // removal by past CompactPersistSegments waves. Compaction's merge
 // tx enqueues each replaced URI as a
@@ -316,15 +274,6 @@ message SweepSegmentsRequest {
 }
 
 message SweepSegmentsResponse {}
-
-// ===========================================================================
-// ListModifiedTables / ListPersistedTables
-// ===========================================================================
-//
-// Scheduler dirty-set discovery RPCs. CHA-445 rehomed these off the deleted
-// StorageMetadataService onto LifecycleService — "what's dirty / what's
-// persisted" is lifecycle enumeration, and the scheduler already holds a
-// LifecycleServiceClient.
 
 // Enumerate `table_uuid`s touched by committed transactions on
 // `(catalog_uuid, branch_uuid)` whose `commit_tx_log.commit_micros` falls in
@@ -383,10 +332,6 @@ message ListPersistedTablesResponse {
   optional string next_page_token = 2;
 }
 
-// ===========================================================================
-// Service
-// ===========================================================================
-
 service LifecycleService {
   // Persists a single table's committed hot data into cold storage.
   // Server-side watermark is clamped to
@@ -430,12 +375,12 @@ service LifecycleService {
 
   // Enumerates `table_uuid`s touched by committed transactions on a branch
   // within a `modified_at` window — the scheduler's per-tick dirty-table
-  // discovery (CHA-445; formerly on StorageMetadataService).
+  // discovery.
   rpc ListModifiedTables(ListModifiedTablesRequest) returns (ListModifiedTablesResponse);
 
   // Enumerates `table_uuid`s with a committed `table_persist_metadata` row in
   // a `persisted_at` window — drives the scheduler's per-tick Purge
-  // enumeration (CHA-445).
+  // enumeration.
   rpc ListPersistedTables(ListPersistedTablesRequest) returns (ListPersistedTablesResponse);
 
   // Catalog-wide persist/snapshot over a branch's dirty set, returning the fork

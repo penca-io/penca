@@ -61,8 +61,6 @@ from collections.abc import Sequence
 
 from xxhash import xxh3_128_hexdigest
 
-# -- Format extensions ---------------------------------------------------
-
 # Format wire codes — mirror of the Rust `penca_core::Format` discriminants
 # (1 = Lance, 2 = Parquet). Formerly the `StorageFormat` proto enum, removed
 # with `storage_metadata.proto` in CHA-445 (the format code is an internal
@@ -84,8 +82,6 @@ def format_from_text(text: str) -> int:
     return FORMAT_FROM_TEXT[text]
 
 
-# -- Global tables (fixed names) -----------------------------------------
-
 CATALOG_STORE = "catalog_store"
 
 MAIN_BRANCH_NAME = "main"
@@ -106,8 +102,6 @@ SYSTEM_SCHEMA_NAME = "__penca_system__"
 SYSTEM_SCHEMAS_TABLE_NAME = "schemas"
 SYSTEM_TABLES_TABLE_NAME = "tables"
 
-# -- Segment metadata tables (fixed names) -------------------------------
-
 TABLE_PERSIST_METADATA = "table_persist_metadata"
 TABLE_PERSIST_SEGMENT_METADATA = "table_persist_segment_metadata"
 TABLE_PURGE_METADATA = "table_purge_metadata"
@@ -120,8 +114,6 @@ COMPACT_SEGMENT_METADATA = "compact_segment_metadata"
 # of cold segment files queued for physical deletion. Compact enqueues
 # rows inside its merge tx; sweep_segments drains them past grace.
 SEGMENT_DELETE_SET = "segment_delete_set"
-
-# -- Per-catalog tables (UUID-prefixed) ----------------------------------
 
 
 def branch_store_table(catalog_uuid: str) -> str:
@@ -181,8 +173,6 @@ def write_sequence(table_uuid: str, branch_uuid: str) -> str:
     return f"{prefix}_data_write_seq"
 
 
-# -- Partitions of per-catalog tables ------------------------------------
-#
 # The tx-log family (commit_tx_log, begin_tx_log, abort_tx_log) plus the
 # per-tx affected-tables index (tx_table_log, CHA-181) are
 # LIST-partitioned by branch_uuid (one leaf per branch). Each
@@ -225,9 +215,6 @@ def tx_table_log_partition(catalog_uuid: str, branch_uuid: str) -> str:
     """Partition of tx_table_log for a specific branch (CHA-181)."""
     partition_uuid = row_uuid_for_pk(catalog_uuid, [branch_uuid, "tx_table_log"])
     return f"{partition_uuid}_tx_table_log_partition"
-
-
-# -- Deterministic UUID derivation ---------------------------------------
 
 
 def deterministic_uuid_from(*parts: str) -> str:
@@ -284,8 +271,6 @@ def genesis_tx_uuid(catalog_uuid: str) -> str:
     return deterministic_uuid_from(catalog_uuid)
 
 
-# -- Structural anchors (ADR 0012; CHA-177; CHA-236) ---------------------
-#
 # The `__penca_system__` schema and its two bootstrap tables are
 # the only namespace objects whose UUIDs stay deterministic — server-
 # internal write paths address them by well-known per-catalog identity
@@ -321,9 +306,6 @@ def system_name_index_uuid(system_table_uuid: str) -> str:
     composite name index (CHA-481). Derived from the system table's own
     ``table_uuid``; mirrors ``penca_core::naming::system_name_index_uuid``."""
     return row_uuid_for_pk(system_table_uuid, ["name_index"])
-
-
-# -- Segment identity ----------------------------------------------------
 
 
 def _hash_to_uuid(hex_digest: str) -> str:
@@ -413,8 +395,6 @@ def table_snapshot_segment_uuid(
     return row_uuid_for_pk(table_snapshot_uuid, [chunk_idx])
 
 
-# -- Segment URIs --------------------------------------------------------
-#
 # CHA-203: cold URIs live under
 # ``{base_uri}/{catalog_uuid}/{branch_uuid}/{persist|snapshot}/{parent_uuid}/{segment_uuid}/data.{ext}``.
 

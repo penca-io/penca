@@ -35,23 +35,13 @@ pub(super) struct WavePlan {
 
 /// Plan one compact wave on a single scope's unsealed segment rows.
 ///
-/// Identifies the active merged file (the one `object_uri` appearing
-/// in >1 row inside the unsealed set, by the active+sealed invariant
-/// uncompacted rows have unique URIs), then walks the uncompacted
-/// rows in input order. Every iteration decides — fold, cascade-seal
-/// (when the current accumulator isn't writable as a new active), or
-/// standalone-seal (when an oversized uncompacted segment leads with
-/// nothing accumulated yet) — so a non-trivial unsealed set always
-/// produces state-changing progress.
+/// The active merged file is the one `object_uri` appearing in >1 row: by the
+/// active+sealed invariant, uncompacted rows have unique URIs.
 ///
-/// Returns `None` only when there is genuinely no work: empty input,
-/// nothing to fold and nothing to seal.
-///
-/// Invariant: every `Some(plan)` commits state-changing progress —
-/// either a new merged file (`input_indices.len() ≥ 2`) or ≥1 sealed
-/// row, or both. This is what closes the "scope stalls forever
-/// because plan_wave keeps returning None on a non-empty unsealed
-/// set" failure mode.
+/// Invariant: every `Some(plan)` commits state-changing progress — a new
+/// merged file (`input_indices.len() ≥ 2`), ≥1 sealed row, or both. Without
+/// it a scope stalls forever, `plan_wave` returning `None` on a non-empty
+/// unsealed set.
 ///
 /// See `docs/algorithms.md` § Compact (cold → cold) for the full
 /// algorithm derivation, invariants, and wave-vs-cycle layering.
@@ -59,10 +49,8 @@ pub(super) fn plan_wave<F>(rows: &[PgRow], max_segment_bytes: i64, uri_of: F) ->
 where
     F: Fn(&PgRow) -> String,
 {
-    // Project the two fields the wave actually folds against — the
-    // grouping URI and the in-memory `size_bytes` (CHA-347) — out of the
-    // opaque `PgRow`s, then run the pure planner. The split keeps the
-    // fold algorithm unit-testable without constructing `PgRow`s.
+    // Projecting out of the opaque `PgRow`s here keeps the fold algorithm
+    // unit-testable without constructing `PgRow`s.
     let uris: Vec<String> = rows.iter().map(&uri_of).collect();
     let sizes: Vec<i64> = rows
         .iter()
@@ -74,22 +62,18 @@ where
 /// Pure fold core of [`plan_wave`], operating on per-row projections:
 /// `uris[i]` is the row's `object_uri` (for active-file grouping) and
 /// `sizes[i]` its recorded `size_bytes`. `uris` and `sizes` are parallel
-/// and equal-length. Holds the entire fold/seal decision so it can be
-/// exercised directly in unit tests.
+/// and equal-length.
 ///
-/// CHA-347 note: `sizes` is the uncompressed in-memory Arrow footprint
-/// (the unit `max_segment_bytes` denominates). The fold only ever
-/// accumulates while `current_size + size <= max_segment_bytes`, so a
-/// merged active's footprint can never exceed the cap — the over-fold
-/// regression guarded by the unit tests below.
+/// `sizes` MUST be the uncompressed in-memory Arrow footprint — the unit
+/// `max_segment_bytes` denominates. Feeding the (smaller) on-disk size makes
+/// the same byte budget over-fold past the cap.
 fn plan_wave_projected(uris: &[String], sizes: &[i64], max_segment_bytes: i64) -> Option<WavePlan> {
     if uris.is_empty() {
         return None;
     }
 
-    // Group rows by object_uri. Active = the URI that appears in >1
-    // row (at most one such by the active+sealed invariant; the rest
-    // of the unsealed set has unique URIs).
+    // Active = the URI appearing in >1 row; at most one such by the
+    // active+sealed invariant.
     let mut uri_counts: HashMap<&str, usize> = HashMap::new();
     for u in uris {
         *uri_counts.entry(u.as_str()).or_insert(0) += 1;
@@ -102,7 +86,6 @@ fn plan_wave_projected(uris: &[String], sizes: &[i64], max_segment_bytes: i64) -
         .iter()
         .find_map(|(u, c)| if *c > 1 { Some(*u) } else { None });
 
-    // Indices of active rows (preserve input order) + their cumulative size.
     let mut active_indices: Vec<usize> = Vec::new();
     let mut active_size: i64 = 0;
     if let Some(u) = active_uri {
@@ -120,8 +103,6 @@ fn plan_wave_projected(uris: &[String], sizes: &[i64], max_segment_bytes: i64) -
         .filter(|i| !active_set.contains(i))
         .collect();
 
-    // Greedy walk. State starts as the active set (extend mode) or
-    // empty (no prior active).
     let mut current: Vec<usize> = active_indices.clone();
     let mut current_size: i64 = active_size;
     let mut seal_indices: Vec<usize> = Vec::new();
@@ -130,7 +111,6 @@ fn plan_wave_projected(uris: &[String], sizes: &[i64], max_segment_bytes: i64) -
     for idx in uncompacted_indices.iter().copied() {
         let s: i64 = sizes[idx];
         if current_size + s <= max_segment_bytes {
-            // Fold.
             current.push(idx);
             current_size += s;
             folded += 1;
@@ -157,18 +137,15 @@ fn plan_wave_projected(uris: &[String], sizes: &[i64], max_segment_bytes: i64) -
             // on top of it would breach) and continue with `current`
             // still empty.
             //
-            // CHA-215 caps fresh persist+snapshot writes at
-            // `max_segment_bytes` via the per-row chunker, so new data
-            // can never reach this arm. The arm stays reachable for
-            // pre-CHA-215 oversized rows that may still live on disk
-            // in long-lived environments; once those are folded /
-            // sealed away, the arm is effectively dead code.
+            // Do not delete this arm as unreachable: the per-row chunker caps
+            // fresh persist+snapshot writes at `max_segment_bytes`, so no new
+            // data reaches it, but legacy oversized rows written before that
+            // cap can still be on disk in long-lived environments.
             seal_indices.push(idx);
         }
     }
 
     if folded == 0 && seal_indices.is_empty() {
-        // Nothing to fold, nothing to seal — pure no-op wave.
         return None;
     }
     if current.len() < 2 {
@@ -201,12 +178,6 @@ mod tests {
         (0..n).map(|i| format!("s{i}")).collect()
     }
 
-    /// CHA-347: the fold only accumulates while
-    /// `current_size + size <= max_segment_bytes`, so a merged active's
-    /// in-memory footprint never exceeds the cap. These tests pin that
-    /// against the in-memory `size_bytes` unit — were the stored value
-    /// the (smaller) on-disk size again, the same byte budget would
-    /// over-fold past the cap.
     fn merged_footprint(sizes: &[i64], input_indices: &[usize]) -> i64 {
         input_indices.iter().map(|&i| sizes[i]).sum()
     }
@@ -233,9 +204,9 @@ mod tests {
     #[test]
     fn two_segments_over_cap_together_do_not_merge() {
         // [60,60] @ cap 100: 60+60=120 > 100, so they must NOT merge —
-        // the leading 60 cascade-seals, no new file is produced. (With a
-        // compressed 30-each unit this would wrongly fold to one 120-byte
-        // segment — the over-fold this fix prevents.)
+        // the leading 60 cascade-seals, no new file is produced. Were
+        // `sizes` the compressed on-disk unit (30 each) this would wrongly
+        // fold to one 120-byte segment.
         let sizes = vec![60, 60];
         let plan = plan_wave_projected(&distinct_uris(2), &sizes, 100).expect("wave");
         assert!(plan.input_indices.is_empty());

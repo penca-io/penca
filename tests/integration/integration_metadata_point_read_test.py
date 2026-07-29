@@ -28,12 +28,18 @@ import re
 import time
 from uuid import uuid4
 
+import pytest
+
 from .integration_helpers import (
     SCALAR_BTREE,
     USER_SCHEMA,
     container_log,
     make_client,
 )
+
+# Serial: reads a process-global side channel; see the `serial` marker in
+# pyproject.toml. TODO(CHA-519): drop with the scrape it protects.
+pytestmark = pytest.mark.serial
 
 
 def _meta_row_uuids_one_re(span: str) -> re.Pattern[str]:
@@ -116,9 +122,7 @@ def _new_catalog_schema_table(client) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # RT-1 — table metadata point-read-by-uuid restricts the resolve.
-# ---------------------------------------------------------------------------
 class TestTableMetadataPointRead:
     """CHA-473: a by-uuid table resolve threads the row_uuids restriction."""
 
@@ -140,9 +144,7 @@ class TestTableMetadataPointRead:
             client.close()
 
 
-# ---------------------------------------------------------------------------
 # RT-2 — schema + index metadata point-read-by-uuid restrict the resolve.
-# ---------------------------------------------------------------------------
 class TestSchemaIndexMetadataPointRead:
     """CHA-473: by-uuid schema/index resolves thread the row_uuids restriction."""
 

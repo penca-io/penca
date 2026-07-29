@@ -1,4 +1,4 @@
-//! CHA-507: cold `tx_log` persist-segment metadata + read helpers.
+//! Cold `tx_log` persist-segment metadata + read helpers.
 //!
 //! `persist_tx_log` (penca-api) flushes a slim per-branch commit map —
 //! `(commit_seq_num, commit_micros, author, comment)` — to cold files and

@@ -3,8 +3,6 @@
 //! [`WriteManager`] implements branch management, transaction lifecycle,
 //! and data mutations (inserts, updates, deletes). Methods accept and
 //! return proto messages directly.
-//!
-//! This is the Rust port of `packages/penca/src/penca/lib/api/write.py`.
 
 use crate::query::QueryManager;
 
@@ -54,10 +52,8 @@ use crate::resolve::{
 use crate::scope::ResolvedScope;
 use crate::tx::with_pg_tx;
 
-// Table metadata column names from resolved auditable store.
-// CHA-177: column names on `__penca_system__.tables` rows. The
-// resolve CTE prepends `row_uuid` automatically — and `row_uuid` IS
-// the canonical table_uuid, so it's not a user column.
+// Column names on `__penca_system__.tables` rows. The resolve CTE prepends
+// `row_uuid` automatically, so it is not listed here.
 const STC_TABLE_NAME: &str = "table_name";
 const STC_ARROW_SCHEMA: &str = "arrow_schema";
 const STC_PARTITION_KEYS: &str = "partition_keys";
@@ -74,16 +70,14 @@ const STC_SNAPSHOT_DENSITY_SECONDS: &str = "snapshot_density_seconds";
 /// Database state is accessed via the driver parameter on each method.
 pub struct WriteManager {
     pub default_tx_timeout_seconds: i64,
-    /// CHA-472: the rehomed metadata read methods (ADR 0028) are now
-    /// `QueryManager` methods, so the write path reaches them through this
-    /// handle (`self.query_manager.resolve_table_metadata(..)` etc.). Built with
-    /// the snapshot-list + snapshot-segment caches enabled (wired in
-    /// `penca_write.rs`), so a hot point-write resolve shares the query path's
-    /// caches; a disabled cache is the per-service opt-out.
+    /// Handle for the metadata reads the write path needs (ADR 0028). Built
+    /// with the snapshot-list + snapshot-segment caches ENABLED, so a hot
+    /// point-write resolve shares the query path's caches; a disabled cache is
+    /// the per-service opt-out.
     pub query_manager: crate::query::QueryManager,
 }
 
-/// CHA-236 — reject DDL targeting `__penca_system__`. The system
+/// Reject DDL targeting `__penca_system__`. The system
 /// schema is structural (deterministic UUID anchor) and is managed
 /// exclusively by `create_catalog_tables`; user mutation paths must
 /// not Create/Update/Delete it.
@@ -98,7 +92,7 @@ fn assert_not_system_schema(catalog_uuid: &Uuid, schema_uuid: &Uuid) -> Result<(
     Ok(())
 }
 
-/// CHA-236 — reject DDL / WriteData targeting the registered system tables
+/// Reject DDL / WriteData targeting the registered system tables
 /// `__penca_system__.{schemas,tables,indexes}`. Those tables back the catalog's
 /// namespace + index metadata; clients must mutate them via the
 /// Create/Update/Delete{Schema,Table,Index} RPCs, not by writing rows directly.
@@ -117,16 +111,14 @@ fn assert_not_system_table(catalog_uuid: &Uuid, table_uuid: &Uuid) -> Result<(),
     Ok(())
 }
 
-/// CHA-479: validate a resolved write-target-table scope and return the parsed
-/// `table_uuid`. Shared by `write_data` and the table/index DDL handlers
-/// (`update_table`, `delete_table`, `{create,update,delete}_index`) so the
-/// resolve+validate layering lives in one place instead of the same block
-/// repeated six times. Rejects the registered system tables
-/// `__penca_system__.{schemas,tables,indexes}` via the canonical `table_uuid`
-/// guard ALWAYS; rejects `__penca_system__` as a *schema* only when a schema
-/// row was resolved — the by-name path. The by-uuid path derives the schema from
-/// the resolved table row (true residency, CHA-381) and relies on the table
-/// guard, so it never re-asserts a caller-supplied schema there.
+/// Validate a resolved write-target-table scope and return the parsed
+/// `table_uuid`. Shared by `write_data` and the table/index DDL handlers so the
+/// resolve+validate layering lives in one place. Rejects the registered system
+/// tables `__penca_system__.{schemas,tables,indexes}` via the canonical
+/// `table_uuid` guard ALWAYS; rejects `__penca_system__` as a *schema* only
+/// when a schema row was resolved — the by-name path. The by-uuid path derives
+/// the schema from the resolved table row (true residency) and relies on the
+/// table guard, so it never re-asserts a caller-supplied schema there.
 fn validate_write_target_table(scope: &ResolvedScope) -> Result<Uuid, ApiError> {
     let table = scope
         .table_row
@@ -141,7 +133,7 @@ fn validate_write_target_table(scope: &ResolvedScope) -> Result<Uuid, ApiError> 
     Ok(table_uuid)
 }
 
-/// CHA-479: validate a resolved write-target-schema scope and return the parsed
+/// Validate a resolved write-target-schema scope and return the parsed
 /// `schema_uuid`. Mirror of [`validate_write_target_table`] for the schema-target
 /// DDL handlers (`update_schema`, `delete_schema`, `create_table`): require the
 /// resolved `schema_uuid` (always `Some` for these requests, which carry a schema
@@ -155,7 +147,7 @@ fn validate_write_target_schema(scope: &ResolvedScope) -> Result<Uuid, ApiError>
     Ok(schema_uuid)
 }
 
-/// CHA-172 — validate `CreateTableRequest.primary_keys` against the
+/// Validate `CreateTableRequest.primary_keys` against the
 /// decoded `arrow_schema`. The three reachable failure modes:
 ///
 /// * **Empty PK list** — Penca derives `row_uuid` from the PK so
@@ -210,8 +202,8 @@ fn validate_create_table_primary_keys(
 /// Map a sqlx error originating from a PG `UNIQUE` constraint
 /// violation onto [`ApiError::AlreadyExists`] with `entity` as the
 /// human-readable subject (e.g. "catalog", "branch"); pass everything
-/// else through unchanged. CHA-236: name-uniqueness on catalog +
-/// branch rename relies on PG `UNIQUE` constraints.
+/// else through unchanged. Name-uniqueness on catalog + branch rename relies
+/// on PG `UNIQUE` constraints.
 fn map_unique_violation<T, E>(result: Result<T, E>, entity: &str) -> Result<T, ApiError>
 where
     E: Into<penca_storage_meta::MetadataError>,
@@ -233,7 +225,7 @@ where
     }
 }
 
-/// CHA-236 rename helper used by `update_schema` / `update_table`.
+/// Rename helper used by `update_schema` / `update_table`.
 ///
 /// Returns the **finalized name** to write to the metadata row:
 /// - When `request_new_name` is `Some(new)` and differs from
@@ -272,10 +264,6 @@ where
     Ok(new_name.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// DDL helpers
-// ---------------------------------------------------------------------------
-
 fn retention_duration_seconds(rc: &Option<RetentionConfig>) -> Option<i64> {
     rc.as_ref().and_then(|r| r.retention_duration_seconds)
 }
@@ -284,15 +272,14 @@ fn snapshot_density_seconds(rc: &Option<RetentionConfig>) -> Option<i64> {
     rc.as_ref().and_then(|r| r.snapshot_density_seconds)
 }
 
-/// CHA-433 do-no-harm guard: on an update, a set `retention_duration_seconds` is
+/// Do-no-harm guard: on an update, a set `retention_duration_seconds` is
 /// **immutable** — every change is rejected with `FAILED_PRECONDITION`. Both
 /// directions are unsafe, for independent reasons:
 ///
 /// - Loosening (a larger duration, or clearing it — an unset field replaces the
 ///   stored value on update, i.e. set -> unset = retain forever) would let a
 ///   time-travel read's historical retention fall *below* the current policy, so
-///   the scope-based read floor could *wrongly reject* a valid read (see
-///   CHA-511).
+///   the scope-based read floor could *wrongly reject* a valid read.
 /// - Shortening prunes pre-fork ancestor history that a descendant branch's
 ///   `audit_data` below its fork point still needs, yielding silent wrong data
 ///   (missing rows read as absent). See TODO(CHA-514).
@@ -352,7 +339,7 @@ async fn auto_commit_tx(
     Ok((tx_uuid, committed))
 }
 
-/// CHA-164 mode-switch shared between [`WriteManager::write_data`]
+/// Mode-switch shared between [`WriteManager::write_data`]
 /// and the schema/table DDL mutations. When `request_tx_uuid` is set,
 /// the caller is appending to an open tx (writes invisible until
 /// CommitTx); when absent, auto-commit a fresh tx tagged with the
@@ -377,13 +364,12 @@ async fn resolve_or_auto_commit_tx(
     request_author: Option<&str>,
     request_comment: Option<&str>,
 ) -> Result<(String, Option<CommittedTx>), ApiError> {
-    // CHA-92: wire-shape checks (author/comment mutual-exclusion and
-    // required-for-auto-commit) moved up to the servicer's
-    // `validate_write_data`; the lib is "use at own risk" and no longer
-    // re-defends them.
+    // Wire-shape checks (author/comment mutual-exclusion and
+    // required-for-auto-commit) live in the servicer's `validate_write_data`;
+    // the lib is "use at own risk" and deliberately does not re-defend them.
     match request_tx_uuid {
         Some(tx) => {
-            // CHA-92: an append targets an existing tx — verify it is open
+            // An append targets an existing tx — verify it is open
             // (begun, not aborted/expired/committed) before writing rows
             // that reference it, so an append against a non-open tx fails
             // fast instead of silently writing orphaned log rows.
@@ -402,7 +388,7 @@ async fn resolve_or_auto_commit_tx(
     }
 }
 
-/// CHA-92: resolve an append-path `tx_uuid` to its open state.
+/// Resolve an append-path `tx_uuid` to its open state.
 ///
 /// Reads the single-shot `begin_tx_log ⟕ abort_tx_log ⟕ commit_tx_log` join via
 /// `HotStorageClient::get_tx_status` against the request branch's leaf
@@ -468,7 +454,7 @@ async fn resolve_tx(
     }
 }
 
-/// CHA-181: which user tables on `source_branch_uuid` actually had a
+/// Which user tables on `source_branch_uuid` actually had a
 /// committed write post-fork. Drives `merge_branch`'s per-table loop so
 /// we only invoke `merge_table_data` on tables the source actually
 /// wrote to — `committed_table_uuids` joins `tx_table_log` against
@@ -543,9 +529,8 @@ async fn materialize_schema_rows_from_batches(
 ) -> Result<(), ApiError> {
     for batch in schema_batches {
         for i in 0..batch.num_rows() {
-            // CHA-380: schema_uuid is a first-class column; re-inserting it
-            // through insert_schema_row re-derives the same row_uuid on the
-            // child branch.
+            // Re-inserting schema_uuid through insert_schema_row re-derives
+            // the same row_uuid on the child branch.
             let schema_uuid_str = rb_uuid_str(batch, "schema_uuid", i).ok_or_else(|| {
                 ApiError::InvalidRequest("__penca_system__.schemas: missing schema_uuid".into())
             })?;
@@ -573,7 +558,7 @@ async fn materialize_schema_rows_from_batches(
 
 /// Copy every `__penca_system__.tables` row from a resolved source
 /// batch set onto `new_branch_str` under `fork_tx_uuid`. Per row this
-/// creates the deterministic per-branch data tables (CHA-177) and then
+/// creates the deterministic per-branch data tables and then
 /// inserts the metadata row carrying the source's `schema_uuid`,
 /// arrow_schema, partition/clustering/PKs, description, and retention.
 async fn materialize_table_rows_from_batches(
@@ -585,8 +570,8 @@ async fn materialize_table_rows_from_batches(
 ) -> Result<(), ApiError> {
     for batch in table_batches {
         for i in 0..batch.num_rows() {
-            // CHA-380: table_uuid is a first-class column (re-derives the
-            // same row_uuid via materialize_table_metadata on the child).
+            // Re-derives the same row_uuid via materialize_table_metadata on
+            // the child.
             let table_uuid: Uuid = rb_uuid_str(batch, "table_uuid", i)
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
@@ -599,18 +584,14 @@ async fn materialize_table_rows_from_batches(
             let row_schema_uuid = rb_uuid_str(batch, "schema_uuid", i).ok_or_else(|| {
                 ApiError::InvalidRequest("__penca_system__.tables: missing schema_uuid".into())
             })?;
-            // CHA-177: per-branch data tables are deterministic in
-            // `(table_uuid, branch_uuid)`.
             let arrow_schema_bytes = rb_binary(batch, STC_ARROW_SCHEMA, i).ok_or_else(|| {
                 ApiError::InvalidRequest("__penca_system__.tables: missing arrow_schema".into())
             })?;
             let arrow_schema = arrow::ipc::convert::try_schema_from_ipc_buffer(&arrow_schema_bytes)
                 .map_err(ApiError::Arrow)?;
 
-            // CHA-177: partition/clustering/primary_keys are PG `text[]`
-            // (arrow `list<utf8>` → `text[]`).
-            // CHA-185: primary_keys must be read before create_data_tables
-            // so the delete_log DDL can carry the PK columns.
+            // primary_keys MUST be read before create_data_tables so the
+            // delete_log DDL can carry the PK columns.
             let partition_keys = rb_string_list(batch, STC_PARTITION_KEYS, i);
             let clustering_keys = rb_string_list(batch, STC_CLUSTERING_KEYS, i);
             let primary_keys = rb_string_list(batch, STC_PRIMARY_KEYS, i);
@@ -650,15 +631,14 @@ async fn materialize_table_rows_from_batches(
     Ok(())
 }
 
-/// Copy `__penca_system__.indexes` rows onto the forked branch (CHA-455),
-/// mirroring [`materialize_table_rows_from_batches`]. `index_uuid` is the
-/// row's own PK column (CHA-380); `table_uuid` is the owning table; the
-/// remaining columns are the index definition.
-/// Returns the number of index rows materialized — the caller emits the
+/// Copy `__penca_system__.indexes` rows onto the forked branch, mirroring
+/// [`materialize_table_rows_from_batches`].
+///
+/// Returns the number of index rows materialized — the caller MUST emit the
 /// `__penca_system__.indexes` tx_table_log membership only when this is
-/// non-zero. An empty fork (parent has no indexes) writes no rows there,
-/// and a spurious membership on an unpersisted table pins PurgeTxLog's
-/// `min(purged_at)` watermark at 0 forever (CHA-455).
+/// non-zero. An empty fork writes no rows there, and a spurious membership on
+/// an unpersisted table pins PurgeTxLog's `min(purged_at)` watermark at 0
+/// forever.
 async fn materialize_index_rows_from_batches(
     driver: &PgTransactionDriver,
     index_batches: &[RecordBatch],
@@ -669,8 +649,8 @@ async fn materialize_index_rows_from_batches(
     let mut count = 0usize;
     for batch in index_batches {
         for i in 0..batch.num_rows() {
-            // CHA-380: index_uuid is a first-class column (re-derives the same
-            // row_uuid via materialize_index_metadata on the child).
+            // Re-derives the same row_uuid via materialize_index_metadata on
+            // the child.
             let index_uuid = rb_uuid_str(batch, "index_uuid", i).ok_or_else(|| {
                 ApiError::InvalidRequest("__penca_system__.indexes: missing index_uuid".into())
             })?;
@@ -699,14 +679,12 @@ async fn materialize_index_rows_from_batches(
 }
 
 impl WriteManager {
-    // -- Branch -----------------------------------------------------------
-
     /// Reject a `CreateBranch` whose source branch is not the catalog's `main`.
     ///
-    /// CHA-515 interim guard. The CreateBranch handler calls this **before**
-    /// `PersistBranch` flushes the source hot→cold, so a rejected non-main fork
-    /// touches nothing. The read planner is single-level (CHA-178), so a fork
-    /// off a non-main branch would silently drop grandparent rows on read.
+    /// Interim guard. MUST be called **before** `PersistBranch` flushes the
+    /// source hot→cold, so a rejected non-main fork touches nothing. The read
+    /// planner is single-level, so a fork off a non-main branch would silently
+    /// drop grandparent rows on read.
     /// TODO(CHA-509): remove once the planner walks the full lineage chain.
     pub async fn ensure_fork_source_is_main(
         &self,
@@ -805,9 +783,8 @@ impl WriteManager {
     /// rows) from the source branch onto the new branch as a single
     /// fork tx.
     ///
-    /// CHA-184: catalog-scoped — the request takes only the catalog
-    /// identifier, and the materialization walks every schema visible
-    /// on the source branch.
+    /// Catalog-scoped: the request takes only the catalog identifier, and the
+    /// materialization walks every schema visible on the source branch.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -850,8 +827,8 @@ impl WriteManager {
             tracing::field::display(&source_branch_uuid),
         );
 
-        // CHA-236: mint random `branch_uuid` server-side. Tests can
-        // still pass an explicit `branch_uuid` for setup determinism.
+        // Minted server-side; tests may pass an explicit `branch_uuid` for
+        // setup determinism.
         let branch_uuid = if let Some(ref uuid_str) = request.branch_uuid {
             uuid_str
                 .parse::<uuid::Uuid>()
@@ -863,30 +840,24 @@ impl WriteManager {
 
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
-        // CHA-178: the resolved source branch is the child's parent lineage,
-        // recorded on branch_store so the read planner can enumerate the
-        // parent's cold tier as a second source.
         let source_branch_str = source_branch_uuid.to_string();
 
-        // CHA-273 rework: the SOURCE branch hot→cold flush already happened —
-        // the create_branch gRPC handler resolved the fork position (`fork`,
-        // `resolve_fork_watermark`) and called PersistBranch (in the lifecycle
-        // pod) BEFORE this. So everything committed on the source at/before the
-        // fork is already durable in cold (what the child's cross-branch cold
-        // read, CHA-178, consumes). We record the fork and seed the child from it
-        // here; no persist runs in the write pod. `fork` is the resolved fork
-        // position (`resolve_fork_watermark` errored if it named no committed
-        // tx), and `fork.commit_seq_num` is what we record and seed the child from.
+        // The SOURCE branch hot→cold flush already happened: the gRPC handler
+        // resolved the fork position and called PersistBranch (in the lifecycle
+        // pod) BEFORE this, so everything committed on the source at/before the
+        // fork is already durable in cold — what the child's cross-branch cold
+        // read consumes. This only records the fork and seeds the child; no
+        // persist runs in the write pod.
         //
-        // INVARIANT (load-bearing for CHA-178): PersistBranch bounds the source
-        // cold tier by `commit_micros <= fork.commit_micros`, but `commit_micros`
-        // is only *non-strictly* monotonic — a source commit in the SAME
-        // microsecond as the fork (with a higher `commit_seq_num`) can leak into
-        // the source cold tier. Harmless (persist is idempotent; the row is on the
-        // source), but the child's "sees nothing committed after the fork"
-        // guarantee MUST be enforced by CHA-178 filtering the parent-cold read on
-        // `commit_seq_num <= fork.commit_seq_num` (the seeded fork seq, CHA-487),
-        // NOT on micros. Do not give CHA-178's parent-cold ceiling a micros bound.
+        // INVARIANT: PersistBranch bounds the source cold tier by
+        // `commit_micros <= fork.commit_micros`, but `commit_micros` is only
+        // *non-strictly* monotonic — a source commit in the SAME microsecond as
+        // the fork (with a higher `commit_seq_num`) can leak into the source
+        // cold tier. Harmless (persist is idempotent, the row is on the source),
+        // but the child's "sees nothing committed after the fork" guarantee MUST
+        // therefore be enforced by filtering the parent-cold read on
+        // `commit_seq_num <= fork.commit_seq_num`, NOT on micros. Do not give
+        // the parent-cold ceiling a micros bound.
         // TODO(CHA-500): once Persist accepts a seq cutoff, PersistBranch bounds
         // the flush at `fork.commit_seq_num` instead of `commit_micros`, making it
         // seq-exact and retiring this non-strict-micros leak entirely.
@@ -898,8 +869,8 @@ impl WriteManager {
                     &branch_str,
                     &request.branch_name,
                     fork.commit_seq_num,
-                    // CHA-178: the resolved source branch is the parent lineage
-                    // the read planner's parent-cold source keys on.
+                    // The parent lineage the read planner's parent-cold source
+                    // keys on.
                     Some(source_branch_str.as_str()),
                 )
                 .await,
@@ -908,26 +879,23 @@ impl WriteManager {
 
             LifecycleManager::ensure_branch_partitions(tx, &catalog_str, &branch_str).await?;
 
-            // CHA-487: seed the child's commit_seq_num counter from the fork
-            // commit T so the child's seqs (> commit_seq_num(T)) are disjoint
-            // from the parent's (<= commit_seq_num(T)); the existing
-            // latest-wins-on-commit_seq_num resolution then shadows the parent
-            // with no lineage tiebreak (the substrate CHA-178's cross-branch read
-            // consumes). Must precede materialize_metadata_from_source, whose
-            // fork/materialization tx is the child's first commit and must
-            // allocate the seeded value.
+            // Seed the child's commit_seq_num counter from the fork commit T so
+            // the child's seqs (> seq(T)) are disjoint from the parent's
+            // (<= seq(T)); latest-wins-on-commit_seq_num resolution then shadows
+            // the parent with no lineage tiebreak. MUST precede
+            // materialize_metadata_from_source, whose fork/materialization tx is
+            // the child's first commit and has to allocate the seeded value.
             //
-            // CHA-273 rework: seed from `fork.commit_seq_num` — T resolved ONCE
-            // under PersistBranch — not a fresh MAX re-read here, closing the
-            // window where a source commit between the flush and this read bumps
-            // MAX past T.
+            // Seeding from `fork.commit_seq_num` — T resolved ONCE under
+            // PersistBranch — rather than a fresh MAX re-read closes the window
+            // where a source commit between the flush and this read bumps MAX
+            // past T.
             //
-            // TODO(CHA-178): the remaining seam is the fork metadata-read axis.
-            // materialize_metadata_from_source reads source metadata bounded on
-            // micros, so a source DDL in the same micros as T (seq > fork_seq)
-            // could be inherited while sitting above this seed; CHA-178 should
-            // bound the source metadata read by seq (AsOfSeq(fork_seq)) to close
-            // it, and give the parent-cold read ceiling the same fork_seq bound.
+            // TODO(CHA-178): materialize_metadata_from_source reads source
+            // metadata bounded on micros, so a source DDL in the same micros as
+            // T (seq > fork_seq) could be inherited while sitting above this
+            // seed; bound that read by seq (AsOfSeq(fork_seq)) to close it, and
+            // give the parent-cold read ceiling the same fork_seq bound.
             LifecycleManager::seed_commit_seq_num_from_fork(
                 tx,
                 &catalog_str,
@@ -966,9 +934,9 @@ impl WriteManager {
     /// Phase 2: delete cold files via FormatWriter.
     /// Phase 3: transactional metadata cleanup.
     ///
-    /// CHA-184: catalog-scoped — phases 1–3 walk every schema's tables
-    /// on the branch, so cold segments + log/snapshot metadata for
-    /// `s1.t1`, `s2.t2`, ... are all cleaned up.
+    /// Catalog-scoped: phases 1–3 walk every schema's tables on the branch,
+    /// so cold segments + log/snapshot metadata for `s1.t1`, `s2.t2`, ... are
+    /// all cleaned up.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -1007,19 +975,15 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
 
-        // Phase 1: Collect all cold storage file URIs.
-        // CHA-177: data tables = `data_log_prefix(table_uuid, branch)_data_*`,
-        // deterministic per-branch.
-        // CHA-184: schema_uuid=None → catalog-wide table list.
+        // Phase 1: collect all cold storage file URIs. `schema_uuid = None`
+        // makes this the catalog-wide table list.
         let table_uuid_strs = self
             .query_manager
             .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
             .await?;
 
-        // CHA-203/CHA-218: enumerate cold persist segments per
-        // `(branch, table)`. Cold no longer holds commit_tx_log, so the
-        // touched set is just the data tables. Snapshot segments key
-        // directly on `(branch, table)`.
+        // Cold holds no commit_tx_log, so the touched set is just the data
+        // tables; snapshot segments key directly on `(branch, table)`.
         let segment_table_uuids: Vec<&str> = table_uuid_strs.iter().map(String::as_str).collect();
 
         let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
@@ -1042,8 +1006,8 @@ impl WriteManager {
             snap_segments.extend(segs);
         }
 
-        // CHA-202: also enumerate in-flight compact merged files
-        // tracked in `compact_segment_metadata`. Two cases:
+        // Also enumerate in-flight compact merged files tracked in
+        // `compact_segment_metadata`. Two cases:
         //   - committed rows: the merged file is still referenced by
         //     `table_*_segment_metadata` rows on the branch and is
         //     covered by the persist/snap enumerations above. The
@@ -1083,7 +1047,7 @@ impl WriteManager {
                     .await?;
                 }
 
-                // CHA-198: drop_branch_partitions removes the per-branch
+                // drop_branch_partitions removes the per-branch
                 // leaves of branch_persist_metadata, table_persist_metadata,
                 // table_persist_segment_metadata, table_snapshot_metadata,
                 // and table_snapshot_segment_metadata via DROP TABLE
@@ -1100,7 +1064,7 @@ impl WriteManager {
         Ok(DeleteBranchResponse {})
     }
 
-    /// Rename a branch (CHA-236). Branches are catalog-scoped; the
+    /// Rename a branch. Branches are catalog-scoped; the
     /// request carries the catalog identifier alongside the branch
     /// identifier and an `optional new_branch_name`. Not tx-tracked —
     /// branch renames update `branch_store` directly (same tier as
@@ -1164,10 +1128,9 @@ impl WriteManager {
     /// Locks the source branch's commit_tx_log partition to serialize with
     /// concurrent commits, then copies data to the target branch.
     ///
-    /// CHA-184: catalog-scoped — the merge fans out across every
-    /// schema's tables on the source branch (driven by source's
-    /// `tx_table_log` since fork, intersected with source's
-    /// catalog-wide `__penca_system__.tables`).
+    /// Catalog-scoped: the merge fans out across every schema's tables on the
+    /// source branch, driven by source's `tx_table_log` since fork,
+    /// intersected with source's catalog-wide `__penca_system__.tables`.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -1225,12 +1188,11 @@ impl WriteManager {
         let commit_micros = with_pg_tx(pool, async |tx| {
             let hot = HotStorageClient;
 
-            // Lock the catalog's source-branch commit_tx_log partition to serialize
-            // with concurrent commits. After CHA-163 the partition is
-            // catalog-scoped, so this lock blocks new commits on the source
-            // branch from any schema in the catalog — broader than the
-            // pre-CHA-163 per-schema lock, which is the right scope for
-            // multi-schema-coherent merges.
+            // Lock the catalog's source-branch commit_tx_log partition to
+            // serialize with concurrent commits. The partition is
+            // catalog-scoped, so this blocks new commits on the source branch
+            // from ANY schema in the catalog — the right scope for a
+            // multi-schema-coherent merge.
             let source_tx_part = commit_tx_log_partition(&catalog_uuid, &source_branch_uuid);
             hot.lock_table(tx, &source_tx_part, "EXCLUSIVE").await?;
 
@@ -1257,7 +1219,7 @@ impl WriteManager {
 
             // Create merge transaction on target branch. A merge tx is just
             // an atomic auto-commit on commit_tx_log — same shape as WriteData's
-            // auto-commit branch and CHA-164 DDL auto-commits.
+            // auto-commit branch and the DDL auto-commits.
             let (merge_tx_uuid, committed) = auto_commit_tx(
                 tx,
                 &catalog_uuid,
@@ -1268,31 +1230,24 @@ impl WriteManager {
             .await?;
             let commit_micros = committed.commit_micros;
 
-            // CHA-181: drive the merge loop from source's tx_table_log
-            // (not source's full table-metadata) so we only call
-            // merge_table_data on tables source actually wrote to since
-            // fork. merge_table_data is INSERT-FROM-SELECT against
-            // source's per-table upsert/delete log; on a table source
-            // never wrote to, it scans the empty post-fork window and
-            // writes nothing. With N=50 tables and writes to 3, today's
-            // shape pays 94 wasted SQL calls per merge — the index exists
-            // for exactly this kind of "tables this branch wrote to since
-            // X" lookup, so use it on the merge call site too.
+            // Drive the merge loop from source's tx_table_log, not source's
+            // full table-metadata, so merge_table_data is only called on tables
+            // source actually wrote to since fork. On an untouched table it
+            // would scan the empty post-fork window and write nothing — with
+            // N=50 tables and writes to 3 that is 94 wasted SQL calls per merge.
             //
-            // (Source's `commit_tx_log_partition` only contains source-branch txs,
-            // all of which are post-fork by definition, so the JOIN's
-            // committed-only filter is the precise predicate without
-            // needing fork-point arithmetic.)
+            // Source's `commit_tx_log_partition` contains only source-branch
+            // txs, all post-fork by definition, so the JOIN's committed-only
+            // filter is the precise predicate with no fork-point arithmetic.
             let touched_table_uuids =
                 enumerate_touched_table_uuids(tx, &hot, &catalog_uuid, &source_branch_uuid).await?;
 
             // Fetch full table metadata for source. We still need user
             // tables' arrow_schema + naming for `merge_table_data`; only
             // the per-table merge_table_data calls themselves are pruned.
-            // CHA-168: read goes through stream_merged so it tolerates
-            // post-persist state where __penca_system__.tables rows live
-            // in cold.
-            // CHA-184: schema_uuid=None → catalog-wide read so the merge
+            // The read goes through stream_merged so it tolerates the
+            // post-persist state where __penca_system__.tables rows live in
+            // cold. `schema_uuid = None` makes it catalog-wide, so the merge
             // fans out across every schema's tables on the source branch.
             let table_batches = self
                 .query_manager
@@ -1303,26 +1258,22 @@ impl WriteManager {
                     None,
                     &source_str,
                     None,
-                    // Catalog-wide read (every schema/table on the branch) —
-                    // no single row_uuid (CHA-473) / no name key (CHA-484).
+                    // Catalog-wide read: no single row_uuid, no name key.
                     None,
                     None,
-                    // CHA-86: read source's metadata as-of the merge commit
-                    // point rather than unbounded.
+                    // As-of the merge commit point, never unbounded.
                     &penca_merge::ReadSnapshot::AsOfMicros(commit_micros),
                 )
                 .await?;
 
-            // CHA-181: collect distinct user table_uuids merge_tx writes
-            // to on the target branch so we can emit the tx_table_log
-            // membership rows after the loop. merge_table_data is bulk
-            // INSERT-FROM-SELECT (not WriteData-shape) so the standard
-            // apply_change emit doesn't fire.
+            // Collect distinct user table_uuids merge_tx writes to on the
+            // target branch, so the tx_table_log membership rows can be emitted
+            // after the loop: merge_table_data is bulk INSERT-FROM-SELECT, not
+            // WriteData-shape, so the standard apply_change emit never fires.
             let mut merged_table_uuids: Vec<String> = Vec::with_capacity(touched_table_uuids.len());
             for batch in &table_batches {
                 for i in 0..batch.num_rows() {
-                    // CHA-380: table_uuid is a first-class column (was the
-                    // overloaded row_uuid); it must match touched_table_uuids.
+                    // Must match touched_table_uuids.
                     let table_uuid: Uuid = rb_uuid_str(batch, "table_uuid", i)
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| {
@@ -1381,8 +1332,6 @@ impl WriteManager {
         Ok(MergeBranchResponse { commit_micros })
     }
 
-    // -- Catalog DDL ------------------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -1396,11 +1345,9 @@ impl WriteManager {
         driver: &impl DbDriver<Row = PgRow>,
         request: &CreateCatalogRequest,
     ) -> Result<CreateCatalogResponse, ApiError> {
-        // CHA-236: mint random `catalog_uuid` + `main_branch_uuid` +
-        // `public_schema_uuid` server-side. Clients cannot recompute
-        // these — they capture them from the response (CreateCatalog
-        // returns the catalog + its main_branch_uuid; ListSchemas /
-        // GetSchema returns the public schema).
+        // Minted server-side. Clients cannot recompute these — they capture
+        // them from the response (CreateCatalog returns the catalog + its
+        // main_branch_uuid; ListSchemas / GetSchema returns the public schema).
         let catalog_uuid = Uuid::new_v4();
         let main_branch_uuid = Uuid::new_v4();
         let public_schema_uuid = Uuid::new_v4();
@@ -1429,7 +1376,7 @@ impl WriteManager {
         // Bootstrap the catalog's per-catalog metadata tables
         // (branch_store, tx-log family) plus the
         // `__penca_system__.{schemas,tables}` data tables on main and
-        // their four self-describing bootstrap rows (CHA-177).
+        // their four self-describing bootstrap rows.
         LifecycleManager::create_catalog_tables(
             driver,
             &catalog_uuid_str,
@@ -1465,10 +1412,8 @@ impl WriteManager {
         tracing::Span::current().record("catalog_uuid", tracing::field::display(&catalog_uuid));
 
         let catalog_str = catalog_uuid.to_string();
-        // CHA-236: `new_catalog_name`, when set, renames the catalog
-        // in place. `catalog_store.UNIQUE(catalog_name)` enforces
-        // uniqueness; a collision surfaces as `unique_violation` →
-        // `AlreadyExists`.
+        // `catalog_store.UNIQUE(catalog_name)` enforces rename uniqueness; a
+        // collision surfaces as `unique_violation` → `AlreadyExists`.
         map_unique_violation(
             LifecycleManager::update_catalog(
                 driver,
@@ -1520,8 +1465,7 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         // DeleteCatalog cascades against main only; per-branch schemas
         // are dropped en masse when `drop_catalog_tables` CASCADEs the
-        // per-catalog physicals. CHA-236: main is random and threaded
-        // into the cascade + drop.
+        // per-catalog physicals.
         let main_branch = resolve_main_branch_uuid(driver, &catalog_uuid).await?;
         span.record("main_branch_uuid", tracing::field::display(&main_branch));
         let main_branch_str = main_branch.to_string();
@@ -1531,9 +1475,9 @@ impl WriteManager {
             .list_schema_uuids_for_catalog(driver, dl_driver, &catalog_str, None)
             .await?;
 
-        // CHA-236: skip the system schema in the cascade — it's a
-        // structural anchor managed by `create_catalog_tables` and the
-        // whole catalog physicals get CASCADE-dropped below anyway.
+        // Skip the system schema in the cascade — it is a structural anchor
+        // managed by `create_catalog_tables`, and the whole catalog physicals
+        // get CASCADE-dropped below anyway.
         let system_schema_str = system_schema_uuid(&catalog_uuid).to_string();
         for schema_uuid in &schema_uuids {
             if schema_uuid == &system_schema_str {
@@ -1561,8 +1505,6 @@ impl WriteManager {
         })
     }
 
-    // -- Schema DDL -------------------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -1578,11 +1520,10 @@ impl WriteManager {
         dl_driver: &L,
         request: &CreateSchemaRequest,
     ) -> Result<CreateSchemaResponse, ApiError> {
-        // CHA-236: mint random `schema_uuid` server-side. CHA-479: base-only
-        // resolve through the shared `ResolvedScope` (CreateSchema carries no
-        // schema ident, so `scope.schema_uuid` stays `None`), then mint. No
-        // `assert_not_system_*`: a freshly minted v4 cannot collide with the
-        // deterministic `system_schema_uuid(catalog)`.
+        // Base-only resolve: CreateSchema carries no schema ident, so
+        // `scope.schema_uuid` stays `None`. No `assert_not_system_*` needed —
+        // a freshly minted v4 cannot collide with the deterministic
+        // `system_schema_uuid(catalog)`.
         let scope =
             ResolvedScope::resolve_schema(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
@@ -1603,10 +1544,9 @@ impl WriteManager {
         // concurrent reader can't observe commit_tx_log committed before
         // `__penca_system__.schemas` lands.
         with_pg_tx(pool, async |tx| {
-            // CHA-236: explicit name-uniqueness pre-check (pg_now-pinned
-            // snapshot + RYOW if joining an open tx). `__penca_system__.schemas`
-            // has no PG UNIQUE constraint (rows live in an auditable-store
-            // append log), so we enforce within-tx visibility here.
+            // `__penca_system__.schemas` has no PG UNIQUE constraint (rows
+            // live in an auditable-store append log), so this within-tx
+            // visibility check IS the name-uniqueness enforcement.
             if self
                 .query_manager
                 .meta_get_schema(
@@ -1682,15 +1622,10 @@ impl WriteManager {
         dl_driver: &L,
         request: &UpdateSchemaRequest,
     ) -> Result<UpdateSchemaResponse, ApiError> {
-        // CHA-236: name → uuid uses a pg_now-pinned snapshot + RYOW under
-        // the request's tx (no `as_of_micros` on writes). Branch resolves first via
-        // `branch_store` SELECT (snapshot-blind). Reject
-        // `__penca_system__` before opening a Pg tx — runs inside the
-        // constructor.
-        // CHA-479: resolve through the shared `ResolvedScope`, then layer the
-        // write-only `__penca_system__` guard on top (the assert moved out of
-        // the old `WriteRequestScope` constructor). UpdateSchema always carries
-        // a schema ident, so `scope.schema_uuid` is `Some`.
+        // Name → uuid uses a pg_now-pinned snapshot + RYOW under the request's
+        // tx (writes never carry `as_of_micros`); branch resolves first via a
+        // snapshot-blind `branch_store` SELECT. The write-only
+        // `__penca_system__` guard layers on top, BEFORE any Pg tx opens.
         let scope =
             ResolvedScope::resolve_schema(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
@@ -1712,8 +1647,8 @@ impl WriteManager {
         // re-read in one Pg tx so concurrent readers can't observe a tx
         // committed before the new schema row lands.
         let schema = with_pg_tx(pool, async |tx| {
-            // CHA-164: look up the existing schema to carry forward its name
-            // when no rename was requested. RYOW honoured.
+            // Carries the existing name forward when no rename was requested.
+            // RYOW honoured.
             let existing = self
                 .query_manager
                 .meta_get_schema(
@@ -1728,9 +1663,8 @@ impl WriteManager {
                 .await?
                 .ok_or_else(|| ApiError::NotFound(format!("schema not found: {schema_uuid}")))?;
 
-            // CHA-236: when `new_schema_name` is set, rename. Reject if
-            // another schema on this branch already uses the target name
-            // (visible under our snapshot + open tx).
+            // Rejects when another schema on this branch already uses the
+            // target name, visible under this snapshot + open tx.
             let target_name = rename_or_carry_forward(
                 request.new_schema_name.as_deref(),
                 &existing.schema_name,
@@ -1797,7 +1731,7 @@ impl WriteManager {
                 &branch_str,
                 Some(&tx_uuid),
                 None,
-                None, // CHA-443: as_of_seq — inert on the OpenTx (RYOW) arm
+                None, // as_of_seq — inert on the OpenTx (RYOW) arm
                 None,
             )
             .await?;
@@ -1835,9 +1769,8 @@ impl WriteManager {
         dl_driver: &L,
         request: &DeleteSchemaRequest,
     ) -> Result<DeleteSchemaResponse, ApiError> {
-        // CHA-479: resolve through the shared `ResolvedScope`, then reject
-        // `__penca_system__` (the assert moved out of the old constructor).
-        // DeleteSchema always carries a schema ident.
+        // DeleteSchema always carries a schema ident, so the resolved
+        // `schema_uuid` is `Some` and the `__penca_system__` guard applies.
         let scope =
             ResolvedScope::resolve_schema(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
@@ -1896,7 +1829,7 @@ impl WriteManager {
             &branch_str,
             request_tx_uuid,
             None,
-            None, // CHA-443: as_of_seq
+            None, // as_of_seq
             None,
         )
         .await?;
@@ -1912,9 +1845,9 @@ impl WriteManager {
             )
             .await?;
 
-        // CHA-177: soft-delete only — write tombstones for each table
-        // and the schema. Physical data tables stay addressable;
-        // lifecycle sweep drops them after commit.
+        // Soft-delete only: tombstones for each table and the schema. Physical
+        // data tables stay addressable; the lifecycle sweep drops them after
+        // commit.
         let (tx_uuid, _committed) = resolve_or_auto_commit_tx(
             driver,
             catalog_uuid,
@@ -1943,9 +1876,8 @@ impl WriteManager {
         )
         .await?;
 
-        // CHA-181: emit one row per system table this cascade actually
-        // wrote to. Schemas always (the schema tombstone). Tables only
-        // if the cascade hit any user tables.
+        // One row per system table this cascade actually wrote to: schemas
+        // always (the schema tombstone), tables only if it hit any.
         let mut touched: Vec<String> = vec![system_schemas_table_uuid(catalog_uuid).to_string()];
         if !tables.is_empty() {
             touched.push(system_tables_table_uuid(catalog_uuid).to_string());
@@ -1963,8 +1895,6 @@ impl WriteManager {
         Ok(())
     }
 
-    // -- Table DDL --------------------------------------------------------
-
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -1981,32 +1911,24 @@ impl WriteManager {
         dl_driver: &L,
         request: &CreateTableRequest,
     ) -> Result<CreateTableResponse, ApiError> {
-        // CHA-172: validate primary_keys + arrow_schema at the API
-        // boundary so SQL (via penca-sql-server) and direct gRPC
-        // callers see identical wording for the three reachable
-        // PK bugs (empty / duplicate / undeclared). The PK list is
-        // semantically meaningful regardless of how the request
-        // reached us, so the validation belongs here, not at the
-        // SQL parser. Runs before any I/O.
+        // PK validation lives at this API boundary so SQL (via
+        // penca-sql-server) and direct gRPC callers see identical wording for
+        // the three reachable PK bugs. Runs before any I/O.
         //
-        // CHA-386: the supported-column-type gate is NOT here — it is
+        // The supported-column-type gate is deliberately NOT here — it is
         // enforced upstream in `penca-server-grpc`'s
-        // `validation::write::validate_create_table` (the convergence
-        // point both wire paths share: direct gRPC callers and the SQL
-        // DDL path, which dispatches over `WriteServiceClient` and
-        // re-enters that same servicer). Any future *in-process* caller
-        // of `create_table` that bypasses the gRPC servicer must
-        // replicate the `CanonicalType::from_arrow` check on every
-        // column itself — the asymmetry with the in-crate PK check above
-        // is intentional, not an oversight.
+        // `validation::write::validate_create_table`, the convergence point
+        // both wire paths share. Any future *in-process* caller of
+        // `create_table` that bypasses the gRPC servicer must replicate the
+        // `CanonicalType::from_arrow` check itself; the asymmetry with the
+        // in-crate PK check above is intentional, not an oversight.
         let user_schema = arrow::ipc::convert::try_schema_from_ipc_buffer(&request.arrow_schema)
             .map_err(ApiError::Arrow)?;
         validate_create_table_primary_keys(&request.primary_keys, &user_schema)?;
 
-        // CHA-236: refuse CreateTable in `__penca_system__` — its
-        // contents are managed by the structural bootstrap, not user
-        // CRUD. Reject before opening a tx — runs inside the
-        // constructor.
+        // Refuse CreateTable in `__penca_system__` — its contents are managed
+        // by the structural bootstrap, not user CRUD. Rejected before any tx
+        // opens.
         let scope =
             ResolvedScope::resolve_schema(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
@@ -2022,16 +1944,14 @@ impl WriteManager {
 
         let catalog_str = catalog_uuid.to_string();
 
-        // CHA-236: mint random `table_uuid` server-side.
         let table_uuid = Uuid::new_v4();
         span.record("table_uuid", tracing::field::display(&table_uuid));
 
-        // CHA-236: name-uniqueness pre-check + the DDL + the metadata
-        // INSERT run in one Pg tx so concurrent readers can't observe
-        // commit_tx_log committed before the metadata row lands, and a
-        // duplicate `(branch, schema, name)` from a concurrent
-        // CreateTable fails as `AlreadyExists` instead of silently
-        // last-write-wins.
+        // Name-uniqueness pre-check + DDL + metadata INSERT run in ONE Pg tx,
+        // so concurrent readers can't observe commit_tx_log committed before
+        // the metadata row lands, and a duplicate `(branch, schema, name)` from
+        // a concurrent CreateTable fails as `AlreadyExists` rather than
+        // silently last-write-wins.
         let branch_uuid_str = branch_uuid.to_string();
         with_pg_tx(pool, async |tx| {
             if self
@@ -2063,13 +1983,9 @@ impl WriteManager {
                 request.comment.as_deref(),
             )
             .await?;
-            // CHA-177: per-branch data tables are deterministic in
-            // `(table_uuid, branch_uuid)`. Concurrent CreateTable on the
+            // Per-branch data tables are deterministic in
+            // `(table_uuid, branch_uuid)`, so a concurrent CreateTable on the
             // same `(table, branch)` shares the data table.
-            //
-            // `user_schema` was decoded and the PK list validated
-            // before the tx opened (CHA-172) — reused here.
-
             LifecycleManager::create_data_tables(
                 tx,
                 &table_uuid.to_string(),
@@ -2098,10 +2014,8 @@ impl WriteManager {
             )
             .await?;
 
-            // CHA-455: inline index definitions are written into
-            // `__penca_system__.indexes` in the SAME tx as the table, so
-            // they commit/abort atomically with it. Each gets a random
-            // server-minted index_uuid (mirroring the table_uuid mint).
+            // Inline index definitions go into `__penca_system__.indexes` in
+            // the SAME tx as the table, so they commit/abort atomically with it.
             for def in &request.indexes {
                 LifecycleManager::insert_index_metadata(
                     tx,
@@ -2142,7 +2056,7 @@ impl WriteManager {
         })
     }
 
-    /// CHA-455: define a secondary index on a table. Writes a row into the
+    /// Define a secondary index on a table. Writes a row into the
     /// auditable `__penca_system__.indexes` store (mirror of
     /// `create_table`). Name-uniqueness is enforced within the table.
     #[tracing::instrument(
@@ -2170,7 +2084,6 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
         let table_str = table_uuid.to_string();
-        // CHA-236-style server-minted random uuid.
         let index_uuid = Uuid::new_v4();
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
@@ -2238,7 +2151,7 @@ impl WriteManager {
         })
     }
 
-    /// CHA-455: rename an index (rename-only — column/type changes are a
+    /// Rename an index (rename-only — column/type changes are a
     /// drop+create rebuild). Appends a new auditable version carrying the
     /// new name with the existing columns/type.
     #[tracing::instrument(
@@ -2352,7 +2265,7 @@ impl WriteManager {
         })
     }
 
-    /// CHA-455: drop an index. Soft-delete tombstone into
+    /// Drop an index. Soft-delete tombstone into
     /// `__penca_system__.indexes` (existence is a precondition — NotFound
     /// when absent at the read snapshot, the DDL-delete contract).
     #[tracing::instrument(
@@ -2458,19 +2371,17 @@ impl WriteManager {
         dl_driver: &L,
         request: &UpdateTableRequest,
     ) -> Result<UpdateTableResponse, ApiError> {
-        // CHA-236: reject UpdateTable targeting `__penca_system__.*` —
-        // runs inside the constructor.
+        // Rejects UpdateTable targeting `__penca_system__.*`.
         let scope =
             ResolvedScope::resolve_table(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
         let catalog_uuid = scope.catalog_uuid;
         let branch_uuid = scope.branch_uuid;
         let table_uuid = validate_write_target_table(&scope)?;
-        // CHA-479 wrinkle #2: the by-uuid path derives schema_uuid from the
-        // resolved table row (true residency, CHA-381) rather than the request's
-        // schema — the same identifier dispatch read_data/write_data use
-        // (table_uuid wins over schema_uuid + table_name). resolve_table always
-        // populates schema_uuid.
+        // The by-uuid path derives schema_uuid from the resolved table row
+        // (true residency) rather than the request's schema — the same
+        // identifier dispatch read_data/write_data use, where table_uuid wins
+        // over schema_uuid + table_name.
         let schema_uuid = scope.schema_uuid.ok_or_else(|| {
             ApiError::Internal("resolve_table did not populate schema_uuid".into())
         })?;
@@ -2506,9 +2417,8 @@ impl WriteManager {
                 .await?
                 .ok_or_else(|| ApiError::NotFound(format!("table not found: {table_uuid}")))?;
 
-            // CHA-236: when `new_table_name` is set, rename. Reject if
-            // another table on this branch already uses the target name
-            // (visible under our snapshot + open tx).
+            // Rejects when another table on this branch already uses the
+            // target name, visible under this snapshot + open tx.
             let target_table_name = rename_or_carry_forward(
                 request.new_table_name.as_deref(),
                 &existing.table_name,
@@ -2548,9 +2458,9 @@ impl WriteManager {
                 &request.retention_config,
             )?;
             let rc = &request.retention_config;
-            // CHA-177: per-branch data tables are deterministic in
-            // `(table_uuid, branch_uuid)` — same names as Create, no
-            // carry-forward needed.
+            // Per-branch data tables are deterministic in
+            // `(table_uuid, branch_uuid)` — same names as Create, so no
+            // carry-forward is needed.
             LifecycleManager::insert_table_metadata(
                 tx,
                 &catalog_uuid_str,
@@ -2598,7 +2508,7 @@ impl WriteManager {
                 &branch_uuid_str,
                 Some(&tx_uuid_str),
                 None,
-                None, // CHA-443: as_of_seq — inert on the OpenTx (RYOW) arm
+                None, // as_of_seq — inert on the OpenTx (RYOW) arm
                 None,
             )
             .await?;
@@ -2661,17 +2571,16 @@ impl WriteManager {
         dl_driver: &L,
         request: &DeleteTableRequest,
     ) -> Result<DeleteTableResponse, ApiError> {
-        // CHA-236: reject DeleteTable targeting `__penca_system__.*` —
-        // runs inside the constructor.
+        // Rejects DeleteTable targeting `__penca_system__.*`.
         let scope =
             ResolvedScope::resolve_table(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
         let catalog_uuid = scope.catalog_uuid;
         let branch_uuid = scope.branch_uuid;
         let table_uuid = validate_write_target_table(&scope)?;
-        // CHA-479: schema_uuid is derived from the resolved table row on the
-        // by-uuid path (true residency); delete_table's existence check is keyed
-        // on table_uuid, so the schema is recorded for tracing only.
+        // Derived from the resolved table row on the by-uuid path (true
+        // residency). The existence check is keyed on table_uuid, so the schema
+        // is recorded for tracing only.
         let schema_uuid = scope.schema_uuid.ok_or_else(|| {
             ApiError::Internal("resolve_table did not populate schema_uuid".into())
         })?;
@@ -2698,13 +2607,12 @@ impl WriteManager {
             )
             .await?;
 
-            // CHA-177: soft-delete only — write tombstone to
-            // `__penca_system__.tables` iff the table is visible at the
-            // request's open tx (RYOW honoured for tables created in the
-            // same tx). The existence check + insert run in one query;
-            // `false` means the table didn't exist → NotFound. Data
-            // tables stay addressable; lifecycle sweep drops them after
-            // commit.
+            // Soft-delete only: tombstone `__penca_system__.tables` iff the
+            // table is visible at the request's open tx (RYOW honoured for
+            // tables created in the same tx). The existence check + insert run
+            // in ONE query; `false` means the table didn't exist → NotFound.
+            // Data tables stay addressable; the lifecycle sweep drops them
+            // after commit.
             let existed = LifecycleManager::delete_table_metadata_if_visible(
                 tx,
                 &catalog_uuid_str,
@@ -2734,8 +2642,6 @@ impl WriteManager {
             table_uuid: table_uuid.to_string(),
         })
     }
-
-    // -- Transactions -----------------------------------------------------
 
     #[tracing::instrument(
         skip_all,
@@ -2778,9 +2684,9 @@ impl WriteManager {
         span.record("tx_uuid", tx_uuid.as_str());
         let timeout = request
             .timeout_seconds
-            // CHA-92: an over-max ttl is rejected at the servicer boundary
-            // (validate_begin_tx), so there's no clamp here — embedded lib
-            // callers pass the value through at their own risk.
+            // An over-max ttl is rejected at the servicer boundary
+            // (validate_begin_tx), so there is deliberately no clamp here;
+            // embedded lib callers pass the value through at their own risk.
             .unwrap_or(self.default_tx_timeout_seconds);
 
         let hot = HotStorageClient;
@@ -2822,7 +2728,7 @@ impl WriteManager {
         pool: &PgDriver,
         request: &CommitTxRequest,
     ) -> Result<CommitTxResponse, ApiError> {
-        // Tx ops are catalog-scoped (CHA-163); schema isn't needed.
+        // Tx ops are catalog-scoped; schema isn't needed.
         // commit_tx_log / begin_tx_log / abort_tx_log all live at the catalog
         // level, partitioned by branch. Accept catalog identifiers
         // (uuid or name); schema fields on the request are ignored
@@ -2967,7 +2873,7 @@ impl WriteManager {
         let begin_partition = naming::begin_tx_log_partition(&catalog_uuid, &branch_uuid);
         let abort_partition = abort_tx_log_partition(&catalog_uuid, &branch_uuid);
         let tx_partition = commit_tx_log_partition(&catalog_uuid, &branch_uuid);
-        // CHA-444: aborts allocate from the dedicated abort-order counter.
+        // Aborts allocate from the dedicated abort-order counter.
         let seq_num_partition = naming::abort_seq_num_partition(&catalog_uuid, &branch_uuid);
 
         // See commit_tx (above) for the Pg-tx + FOR UPDATE locking story.
@@ -3025,8 +2931,6 @@ impl WriteManager {
         Ok(AbortTxResponse { aborted_at_micros })
     }
 
-    // -- Data mutations ---------------------------------------------------
-
     /// Apply mutations against a branch. All changes are batched in a
     /// single Pg transaction for one round trip.
     ///
@@ -3050,19 +2954,15 @@ impl WriteManager {
         dl_driver: &L,
         request: &WriteDataRequest,
     ) -> Result<WriteDataResponse, ApiError> {
-        // CHA-475: resolve the request's identifiers once at the boundary,
-        // read-symmetric with `read_data` (`ResolvedScope::resolve_table`),
-        // through the same cached `QueryManager` resolver (CHA-472). The by-uuid
-        // target resolves catalog-wide with no schema touched (the eager
-        // `__penca_system__.schemas` resolve is gone); the by-name target
-        // resolves the schema once. Cache eligibility falls out of the snapshot:
-        // an autocommit write (no request tx_uuid) resolves at LatestSeq →
-        // cache-eligible; an append (open tx_uuid) → OpenTx → bypass. The
-        // write-side system guard then validates the canonical uuids:
-        // `assert_not_system_table` always, and `assert_not_system_schema` only
-        // when a schema was actually resolved (the by-name path). The table guard
-        // rejects the full registered system set
-        // `__penca_system__.{schemas,tables,indexes}`.
+        // Resolve identifiers once at the boundary, read-symmetric with
+        // `read_data`, through the same cached `QueryManager` resolver. The
+        // by-uuid target resolves catalog-wide with no schema touched; the
+        // by-name target resolves the schema once. Cache eligibility falls out
+        // of the snapshot: an autocommit write (no request tx_uuid) resolves at
+        // LatestSeq → cache-eligible; an append (open tx_uuid) → OpenTx →
+        // bypass. The write-side system guard then validates the canonical
+        // uuids — `assert_not_system_table` always, `assert_not_system_schema`
+        // only when a schema was actually resolved (the by-name path).
         let scope =
             ResolvedScope::resolve_table(&self.query_manager, pool, dl_driver, request, None)
                 .await?;
@@ -3110,16 +3010,11 @@ impl WriteManager {
         Ok(WriteDataResponse { commit_micros })
     }
 
-    // -- Internal helpers -------------------------------------------------
-
-    /// Process all changes (upserts, deletes) for a set of tables
-    /// CHA-181: explicit `tx_table_log` emit for write paths that
-    /// bypass `apply_change` — the 6 DDL handlers (which write rows
-    /// to `__penca_system__.{schemas,tables}` via direct SQL),
-    /// `merge_branch` (which uses bulk INSERT-FROM-SELECT via
-    /// `merge_table_data`), and `materialize_metadata_from_source`'s
-    /// fork emit. `apply_change` itself emits inline; these callers
-    /// share this helper instead.
+    /// Explicit `tx_table_log` emit for the write paths that bypass
+    /// `apply_change` — the DDL handlers (direct SQL into
+    /// `__penca_system__.{schemas,tables}`), `merge_branch` (bulk
+    /// INSERT-FROM-SELECT), and `materialize_metadata_from_source`'s fork emit.
+    /// `apply_change` emits inline instead.
     async fn emit_tx_table_log_for_ddl(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &uuid::Uuid,
@@ -3144,11 +3039,9 @@ impl WriteManager {
         Ok(())
     }
 
-    /// CHA-181 wrapper: emit one `tx_table_log` row for a DDL that wrote
-    /// exactly `__penca_system__.schemas` (Create/Update/DeleteSchema on
-    /// a user schema). Thin delegate to `emit_tx_table_log_for_ddl`; the
-    /// canonical entry-point is still the bulk variant — the wrapper
-    /// just hides the one-element slice literal at the call site.
+    /// Emit one `tx_table_log` row for a DDL that wrote exactly
+    /// `__penca_system__.schemas`. Thin delegate to the bulk variant, hiding
+    /// the one-element slice literal at the call site.
     async fn emit_tx_table_log_for_schemas_change(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &uuid::Uuid,
@@ -3167,10 +3060,8 @@ impl WriteManager {
         .await
     }
 
-    /// CHA-181 wrapper: emit one `tx_table_log` row for a DDL that wrote
-    /// exactly `__penca_system__.tables` (Create/Update/DeleteTable).
-    /// Thin delegate to `emit_tx_table_log_for_ddl`; see
-    /// [`Self::emit_tx_table_log_for_schemas_change`] for the rationale.
+    /// Emit one `tx_table_log` row for a DDL that wrote exactly
+    /// `__penca_system__.tables`. Thin delegate to the bulk variant.
     async fn emit_tx_table_log_for_tables_change(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &uuid::Uuid,
@@ -3193,11 +3084,10 @@ impl WriteManager {
     /// pre-resolved target table within an existing transaction, then emit the
     /// `tx_table_log` row iff rows were written.
     ///
-    /// CHA-475: the target table is resolved once at the handler boundary
-    /// (`ResolvedScope::resolve_table`) and threaded in — this fn no longer
-    /// re-resolves the snapshot or the table, and there is no per-`Change` loop
-    /// or distinct-table dedup (a write targets exactly one table). The
-    /// system-table guard also moved to the boundary.
+    /// The target table is resolved once at the handler boundary and threaded
+    /// in, so this neither re-resolves the snapshot nor loops per-`Change` — a
+    /// write targets exactly one table. The system-table guard lives at the
+    /// boundary too.
     ///
     /// TODO(CHA-92): validate the tx is open before appending — the predicate
     /// is `tx_uuid IN begin_tx_log AND tx_uuid NOT IN abort_tx_log` (and not
@@ -3221,12 +3111,10 @@ impl WriteManager {
 
         let hot = HotStorageClient;
 
-        // CHA-387: reuse the `Table` resolved by the boundary
-        // `ResolvedScope::resolve_table` for the upsert/delete row shape
-        // (`arrow_schema`, `primary_keys`) — no second `get_table` refetch. The
-        // by-uuid path resolved catalog-wide, so a write whose `table_uuid`
-        // lives in a schema other than the request `schema_uuid` still writes,
-        // matching the read side (CHA-381).
+        // Reuse the boundary-resolved `Table` for the upsert/delete row shape
+        // rather than refetching. The by-uuid path resolved catalog-wide, so a
+        // write whose `table_uuid` lives in a schema other than the request
+        // `schema_uuid` still writes — matching the read side.
         let user_schema: SchemaRef = Arc::new(
             arrow::ipc::convert::try_schema_from_ipc_buffer(&table.arrow_schema)
                 .map_err(ApiError::Arrow)?,
@@ -3234,7 +3122,7 @@ impl WriteManager {
 
         let mut wrote_rows = false;
 
-        // CHA-431: deletes-first. The delete INSERT runs before the upsert
+        // Deletes-first. The delete INSERT MUST run before the upsert
         // INSERT so that within one batch the co-occurring delete and upsert of
         // a row draw their `write_seq_num` (the upsert/delete logs' shared
         // `write_sequence`, via the column `DEFAULT nextval`) in that order
@@ -3274,7 +3162,7 @@ impl WriteManager {
             }
         }
 
-        // CHA-181: emit one tx_table_log row when rows were written (empty IPC
+        // One tx_table_log row when rows were actually written (empty IPC
         // batches don't count). Idempotent across multiple WriteData calls in
         // one penca tx via the (tx_uuid, branch_uuid, table_uuid) PK conflict.
         if wrote_rows {
@@ -3298,7 +3186,7 @@ impl WriteManager {
     /// inserted (sum across all batches), so the caller can gate
     /// `tx_table_log` emission on actual rows written.
     ///
-    /// CHA-242: rejects duplicate `row_uuid` within the upserts of one
+    /// Rejects duplicate `row_uuid` within the upserts of one
     /// `Change`. Two upsert rows with the same `row_uuid` would share a
     /// `version_uuid = hash(row_uuid, tx_uuid)` and silently collapse
     /// through `insert_upserts`' `ON CONFLICT (version_uuid) DO UPDATE`
@@ -3347,8 +3235,8 @@ impl WriteManager {
                 })
                 .collect::<Result<_, _>>()?;
 
-            // CHA-398: same null-PK rejection the validated-batch entry
-            // points apply — a NULL would mint the empty-string identity.
+            // Same null-PK rejection the validated-batch entry points apply —
+            // a NULL would mint the empty-string identity.
             crate::pk_batch::ensure_no_null_pks(&pk_cols, primary_keys, "upserts")?;
 
             let tx_uuid_parsed: uuid::Uuid = tx_uuid
@@ -3359,8 +3247,8 @@ impl WriteManager {
             let mut row_uuids = Vec::with_capacity(num_rows);
 
             for row_idx in 0..num_rows {
-                // CHA-398: row identity via the shared pk_batch kernel —
-                // same stringify-then-hash step as deletes and ids.
+                // Row identity via the shared pk_batch kernel — the same
+                // stringify-then-hash step as deletes and ids.
                 let row_uuid = crate::pk_batch::row_uuid_for_row(&pk_cols, row_idx, table_uuid)?;
                 if !seen_row_uuids.insert(row_uuid) {
                     return Err(ApiError::InvalidRequest(format!(
@@ -3398,7 +3286,7 @@ impl WriteManager {
     /// `primary_keys`, derive `row_uuid` server-side via
     /// `naming::row_uuid_for_pk`, and append
     /// `(version_uuid, row_uuid, <pk_cols...>, tx_uuid)` rows to the
-    /// delete log (CHA-185).
+    /// delete log.
     ///
     /// Validation is strict on both column **name/order** and Arrow
     /// **data type**: a batch whose schema doesn't match the declared
@@ -3433,9 +3321,8 @@ impl WriteManager {
                 continue;
             }
 
-            // CHA-398: validation + derivation share the read path's
-            // kernel — write-side and read-side row identity agree by
-            // construction.
+            // Validation + derivation share the read path's kernel, so
+            // write-side and read-side row identity agree by construction.
             let row_uuids: Vec<String> = crate::pk_batch::validated_row_uuids_from_batch(
                 &batch,
                 table_uuid,
@@ -3458,14 +3345,12 @@ impl WriteManager {
     /// new branch and create empty per-branch data tables for every
     /// table.
     ///
-    /// CHA-164: each materialized row needs a `tx_uuid` for the
-    /// auditable-store row identity. Auto-commit a single `fork_tx` on
-    /// the new branch (parallel to `merge_tx` for `MergeBranch`),
-    /// tagged with the request's `author` / `comment`, and stamp every
-    /// materialization with that tx_uuid — they're conceptually one
-    /// operation (the branch creation).
+    /// Each materialized row needs a `tx_uuid` for the auditable-store row
+    /// identity. A single auto-committed `fork_tx` on the new branch (parallel
+    /// to `merge_tx` for `MergeBranch`) stamps every materialization, since
+    /// they are conceptually one operation — the branch creation.
     ///
-    /// CHA-184: the walk is catalog-wide.
+    /// The walk is catalog-wide:
     ///   1. Read source's `__penca_system__.schemas` via
     ///      `resolve_schema_metadata` and copy each schema row onto
     ///      the new branch via `insert_schema_row`.
@@ -3492,30 +3377,22 @@ impl WriteManager {
         let new_branch_str = new_branch_uuid.to_string();
         let source_branch_str = source_branch_uuid.to_string();
 
-        // CHA-174: the materialization tx is always auto-commit — no
-        // caller-supplied tx_uuid mode-switch — so reach for
-        // `auto_commit_tx` directly to skip the `Option<CommittedTx>`
-        // unwrap that the mode-switching `resolve_or_auto_commit_tx`
-        // would otherwise force. Local name `fork_tx_uuid` for symmetry
-        // with `merge_tx` in `MergeBranch`.
+        // The materialization tx is always auto-commit — no caller-supplied
+        // tx_uuid mode-switch — so `auto_commit_tx` is used directly to skip
+        // the `Option<CommittedTx>` unwrap `resolve_or_auto_commit_tx` forces.
         //
-        // fork_tx and the two `tx_table_log` rows below are emitted
-        // unconditionally — every branch starts with a fork_tx by
-        // construction (catalog-wide consistency). The empty-source
-        // fast path the pre-CHA-184 shape took never fires in practice
-        // (every catalog has `public` + `__penca_system__`), so
-        // dropping it removes a hidden branch without observable cost.
+        // fork_tx and the `tx_table_log` rows below are emitted
+        // unconditionally: every branch starts with a fork_tx by construction,
+        // and an empty-source fast path never fires in practice since every
+        // catalog has `public` + `__penca_system__`.
         let (fork_tx_uuid, fork_committed) =
             auto_commit_tx(driver, catalog_uuid, new_branch_uuid, author, comment).await?;
-        // CHA-86: the fork captures source's schemas + tables as-of the
-        // fork commit point — a single consistent snapshot, not unbounded.
+        // The fork captures source's schemas + tables as-of the fork commit
+        // point — a single consistent snapshot, never unbounded.
         let fork_as_of = fork_committed.commit_micros;
 
-        // -- Schemas ----------------------------------------------------
-        //
-        // Read source's `__penca_system__.schemas` rows. CHA-168:
-        // routes through stream_merged so a post-persist source (rows live
-        // in cold) is tolerated.
+        // Routed through stream_merged so a post-persist source (rows live in
+        // cold) is tolerated.
         let schema_batches = self
             .query_manager
             .resolve_schema_metadata(
@@ -3524,8 +3401,7 @@ impl WriteManager {
                 &catalog_str,
                 &source_branch_str,
                 None,
-                // Catalog-wide fork copy — no single row_uuid (CHA-473) / no
-                // name key (CHA-484).
+                // Catalog-wide fork copy: no single row_uuid, no name key.
                 None,
                 None,
                 &penca_merge::ReadSnapshot::AsOfMicros(fork_as_of),
@@ -3540,11 +3416,7 @@ impl WriteManager {
         )
         .await?;
 
-        // -- Tables -----------------------------------------------------
-        //
-        // Read source's `__penca_system__.tables` rows for every
-        // schema (schema_uuid=None on resolve_table_metadata gives the
-        // catalog-wide read).
+        // `schema_uuid = None` gives the catalog-wide read across every schema.
         let table_batches = self
             .query_manager
             .resolve_table_metadata(
@@ -3554,8 +3426,7 @@ impl WriteManager {
                 None,
                 &source_branch_str,
                 None,
-                // Catalog-wide read (every schema/table) — no single
-                // row_uuid (CHA-473) / no name key (CHA-484).
+                // Catalog-wide read: no single row_uuid, no name key.
                 None,
                 None,
                 &penca_merge::ReadSnapshot::AsOfMicros(fork_as_of),
@@ -3570,11 +3441,8 @@ impl WriteManager {
         )
         .await?;
 
-        // -- Indexes (CHA-455) ------------------------------------------
-        //
-        // Copy source's `__penca_system__.indexes` rows so index
-        // definitions are inherited by the child branch (mirroring the
-        // schemas/tables fork copy).
+        // Index definitions are inherited by the child branch, mirroring the
+        // schemas/tables fork copy.
         let index_batches = self
             .query_manager
             .resolve_index_metadata(
@@ -3583,8 +3451,8 @@ impl WriteManager {
                 &catalog_str,
                 &source_branch_str,
                 None,
-                // Catalog-wide fork copy — no single row_uuid (CHA-473) / no
-                // name key (CHA-484) / no table_uuid prefix (CHA-499).
+                // Catalog-wide fork copy: no row_uuid, no name key, no
+                // table_uuid prefix.
                 None,
                 None,
                 None,
@@ -3600,17 +3468,15 @@ impl WriteManager {
         )
         .await?;
 
-        // CHA-181 / CHA-184: fork_tx wrote rows to `__penca_system__`
-        // schemas + tables on the child branch (always — every fork
-        // inherits the source's schemas + tables). Those writes bypass
-        // WriteData, so emit the membership rows explicitly so consumers
-        // can resolve the system tables via `(tx_uuid, table_uuid)`.
+        // fork_tx always wrote rows to `__penca_system__` schemas + tables on
+        // the child branch, and those writes bypass WriteData, so the
+        // membership rows are emitted explicitly — otherwise consumers cannot
+        // resolve the system tables via `(tx_uuid, table_uuid)`.
         //
-        // CHA-455: `indexes` is included ONLY when the fork actually
-        // copied index rows (the source had indexes). An empty fork writes
-        // nothing to `__penca_system__.indexes`, and a spurious
-        // tx_table_log entry on that unpersisted table would pin
-        // PurgeTxLog's `min(purged_at)` watermark at 0 forever.
+        // `indexes` is included ONLY when the fork actually copied index rows.
+        // An empty fork writes nothing there, and a spurious tx_table_log entry
+        // on that unpersisted table would pin PurgeTxLog's `min(purged_at)`
+        // watermark at 0 forever.
         let mut touched = vec![
             naming::system_schemas_table_uuid(catalog_uuid).to_string(),
             naming::system_tables_table_uuid(catalog_uuid).to_string(),
@@ -3637,13 +3503,13 @@ impl WriteManager {
 /// `fork_commit_seq_num` (the commit-order position it forked from), so the
 /// guard is a direct seq comparison against the target's `commit_tx_log` — no
 /// base-tx lookup, and never vacuous: a branch always carries a real fork
-/// position (subsumes the CHA-494 "absent base_tx ⇒ pass" concern).
+/// position.
 ///
 /// Precondition: this comparison is only meaningful when `target` and the
 /// source share one `commit_seq_num` origin — which holds for the fork-from-main
 /// / merge-to-main paths because the child's counter is seeded from the fork
-/// point (CHA-487). Merging a branch into a target it did not fork from is out
-/// of scope here; real conflict detection (CHA-5) will subsume this shortcut.
+/// point. Merging a branch into a target it did not fork from is out of scope
+/// here; TODO(CHA-5) real conflict detection subsumes this shortcut.
 async fn ensure_fast_forward(
     driver: &impl DbDriver<Row = PgRow>,
     catalog_uuid: &uuid::Uuid,
@@ -3653,7 +3519,7 @@ async fn ensure_fast_forward(
     let target_tx_part = commit_tx_log_partition(catalog_uuid, target_branch_uuid);
     let target_tx_q = PgDialect::quote_identifier(&target_tx_part);
     // commit_tx_log is committed-only by construction (commits are inserted at
-    // `CommitTx`; aborts go to `abort_tx_log`), and the seeded fork seq (CHA-487)
+    // `CommitTx`; aborts go to `abort_tx_log`), and the seeded fork seq
     // makes source and target seqs comparable, so a target commit past the fork
     // point is exactly `commit_seq_num > fork_commit_seq_num`.
     let sql = format!("SELECT 1 FROM {target_tx_q} WHERE commit_seq_num > $1 LIMIT 1");

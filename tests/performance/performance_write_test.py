@@ -26,10 +26,6 @@ from .performance_helpers import (
     setup_performance_schema,
 )
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 
 class TestWritePerformance:
     """Write throughput under different conditions."""

@@ -1,8 +1,6 @@
 //! Arrow batch utilities shared by persist / snapshot / compact paths:
 //! committed-at bounds, hot↔cold schema projection, partition
-//! labeling/split, and clustering sort. (Merge-read collection moved
-//! out in CHA-404 — the snapshot path consumes
-//! `penca_merge::stream_all_cold_parts` directly.)
+//! labeling/split, and clustering sort.
 
 use std::sync::Arc;
 
@@ -17,7 +15,7 @@ use crate::error::ApiError;
 
 /// Compute (min, max) of an Int64 column across a batch, by name. Shared
 /// by the per-segment bounds stamped at persist time — `commit_micros`
-/// (the visibility/time axis) and `commit_seq_num` (CHA-430's commit-order
+/// (the visibility/time axis) and `commit_seq_num` (the commit-order
 /// axis). Nulls are skipped; an empty/all-null column yields
 /// `(i64::MAX, i64::MIN)` (the caller stamps these onto an empty chunk,
 /// which has no rows to select).
@@ -52,12 +50,10 @@ pub(super) fn batch_committed_at_bounds(batch: &RecordBatch) -> Result<(i64, i64
     batch_int64_col_bounds(batch, "commit_micros")
 }
 
-/// Compute (min, max) of `commit_seq_num` across a batch (CHA-430). Stamped
-/// onto each cold persist segment's metadata so segment selection can
-/// later prune on the commit-order (seq) axis — a segment whose
-/// `[min, max]` seq range falls outside a requested bound can be skipped
-/// whole. The seq-axis read predicate itself lands with the read-surface
-/// work in CHA-429; this only records the bound.
+/// Compute (min, max) of `commit_seq_num` across a batch. Stamped onto each
+/// cold persist segment's metadata so segment selection can prune on the
+/// commit-order (seq) axis — a segment whose `[min, max]` seq range falls
+/// outside a requested bound is skipped whole.
 pub(super) fn batch_commit_seq_num_bounds(batch: &RecordBatch) -> Result<(i64, i64), ApiError> {
     batch_int64_col_bounds(batch, "commit_seq_num")
 }
@@ -70,7 +66,7 @@ pub(super) fn batch_commit_seq_num_bounds(batch: &RecordBatch) -> Result<(i64, i
 /// (`t.<col>`) and are appended by the hot client itself — not
 /// declared here.
 ///
-/// CHA-431: `write_seq_num` is the within-tx mutation ordinal
+/// `write_seq_num` is the within-tx mutation ordinal
 /// (`write_sequence`-sourced default on `upsert_log`); persist projects
 /// it through to cold so the merge-on-read `(commit_seq_num, write_seq_num)`
 /// order stays consistent across tiers.
@@ -81,8 +77,8 @@ pub(super) fn hot_upsert_read_schema(user_schema: &SchemaRef) -> SchemaRef {
         Arc::new(Field::new("tx_uuid", DataType::Utf8, false)),
     ];
     fields.extend(user_schema.fields().iter().cloned());
-    // CHA-431: write_seq_num trails the user cols — persist projects it
-    // through to cold (via project_to_cold_layout) so the merge's
+    // write_seq_num trails the user cols — persist projects it through to
+    // cold (via project_to_cold_layout) so the merge's
     // (commit_seq_num, write_seq_num) order works on both tiers.
     fields.push(Arc::new(Field::new(
         "write_seq_num",
@@ -92,12 +88,12 @@ pub(super) fn hot_upsert_read_schema(user_schema: &SchemaRef) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// CHA-218: project the widened hot-shaped batch (returned by
-/// `read_committed_upserts` / `read_committed_deletes`) to the cold
-/// on-disk layout. Drops `version_uuid` and `tx_uuid`; keeps every
-/// remaining column in its source order. The trailing tx metadata
-/// columns (`committed_at, began_at, comment, author` and, CHA-430,
-/// `commit_seq_num`) thereby become inline columns of the cold segment row.
+/// Project the widened hot-shaped batch (returned by
+/// `read_committed_upserts` / `read_committed_deletes`) to the cold on-disk
+/// layout. Drops `version_uuid` and `tx_uuid`; keeps every remaining column in
+/// its source order, so the trailing tx metadata columns (`committed_at,
+/// began_at, comment, author, commit_seq_num`) become inline columns of the
+/// cold segment row.
 pub(super) fn project_to_cold_layout(batch: &RecordBatch) -> Result<RecordBatch, ApiError> {
     let schema = batch.schema();
     let indices: Vec<usize> = schema
@@ -113,7 +109,7 @@ pub(super) fn project_to_cold_layout(batch: &RecordBatch) -> Result<RecordBatch,
 /// Stringified partition label for one row over the partition-key
 /// columns: the bare value for a single key, a JSON-encoded list of the
 /// stringified parts for composite keys. The single shared definition
-/// of partition identity (CHA-404): `partition_record_batch` (delta
+/// of partition identity: `partition_record_batch` (delta
 /// grouping) and the prior-stream run-grouping must agree on label
 /// identity by construction, or a partition's delta and prior rows
 /// land in different groups. Label shape is fixed by the column set
@@ -132,16 +128,13 @@ pub(super) fn partition_label(columns: &[&ArrayRef], row: usize) -> Result<Strin
     }
 }
 
-/// Derive a prior snapshot segment row's [`PartitionOrderKey`] (typed
-/// order + label identity) from its `statistics` blob (CHA-406, ADR 0024
-/// §3) — the prior-row identity mechanism: post-CHA-407 the segment table
+/// Derive a prior snapshot segment row's [`PartitionOrderKey`] (typed order +
+/// label identity) from its `statistics` blob (ADR 0024 §3). The segment table
 /// records no partition label, but a label-exact writer leaves every
-/// partition-key column constant within a segment row, so `min == max` in
-/// its stats IS the partition value. CHA-459 widens the old
-/// label-from-statistics to also encode the typed sort row off the SAME
-/// 1-row key arrays (via `ordering`), so the carried map can merge in
-/// typed order; the `.label()` projection is byte-identical to the old
-/// result (same `partition_label` formatter, same scalars).
+/// partition-key column constant within a segment row, so `min == max` in its
+/// stats IS the partition value. The typed sort row is encoded off the SAME
+/// 1-row key arrays (via `ordering`) so the carried map merges in typed order;
+/// `.label()` uses the same `partition_label` formatter over the same scalars.
 ///
 /// Returns:
 /// - `Ok(Some(key))` — derivable; each key part is the stats scalar
@@ -214,9 +207,8 @@ pub(super) fn partition_order_key_from_statistics(
 /// Build the Arrow [`SortField`]s for `keys` from `schema` — default
 /// options (ascending, nulls-first), matching `sort_record_batch_by_keys`
 /// and the writer's clustering-sort convention so the typed partition
-/// order agrees with the on-segment row order. Shared by
-/// [`PartitionOrdering`] (and, CHA-459 IMPL2, the packer's clustering-key
-/// merge in place of its private `sort_key_fields`).
+/// order agrees with the on-segment row order. Shared by [`PartitionOrdering`]
+/// and the packer's clustering-key merge.
 pub(super) fn partition_sort_fields(
     schema: &SchemaRef,
     keys: &[String],
@@ -231,7 +223,7 @@ pub(super) fn partition_sort_fields(
         .collect()
 }
 
-/// The typed ordering key for one snapshot partition (CHA-459). Snapshot
+/// The typed ordering key for one snapshot partition. Snapshot
 /// partitions are *identified* by their stringified `partition_label`
 /// (carry-forward equality + the stored `partition_value`) but must be
 /// *ordered* by the typed partition-column value: a stringified-label
@@ -323,10 +315,9 @@ impl PartitionOrdering {
 
 /// Split a RecordBatch into partitions by the given key columns.
 ///
-/// Mirrors `lifecycle.py::_partition_table`: one entry per unique key
-/// value, labeled by the stringified value (JSON-encoded list for
-/// composite keys). Empty `partition_keys` yields a single unpartitioned
-/// entry labeled with `None`. CHA-459: groups are emitted in *typed*
+/// One entry per unique key value, labeled by the stringified value
+/// (JSON-encoded list for composite keys). Empty `partition_keys` yields a
+/// single unpartitioned entry labeled with `None`. Groups are emitted in *typed*
 /// partition-column order (via [`PartitionOrdering`]), not stringified-label
 /// order — so an `Int` key emits `2` before `10`.
 pub(super) fn partition_record_batch(
@@ -360,8 +351,8 @@ pub(super) fn partition_record_batch(
         groups.entry(label).or_default().push(i as u32);
     }
 
-    // Emit groups in typed partition-column order (CHA-459), not the
-    // BTreeMap's stringified-label order.
+    // Emit in typed partition-column order, NOT the BTreeMap's
+    // stringified-label order.
     let ordering = PartitionOrdering::new(&batch.schema(), partition_keys)?;
     let mut out: Vec<(PartitionOrderKey, Option<String>, RecordBatch)> =
         Vec::with_capacity(groups.len());
@@ -478,13 +469,12 @@ mod tests {
         assert_eq!(parts[0].1.num_rows(), 3);
     }
 
-    /// CHA-459 Part A: a non-string partition key must group in *typed*
-    /// partition-column order, not stringified-label order. For an `Int64`
-    /// key with values `{2, 10}`, typed-ascending is `[2, 10]`; the old
-    /// `BTreeMap<String, _>` grouping yields the lexicographic `["10", "2"]`
-    /// (`'1' < '2'`), which is semantically wrong as an ordering and is the
-    /// blocking correctness bug for any future `output_ordering`
-    /// advertisement over the partition columns.
+    /// A non-string partition key must group in *typed* partition-column
+    /// order, not stringified-label order. For an `Int64` key with values
+    /// `{2, 10}`, typed-ascending is `[2, 10]`; a plain
+    /// `BTreeMap<String, _>` grouping yields the lexicographic `["10", "2"]`,
+    /// which would break any `output_ordering` advertisement over the
+    /// partition columns.
     #[test]
     fn partition_int_key_groups_in_typed_order() {
         let schema = Arc::new(Schema::new(vec![
@@ -567,7 +557,7 @@ mod tests {
         assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
     }
 
-    /// CHA-430: both per-segment bounds helpers route through the shared
+    /// Both per-segment bounds helpers route through the shared
     /// `batch_int64_col_bounds`, picking their own column by name. Pin
     /// that they read the right column and span its full min/max.
     #[test]
@@ -613,10 +603,9 @@ mod tests {
     }
 }
 
-/// CHA-406/CHA-459 prior-row order-key-from-statistics derivation. The
-/// matrix is spelled out per the helper-testing convention (pure primitive
-/// signature, exhaustive cross-product): key column types × {constant
-/// value, all-null} × {single key, composite key}, each asserting the
+/// Prior-row order-key-from-statistics derivation. The matrix is an
+/// exhaustive cross-product: key column types × {constant value, all-null} ×
+/// {single key, composite key}, each asserting the
 /// derived key's `.label()` equals `partition_label` over the same row —
 /// the parity oracle. Plus the underivable degrades (min ≠ max, malformed
 /// bytes, empty stats) that drive the full-rewrite fallback.

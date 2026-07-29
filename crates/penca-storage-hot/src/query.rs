@@ -31,13 +31,11 @@ pub fn stream_query_as_batches<'a, D: DbDriver<Row = PgRow> + 'a>(
     schema: SchemaRef,
     batch_size: usize,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch, HotStorageError>> + Send + 'a>> {
-    // CHA-417: one stream-level span per query (not per batch) so the hot
-    // cursor read — the all_hot fast path included — shows up in the span
-    // table with its own busy/idle timing; the counters the old
-    // start/complete events carried are span fields recorded at
-    // end-of-stream. An errored or client-cancelled stream still closes
-    // the span (with timing) but leaves the count fields unrecorded —
-    // a timed close with no counts reads as "aborted", not "zero rows".
+    // One stream-level span per query, not per batch, so the hot cursor read
+    // shows up in the span table with its own busy/idle timing. Counts are
+    // recorded as span fields at end-of-stream, so an errored or
+    // client-cancelled stream closes the span with timing but no counts —
+    // which reads as "aborted", not "zero rows".
     let span = tracing::debug_span!(
         "stream_query_as_batches",
         batch_size,

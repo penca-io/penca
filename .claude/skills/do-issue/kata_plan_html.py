@@ -33,7 +33,7 @@ import subprocess
 import sys
 from typing import Any
 
-# --- layer model ------------------------------------------------------------
+# layer model
 
 ORCH_ORDER = ["orch:run-cleanup", "orch:open-pr", "orch:spawn-review"]
 ORCH_SHORT = {
@@ -45,7 +45,7 @@ KIND_RED, KIND_IMPL, KIND_ORCH, KIND_OTHER = "red", "impl", "orch", "other"
 LAYER_RANK = {KIND_RED: 0, KIND_IMPL: 1, KIND_ORCH: 2, KIND_OTHER: 3}
 
 
-# --- kata access ------------------------------------------------------------
+# kata access
 
 
 def run_kata(args: list[str]) -> Any:
@@ -96,7 +96,7 @@ def orch_label(labels: list[str]) -> str:
     return ""
 
 
-# --- model ------------------------------------------------------------------
+# model
 
 
 class Task:
@@ -182,7 +182,7 @@ def fetch_payloads(slug: str) -> tuple[dict, list[dict]]:
     return listing, [run_kata(["show", qid]) for qid in qids]
 
 
-# --- text helpers -----------------------------------------------------------
+# text helpers
 
 
 def strip_prefix(title: str) -> str:
@@ -231,7 +231,7 @@ def e(s: str) -> str:
     return html.escape(s, quote=True)
 
 
-# --- rendering --------------------------------------------------------------
+# rendering
 
 MERMAID_SUBGRAPHS = [
     (KIND_RED, "RED", "Red-tests"),

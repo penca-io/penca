@@ -1,7 +1,6 @@
 //! Arrow IPC / Flight encoding helpers used by the trait-impl arms in
 //! [`super::service`]. Vendored from datafusion-flight-sql-server
-//! v0.4.16 (same provenance as the trait impl). The relocation is pure
-//! file-move; behavior preserved exactly.
+//! v0.4.16 (same provenance as the trait impl).
 //!
 //! Lives in its own module so `service.rs` stays focused on
 //! [`arrow_flight::sql::server::FlightSqlService`] trait body + the
@@ -50,7 +49,7 @@ pub(super) fn get_schema_for_plan(logical_plan: &LogicalPlan) -> SchemaRef {
 /// `get_flight_info` advertised, returning the schema the stream must encode to
 /// — or `None` when no reconciliation is needed (the hot path).
 ///
-/// CHA-402: `get_flight_info` advertises the *logical* plan's schema
+/// `get_flight_info` advertises the *logical* plan's schema
 /// ([`get_schema_for_plan`]); `DoGet` streams the *physical* plan's schema.
 /// DataFusion's scalar-subquery decorrelation (`scalar_subquery_to_join`)
 /// rewrites a correlated `COUNT` to a LEFT JOIN and over-marks the
@@ -132,7 +131,7 @@ pub(super) fn parameter_schema_for_plan(
     Ok(builder.finish().into())
 }
 
-/// CHA-333: decode bound parameters from a `DoPutPreparedStatementUpdate`
+/// Decode bound parameters from a `DoPutPreparedStatementUpdate`
 /// FlightData stream into `ParamValues`. The Apache flight-sql-jdbc-driver
 /// sends parameters in this DoPut body — empty `VectorSchemaRoot` (no
 /// `setXxx` calls) → `None`, schema with N fields and one row → `Some`
@@ -314,9 +313,9 @@ mod tests {
 
     #[test]
     fn reconcile_tightens_stream_to_advertised_nullability() {
-        // The CHA-402 shape: the physical stream over-marks a COUNT column
-        // nullable; the advertised (logical) schema has it non-null. Reconcile to
-        // the advertised nullability while keeping the stream's field type.
+        // The physical stream over-marks a COUNT column nullable; the
+        // advertised (logical) schema has it non-null. Reconcile to the
+        // advertised nullability while keeping the stream's field type.
         let stream = Schema::new(vec![
             Field::new("aid", DataType::Int64, false),
             Field::new("my_txns", DataType::Int64, true),

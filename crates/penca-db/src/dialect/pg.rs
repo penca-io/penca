@@ -1,15 +1,13 @@
 //! Postgres-specific SQL expressions, DDL, and type mapping.
 //!
-//! This is the Rust port of `packages/penca/src/penca/lib/db/dialect/pg_dialect.py`.
-//!
 //! Three tiers of DDL:
 //! - **Global** (bootstrap): catalog_store, segment metadata
 //! - **Per-catalog** (UUID-prefixed): branch_store, tx-log family
 //!   (commit_tx_log / begin_tx_log / abort_tx_log), each LIST-partitioned by
 //!   branch_uuid
-//! - **Per-table** (data_log_prefix-prefixed, CHA-177): upsert_log,
-//!   delete_log — covers user data and the system tables under
-//!   `__penca_system__.{schemas,tables}` via the same shape
+//! - **Per-table** (data_log_prefix-prefixed): upsert_log, delete_log — covers
+//!   user data and the system tables under `__penca_system__.{schemas,tables}`
+//!   via the same shape
 //!
 //! Per-catalog tx-log tables use LIST partitioning on branch_uuid so each
 //! branch gets its own partition for write isolation and cheap DROP on
@@ -61,16 +59,10 @@ impl Dialect for PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DbDialect trait implementation
-// ---------------------------------------------------------------------------
-
 impl DbDialect for PgDialect {
     fn arrow_type_to_sql(arrow_type: &DataType) -> Result<String, ArrowTypeError> {
-        // The supported set is owned by `penca_core::types` (CHA-386);
-        // this dialect only decides the PG column type for each canonical
-        // variant. `from_arrow` is the gate; `pg_column_type` is total
-        // over the enum.
+        // `penca_core::types` owns the supported set: `from_arrow` is the gate,
+        // and `pg_column_type` is total over the enum.
         let ct = CanonicalType::from_arrow(arrow_type).map_err(|e| ArrowTypeError(e.0))?;
         Ok(Self::pg_column_type(&ct))
     }
@@ -81,17 +73,15 @@ impl DbDialect for PgDialect {
 }
 
 impl PgDialect {
-    /// The Postgres column type for a canonical Arrow type. Total over
-    /// [`CanonicalType`] with no `_` arm — the cross-crate exhaustiveness
-    /// contract (CHA-386): a new canonical variant is a compile error
-    /// here until its PG mapping is named.
+    /// The Postgres column type for a canonical Arrow type. Deliberately total
+    /// over [`CanonicalType`] with no `_` arm, so a new canonical variant is a
+    /// compile error here until its PG mapping is named.
     ///
     /// PG has no unsigned integers, so they widen to the next signed type
     /// that holds the full range (`UInt8`→SMALLINT, `UInt16`→INTEGER,
     /// `UInt32`→BIGINT). `UInt64`→NUMERIC: a signed `i64` BIGINT cannot
     /// hold values above `i64::MAX`, so the lossless mapping is
-    /// arbitrary-precision NUMERIC (CHA-386 — corrects the prior lossy
-    /// `UInt64`→BIGINT).
+    /// arbitrary-precision NUMERIC.
     fn pg_column_type(ct: &CanonicalType) -> String {
         match ct {
             CanonicalType::Int8 | CanonicalType::Int16 | CanonicalType::UInt8 => "SMALLINT".into(),
@@ -124,24 +114,18 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: global tables (bootstrap)
-// ---------------------------------------------------------------------------
-
 impl PgDialect {
     /// Create global resource tables if they don't already exist.
     ///
-    /// Idempotent — safe to call on every startup. Post-CHA-198 the
-    /// only global table left is `catalog_store`; the persist + snapshot
-    /// metadata parents are per-catalog and created in
-    /// [`Self::create_catalog_tables`].
+    /// Idempotent — safe to call on every startup. `catalog_store` is the only
+    /// global table; the persist + snapshot metadata parents are per-catalog
+    /// and created in [`Self::create_catalog_tables`].
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn bootstrap(driver: &impl DbDriver) -> Result<(), sqlx::Error> {
-        // catalog_store. CHA-236: UNIQUE(catalog_name) enforces global
-        // catalog-name uniqueness now that `catalog_uuid` is random
-        // (no longer xxh3(catalog_name)). CHA-239 will migrate this to
-        // a partial index `WHERE deleted_at_micros IS NULL` once
-        // soft-delete lands.
+        // UNIQUE(catalog_name) is what enforces global catalog-name uniqueness:
+        // `catalog_uuid` is randomly minted, so it no longer derives from the
+        // name. CHA-239 migrates this to a partial index
+        // `WHERE deleted_at_micros IS NULL` once soft-delete lands.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {CATALOG_STORE} (
@@ -156,19 +140,13 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: per-catalog tables (branch_store, tx-log family) + system-table
-// physicals on main (CHA-177)
-// ---------------------------------------------------------------------------
-
 impl PgDialect {
     /// Create per-catalog metadata tables and bootstrap the main branch.
     ///
-    /// Mirrors Python `LifecycleManager.create_catalog_tables`. Creates
-    /// `branch_store` + the tx-log family (partitioned by branch_uuid),
-    /// then bootstraps `__penca_system__.{schemas,tables}` as standard
-    /// Penca Tables on the main branch (CHA-177) and seeds the four
-    /// well-known rows with the catalog's genesis tx.
+    /// Creates `branch_store` + the tx-log family (partitioned by branch_uuid),
+    /// then bootstraps `__penca_system__.{schemas,tables}` as standard Penca
+    /// Tables on the main branch and seeds the four well-known rows with the
+    /// catalog's genesis tx.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -193,11 +171,10 @@ impl PgDialect {
 
     /// Create `branch_store`, the per-catalog branch directory.
     ///
-    /// CHA-236: UNIQUE(branch_name) enforces per-catalog branch-name
-    /// uniqueness now that `branch_uuid` is random (no longer
-    /// xxh3(catalog_uuid, branch_name)). CHA-239 will migrate this to
-    /// a partial index `WHERE deleted_at_micros IS NULL` once
-    /// soft-delete lands.
+    /// UNIQUE(branch_name) is what enforces per-catalog branch-name uniqueness:
+    /// `branch_uuid` is randomly minted, so it no longer derives from the name.
+    /// CHA-239 migrates this to a partial index
+    /// `WHERE deleted_at_micros IS NULL` once soft-delete lands.
     async fn create_branch_store_table(
         driver: &impl DbDriver,
         catalog_uuid: &Uuid,
@@ -205,11 +182,10 @@ impl PgDialect {
         let branch_store = naming::branch_store_table(catalog_uuid);
         driver
             .execute_no_result(&format!(
-                // CHA-178: `parent_branch_uuid` records the fork lineage (the
-                // source branch) so the read planner can enumerate the parent's
-                // cold tier as a second source, capped at the fork seq
-                // (`fork_commit_seq_num`, CHA-505). NULL for `main` and any
-                // non-forked branch.
+                // `parent_branch_uuid` records the fork lineage so the read
+                // planner can enumerate the parent's cold tier as a second
+                // source, capped at `fork_commit_seq_num`. NULL for `main` and
+                // any non-forked branch.
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
                     branch_uuid          UUID PRIMARY KEY,
                     branch_name          TEXT NOT NULL UNIQUE,
@@ -236,7 +212,6 @@ impl PgDialect {
         let commit_tx_log = naming::commit_tx_log_table(catalog_uuid);
         let tx_table_log = naming::tx_table_log_table(catalog_uuid);
 
-        // begin_tx_log (LIST partitioned by branch_uuid)
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -253,7 +228,6 @@ impl PgDialect {
             ))
             .await?;
 
-        // commit_tx_log (LIST partitioned by branch_uuid)
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -270,9 +244,8 @@ impl PgDialect {
             ))
             .await?;
 
-        // abort_tx_log (LIST partitioned by branch_uuid). Append-only
-        // ledger of aborted transactions; CommitTx checks this table as
-        // a precondition and AbortTx writes to it.
+        // Append-only ledger of aborted transactions; CommitTx checks this
+        // table as a precondition and AbortTx writes to it.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -286,8 +259,7 @@ impl PgDialect {
             ))
             .await?;
 
-        // Unique index on commit_tx_log (branch_uuid, commit_micros) to
-        // enforce one commit per timestamp per branch.
+        // Enforces one commit per timestamp per branch.
         let commit_tx_log_idx = format!("idx_{}_committed", commit_tx_log.replace('-', "_"));
         driver
             .execute_no_result(&format!(
@@ -298,9 +270,8 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-428: unique index on (branch_uuid, commit_seq_num) — the
-        // commit-order serial is unique + gapless per branch (allocated
-        // by the `commit_tx_log_seq_num` counter row inside the commit statement).
+        // The commit-order serial is unique + gapless per branch, allocated by
+        // the `commit_tx_log_seq_num` counter row inside the commit statement.
         let commit_tx_log_seq_idx = format!("idx_{}_seq", commit_tx_log.replace('-', "_"));
         driver
             .execute_no_result(&format!(
@@ -311,17 +282,14 @@ impl PgDialect {
             ))
             .await?;
 
-        // tx_table_log (CHA-181): per-(tx, table) summary index. One
-        // row per distinct (tx_uuid, branch_uuid, table_uuid) — bulk
-        // inserts pay one summary row, not per-row overhead. PK alone
-        // enforces idempotent emission across multiple WriteData
-        // calls within the same penca tx.
+        // Per-(tx, table) summary index: bulk inserts pay one summary row, not
+        // per-row overhead, and the PK alone enforces idempotent emission
+        // across multiple WriteData calls within the same penca tx.
         //
-        // PK leads on `tx_uuid` (matching the tx-log family) so
-        // downstream lookups — CHA-5 conflict detection and CHA-168
-        // persist both probe `WHERE tx_uuid IN (...)` after a commit_tx_log
-        // scan — hit the PK directly. No secondary index on tx_uuid
-        // needed.
+        // The PK leads on `tx_uuid` (matching the tx-log family) so downstream
+        // lookups — conflict detection and persist both probe
+        // `WHERE tx_uuid IN (...)` after a commit_tx_log scan — hit the PK
+        // directly, needing no secondary index on tx_uuid.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -336,11 +304,10 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the CHA-428 `commit_tx_log_seq_num` parent — the per-branch gapless
+    /// Create the `commit_tx_log_seq_num` parent — the per-branch gapless
     /// commit-order counter for `commit_tx_log`. Exactly one row per branch
     /// (`branch_uuid` PK) holding `seq_num` = the next `commit_seq_num` to
-    /// assign (seeded at 0). LIST-partitioned by `branch_uuid` like the
-    /// tx-log family; per-branch leaves + their single counter row are
+    /// assign (seeded at 0). Per-branch leaves + their single counter row are
     /// added by [`Self::ensure_tx_log_branch_partitions`].
     ///
     /// Co-located with the tx-log family in the per-branch stack (NOT on
@@ -348,8 +315,7 @@ impl PgDialect {
     /// the same tx as the `commit_tx_log` INSERT, so it must share that pg
     /// instance. A dedicated table also keeps the hot commit counter off
     /// `branch_store`, so commits never lock-contend with branch metadata
-    /// writes. The per-data-table mutation counter (`write_seq_num`) is a
-    /// separate table in CHA-431 (`write_seq_num`).
+    /// writes.
     async fn create_commit_tx_log_seq_num_parent(
         driver: &impl DbDriver,
         catalog_uuid: &Uuid,
@@ -367,21 +333,23 @@ impl PgDialect {
         Ok(())
     }
 
-    /// CHA-487: seed a forked child branch's `commit_tx_log_seq_num` counter
-    /// from the source branch's fork commit, so the child's commit seqs
+    /// Seed a forked child branch's `commit_tx_log_seq_num` counter from the
+    /// source branch's fork commit, so the child's commit seqs
     /// (`> commit_seq_num(T)`) are disjoint from the parent's
-    /// (`<= commit_seq_num(T)`). The existing latest-wins-on-`commit_seq_num`
-    /// resolution then lets the child shadow the parent across the fork
-    /// boundary with no lineage tiebreak — the substrate the cross-branch read
-    /// merge (CHA-178) consumes.
+    /// (`<= commit_seq_num(T)`). Latest-wins-on-`commit_seq_num` resolution
+    /// then lets the child shadow the parent across the fork boundary with no
+    /// lineage tiebreak.
     ///
     /// `fork_seq` is `commit_seq_num(T)`, the fork commit resolved ONCE inside
-    /// PersistBranch (CHA-273 rework) — the source branch's head commit, or the
-    /// named `base_tx`. It is a committed seq by construction (PersistBranch
-    /// reads it from the source's `commit_tx_log`, never the write-side counter,
-    /// which can transiently lead the log by an allocated-but-uncommitted seq),
-    /// so a fork never pins to an uncommitted seq. A source with zero commits
-    /// resolves to `fork_seq = 0` (a default Watermark), seeding the child to 1.
+    /// PersistBranch — the source branch's head commit, or the named `base_tx`.
+    /// It is a committed seq by construction (PersistBranch reads it from the
+    /// source's `commit_tx_log`, never the write-side counter, which can
+    /// transiently lead the log by an allocated-but-uncommitted seq), so a fork
+    /// never pins to an uncommitted seq. Resolving `fork_seq` under
+    /// PersistBranch rather than re-reading `MAX(commit_seq_num)` here also
+    /// closes the window where a source commit between the flush and the
+    /// seed-read would bump `MAX` past `T`. A source with zero commits resolves
+    /// to `fork_seq = 0`, seeding the child to 1.
     ///
     /// The counter row holds the *next* `commit_seq_num` *to assign* and
     /// allocation returns the pre-increment value (see
@@ -391,12 +359,6 @@ impl PgDialect {
     ///
     /// Must run after [`Self::ensure_branch_partitions`] (which seeds the child
     /// counter row to 0) and before the child's first commit.
-    ///
-    /// CHA-273 rework: seeding from the returned `fork_seq` (resolved atomically
-    /// under PersistBranch) — rather than a fresh `MAX(commit_seq_num)` re-read
-    /// in this tx — closes the window where a source commit between the flush and
-    /// the seed-read would bump `MAX` past `T`. The remaining CHA-178 seam is on
-    /// the *metadata-read* axis (the micros-bounded fork read), not this seed.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -414,9 +376,8 @@ impl PgDialect {
     ) -> Result<(), sqlx::Error> {
         let child_seq_num =
             naming::commit_tx_log_seq_num_partition(catalog_uuid, child_branch_uuid);
-        // Set the seed = fork_seq + 1 directly. The child's counter partition
-        // holds exactly its one row; the branch predicate targets it directly
-        // (partition-direct, trusted UUID).
+        // The child's counter partition holds exactly its one row, so the
+        // branch predicate targets it directly (partition-direct, trusted UUID).
         driver
             .execute_no_result(&format!(
                 "UPDATE {child} SET seq_num = {seed} WHERE branch_uuid = '{child_branch_uuid}'",
@@ -427,8 +388,8 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the CHA-444 (ADR 0027) `abort_seq_num` parent — the per-branch
-    /// gapless **abort**-order counter, the abort-axis sibling of
+    /// Create the `abort_seq_num` parent (ADR 0027) — the per-branch gapless
+    /// **abort**-order counter, the abort-axis sibling of
     /// [`Self::create_commit_tx_log_seq_num_parent`]. Exactly one row per branch
     /// (`branch_uuid` PK) holding `seq_num` = the next `aborted_at_seq_num` to
     /// assign (seeded at 0). Incremented under a row lock in the same
@@ -454,17 +415,15 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the CHA-198 persist + snapshot metadata parent tables.
+    /// Create the persist + snapshot metadata parent tables.
     ///
     /// LIST-partitioned by `branch_uuid` (one leaf per branch, matches
     /// the tx-log family). Composite PKs `(branch_uuid, <existing>)`;
-    /// per-segment `commit_micros` gates plan visibility unchanged.
+    /// per-segment `commit_micros` gates plan visibility.
     ///
-    /// CHA-203: `log_kind` lives on `table_persist_metadata` only (part
-    /// of the deterministic identity chain). Segments JOIN up to read
-    /// the kind — no denormalized column. The text columns
-    /// `hot_storage_table_name` and `data_log_prefix_uuid` are gone
-    /// from every parent below.
+    /// `log_kind` lives on `table_persist_metadata` only, as part of the
+    /// deterministic identity chain; segments JOIN up to read the kind rather
+    /// than denormalizing a column.
     async fn create_persist_snapshot_metadata_parents(
         driver: &impl DbDriver,
         catalog_uuid: &Uuid,
@@ -478,11 +437,11 @@ impl PgDialect {
         let table_snapshot_segment_metadata =
             naming::table_snapshot_segment_metadata_table(catalog_uuid);
 
-        // table_persist_metadata — one row per (branch, table, persisted_at,
-        // log_kind). `log_kind` is part of the deterministic identity
-        // chain (`table_persist_uuid = row_uuid_for_pk(catalog_uuid,
-        // [branch_uuid, table_uuid, persisted_at, log_kind])`),
-        // CHECK-restricted to the closed set the writer emits.
+        // One row per (branch, table, persisted_at, log_kind). `log_kind` is
+        // part of the deterministic identity chain (`table_persist_uuid =
+        // row_uuid_for_pk(catalog_uuid, [branch_uuid, table_uuid,
+        // persisted_at, log_kind])`), hence the CHECK pinning it to the closed
+        // set the writer emits.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -505,17 +464,15 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_persist_segment_metadata — one row per cold file. Plan
-        // visibility gates on the segment's own `commit_micros`.
-        // Segments JOIN to `table_persist_metadata` on `table_persist_uuid`
-        // for the log_kind classification.
+        // One row per cold file. Plan visibility gates on the segment's own
+        // `commit_micros`; segments JOIN to `table_persist_metadata` on
+        // `table_persist_uuid` for the log_kind classification.
         //
-        // `is_sealed` (CHA-202): per-scope active+sealed compact model.
-        // `false` for both uncompacted rows and rows pointing at the
-        // current active merged file; `true` for rows of a previously-
-        // sealed merged file. Sealed rows never participate in another
-        // compact wave. One-way transition false → true (set on
-        // seal-and-start-new boundary).
+        // `is_sealed` drives the per-scope active+sealed compact model:
+        // `false` for both uncompacted rows and rows pointing at the current
+        // active merged file, `true` for rows of a previously-sealed merged
+        // file. Sealed rows never participate in another compact wave, and the
+        // false → true transition is one-way.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -545,15 +502,16 @@ impl PgDialect {
             ))
             .await?;
 
-        // tx_log_persist_segment_metadata (CHA-507) — one row per cold
-        // tx_log file. persist_tx_log flushes a slim per-branch commit map
-        // (commit_seq_num -> commit_micros/author/comment) so fork positions
-        // and audit tx-metadata survive hot commit_tx_log GC. Slim +
-        // low-volume, so unpartitioned with branch_uuid as a column (unlike
-        // the high-volume, per-branch-partitioned persist segment index).
-        // `committed_at_micros` NULL = uncommitted: the two-phase durable
-        // write inserts NULL, writes the file, then stamps it committed, so a
-        // crashed flush leaves the row invisible to reads and the watermark.
+        // One row per cold tx_log file. persist_tx_log flushes a slim
+        // per-branch commit map (commit_seq_num -> commit_micros/author/
+        // comment) so fork positions and audit tx-metadata survive hot
+        // commit_tx_log GC. Slim + low-volume, so unpartitioned with
+        // branch_uuid as a plain column, unlike the high-volume,
+        // per-branch-partitioned persist segment index.
+        //
+        // `committed_at_micros` NULL = uncommitted: the two-phase durable write
+        // inserts NULL, writes the file, then stamps it committed, so a crashed
+        // flush leaves the row invisible to reads and the watermark.
         let tx_log_persist_segment_metadata =
             naming::tx_log_persist_segment_metadata_table(catalog_uuid);
         driver
@@ -575,16 +533,13 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_purge_metadata — one row per purge wave that advances a
-        // watermark. CHA-444 (ADR 0027): seq-only. `last_purged_commit_seq_num`
-        // (`Pu`) is the committed hot↔cold read fence `plan()` reads;
-        // `last_purged_aborted_seq_num` (`Pa`) is the abort cleanup frontier.
-        // Both nullable — a wave records only the axis(es) it advanced; the
-        // branch-min/MAX consumers ignore NULL. `purged_at_micros` is gone (its
-        // watermark role moved to the seq columns; the deterministic
-        // `table_purge_uuid` seed moved to the `(Pu, Pa)` pair). `commit_micros`
-        // stays — it is the two-phase commit timestamp, used by commit_tx_log GC's
-        // as-of isolation. LIST-partitioned by branch_uuid.
+        // One row per purge wave that advances a watermark. Seq-only per
+        // ADR 0027: `last_purged_commit_seq_num` (`Pu`) is the committed
+        // hot↔cold read fence `plan()` reads; `last_purged_aborted_seq_num`
+        // (`Pa`) is the abort cleanup frontier. Both nullable — a wave records
+        // only the axis(es) it advanced, and the branch-min/MAX consumers
+        // ignore NULL. `commit_micros` is NOT a watermark: it is the two-phase
+        // commit timestamp, used by commit_tx_log GC's as-of isolation.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -601,19 +556,15 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_metadata
+        // `partition_keys` / `clustering_keys` are the write-time layout keys
+        // that governed this snapshot's partition split and intra-partition
+        // sort (clustering defaults to primary keys when unset). Parent-level,
+        // not per-segment: a key change between snapshots forces a full rewrite
+        // (ADR 0024), so every segment in one snapshot shares one key set by
+        // construction. Carry-forward reads them for key-change detection.
         //
-        // `partition_keys` / `clustering_keys` (CHA-404): the write-time
-        // layout keys that governed this snapshot's partition split and
-        // intra-partition sort (clustering defaults to primary keys when
-        // unset). Parent-level, not per-segment: a key change between
-        // snapshots forces a full rewrite (ADR 0024), so every segment
-        // in one snapshot shares one key set by construction. CHA-406's
-        // carry-forward reads them for key-change detection.
-        //
-        // This DDL only runs at CreateCatalog; pre-release there is no
-        // in-place migration path — recreate catalogs that predate a
-        // schema change.
+        // This DDL only runs at CreateCatalog; pre-release there is no in-place
+        // migration path — recreate catalogs that predate a schema change.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -643,13 +594,11 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_segment_metadata
-        //
-        // Snapshot segments are immutable — never compacted (ADR 0024,
-        // CHA-407): no `is_sealed`, no active+sealed model on this
-        // side. `"offset"`/`length` are the CHA-404 packed row-range
-        // addressing, written explicitly on every row (a single-segment
-        // file is the whole-file range, never NULL), hence NOT NULL.
+        // Snapshot segments are immutable — never compacted (ADR 0024) — so
+        // there is no `is_sealed` and no active+sealed model on this side.
+        // `"offset"`/`length` are packed row-range addressing, written
+        // explicitly on every row (a single-segment file is the whole-file
+        // range, never NULL), hence NOT NULL.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -674,23 +623,20 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-202: in-flight compact merged-file tracking, distinct from
-        // `table_persist_segment_metadata`. The compactor INSERTs a
-        // row(NULL) before writing a merged file, then UPDATEs
-        // `commit_micros` inside the same tx that re-points the
-        // input `table_persist_segment_metadata` rows. On crash, the
-        // NULL-row + file remain on disk for a future orphan-cleanup
-        // routine — concurrent compaction safety itself comes from
-        // `SELECT FOR UPDATE` on the input segment rows, not from any
-        // sweep over this table. `branch_uuid` / `table_uuid` are
-        // NOT NULL so any helper that forgets to pin scope fails
-        // loudly at INSERT.
+        // In-flight compact merged-file tracking, distinct from
+        // `table_persist_segment_metadata`. The compactor INSERTs a row(NULL)
+        // before writing a merged file, then UPDATEs `commit_micros` inside the
+        // same tx that re-points the input `table_persist_segment_metadata`
+        // rows. On crash, the NULL-row + file remain on disk for a future
+        // orphan-cleanup routine — concurrent compaction safety itself comes
+        // from `SELECT FOR UPDATE` on the input segment rows, not from any
+        // sweep over this table. `branch_uuid` / `table_uuid` are NOT NULL so
+        // any helper that forgets to pin scope fails loudly at INSERT.
         //
-        // Partitioned BY LIST (branch_uuid) (CHA-198 shape) so
-        // `DeleteBranch` reclaims rows via DROP PARTITION CASCADE in
-        // `drop_branch_partitions`. `branch_uuid` participates in the
-        // PK because PG requires the partition key in any unique
-        // constraint.
+        // Partitioned BY LIST (branch_uuid) so `DeleteBranch` reclaims rows via
+        // DROP PARTITION CASCADE in `drop_branch_partitions`. `branch_uuid`
+        // participates in the PK because PG requires the partition key in any
+        // unique constraint.
         //
         // No FK to `table_persist_segment_metadata` (ADR 0015). No indices
         // beyond the PK — the in-flight set is small and orphan cleanup
@@ -709,21 +655,18 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-233 / ADR 0019 §"Four-part mechanism" item 3:
-        // segment_delete_set holds cold segment files queued for
-        // physical deletion past the universal grace window. The
-        // persist-compact merge tx INSERTs one row per replaced old
+        // ADR 0019 §"Four-part mechanism" item 3: segment_delete_set holds cold
+        // segment files queued for physical deletion past the universal grace
+        // window. The persist-compact merge tx INSERTs one row per replaced old
         // URI atomically with the URI swap on
-        // `table_persist_segment_metadata`; `sweep_segments` reads
-        // rows whose `written_at_micros + query_timeout < now`,
-        // deletes the cold file, then deletes the row. The sweep
-        // discriminates only by `object_uri` — no `kind` column.
+        // `table_persist_segment_metadata`; `sweep_segments` reads rows whose
+        // `written_at_micros + query_timeout < now`, deletes the cold file,
+        // then deletes the row. The sweep discriminates only by `object_uri` —
+        // there is deliberately no `kind` column.
         //
-        // Partitioned BY LIST (branch_uuid) so `DeleteBranch`
-        // reclaims rows via DROP PARTITION CASCADE; `branch_uuid`
-        // participates in the PK per PG's partition-key constraint.
-        // The `(branch_uuid, written_at_micros)` index serves the
-        // sweep scan after partition pruning.
+        // Partitioned BY LIST (branch_uuid) so `DeleteBranch` reclaims rows via
+        // DROP PARTITION CASCADE; `branch_uuid` participates in the PK per PG's
+        // partition-key constraint.
         let segment_delete_set = naming::segment_delete_set_table(catalog_uuid);
         driver
             .execute_no_result(&format!(
@@ -739,20 +682,18 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_index_metadata (CHA-412 / ADR 0026 §5): the PARENT
-        // of the cold-index materialization — one row per `(snapshot, index)`,
-        // the snapshot "has" this index. Mirrors `table_snapshot_metadata`: a
-        // fileless header, two-phase committed, retired with the snapshot,
-        // re-declared fresh each snapshot. `index_uuid` is NULLable (NULL ⇒
-        // the strictly-internal `row_uuid` identity index; non-NULL ⇒ a
-        // logical, un-enforced reference to `__penca_system__.indexes`, ADR
-        // 0015). The role discriminator IS `index_uuid IS NULL` — there is no
-        // `index_kind`. `key_columns` (CHA-485) denormalizes a USER index's
-        // declared key columns onto the snapshot-scoped header so planner
-        // covering-index selection reads only snapshot-index metadata (ADR
-        // 0026 §5 — planning never reads `index_metadata`); NULL for the
-        // internal identity index and the built-in system name indexes
-        // (neither is planner-selectable). LIST-partitioned by `branch_uuid`.
+        // The PARENT of the cold-index materialization (ADR 0026 §5) — one row
+        // per `(snapshot, index)`. Mirrors `table_snapshot_metadata`: a fileless
+        // header, two-phase committed, retired with the snapshot, re-declared
+        // fresh each snapshot. `index_uuid` is NULLable (NULL ⇒ the
+        // strictly-internal `row_uuid` identity index; non-NULL ⇒ a logical,
+        // un-enforced reference to `__penca_system__.indexes`, ADR 0015); that
+        // NULL-ness IS the role discriminator, so there is no `index_kind`.
+        // `key_columns` denormalizes a USER index's declared key columns onto
+        // this snapshot-scoped header so planner covering-index selection reads
+        // only snapshot-index metadata and never `index_metadata`; NULL for the
+        // internal identity index and the built-in system name indexes, neither
+        // of which is planner-selectable.
         let table_snapshot_index_metadata =
             naming::table_snapshot_index_metadata_table(catalog_uuid);
         driver
@@ -771,18 +712,16 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_segment_index_metadata (CHA-412 / ADR 0026 §5): the
-        // CHILD — one row per `(segment, index)` sidecar, referencing its
-        // parent via `table_snapshot_index_uuid`. Shaped like
+        // The CHILD (ADR 0026 §5) — one row per `(segment, index)` sidecar,
+        // referencing its parent via `table_snapshot_index_uuid`. Shaped like
         // `table_snapshot_segment_metadata` because an index sidecar is itself
         // a cold file: `object_uri`/`offset`/`length` addressing, `statistics`
         // (indexed-key min/max bounds, binary — decoded in-planner by the
-        // CHA-454 seek), the two-phase commit pair, and `segment_delete_set`
-        // GC participation. The index identity (internal `row_uuid` vs a user
-        // index) lives on the parent (`table_snapshot_index_metadata.index_uuid`);
-        // the child carries only the `table_snapshot_index_uuid` FK. Carries
-        // forward by reference with its base segment. The artifact BUILD that
-        // writes new-segment rows is CHA-412.
+        // seek), the two-phase commit pair, and `segment_delete_set` GC
+        // participation. The index identity (internal `row_uuid` vs a user
+        // index) lives on the parent, so the child carries only the
+        // `table_snapshot_index_uuid` FK and carries forward by reference with
+        // its base segment.
         let table_snapshot_segment_index_metadata =
             naming::table_snapshot_segment_index_metadata_table(catalog_uuid);
         driver
@@ -808,8 +747,7 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the CHA-198 secondary indexes on the persist + snapshot
-    /// metadata parents.
+    /// Create the secondary indexes on the persist + snapshot metadata parents.
     ///
     /// Created on the parent → PG propagates a matching index to every
     /// current and future leaf partition. Without these, LIST
@@ -859,13 +797,13 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_purge_metadata: load-bearing for the seq watermark MAX
-        // queries (CHA-444 / ADR 0027). `plan()`'s read fence reads
-        // `MAX(last_purged_commit_seq_num)` (`Pu`) and commit_tx_log GC reads both
-        // `MAX(last_purged_commit_seq_num)` and `MAX(last_purged_aborted_seq_num)`
-        // (`Pa`), each `WHERE table_uuid = $ AND commit_micros IS NOT
-        // NULL`. One partial index per seq column lets MAX walk the leaf once
-        // and skips phase-1 (uncommitted) rows in-index.
+        // Load-bearing for the seq watermark MAX queries (ADR 0027). `plan()`'s
+        // read fence reads `MAX(last_purged_commit_seq_num)` (`Pu`) and
+        // commit_tx_log GC reads both that and
+        // `MAX(last_purged_aborted_seq_num)` (`Pa`), each
+        // `WHERE table_uuid = $ AND commit_micros IS NOT NULL`. One partial
+        // index per seq column lets MAX walk the leaf once and skips phase-1
+        // (uncommitted) rows in-index.
         let idx_tpm_pu = format!("idx_{cat_u}_tpm_pu");
         driver
             .execute_no_result(&format!(
@@ -887,15 +825,15 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_metadata: load-bearing for
-        // read_snapshot_segments_for_table's "latest committed snapshot"
-        // sub-select (`ORDER BY snapshotted_at_micros DESC LIMIT 1`)
-        // and `MAX(snapshotted_at_micros)` in `get_table_metadata`.
-        // The current `(table_uuid, commit_micros DESC)` shape
-        // is a point lookup by `table_uuid` only — neither consumer
-        // sorts on `commit_micros`, so its DESC ordering does
-        // nothing useful here. Pre-existing; reshaping is tracked
-        // separately.
+        // Load-bearing for read_snapshot_segments_for_table's "latest committed
+        // snapshot" sub-select (`ORDER BY snapshotted_at_micros DESC LIMIT 1`)
+        // and `MAX(snapshotted_at_micros)` in `last_durable_snapshot_at`. The
+        // `(table_uuid, commit_micros DESC)` shape acts as a point lookup by
+        // `table_uuid` only — neither consumer sorts on `commit_micros`, so the
+        // DESC ordering does nothing useful, and `branch_uuid` (in every
+        // consumer's WHERE) is absent from the key entirely.
+        // TODO(CHA-535): reshape to what the consumers actually filter and
+        // order by, once measurement confirms it matters at realistic scale.
         let idx_tsm_t = format!("idx_{cat_u}_tsm_t");
         driver
             .execute_no_result(&format!(
@@ -906,8 +844,8 @@ impl PgDialect {
             ))
             .await?;
 
-        // table_snapshot_segment_metadata: load-bearing for the JOIN in
-        // get_snapshot_segments_for_table + get_table_metadata.
+        // Load-bearing for the JOIN in get_snapshot_segments_for_table +
+        // get_table_metadata.
         let idx_tssm_snap = format!("idx_{cat_u}_tssm_snap");
         driver
             .execute_no_result(&format!(
@@ -918,12 +856,10 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-202: partial index on `(branch_uuid) WHERE is_sealed =
-        // false`, persist side only (snapshot segments are immutable
-        // and never compact — ADR 0024). Compact enumerates the
-        // unsealed subset per scope on every wave; on a long-running
-        // branch the sealed set accumulates faster than the unsealed,
-        // so a partial index that contains only unsealed rows keeps
+        // Persist side only — snapshot segments are immutable and never compact
+        // (ADR 0024). Compact enumerates the unsealed subset per scope on every
+        // wave; on a long-running branch the sealed set accumulates faster than
+        // the unsealed, so a PARTIAL index containing only unsealed rows keeps
         // enumeration cheap as the total row count grows.
         let idx_tfsm_seal = format!("idx_{cat_u}_tfsm_seal");
         driver
@@ -935,18 +871,15 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-233: segment_delete_set.sweep_segments scans by
-        // `written_at_micros < now - query_timeout` after partition
-        // pruning on `branch_uuid`. The `(branch_uuid,
-        // written_at_micros)` index bounds the scan to grace-expired
-        // rows rather than the whole deferred set. Since CHA-405's
-        // refcount gate, grace-expired is not the same as deletable:
-        // a URI queued by an early retirement while later snapshots
-        // still reference it (carry-forward) sits in the expired range
-        // until the last reference drops, so each sweep re-scans that
-        // standing subset and pays one index-served `object_uri` probe
-        // per row. Enqueue-at-last-drop is the structural alternative
-        // if the blocked set ever proves large in practice.
+        // `sweep_segments` scans by `written_at_micros < now - query_timeout`
+        // after partition pruning on `branch_uuid`; this index bounds the scan
+        // to grace-expired rows rather than the whole deferred set. Note
+        // grace-expired is NOT the same as deletable under the refcount gate: a
+        // URI queued by an early retirement while later snapshots still
+        // reference it (carry-forward) sits in the expired range until the last
+        // reference drops, so each sweep re-scans that standing subset and pays
+        // one index-served `object_uri` probe per row. Enqueue-at-last-drop is
+        // the structural alternative if the blocked set ever proves large.
         let idx_sds_age = format!("idx_{cat_u}_sds_age");
         driver
             .execute_no_result(&format!(
@@ -957,17 +890,15 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-405: the sweep's refcount gate anti-joins each eligible
-        // `segment_delete_set` row against
-        // `table_snapshot_segment_metadata` on `object_uri` (delete
-        // only at snapshot reference count zero, ADR 0024 §4). This
-        // index serves that per-candidate probe; partition pruning on
-        // `branch_uuid` happens first, so the URI alone suffices.
+        // The sweep's refcount gate anti-joins each eligible
+        // `segment_delete_set` row against `table_snapshot_segment_metadata` on
+        // `object_uri` (delete only at snapshot reference count zero,
+        // ADR 0024 §4). This index serves that per-candidate probe; partition
+        // pruning on `branch_uuid` happens first, so the URI alone suffices.
         //
-        // Stale-catalog note (pre-release, in-place DDL): this CREATE
-        // only runs at CreateCatalog, so catalogs created before
-        // CHA-405 lack the index — the gate stays correct there, the
-        // probe just seq-scans the branch leaf.
+        // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
+        // at CreateCatalog, so older catalogs lack the index — the gate stays
+        // correct there, the probe just seq-scans the branch leaf.
         let idx_tssm_uri = format!("idx_{cat_u}_tssm_uri");
         driver
             .execute_no_result(&format!(
@@ -978,12 +909,11 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-412: table_snapshot_segment_index_metadata (the child) is read
-        // by query planning (CHA-454) grouped by `segment_uuid` (probe the
-        // sidecars for the base segments in the plan), and the carry-forward /
-        // GC-enqueue plumbing looks rows up by the same key. Index
-        // `(segment_uuid)` so that lookup is served after the `branch_uuid`
-        // partition prune instead of a leaf seq-scan.
+        // The child table is read by query planning grouped by `segment_uuid`
+        // (probe the sidecars for the base segments in the plan), and the
+        // carry-forward / GC-enqueue plumbing looks rows up by the same key.
+        // Without this the lookup is a leaf seq-scan after the `branch_uuid`
+        // partition prune.
         let table_snapshot_segment_index_metadata =
             naming::table_snapshot_segment_index_metadata_table(catalog_uuid);
         let idx_tssim_seg = format!("idx_{cat_u}_tssim_seg");
@@ -996,12 +926,10 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-412: the GC sweep's refcount gate
-        // (`eligible_segment_delete_set_rows`) anti-joins the child sidecar
-        // table on `object_uri` to pin shared carried-sidecar files, mirroring
-        // the base-segment `idx_..._tssm_uri` probe. Index `(object_uri)` so
-        // that per-candidate probe is served after the `branch_uuid` partition
-        // prune instead of a leaf seq-scan.
+        // The GC sweep's refcount gate (`eligible_segment_delete_set_rows`)
+        // anti-joins the child sidecar table on `object_uri` to pin shared
+        // carried-sidecar files, mirroring the base-segment `idx_..._tssm_uri`
+        // probe.
         let idx_tssim_uri = format!("idx_{cat_u}_tssim_uri");
         driver
             .execute_no_result(&format!(
@@ -1012,10 +940,9 @@ impl PgDialect {
             ))
             .await?;
 
-        // CHA-412: query planning (CHA-454) asks "does snapshot S have index
-        // X?" against the parent `table_snapshot_index_metadata` keyed by
-        // `table_snapshot_uuid`. Index it so that lookup is served after the
-        // `branch_uuid` partition prune instead of a leaf seq-scan.
+        // Query planning asks "does snapshot S have index X?" against the
+        // parent keyed by `table_snapshot_uuid`; without this the lookup is a
+        // leaf seq-scan after the `branch_uuid` partition prune.
         let table_snapshot_index_metadata =
             naming::table_snapshot_index_metadata_table(catalog_uuid);
         let idx_tsim_snap = format!("idx_{cat_u}_tsim_snap");
@@ -1032,13 +959,12 @@ impl PgDialect {
 
     /// Seed the genesis tx row + main `branch_store` row, then bootstrap
     /// `__penca_system__.{schemas,tables}` as real Penca Tables on the
-    /// main branch (CHA-177). Assumes the tx-log family + metadata
-    /// branch partitions for `main_branch_uuid` already exist.
+    /// main branch. Assumes the tx-log family + metadata branch partitions for
+    /// `main_branch_uuid` already exist.
     ///
-    /// `main_branch_uuid` is random-minted by the caller (CHA-236) and
-    /// threaded in. Bootstrap row insertion for the system tables is
-    /// handled by `penca_storage_meta::LifecycleManager` — pg_dialect
-    /// just creates the data tables here.
+    /// Bootstrap ROW insertion for the system tables is handled by
+    /// `penca_storage_meta::LifecycleManager`; this only creates the data
+    /// tables.
     async fn seed_genesis_and_system_tables(
         driver: &impl DbDriver,
         catalog_uuid: &Uuid,
@@ -1049,17 +975,16 @@ impl PgDialect {
         let commit_tx_log_part = naming::commit_tx_log_partition(catalog_uuid, main_branch_uuid);
         let commit_tx_log_seq_num_part =
             naming::commit_tx_log_seq_num_partition(catalog_uuid, main_branch_uuid);
-        // `began_at_micros` uses the Postgres server clock to match how
-        // every other tx row is written (`microsecond_epoch()` is the
-        // canonical NOW expression). Mirrors the Python genesis path
-        // (`metadata.py::create_catalog_tables`).
+        // `began_at_micros` uses the Postgres server clock to match how every
+        // other tx row is written — `microsecond_epoch()` is the canonical NOW
+        // expression.
         let now_micros = Self::microsecond_epoch();
-        // CHA-428: genesis is the first commit, so it allocates commit_seq_num = 0
-        // from the same counter every other commit uses. The commit_tx_log counter
-        // row was seeded by `ensure_tx_log_branch_partitions` (run at line ~188
-        // of `create_catalog_tables`, before this fn at ~190), so it exists.
-        // This direct INSERT mirrors the `commit_tx_log_insert_sql` CTE (genesis skips
-        // begin_tx_log, so it can't route through that shared path).
+        // Genesis is the first commit, so it allocates commit_seq_num = 0 from
+        // the same counter every other commit uses; the counter row was seeded
+        // by `ensure_tx_log_branch_partitions`, which `create_catalog_tables`
+        // runs before this. The INSERT duplicates the `commit_tx_log_insert_sql`
+        // CTE because genesis skips begin_tx_log and so cannot route through
+        // that shared path.
         driver
             .execute_no_result(&format!(
                 r#"WITH c AS (
@@ -1089,9 +1014,8 @@ impl PgDialect {
 
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(catalog_uuid);
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
-        // create_data_tables returns DataTableError (which wraps
-        // sqlx::Error); the system table schemas are static + valid
-        // so the only failure mode is sqlx::Error in practice.
+        // The system table schemas are static + valid, so the only reachable
+        // `DataTableError` variant here is `Sql`; anything else is a bug.
         Self::create_data_tables(
             driver,
             &sys_schemas_table_uuid,
@@ -1116,7 +1040,6 @@ impl PgDialect {
             DataTableError::Sql(s) => s,
             other => panic!("unexpected DDL error in bootstrap: {other:?}"),
         })?;
-        // CHA-455: the third system Penca Table, `__penca_system__.indexes`.
         let sys_indexes_table_uuid = naming::system_indexes_table_uuid(catalog_uuid);
         Self::create_data_tables(
             driver,
@@ -1135,8 +1058,8 @@ impl PgDialect {
 
     /// Drop all per-catalog tables (CASCADE removes any sub-partitions).
     ///
-    /// `main_branch_uuid` is required to address main's system-table
-    /// physicals (post-CHA-236 it's random and threaded by the caller).
+    /// `main_branch_uuid` is required to address main's system-table physicals:
+    /// it is randomly minted, so it cannot be re-derived here.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -1171,21 +1094,17 @@ impl PgDialect {
             naming::abort_tx_log_table(catalog_uuid),
             naming::commit_tx_log_table(catalog_uuid),
             naming::begin_tx_log_table(catalog_uuid),
-            // CHA-428: per-branch commit-order counter parent.
             naming::commit_tx_log_seq_num_table(catalog_uuid),
-            // CHA-444: per-branch abort-order counter parent.
             naming::abort_seq_num_table(catalog_uuid),
             naming::branch_store_table(catalog_uuid),
         ];
         Self::drop_tables_if_exist(driver, &tables).await
     }
 
-    /// Arrow schema for `__penca_system__.schemas` user columns
-    /// (CHA-177). Mirrors `util.schema.SYSTEM_SCHEMAS_USER_COLUMNS`.
-    /// `schema_uuid` is the row's own identity as a first-class PK column
-    /// (CHA-380); `row_uuid = row_uuid_for_pk(system_schemas_table_uuid,
-    /// [schema_uuid])` like every other Penca table. Branch is implicit in
-    /// partition placement.
+    /// Arrow schema for `__penca_system__.schemas` user columns.
+    /// `schema_uuid` is the row's own identity as a first-class PK column, so
+    /// `row_uuid = row_uuid_for_pk(system_schemas_table_uuid, [schema_uuid])`
+    /// like every other Penca table. Branch is implicit in partition placement.
     pub fn system_schemas_arrow_schema() -> arrow::datatypes::Schema {
         use arrow::datatypes::{DataType, Field};
         arrow::datatypes::Schema::new(vec![
@@ -1197,13 +1116,12 @@ impl PgDialect {
         ])
     }
 
-    /// Arrow schema for `__penca_system__.tables` user columns
-    /// (CHA-177). Mirrors `util.schema.SYSTEM_TABLES_USER_COLUMNS`.
-    /// `table_uuid` is the row's own identity as a first-class PK column
-    /// (CHA-380); `row_uuid = row_uuid_for_pk(system_tables_table_uuid,
-    /// [table_uuid])` like every other Penca table. Branch is implicit in
-    /// partition placement. `schema_uuid` is a distinct foreign key (each
-    /// row's schema parent), not the row's own identity.
+    /// Arrow schema for `__penca_system__.tables` user columns.
+    /// `table_uuid` is the row's own identity as a first-class PK column, so
+    /// `row_uuid = row_uuid_for_pk(system_tables_table_uuid, [table_uuid])`
+    /// like every other Penca table. Branch is implicit in partition placement.
+    /// `schema_uuid` is a distinct foreign key (each row's schema parent), NOT
+    /// the row's own identity.
     pub fn system_tables_arrow_schema() -> arrow::datatypes::Schema {
         use arrow::datatypes::{DataType, Field};
         arrow::datatypes::Schema::new(vec![
@@ -1244,13 +1162,12 @@ impl PgDialect {
         ])
     }
 
-    /// Arrow schema for `__penca_system__.indexes` user columns
-    /// (CHA-455). `index_uuid` is the row's own identity as a first-class PK
-    /// column (CHA-380); `row_uuid = row_uuid_for_pk(system_indexes_table_uuid,
-    /// [index_uuid])`. Branch is implicit in partition placement. `table_uuid`
-    /// is a distinct foreign key (the owning table, the list-by-table filter
-    /// key), NOT the row's own identity; `index_name` is unique only within
-    /// that table.
+    /// Arrow schema for `__penca_system__.indexes` user columns.
+    /// `index_uuid` is the row's own identity as a first-class PK column, so
+    /// `row_uuid = row_uuid_for_pk(system_indexes_table_uuid, [index_uuid])`.
+    /// Branch is implicit in partition placement. `table_uuid` is a distinct
+    /// foreign key (the owning table, the list-by-table filter key), NOT the
+    /// row's own identity; `index_name` is unique only within that table.
     pub fn system_indexes_arrow_schema() -> arrow::datatypes::Schema {
         use arrow::datatypes::{DataType, Field};
         arrow::datatypes::Schema::new(vec![
@@ -1271,9 +1188,9 @@ impl PgDialect {
     }
 
     /// The declared primary-key column of each `__penca_system__` table — the
-    /// row's own entity uuid (CHA-380). These are the single source of truth
-    /// for the PK passed to `create_data_tables` (widening the delete log) and
-    /// seeded onto the self-describing rows so `row_uuid = row_uuid_for_pk(
+    /// row's own entity uuid. The single source of truth for the PK passed to
+    /// `create_data_tables` (widening the delete log) and seeded onto the
+    /// self-describing rows so `row_uuid = row_uuid_for_pk(
     /// system_<x>_table_uuid, [<entity>_uuid])` holds like every other table.
     pub fn system_schemas_primary_keys() -> Vec<String> {
         vec!["schema_uuid".to_string()]
@@ -1290,19 +1207,14 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: branch partitions (CHA-177: tx-log family only)
-// ---------------------------------------------------------------------------
-
 impl PgDialect {
     /// Create all per-catalog log partitions for a branch.
     ///
-    /// Creates the tx-log-family branch partitions (CHA-181) and the
-    /// CHA-198 persist + snapshot metadata branch partitions. CHA-177:
-    /// schema/table metadata are first-class Penca Tables under
-    /// `__penca_system__.{schemas,tables}` — their per-branch physicals
-    /// are created by the standard CreateBranch materialize path
-    /// (`write_data` against the system tables), not here. Idempotent.
+    /// Creates the tx-log-family branch partitions and the persist + snapshot
+    /// metadata branch partitions. Schema/table metadata are first-class Penca
+    /// Tables under `__penca_system__.{schemas,tables}`, so their per-branch
+    /// physicals are created by the standard CreateBranch materialize path
+    /// (`write_data` against the system tables), NOT here. Idempotent.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -1315,9 +1227,9 @@ impl PgDialect {
     ) -> Result<(), sqlx::Error> {
         Self::ensure_tx_log_branch_partitions(driver, catalog_uuid, branch_uuid).await?;
         Self::ensure_metadata_branch_partitions(driver, catalog_uuid, branch_uuid).await?;
-        // CHA-177: each branch gets its own physical for the system
-        // tables (per-branch deterministic prefix). Bootstrap them now
-        // so materialize / CRUD writes have somewhere to land.
+        // Each branch gets its own physical for the system tables (per-branch
+        // deterministic prefix); bootstrap them now so materialize / CRUD
+        // writes have somewhere to land.
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(catalog_uuid);
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
         let sys_indexes_table_uuid = naming::system_indexes_table_uuid(catalog_uuid);
@@ -1345,7 +1257,6 @@ impl PgDialect {
             DataTableError::Sql(s) => s,
             other => panic!("unexpected DDL error in branch bootstrap: {other:?}"),
         })?;
-        // CHA-455: `__penca_system__.indexes` per-branch physical.
         Self::create_data_tables(
             driver,
             &sys_indexes_table_uuid,
@@ -1377,32 +1288,25 @@ impl PgDialect {
             naming::abort_tx_log_partition(catalog_uuid, branch_uuid),
             naming::commit_tx_log_partition(catalog_uuid, branch_uuid),
             naming::begin_tx_log_partition(catalog_uuid, branch_uuid),
-            // CHA-428: per-branch commit-order counter partition.
             naming::commit_tx_log_seq_num_partition(catalog_uuid, branch_uuid),
-            // CHA-444: per-branch abort-order counter partition.
             naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
-            // CHA-198: per-branch persist + snapshot metadata partitions
-            // hang under the same per-catalog parents; drop them in the
-            // same CASCADE loop so DeleteBranch leaves no residue.
+            // The persist + snapshot metadata partitions hang under the same
+            // per-catalog parents, so they drop in this same CASCADE loop and
+            // DeleteBranch leaves no residue.
             naming::table_snapshot_segment_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_snapshot_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_purge_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_persist_segment_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
-            // CHA-202: in-flight compact tracking is also per-branch
-            // partitioned; drop alongside the rest.
             naming::compact_segment_metadata_partition(catalog_uuid, branch_uuid),
-            // CHA-233: segment_delete_set partition. DROP CASCADE
-            // here drops any pending deferred-delete rows along with
-            // the branch; the underlying cold files are reclaimed by
-            // the cold-side branch teardown.
+            // DROP CASCADE discards any pending deferred-delete rows along with
+            // the branch; the underlying cold files are reclaimed by the
+            // cold-side branch teardown.
             naming::segment_delete_set_partition(catalog_uuid, branch_uuid),
-            // CHA-412: per-branch cold-index parent + child metadata partitions.
             naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),
             naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
         ];
         Self::drop_tables_if_exist(driver, &tx_partitions).await?;
-        // Drop branch's system-table data tables.
         let sys_schemas_table_uuid = naming::system_schemas_table_uuid(catalog_uuid);
         let sys_tables_table_uuid = naming::system_tables_table_uuid(catalog_uuid);
         let sys_indexes_table_uuid = naming::system_indexes_table_uuid(catalog_uuid);
@@ -1438,12 +1342,10 @@ impl PgDialect {
                 naming::tx_table_log_partition(catalog_uuid, branch_uuid),
                 naming::tx_table_log_table(catalog_uuid),
             ),
-            // CHA-428: per-branch commit-order counter partition, seeded below.
             (
                 naming::commit_tx_log_seq_num_partition(catalog_uuid, branch_uuid),
                 naming::commit_tx_log_seq_num_table(catalog_uuid),
             ),
-            // CHA-444: per-branch abort-order counter partition, seeded below.
             (
                 naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
                 naming::abort_seq_num_table(catalog_uuid),
@@ -1452,11 +1354,11 @@ impl PgDialect {
 
         Self::ensure_list_partitions(driver, branch_uuid, &partitions).await?;
 
-        // CHA-428 / CHA-444: seed this branch's commit-order and abort-order
-        // counter rows (next-to-assign = 0). Seeded here — the inner fn both
-        // `create_catalog_tables` (before genesis) and `ensure_branch_partitions`
-        // (CreateBranch) call — so genesis and every new branch can allocate
-        // from them. Idempotent so re-runs are no-ops.
+        // Seed this branch's commit-order and abort-order counter rows
+        // (next-to-assign = 0). This is the inner fn that BOTH
+        // `create_catalog_tables` (before genesis) and
+        // `ensure_branch_partitions` (CreateBranch) call, so genesis and every
+        // new branch can allocate from them. Idempotent so re-runs are no-ops.
         for part in [
             naming::commit_tx_log_seq_num_partition(catalog_uuid, branch_uuid),
             naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
@@ -1472,8 +1374,7 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the CHA-198 persist + snapshot metadata branch partitions
-    /// for a branch.
+    /// Create the persist + snapshot metadata branch partitions for a branch.
     ///
     /// Covers table_persist_metadata / table_persist_segment_metadata /
     /// table_purge_metadata / table_snapshot_metadata /
@@ -1514,8 +1415,6 @@ impl PgDialect {
                 naming::segment_delete_set_partition(catalog_uuid, branch_uuid),
                 naming::segment_delete_set_table(catalog_uuid),
             ),
-            // CHA-412: cold-index parent + child metadata, same per-branch
-            // LIST partition shape as the other snapshot-metadata tables.
             (
                 naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_snapshot_index_metadata_table(catalog_uuid),
@@ -1570,10 +1469,6 @@ impl PgDialect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DDL: per-table data tables
-// ---------------------------------------------------------------------------
-
 /// Errors from DDL operations on data tables.
 #[derive(Debug, thiserror::Error)]
 pub enum DataTableError {
@@ -1597,10 +1492,10 @@ pub enum DataTableError {
 impl PgDialect {
     /// Create per-branch upsert and delete log tables for a data table.
     ///
-    /// CHA-185: the delete_log carries `(row_uuid, <pk_cols...>, tx_uuid)`
-    /// — PK columns interleave between `row_uuid` and `tx_uuid`, in
-    /// table-declared PK order, so `audit_data` renders deletes natively
-    /// without joining back to upsert_log.
+    /// The delete_log carries `(row_uuid, <pk_cols...>, tx_uuid)` — PK columns
+    /// interleave between `row_uuid` and `tx_uuid`, in table-declared PK order,
+    /// so `audit_data` renders deletes natively without joining back to
+    /// upsert_log.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -1621,20 +1516,19 @@ impl PgDialect {
         let upsert_log = naming::upsert_log_table(table_uuid, branch_uuid);
         let delete_log = naming::delete_log_table(table_uuid, branch_uuid);
 
-        // CHA-431: create the per-(table, branch) `write_sequence` BEFORE the
-        // data logs so each log's `write_seq_num` column can default to its
-        // `nextval` — every writer (WriteData, CreateBranch materialize,
-        // genesis, branch-merge) then stamps the ordinal automatically, no
-        // per-writer plumbing. `START 0` → the first mutation stamps
-        // `write_seq_num = 0`. `CACHE 1` (no per-backend caching) is load-bearing:
-        // mutations across separate WriteData calls in one tx must order by
-        // call sequence, so `write_seq_num` has to be globally monotonic in
-        // allocation order. With a cached block per backend, a later call on a
-        // pooled connection holding a lower block would draw a SMALLER ordinal
-        // than an earlier call — inverting update-then-delete. `nextval` is
-        // still lock-free (a brief buffer latch, not the tx-duration row lock a
-        // counter-row allocator would hold). Named off the data-object prefix →
-        // no catalog_uuid.
+        // Create the per-(table, branch) `write_sequence` BEFORE the data logs
+        // so each log's `write_seq_num` column can default to its `nextval` —
+        // every writer then stamps the ordinal automatically, with no
+        // per-writer plumbing.
+        //
+        // `CACHE 1` (no per-backend caching) is load-bearing: mutations across
+        // separate WriteData calls in one tx must order by call sequence, so
+        // `write_seq_num` has to be globally monotonic in allocation order.
+        // With a cached block per backend, a later call on a pooled connection
+        // holding a lower block would draw a SMALLER ordinal than an earlier
+        // call — inverting update-then-delete. `nextval` is still lock-free (a
+        // brief buffer latch, not the tx-duration row lock a counter-row
+        // allocator would hold).
         let write_seq_qi = Self::quote_identifier(&naming::write_sequence(table_uuid, branch_uuid));
         driver
             .execute_no_result(&format!(
@@ -1642,7 +1536,6 @@ impl PgDialect {
             ))
             .await?;
 
-        // Build user column definitions from the Arrow schema
         let mut user_columns = String::new();
         for field in arrow_schema.fields() {
             let sql_type = Self::arrow_type_to_sql(field.data_type())?;
@@ -1650,8 +1543,8 @@ impl PgDialect {
             user_columns.push_str(&format!(",\n                    {col} {sql_type}"));
         }
 
-        // CHA-185: PK columns for delete_log, in declared order. Resolved
-        // against arrow_schema so the SQL type matches the user table.
+        // PK columns for delete_log, in declared order. Resolved against
+        // arrow_schema so the SQL type matches the user table.
         let mut delete_pk_columns = String::new();
         for pk in primary_keys {
             let field = arrow_schema
@@ -1662,17 +1555,13 @@ impl PgDialect {
             delete_pk_columns.push_str(&format!(",\n                    {col} {sql_type}"));
         }
 
-        // CHA-431: each data-log row carries `write_seq_num` (the within-tx
-        // mutation ordinal) as the secondary key in the merge-on-read
-        // version order `(commit_seq_num, write_seq_num)`; it defaults to the
-        // per-(table, branch) `write_sequence` created above, so every
-        // writer stamps it automatically.
+        // `write_seq_num` is the within-tx mutation ordinal — the secondary key
+        // in the merge-on-read version order `(commit_seq_num, write_seq_num)`.
         //
-        // `version_uuid` is deterministic = xxh3(row_uuid, tx_uuid)
-        // (see naming::version_uuid), so the PRIMARY KEY alone
-        // enforces the auditable-store invariant: at most one version
-        // per (entity, tx). No separate UNIQUE(row_uuid, tx_uuid)
-        // index needed (ADR 0013).
+        // `version_uuid` is deterministic = xxh3(row_uuid, tx_uuid) (see
+        // naming::version_uuid), so the PRIMARY KEY alone enforces the
+        // auditable-store invariant of at most one version per (entity, tx);
+        // no separate UNIQUE(row_uuid, tx_uuid) index is needed (ADR 0013).
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -1709,22 +1598,19 @@ impl PgDialect {
         // to ~ms). The trailing `row_uuid` makes Query B's
         // `SELECT row_uuid ... USING (tx_uuid)` an index-only scan.
         //
-        // `(row_uuid, tx_uuid)` (CHA-398): serves the ids point-lookup
-        // pushdown — the merge `_u`/`_d` sources and the per-arm exclusion
-        // scans probe by `WHERE row_uuid IN (...)` below the latest-wins
-        // dedup, where `tx_uuid` has the wrong leading column. One btree
-        // covers every PK shape, composite included (`row_uuid` derivation
-        // is deterministic). The write-amplification trade was measured in
-        // PR #203's A/B (~82s load-time amp with no consumer, which is why
-        // it was deferred until this consumer existed); the CHA-417 frame
-        // — ~60ms saved per hot point read vs insert-side maintenance at
-        // ~7.6ms/op — pays for it on read-heavy OLTP.
+        // `(row_uuid, tx_uuid)`: serves the ids point-lookup pushdown — the
+        // merge `_u`/`_d` sources and the per-arm exclusion scans probe by
+        // `WHERE row_uuid IN (...)` below the latest-wins dedup, where
+        // `tx_uuid` has the wrong leading column. One btree covers every PK
+        // shape, composite included (`row_uuid` derivation is deterministic).
+        // It costs measurable write amplification (~7.6ms/op of insert-side
+        // maintenance) and pays for itself only on read-heavy OLTP, at ~60ms
+        // saved per hot point read.
         //
-        // Created here at table-creation time only, so log tables that
-        // predate this change keep seq-scanning until recreated. Penca is
-        // pre-release (no persistent logs predate it; dev/test/perf recreate
-        // tables per run), so no backfill is needed today — a one-time index
-        // backfill over existing logs is a production-hardening follow-up.
+        // Created at table-creation time only, so log tables predating this
+        // keep seq-scanning until recreated. Penca is pre-release, so no
+        // backfill is needed today — a one-time index backfill over existing
+        // logs is a production-hardening follow-up.
         //
         // The index names are derived from the per-branch log table name,
         // NOT from `table_uuid`: `upsert_log_table`/`delete_log_table` are
@@ -1771,7 +1657,6 @@ impl PgDialect {
             naming::delete_log_table(table_uuid, branch_uuid),
         ];
         Self::drop_tables_if_exist(driver, &tables).await?;
-        // CHA-431: drop the table's write_sequence alongside its logs.
         driver
             .execute_no_result(&format!(
                 "DROP SEQUENCE IF EXISTS {qi}",
@@ -1842,8 +1727,6 @@ mod tests {
     use super::*;
     use arrow::datatypes::{Field, TimeUnit};
 
-    // -- quote_identifier ---------------------------------------------------
-
     #[test]
     fn test_quote_simple_identifier() {
         assert_eq!(PgDialect::quote_identifier("my_table"), "\"my_table\"");
@@ -1857,14 +1740,10 @@ mod tests {
         );
     }
 
-    // -- quote_column -------------------------------------------------------
-
     #[test]
     fn test_quote_column() {
         assert_eq!(PgDialect::quote_column("t", "my_col"), "t.\"my_col\"");
     }
-
-    // -- arrow_type_to_sql --------------------------------------------------
 
     #[test]
     fn test_integer_types() {
@@ -1896,8 +1775,7 @@ mod tests {
             PgDialect::arrow_type_to_sql(&DataType::UInt32).unwrap(),
             "BIGINT"
         );
-        // UInt64 -> NUMERIC (not BIGINT): u64::MAX exceeds i64::MAX, so
-        // BIGINT would be lossy. CHA-386 corrects this.
+        // NUMERIC, not BIGINT: u64::MAX exceeds i64::MAX.
         assert_eq!(
             PgDialect::arrow_type_to_sql(&DataType::UInt64).unwrap(),
             "NUMERIC"
@@ -1993,7 +1871,6 @@ mod tests {
 
     #[test]
     fn test_time_types() {
-        // CHA-386: Time32/Time64 newly map through the canonical registry.
         assert_eq!(
             PgDialect::arrow_type_to_sql(&DataType::Time32(TimeUnit::Millisecond)).unwrap(),
             "TIME"
@@ -2006,7 +1883,6 @@ mod tests {
 
     #[test]
     fn test_fixed_size_list_type() {
-        // CHA-386: FixedSizeList of a scalar widens to the PG array type.
         let inner = Field::new("item", DataType::Int32, true);
         let dt = DataType::FixedSizeList(inner.into(), 3);
         assert_eq!(PgDialect::arrow_type_to_sql(&dt).unwrap(), "INTEGER[]");
@@ -2016,8 +1892,6 @@ mod tests {
     fn test_unsupported_type() {
         assert!(PgDialect::arrow_type_to_sql(&DataType::Null).is_err());
     }
-
-    // -- microsecond_epoch --------------------------------------------------
 
     #[test]
     fn test_microsecond_epoch() {

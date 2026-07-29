@@ -51,14 +51,9 @@ from .integration_helpers import (
     setup_schema,
 )
 
-# ── Per-catalog parent table names ────────────────────────────────────
-
 TABLE_PERSIST_METADATA = "table_persist_metadata"
 TABLE_PURGE_METADATA = "table_purge_metadata"
 TABLE_SNAPSHOT_METADATA = "table_snapshot_metadata"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _make_lifecycle_stub() -> LifecycleServiceStub:
@@ -279,9 +274,6 @@ def _list_persisted_tables_all(
         page_token = resp.next_page_token
 
 
-# ── White-box state probes (per-table watermarks) ────────────────────
-
-
 def _latest_committed_persisted_at(catalog_uuid, branch_uuid, table_uuid):
     parent = f"{catalog_uuid}_{TABLE_PERSIST_METADATA}"
     rows = get_pg_driver().execute(
@@ -348,9 +340,6 @@ def _count_persist_rows(catalog_uuid, branch_uuid, table_uuid):
         ).format(tbl=Identifier(parent)),
         (branch_uuid, table_uuid),
     )[0][0]
-
-
-# ── ListModifiedTables ───────────────────────────────────────────────
 
 
 class TestListModifiedTables:
@@ -525,7 +514,6 @@ class TestListModifiedTables:
         full = _list_modified_tables_all(
             catalog_uuid, branch_uuid, min_micros=first_micros
         )
-        # All 5 must show up.
         assert sorted(full) == sorted(tables.values()), (
             f"unpaginated response missing tables: got {full}, "
             f"expected {sorted(tables.values())}"
@@ -577,9 +565,6 @@ class TestListModifiedTables:
         assert filtered == [tables["t_old"], tables["t_recent"]], (
             f"expected [t_old, t_recent] (MAX(committed_at) ASC); got {filtered}"
         )
-
-
-# ── ListPersistedTables ──────────────────────────────────────────────
 
 
 class TestListPersistedTables:
