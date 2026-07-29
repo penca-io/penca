@@ -162,16 +162,12 @@ class PurgeTxLogResponse(_message.Message):
     def __init__(self) -> None: ...
 
 class SweepSegmentsRequest(_message.Message):
-    __slots__ = ("catalog_uuid", "catalog_name", "branch_uuid", "branch_name")
+    __slots__ = ("catalog_uuid", "catalog_name")
     CATALOG_UUID_FIELD_NUMBER: _ClassVar[int]
     CATALOG_NAME_FIELD_NUMBER: _ClassVar[int]
-    BRANCH_UUID_FIELD_NUMBER: _ClassVar[int]
-    BRANCH_NAME_FIELD_NUMBER: _ClassVar[int]
     catalog_uuid: str
     catalog_name: str
-    branch_uuid: str
-    branch_name: str
-    def __init__(self, catalog_uuid: _Optional[str] = ..., catalog_name: _Optional[str] = ..., branch_uuid: _Optional[str] = ..., branch_name: _Optional[str] = ...) -> None: ...
+    def __init__(self, catalog_uuid: _Optional[str] = ..., catalog_name: _Optional[str] = ...) -> None: ...
 
 class SweepSegmentsResponse(_message.Message):
     __slots__ = ()

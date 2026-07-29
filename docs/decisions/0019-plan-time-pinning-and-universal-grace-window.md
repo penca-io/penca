@@ -142,6 +142,20 @@ Removing any one pillar reopens at least one of the TOCTOU windows.
    compaction — no `kind` discriminator, since `sweep_segments`
    treats every row as an `object_uri` to delete.
 
+   *Amended by CHA-531.* The set is keyed on `object_uri` alone,
+   catalog-wide and unpartitioned. Carry-forward makes one cold file
+   reachable from any branch, so "this file is queued for deletion" is a
+   property of the file, not of a branch; branch-keying it would give one
+   file several rows ageing on independent clocks, and eligibility would
+   have to take a cross-branch max to stop a parent deleting, inside its
+   own expired window, a carried file a child had only just released.
+   One row makes that unrepresentable: the last retirement to touch a URI
+   refreshes `written_at_micros` in place (`ON CONFLICT DO UPDATE`), so
+   the grace window is the newest release's by construction. The
+   reference-count probes are catalog-wide for the same reason; see
+   [ADR 0024 §4](0024-incremental-snapshot.md). `sweep_segments` is
+   therefore catalog-scoped — it takes no branch argument.
+
 4. **Enforced query runtime cap.** `read_data`, `audit_data`, and
    their callees wrap the returned `BatchStream` so each `next()` is
    bounded by `(T_q + query_timeout) - now`, where `T_q` is the
@@ -304,8 +318,30 @@ now the rule lives here.
 * **Compaction GC is delayed by `query_timeout`.** Cold storage
   cost rises by the same window-bounded factor. The
   `segment_delete_set` itself is small (one row per compacted-away
-  file, deleted on sweep) and partitioned by `branch_uuid` to match
-  the rest of the lifecycle tables.
+  file, deleted on sweep) and unpartitioned (CHA-531).
+
+  *Amended by CHA-531.* "Small" no longer holds unconditionally. A
+  row whose file is still referenced across a fork edge is **not**
+  deleted on sweep — it stays queued in the expired range and is
+  re-scanned by every subsequent sweep. Two things make a set stand:
+  a legitimately long-lived carried reference (bounded — it clears
+  when the last referencing snapshot retires), and crash-orphaned
+  uncommitted snapshot rows (unbounded until TODO(CHA-435) lands a
+  reaper). The live-lock CHA-435 addresses is **catalog-scoped**, but
+  its shape is unchanged by carry-forward: with one row per file, an
+  orphan blocks exactly the files its own snapshot references and
+  nothing else. `sweep_segments`' `eligible`/`deleted` pair is the
+  triage signal — a persistent `eligible = 0` against a growing
+  delete set reads as "everything still referenced".
+* **The grace arm assumes a uniform `query_timeout`.** Eligibility
+  compares `written_at_micros` against a *single* `query_timeout` —
+  the one belonging to the sweeping process
+  (`QUERY_TIMEOUT_SECONDS`, passed down as
+  `LifecycleManager::query_timeout_micros`), not one per row. Deploy
+  a shorter timeout on one lifecycle process and it can expire a row
+  another process only just refreshed, reopening the TOCTOU window
+  that pillar 3 closes. Uniform deployment across a catalog is
+  currently an operational convention, not an enforced invariant.
 * **Long-running analytical queries hit a hard cap.** Queries that
   exceeded the default 15 min previously completed silently;
   under this ADR they get a `RESOURCE_EXHAUSTED` cancellation.

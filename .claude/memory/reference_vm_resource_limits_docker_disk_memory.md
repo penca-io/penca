@@ -46,6 +46,20 @@ interact, so they live together.
   on CI's Rust job (no time limit, ~5 min) for the full workspace.
   `cargo check` / `clippy --workspace` DO fit (~5 min warm) and cover all
   non-test code.
+- **Killing a gate/wrapper script does NOT kill `just integration-test`** — it
+  detaches and keeps running. The survivor then races the next run over the
+  same `COMPOSE_PROJECT_NAME`, tearing down each other's containers, and
+  **every test fails with no Python-level error text** (bare `FFFF...`, no
+  `FAILED`/traceback lines, docker build output interleaved with pytest
+  output). Cost a 33%-deep run on 2026-07-29 (CHA-531) that read like a real
+  regression from doc-only commits. Before blaming code:
+  `pgrep -af '[j]ust integration-test'` — **two** PIDs means a race, not a bug.
+  Same attribute-before-debugging rule as the `COMPOSE_PROJECT_NAME` case
+  above. Fixes: launch the wrapper under `setsid` so the whole process group
+  dies together (`kill -- -<pgid>`), and have it refuse to start while another
+  suite is alive. Bracket the first char in `pgrep -f` patterns
+  (`'[j]ust ...'`) or the check matches its own cmdline — the recurring
+  self-match hazard, cf. [[feedback_slow_commands_capture_and_wait]].
 
 ## Memory: ~7 GB, and an OOM kill silently moves the port
 

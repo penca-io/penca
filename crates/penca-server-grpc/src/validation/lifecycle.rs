@@ -71,8 +71,7 @@ pub fn validate_snapshot(req: &SnapshotRequest) -> Result<(), Status> {
 }
 
 pub fn validate_sweep_segments(req: &SweepSegmentsRequest) -> Result<(), Status> {
-    check_opt_uuid("catalog_uuid", req.catalog_uuid.as_deref())?;
-    check_opt_uuid("branch_uuid", req.branch_uuid.as_deref())
+    check_opt_uuid("catalog_uuid", req.catalog_uuid.as_deref())
 }
 
 pub fn validate_purge_tx_log(req: &PurgeTxLogRequest) -> Result<(), Status> {
@@ -128,7 +127,7 @@ mod tests {
         assert_eq!(code(validate_persist(&persist_bad)), Code::InvalidArgument);
         assert!(validate_persist(&PersistRequest::default()).is_ok());
         assert!(validate_snapshot(&SnapshotRequest::default()).is_ok());
-        // catalog/branch-only requests.
+        // Catalog-only request (the sweep is catalog-scoped since CHA-531).
         let sweep_bad = SweepSegmentsRequest {
             catalog_uuid: Some("nope".into()),
             ..Default::default()
