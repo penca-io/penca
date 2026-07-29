@@ -21,19 +21,23 @@
 //!
 //! ## Failure semantics
 //!
-//! Per-branch errors inside a tick are logged and swallowed; watermarks still
-//! advance.
+//! A branch-level error (a listing RPC failing) propagates out of the snapshot
+//! loop's per-branch step, so its watermarks do NOT advance and the next tick
+//! re-runs the same window. The persist loop carries no watermarks, so its
+//! per-branch RPC error is only logged. Either way the sweep continues to the
+//! next branch.
 //!
 //! `PersistBranch` and `SnapshotBranch` enumerate their dirty sets
 //! **unwindowed** server-side, so a table that fails one of them stays
 //! enumerated and is retried on every subsequent tick regardless of whether it
 //! sees further writes.
 //!
-//! The **Purge** passes are the windowed ones: they re-enumerate only tables
+//! The two **Purge** passes are the windowed ones: they re-enumerate only tables
 //! falling in the next `[last_tick, now)` window, so a one-off failure on a
-//! table that then goes idle is **not** retried until further committed
-//! persists bring it back into a window. Durable per-table retry queues are
-//! deferred past v0.
+//! table that then goes quiet is **not** retried until it re-enters a window —
+//! a further committed or aborted write for the modified pass, a further
+//! committed persist for the aged-persisted one. Durable per-table retry queues
+//! are deferred past v0.
 //!
 //! Retry interval is per-op: the persist cadence for Persist, the snapshot
 //! cadence for the rest.
