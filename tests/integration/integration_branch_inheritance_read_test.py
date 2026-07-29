@@ -10,18 +10,14 @@ Run via ``just integration-test branch_inheritance_read``.
 
 from __future__ import annotations
 
+import time
 from uuid import uuid4
 
 import pyarrow as pa
 import pytest
 from penca_client import Mutation
 
-from .integration_helpers import (
-    USER_SCHEMA,
-    container_log,
-    make_client,
-    poll_log_for,
-)
+from .integration_helpers import USER_SCHEMA, container_log, make_client
 
 
 def _commit_rows(
@@ -583,6 +579,28 @@ def _base_cold_source_values(since: int, table_uuid: str) -> list[str]:
     ]
 
 
+def _await_base_cold_source_values(since: int, table_uuid: str, expected: int):
+    """Poll until the USER table's markers have flushed, then return them.
+
+    The flush barrier must be scoped the same way the values are. `read_data`
+    plans the `__penca_system__` tables through `ResolvedScope::resolve_table`
+    BEFORE it plans the user table, so a barrier polling the unscoped
+    `base_cold_source=` substring returns on a system-table line that has
+    already flushed while the user-table line has not — the exact lag the
+    barrier exists to absorb, yielding a spuriously short value list.
+
+    Returns as soon as ``expected`` markers are visible, or whatever has flushed
+    by the deadline so the caller's assertion reports the real shortfall.
+    """
+    deadline = time.monotonic() + 5.0
+    values = _base_cold_source_values(since, table_uuid)
+    while len(values) < expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        values = _base_cold_source_values(since, table_uuid)
+
+    return values
+
+
 def _seed_forked_history(client, catalog_label: str):
     """Seed a parent whose cold tier straddles a snapshot, then fork off its head.
 
@@ -662,17 +680,9 @@ def test_forked_current_time_read_has_no_base_cold_source():
     assert _value_for(got, "k") == 4, (
         f"child head must read the parent state as-of the fork (4), saw {got.to_pydict()}"
     )
-    # Flush barrier: the container's json-log flush lags the RPC return, so wait
-    # for the marker to appear at all before asserting on WHICH value it carries.
-    assert poll_log_for("query", since, "base_cold_source="), (
-        "no base_cold_source marker reached the query log — the scrape window is "
-        "wrong, not the gate"
-    )
-    assert _base_cold_source_values(since, scope["table_uuid"]) == [
-        _BASE_SOURCE_NONE
-    ], (
-        "a forked current-time read must consult no base cold source, saw "
-        f"{_base_cold_source_values(since, scope['table_uuid'])}"
+    values = _await_base_cold_source_values(since, scope["table_uuid"], expected=1)
+    assert values == [_BASE_SOURCE_NONE], (
+        f"a forked current-time read must consult no base cold source, saw {values}"
     )
 
 
@@ -707,11 +717,7 @@ def test_forked_below_fork_as_of_read_still_reaches_the_parent():
     )
 
     # Both reads are below the fork, so BOTH must keep enumerating the parent.
-    assert poll_log_for("query", since, "base_cold_source="), (
-        "no base_cold_source marker reached the query log — the scrape window is "
-        "wrong, not the gate"
-    )
-    values = _base_cold_source_values(since, scope["table_uuid"])
+    values = _await_base_cold_source_values(since, scope["table_uuid"], expected=2)
     assert values == [_BASE_SOURCE_PRESENT, _BASE_SOURCE_PRESENT], (
         f"both below-fork reads must enumerate the parent's cold tier, saw {values}"
     )
