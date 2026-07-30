@@ -618,8 +618,14 @@ impl QueryManager {
     /// Resolve a [`ReadSnapshot`] from `(open_tx_uuid, as_of_micros,
     /// as_of_seq)`.
     ///
-    /// Mutex precedence (callers must enforce the mutex at the proto
-    /// boundary; this method picks deterministically if several are set):
+    /// `open_tx_uuid` alongside either `as_of` is REJECTED here
+    /// (`InvalidRequest`), not resolved by precedence: RYOW is anchored at the
+    /// tx's own begin frontier, so an as_of pin beside it is a contradiction
+    /// rather than a ranking question. The `as_of_micros` / `as_of_seq` pair is
+    /// still resolved by precedence — micros wins — because both are pins on the
+    /// same committed history and picking one is well-defined.
+    ///
+    /// Resolution order once the rejection above passes:
     ///
     /// 1. `open_tx_uuid = Some` → resolves the tx through [`resolve_tx`] and
     ///    returns [`ReadSnapshot::OpenTx`] for snapshot-isolation + RYOW. A tx

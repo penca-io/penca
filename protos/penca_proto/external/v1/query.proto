@@ -118,8 +118,8 @@ message GetSchemaRequest {
   // serial) axis — resolves names as of `commit_seq_num <= as_of_seq`. The seq
   // sibling of `as_of_micros`, so the SQL session pin can resolve identifiers
   // on the same seq axis as its data read. Mutually exclusive with
-  // `as_of_micros` / `open_tx_uuid` (resolver precedence: open_tx, then
-  // micros, then seq).
+  // `open_tx_uuid`; INVALID_ARGUMENT if both set. Setting both `as_of_micros`
+  // and `as_of_seq` resolves to `as_of_micros`.
   optional int64 as_of_seq = 9;
 }
 
