@@ -317,17 +317,13 @@ impl LifecycleManager {
         Ok(())
     }
 
-    /// Get `(table_snapshot_segment_uuid, object_uri)` for all snapshots of a
-    /// table.
-    ///
-    /// 1 SQL query.
     /// Every committed-or-not snapshot segment on a branch, across all tables.
     ///
     /// Branch teardown's enumeration. Table-agnostic on purpose: the segment
     /// parent is LIST-partitioned on `branch_uuid`, so scoping by branch alone
     /// is both complete and cheaper than the per-table loop — and, unlike that
     /// loop, it needs no table list, so teardown does not have to resolve one
-    /// (a cold-capable read) while holding the parents' `ACCESS EXCLUSIVE`.
+    /// (a cold-capable read) inside its exclusive window.
     pub async fn get_snapshot_segments_for_branch(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -354,6 +350,10 @@ impl LifecycleManager {
             .collect())
     }
 
+    /// Get `(table_snapshot_segment_uuid, object_uri)` for all snapshots of a
+    /// table.
+    ///
+    /// 1 SQL query.
     pub async fn get_snapshot_segments_for_table(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,

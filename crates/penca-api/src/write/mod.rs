@@ -1090,13 +1090,44 @@ impl WriteManager {
         // so reissuing DeleteBranch is safe — what the caller needs is to be able
         // to TELL a lock loss from a real failure, which is why this maps to
         // `Aborted` (retry at a higher level) rather than the default `Internal`.
+        // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
+        // resolved BEFORE the teardown transaction and used only for their drops.
+        //
+        // It cannot move inside. `list_table_uuids_for_branch` plans through
+        // `QueryManager::plan`, which reads the catalog-wide metadata parents BY
+        // NAME — so running it in the transaction takes `ACCESS SHARE` on every
+        // one of them, which is precisely what
+        // `lock_branch_teardown_partitions` is built to avoid: it stalls plans on
+        // every branch in the catalog while this cold-capable read waits on
+        // object storage, and it sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
+        // upgrade at the drops that deadlocks two concurrent teardowns of
+        // DIFFERENT branches. Partition-scoping the enumerations bought exactly
+        // that property; planning inside the lock gives it back.
+        //
+        // The cost is a real leak, stated plainly rather than filed under
+        // "best effort": a `CreateTable` committing between this read and the
+        // lock is missed, and since teardown removes the `branch_store` row,
+        // nothing ever returns to drop its `upsert_log` / `delete_log` /
+        // `write_sequence` relations. They are hot-only — no cold file, so no
+        // delete-set consequence — but they are permanent.
+        //
+        // Pre-existing, not introduced here: `main` resolves this list the same
+        // way. Closing it needs a branch-scoped table enumeration that does not
+        // plan through the parents, which does not exist today — the hot data
+        // relations are named `hash(table_uuid, branch_uuid)`, so they cannot be
+        // recovered from `pg_class` by branch either. Needs its own ticket.
+        let table_uuid_strs = self
+            .query_manager
+            .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
+            .await?;
+
         self.delete_branch_tx(
             pool,
-            dl_driver,
             &catalog_uuid,
             &catalog_str,
             &branch_str,
             branch_uuid,
+            &table_uuid_strs,
         )
         .await
         .map_err(|e| {
@@ -1119,14 +1150,15 @@ impl WriteManager {
     /// construction — the resolution and `main` guard that precede it are
     /// ordinary reads that must NOT hold the parents' ACCESS EXCLUSIVE. There is
     /// no retry: see the note at its call site.
-    async fn delete_branch_tx<L: DlDriver + ?Sized>(
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_branch_tx(
         &self,
         pool: &PgDriver,
-        dl_driver: &L,
         catalog_uuid: &Uuid,
         catalog_str: &str,
         branch_str: &str,
         branch_uuid: Uuid,
+        table_uuid_strs: &[String],
     ) -> Result<(), ApiError> {
         with_pg_tx(pool, async |tx| {
             PgDialect::lock_branch_teardown_partitions(tx, catalog_uuid, &branch_uuid).await?;
@@ -1199,36 +1231,9 @@ impl WriteManager {
                 .into_iter()
                 .collect();
 
-            // The branch's HOT data tables. `schema_uuid = None` makes the
-            // list catalog-wide.
-            //
-            // Resolved HERE — behind the lock, and with an unbounded snapshot
-            // — because both matter and each covers a different failure. A
-            // table created before the lock but after a pre-lock read would
-            // be missed, and once `branch_store` loses its row nothing ever
-            // returns to drop its `upsert_log` / `delete_log` relations: a
-            // permanent leak, not untidiness. And `now_snapshot` would not
-            // fix it, since PG's `now()` is `transaction_timestamp()`, fixed
-            // at this transaction's FIRST statement — before the lock was
-            // granted — so a `CreateTable` committing while we waited out
-            // `lock_timeout` stays invisible to a time-pinned read.
-            //
-            // Safe under the lock now only because the lock is
-            // partition-scoped: this is a merge read that can reach cold
-            // storage, and stalling on object-store I/O holds `EXCLUSIVE` on
-            // nothing but the branch being deleted.
-            //
-            // Before `delete_branch`, not after: resolving a table list plans
-            // through the branch's lineage in `branch_store`, so once that row
-            // is gone the read comes back with a NULL `fork_commit_seq_num` and
-            // fails to decode.
-            let table_uuid_strs = self
-                .query_manager
-                .list_all_table_uuids_for_branch(tx, dl_driver, catalog_str, None, branch_str)
-                .await?;
             let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
             if deleted {
-                for table_uuid_str in &table_uuid_strs {
+                for table_uuid_str in table_uuid_strs {
                     LifecycleManager::drop_data_tables(
                         tx,
                         table_uuid_str,

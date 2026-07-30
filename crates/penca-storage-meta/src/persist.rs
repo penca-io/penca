@@ -736,14 +736,6 @@ impl LifecycleManager {
         Ok(rows)
     }
 
-    /// Return `(table_persist_segment_uuid, object_uri)` for every segment
-    /// belonging to any of the given tables on a branch.
-    ///
-    /// Keyed on `(branch_uuid, table_uuid IN (...))` on the segment table
-    /// directly. Used by DeleteBranch to enumerate every cold file the branch
-    /// owns.
-    ///
-    /// 1 SQL query.
     /// Every persist segment on a branch, across all tables.
     ///
     /// Branch teardown's enumeration — see
@@ -775,6 +767,14 @@ impl LifecycleManager {
             .collect())
     }
 
+    /// Return `(table_persist_segment_uuid, object_uri)` for every segment
+    /// belonging to any of the given tables on a branch.
+    ///
+    /// Keyed on `(branch_uuid, table_uuid IN (...))` on the segment table
+    /// directly. Used by DeleteBranch to enumerate every cold file the branch
+    /// owns.
+    ///
+    /// 1 SQL query.
     pub async fn get_table_persist_segments_for_tables(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
