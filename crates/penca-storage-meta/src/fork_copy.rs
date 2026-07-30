@@ -358,9 +358,26 @@ impl LifecycleManager {
     ) -> Result<()> {
         let persist_meta = naming::table_persist_metadata_table(catalog);
         let persist_seg = naming::table_persist_segment_metadata_table(catalog);
-        // Above the adopted baseline; from genesis when the parent had no
-        // eligible snapshot.
-        let from_micros = baseline_watermark.map_or(i64::MIN, |w| w.saturating_add(1));
+        // Headers from the baseline INCLUSIVE; segments only strictly above it.
+        //
+        // The inclusive header is load-bearing and easy to lose. The read plan's
+        // snapshot pick is bounded by
+        // `snapshotted_at_micros <= LEAST(as_of, COALESCE(persist_wm, -1))`, where
+        // `persist_wm = MAX(persisted_at_micros)` over the CHILD's persist
+        // headers. When the parent's newest snapshot sits exactly at its persist
+        // watermark — which is what `write -> persist -> snapshot` produces, the
+        // default shape — a segments-only window copies nothing at all, leaving
+        // the child with no persist header, `persist_wm` NULL, the bound collapsed
+        // to -1, and the inherited snapshot never picked. Reads then return zero
+        // rows even though the copy is present, which is the exact failure the
+        // `Pu` seed above was meant to close; `Pu` is only one of two gates.
+        //
+        // Copying the baseline's header (header only, no segments) makes
+        // `persist_wm >= snapshotted_at_micros` so the pick succeeds. No segments
+        // means nothing is double-counted against the snapshot that already
+        // materializes those rows, and no extra parent files are pinned.
+        let header_from = baseline_watermark.unwrap_or(i64::MIN);
+        let segment_from = baseline_watermark.map_or(i64::MIN, |w| w.saturating_add(1));
 
         let headers = driver
             .execute_params(
@@ -374,7 +391,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(parent_branch_uuid)?,
                     SqlValue::Uuid(*table),
-                    SqlValue::Int64(from_micros),
+                    SqlValue::Int64(header_from),
                 ],
             )
             .await?;
@@ -420,7 +437,11 @@ impl LifecycleManager {
                 )
                 .await?;
 
-            // 6. Its segments, with the two overrides that make the copy sound.
+            // 6. Its segments — but not for the baseline's own header, whose rows
+            //    the inherited snapshot already materializes.
+            if persisted_at <= segment_from.saturating_sub(1) {
+                continue;
+            }
             let segs = driver
                 .execute_params(
                     &format!(

@@ -1795,6 +1795,7 @@ impl QueryManager {
                         &catalog_uuid_str,
                         &branch_uuid_str,
                         &table_uuid_str,
+                        fork_commit_seq_num,
                     )
                     .await?;
                 let base_cold_to = match inherited_watermark {

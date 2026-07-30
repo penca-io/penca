@@ -27,7 +27,14 @@ from penca_client.naming import (
 )
 from psycopg.sql import SQL, Identifier
 
-from .integration_helpers import USER_SCHEMA, get_pg_driver, make_client, setup_schema
+from .integration_helpers import (
+    USER_SCHEMA,
+    get_pg_driver,
+    make_client,
+    setup_partitioned_table,
+    setup_schema,
+    write_cycle,
+)
 
 
 def _write_committed_rows(
@@ -716,3 +723,108 @@ def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
         "audit_data emitted the parent's POST-fork row: the per-segment "
         f"max_commit_seq_num ceiling is not applied on the audit read path. Saw {names}"
     )
+
+
+def test_fork_reads_when_the_parents_snapshot_covers_its_whole_persist():
+    """A fork must read its inherited rows before it writes anything of its own.
+
+    This is the DEFAULT parent shape, not a corner: `write -> persist ->
+    snapshot` with no `snapshot_at` sets `snapshotted_at_micros` exactly equal to
+    the persist watermark. A segments-only copy window then copies nothing to the
+    persist tier, so the child has no persist header, `persist_wm` is NULL, and
+    the read plan's snapshot pick — bounded by
+    `snapshotted_at_micros <= LEAST(as_of, COALESCE(persist_wm, -1))` — collapses
+    to -1 and never picks the inherited snapshot. The copy is present in metadata
+    and the read returns zero rows, which is the same class of failure seeding
+    `Pu` was meant to close; `Pu` is only one of the two gates.
+
+    Every other fork-read test hides it by leaving an unpersisted tail on the
+    parent or writing on the child first.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("pf_covered")
+    )
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]}, schema=USER_SCHEMA
+        ),
+    )
+    child = client.create_branch(
+        f"pf_covered_kid_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-539",
+    ).branch_uuid
+
+    # No write on the child, no second persist. Straight read.
+    got = client.read_data(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child,
+    )
+    assert set(got.column("name").to_pylist()) == {"alice", "bob", "carol"}, (
+        "a fresh fork read nothing: the inherited snapshot was never picked, so "
+        "the copy is invisible. Check that the child has a persist header at the "
+        f"baseline watermark. Saw {got.column('name').to_pylist()}"
+    )
+
+
+def test_fork_audit_stays_deduped_after_the_child_snapshots():
+    """The audit base-arm cap must survive the child taking its own snapshot.
+
+    `inherited_baseline_watermark` is bounded at the fork on the seq axis. Without
+    that bound an unqualified `MIN(snapshotted_at_micros)` returns the child's
+    FIRST OWN snapshot once it takes one — well above the fork — and the base arm
+    re-selects every pre-fork parent segment the child already holds as a copy,
+    duplicating every inherited change row again.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("pf_dedup")
+    )
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob"], "value": [1, 2]}, schema=USER_SCHEMA
+        ),
+    )
+    child = client.create_branch(
+        f"pf_dedup_kid_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-539",
+    ).branch_uuid
+    # The child's OWN snapshot, which is what drags an unbounded MIN() upward.
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child,
+        upserts=pa.table({"name": ["dave"], "value": [4]}, schema=USER_SCHEMA),
+    )
+
+    upserts, _deletes = client.audit_data(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=child,
+        after_seq=0,
+        before_seq=10_000,
+    )
+    names = upserts.column("name").to_pylist()
+    for inherited in ("alice", "bob"):
+        assert names.count(inherited) == 1, (
+            f"inherited change row {inherited!r} emitted {names.count(inherited)} "
+            "times after the child snapshotted: the baseline-watermark pick is not "
+            f"bounded at the fork. Full list: {names}"
+        )

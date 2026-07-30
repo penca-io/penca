@@ -996,9 +996,17 @@ impl QueryManager {
     /// — its own oldest committed snapshot, which for a seeded child IS the
     /// inherited baseline.
     ///
-    /// `None` when the child holds no snapshot, which means it inherited from
-    /// genesis (the parent had no eligible snapshot at the fork) and its own
-    /// persist rows cover the whole inherited history. The audit base arm uses
+    /// Bounded at the fork on the seq axis, which is what keeps the answer
+    /// stable. A child's own snapshots all commit above `fork_commit_seq_num`
+    /// (`seed_commit_seq_num_from_fork`), so without the bound an unqualified
+    /// `MIN` would return the child's FIRST OWN snapshot once it takes one —
+    /// well above the fork — and the base arm would re-select every pre-fork
+    /// parent segment the child already holds as a copy, duplicating every
+    /// inherited change row again.
+    ///
+    /// `None` when the child holds no snapshot at or below the fork, which means
+    /// it inherited from genesis (the parent had no eligible snapshot there) and
+    /// its own persist rows cover the whole inherited history. The audit base arm uses
     /// this to stop where the child's own coverage begins; without it the two
     /// arms overlap and `audit_data`, which concatenates without dedup, emits
     /// every inherited change row twice.
@@ -1008,6 +1016,7 @@ impl QueryManager {
         catalog_uuid: &str,
         branch_uuid: &str,
         table_uuid: &str,
+        fork_commit_seq_num: i64,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
         let snap = naming::table_snapshot_metadata_table(&catalog);
@@ -1016,12 +1025,14 @@ impl QueryManager {
                 &format!(
                     "SELECT MIN(snapshotted_at_micros) AS baseline FROM {snap} \
                      WHERE branch_uuid = $1 AND table_uuid = $2 \
-                       AND commit_micros IS NOT NULL",
+                       AND commit_micros IS NOT NULL \
+                       AND commit_seq_num <= $3",
                     snap = qi(&snap),
                 ),
                 &[
                     SqlValue::uuid_str(branch_uuid)?,
                     SqlValue::uuid_str(table_uuid)?,
+                    SqlValue::Int64(fork_commit_seq_num),
                 ],
             )
             .await?;
