@@ -24,11 +24,11 @@ Agents make it worse. Weekly refreshes were fine when an experiment took a quart
 iterate by the minute, fork aggressively, read data they wrote seconds ago, and write
 without review. Same problems, at machine speed.
 
-Penca collapses the split. One copy of your data, in open columnar files on your own bucket,
-serves both workloads, and you can fork it like a git branch: a full read-write copy that
-copies no rows. Fork production, let something loose on it, compare what it did, discard it.
-Every mutation appends to an immutable log with an author and a timestamp, so any state is
-auditable and readable as of any point in time.
+Penca collapses the split. Your data lives once, in open columnar files on your own bucket,
+and both workloads run against that copy. You can fork it like a git branch, which gives you
+a full read-write database that copies no rows. Fork production, let something loose on it,
+compare what it did, discard it. Every mutation appends to an immutable log with an author
+and a timestamp, so any state stays auditable and readable as of any point in time.
 
 Writes land in an internal Postgres hot tier under a real ACID transaction; a background
 pipeline moves them out to columnar files (Lance by default, Parquet supported). Reads merge
@@ -154,9 +154,10 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 - **No configurable isolation level.** What you get is fixed per operation: a snapshot at
   `BEGIN` for reads in a transaction, last-writer-wins for upserts, READ COMMITTED for
   `UPDATE`/`DELETE`. There is no setting to choose, per catalog or at all.
-- **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
-  operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
-  single-statement read-modify-write. TPC-B tracks the gap, not parity.
+- **OLTP is passable, not competitive.** A point read or write is dominated by the fixed
+  per-statement pipeline rather than by the storage underneath it, and the SQL path pays
+  more of that than the gRPC one. Good enough to build on, not a swap for Postgres on
+  single-client transactional work. Measure it yourself with `examples/oltp_demo.py`.
 - **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
   at small scale Postgres still wins the analytical query, a crossover rather than a wall
   ([docs/performance.md](docs/performance.md)).
