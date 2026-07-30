@@ -81,7 +81,7 @@ just penca-up --db ~/.penca/data
 
 ## How this differs
 
-The defensible claim is the *conjunction*, on one copy. Each alternative holds a leg of it:
+The defensible claim is the *conjunction*, on one copy. Each alternative holds part of it:
 
 - **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
   branch: queries run on the row store, at row-store cost.
@@ -89,15 +89,17 @@ The defensible claim is the *conjunction*, on one copy. Each alternative holds a
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie.** Branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks Lakebase.** The closest peer. Databricks named the category
-  [LTAP](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-ltap-first-lake-transactionalanalytical),
-  and it argues the same thing we do: the way out of the split is storing the data once in
-  open formats instead of syncing a second copy to read it. We could not have asked for
-  better validation. Two things land differently. Their lakehouse copy still arrives by
-  managed sync, and on versioning, LTAP keeps intermediate row versions for Postgres MVCC
-  and point-in-time recovery, but they stay invisible to lakehouse readers and are
-  garbage-collected in time. Branching there is metadata-only as it is here, while the
-  row-level audit trail and `as_of` queries have no counterpart.
+- **Databricks LTAP.** The closest peer by far.
+  [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage), built
+  on Lakebase and announced in June 2026, argues the same thing we do: the way out of the
+  split is storing the data once in open formats instead of syncing a second copy to read
+  it. We could not have asked for better validation. Where the two diverge is data
+  versioning. LTAP keeps intermediate row versions to preserve Postgres MVCC and
+  point-in-time recovery, but they stay invisible to Iceberg and Delta readers and are
+  garbage-collected in time. Branching there is metadata-only, as it is here. Penca is
+  Apache-2.0 and self-hostable rather than a managed service, and it makes that version
+  history a first-class queryable surface: a row-level audit trail and `as_of` reads today,
+  revert to come.
 
 ## Architecture
 
