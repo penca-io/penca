@@ -1185,18 +1185,28 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
     # parent's must name the SAME slice, or the two branches decode
     # independently, every assertion below still passes, and this test covers
     # nothing. Metadata-only, so it does not warm the cache it is about to probe.
-    shared_slices = get_pg_driver().execute(
-        SQL(
-            "SELECT count(*) FROM {tbl} p JOIN {tbl} c"
-            ' ON p.object_uri = c.object_uri AND p."offset" IS NOT DISTINCT FROM c."offset"'
-            " WHERE p.branch_uuid = %s AND c.branch_uuid = %s AND p.table_uuid = %s"
-        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}")),
-        (main_branch, child, table_uuid),
-    )
-    if shared_slices[0][0] == 0:
+    #
+    # BOTH tiers, because which one carries the shared slice depends on the
+    # fixture: here the snapshot covers the whole persist, so `copy_inherited_
+    # persist` finds nothing above the baseline watermark and the inheritance is
+    # entirely snapshot segments. Checking only the persist table looked correct
+    # and reported "no shared slice" on a fixture that has one.
+    shared = 0
+    for base in (TABLE_PERSIST_SEGMENT_METADATA, TABLE_SNAPSHOT_SEGMENT_METADATA):
+        rows = get_pg_driver().execute(
+            SQL(
+                "SELECT count(*) FROM {tbl} p JOIN {tbl} c"
+                ' ON p.object_uri = c.object_uri AND p."offset" IS NOT DISTINCT FROM c."offset"'
+                " WHERE p.branch_uuid = %s AND c.branch_uuid = %s AND p.table_uuid = %s"
+            ).format(tbl=Identifier(f"{catalog_uuid}_{base}")),
+            (main_branch, child, table_uuid),
+        )
+        shared += rows[0][0]
+
+    if shared == 0:
         raise RuntimeError(
-            "setup failed: the fork holds no persist row naming the parent's "
-            "slice, so both branches would decode independently and the "
+            "setup failed: the fork holds no cold row naming the parent's slice "
+            "in either tier, so both branches would decode independently and the "
             "cross-branch cache sharing this test pins is unreachable"
         )
 
