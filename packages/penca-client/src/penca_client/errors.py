@@ -47,10 +47,10 @@ class AbortedError(ApiError):
     Distinct from ``FailedPreconditionError``, which means the request itself was
     wrong and reissuing it unchanged will fail again. Raised when a server-side
     operation loses a lock race with a concurrent catalog operation — currently
-    ``DeleteBranch``, whose teardown transaction takes catalog-wide locks and
-    rolls back wholly on contention. Retrying is the caller's call: the server
-    deliberately does not loop, since a retry with no backoff turns a loud
-    conflict into a quiet livelock.
+    ``DeleteBranch``, which locks only the branch's own partitions but must still
+    take a catalog-wide lock to drop them, and rolls back wholly on contention.
+    Retrying is the caller's call: the server deliberately does not loop, since a
+    retry with no backoff turns a loud conflict into a quiet livelock.
     """
 
 

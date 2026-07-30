@@ -771,8 +771,9 @@ impl LifecycleManager {
     /// belonging to any of the given tables on a branch.
     ///
     /// Keyed on `(branch_uuid, table_uuid IN (...))` on the segment table
-    /// directly. Used by DeleteBranch to enumerate every cold file the branch
-    /// owns.
+    /// directly. No caller since branch teardown moved to
+    /// [`Self::get_table_persist_segments_for_branch`], which needs no table
+    /// list; retained as the table-scoped shape a future caller would want.
     ///
     /// 1 SQL query.
     pub async fn get_table_persist_segments_for_tables(

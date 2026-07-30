@@ -1378,9 +1378,23 @@ impl PgDialect {
             .map(|t| Self::quote_identifier(t))
             .collect::<Vec<_>>()
             .join(", ");
-        // Bounded wait, so a teardown that loses a lock race fails fast rather
-        // than parking on the lock. The caller reports what is left as `Aborted`
-        // for the client to reissue.
+        // `SET LOCAL` is TRANSACTION-scoped, not statement-scoped, so this bound
+        // governs every later statement too — including the 14 `DROP TABLE`s,
+        // which is where it actually bites. That is deliberate but worth stating,
+        // because the dominant conflict is not another teardown: `compact` opens
+        // with `SELECT ... FOR UPDATE OF seg` naming the catalog-wide
+        // `table_persist_segment_metadata` PARENT, so it holds `ROW SHARE` there
+        // across its whole cold read and merged write. A drop needs `ACCESS
+        // EXCLUSIVE` on that parent, so a compact running anywhere in the catalog
+        // for longer than this bound fails the teardown.
+        //
+        // Failing is the right end of the trade — waiting instead would queue
+        // every subsequent lock request on that parent behind us, turning one
+        // slow compact into a catalog-wide stall. The caller reports it as
+        // `Aborted` and reissues. TODO(CHA-546): the root cause is compact naming
+        // the parent rather than the branch's partition; once reads and writes
+        // both target partitions, teardown's drops contend with nothing outside
+        // the branch and this stops being reachable in steady state.
         //
         // Both errors propagate UNWRAPPED. Re-wrapping as `sqlx::Error::Protocol`
         // would erase the `Error::Database` variant, and `as_database_error()`
