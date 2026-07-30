@@ -13,6 +13,22 @@ use sqlx::postgres::PgRow;
 use crate::helpers::{epoch, parse_uuid, qi};
 use crate::{LifecycleManager, Result};
 
+/// How much older than the reader-safety grace window a refcount-pinned
+/// `segment_delete_set` row must be before the sweep reaps it.
+///
+/// Deliberately not 1×. The gate's threshold answers "is it safe to delete this
+/// file now"; this answers "has this pin proven durable", and collapsing the two
+/// costs the delete-set row its value as evidence: with one threshold, a row's
+/// absence after a sweep conflates "reaped because still referenced" with
+/// "collected because unreferenced". For an index sidecar there is no second
+/// observable — no read reaches the file — so a refcount-gate regression would
+/// become indistinguishable from correct behaviour.
+///
+/// The value only has to be comfortably clear of the grace window; the growth it
+/// bounds accrues per deleted fork, not per second, so reaping an hour late
+/// costs nothing.
+const REAP_GRACE_MULTIPLE: i64 = 10;
+
 impl LifecycleManager {
     // Concurrency safety for compaction itself comes from `SELECT FOR
     // UPDATE` on the input `table_persist_segment_metadata` rows, not
@@ -353,6 +369,7 @@ impl LifecycleManager {
                 &seg_table,
                 &seg_index_table,
                 &persist_seg_table,
+                false,
             ),
         );
         let rows = driver
@@ -364,27 +381,62 @@ impl LifecycleManager {
             .collect())
     }
 
-    /// The "some row still references this URI" disjunction, shared verbatim by
-    /// the eligibility gate (negated) and the reaper (asserted).
+    /// The "some row still references this URI" disjunction, over one set of
+    /// referencing tables, shared by the eligibility gate (negated) and the
+    /// reaper (asserted).
     ///
-    /// One source for both because they must stay exact complements. If a fourth
-    /// referencing table were added to the gate but not to the reaper, the reaper
-    /// would drop delete-set rows for URIs that table still references — and
-    /// nothing would re-enqueue them until some *other* reference was dropped.
-    /// Sharing the text makes that class of drift impossible rather than merely
-    /// unlikely.
+    /// One source for WHICH tables, because that half must never drift: if a
+    /// fourth referencing table were added to the gate but not to the reaper, the
+    /// reaper would drop delete-set rows for URIs that table still references.
+    ///
+    /// `committed_only` is where the two callers deliberately differ, and the
+    /// asymmetry is load-bearing in both directions:
+    ///
+    /// - The **gate** counts uncommitted rows too (`false`). An in-flight
+    ///   snapshot's carried refs can outlive its source snapshot's retirement, so
+    ///   a file pinned only by them must not be collected.
+    /// - The **reaper** counts only committed rows (`true`). A delete-set row
+    ///   pinned *solely* by uncommitted refs is the safety net the snapshot
+    ///   FAILURE path depends on: that path deletes its uncommitted carried rows
+    ///   without enqueuing anything, because historically the row was already
+    ///   sitting in the set and the next sweep collected the file once those rows
+    ///   were gone. Reaping it would strand the file with no row and no
+    ///   reference — permanently invisible to every future sweep.
+    ///
+    /// So the two are exact complements over past-grace rows carrying a COMMITTED
+    /// reference. A row pinned only by uncommitted refs is in neither set and
+    /// stays put, exactly as before, until the in-flight op resolves — it commits
+    /// (a committed ref, reapable later) or its cleanup removes the rows (no refs,
+    /// eligible). Bounded either way by in-flight ops, so it does not reintroduce
+    /// the unbounded term; the fork-teardown growth this reaper exists for is
+    /// committed rows and still drains.
+    ///
+    /// Note for CHA-435's anticipated orphan reaper: it must enqueue what it
+    /// dereferences, since it cannot rely on a pre-existing row either.
     fn segment_delete_set_referenced_predicate(
         seg_table: &str,
         seg_index_table: &str,
         persist_seg_table: &str,
+        committed_only: bool,
     ) -> String {
+        let committed = if committed_only {
+            " AND {alias}.commit_micros IS NOT NULL"
+        } else {
+            ""
+        };
+        let arm = |table: &str, alias: &str| {
+            format!(
+                "EXISTS (SELECT 1 FROM {t} {alias} WHERE {alias}.object_uri = sds.object_uri{c})",
+                t = qi(table),
+                alias = alias,
+                c = committed.replace("{alias}", alias),
+            )
+        };
         format!(
-            "EXISTS (SELECT 1 FROM {seg} seg WHERE seg.object_uri = sds.object_uri) \
-             OR EXISTS (SELECT 1 FROM {six} six WHERE six.object_uri = sds.object_uri) \
-             OR EXISTS (SELECT 1 FROM {pseg} pseg WHERE pseg.object_uri = sds.object_uri)",
-            seg = qi(seg_table),
-            six = qi(seg_index_table),
-            pseg = qi(persist_seg_table),
+            "{} OR {} OR {}",
+            arm(seg_table, "seg"),
+            arm(seg_index_table, "six"),
+            arm(persist_seg_table, "pseg"),
         )
     }
 
@@ -402,19 +454,34 @@ impl LifecycleManager {
     /// drain. For an agentic-branch workload that is the dominant term, and the
     /// growth is irreversible once the rows exist.
     ///
-    /// Safe to drop a row that is still referenced because every transition of a
-    /// URI from referenced to unreferenced enqueues it: `retire` on retirement,
-    /// `compact` on superseding an input, and branch teardown on dropping the
-    /// branch's rows — each in the same transaction that removes the references.
-    /// So a reaped row is re-created by whoever later drops the LAST reference,
-    /// and the enqueue's `ON CONFLICT` refresh gives it a fresh grace clock.
+    /// Safe to drop a row that is still referenced by a COMMITTED row, because
+    /// every path that drops a committed reference enqueues the URI in the same
+    /// transaction: `retire` on retirement, `compact` on superseding an input,
+    /// branch teardown on dropping the branch's rows. So a reaped row is
+    /// re-created by whoever later drops the LAST such reference, with a fresh
+    /// grace clock from the `ON CONFLICT` refresh.
     ///
-    /// Carries the SAME `written_at_micros` guard as the gate, so it can never
-    /// reap a row racing an in-flight reader. No table lock is needed despite the
-    /// two statements not being atomic with each other: a reaped-then-dereferenced
-    /// URI is re-enqueued per the invariant above, and the opposite direction
-    /// cannot happen — a new reference to an unreferenced URI would have to be
-    /// copied from an existing row, and by definition there is none.
+    /// That enumeration is exhaustive only over COMMITTED references, which is
+    /// exactly why this counts only those (`committed_only = true` — see
+    /// [`Self::segment_delete_set_referenced_predicate`]). The snapshot FAILURE
+    /// path deletes its uncommitted carried rows without enqueuing anything, so a
+    /// row pinned solely by an in-flight snapshot's carried refs must survive; it
+    /// is the mechanism that path has always relied on.
+    ///
+    /// Reaps on a horizon of [`REAP_GRACE_MULTIPLE`] × the query timeout, strictly
+    /// LONGER than the gate's grace window, because the two answer different
+    /// questions: the gate's asks "is it safe to delete this file now", the reap
+    /// horizon asks "has this pin proven durable". Same-threshold reaping also
+    /// makes the delete-set row useless as evidence — a row's absence would
+    /// conflate reaped with collected, and for a sidecar there is no other
+    /// observable (no read reaches an index file), so a gate regression would be
+    /// indistinguishable from correct behaviour.
+    ///
+    /// No table lock is needed despite the reap and the gate not being atomic
+    /// with each other: a reaped-then-dereferenced URI is re-enqueued per the
+    /// invariant above, and the opposite direction cannot happen — a new
+    /// reference to an unreferenced URI would have to be copied from an existing
+    /// row, and by definition there is none.
     ///
     /// 1 SQL query.
     pub async fn reap_referenced_segment_delete_set_rows(
@@ -442,10 +509,13 @@ impl LifecycleManager {
                 &seg_table,
                 &seg_index_table,
                 &persist_seg_table,
+                true,
             ),
         );
+        let horizon =
+            now_micros - query_timeout_micros.saturating_mul(REAP_GRACE_MULTIPLE);
         let rows = driver
-            .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
+            .execute_params(&sql, &[SqlValue::Int64(horizon)])
             .await?;
 
         Ok(rows.len() as u64)

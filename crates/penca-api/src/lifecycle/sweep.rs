@@ -57,13 +57,15 @@ impl LifecycleManager {
 
         let now_micros = penca_storage_meta::LifecycleManager::now_micros(pool).await?;
 
-        // Reap first: drop past-grace rows whose URI is still referenced, so the
-        // eligibility scan below walks a set that does not accumulate. Nothing
-        // else ever removes such a row — the unlink path only deletes after a
-        // successful delete — so before this they sat in the expired range
-        // forever, and enqueue-only branch teardown made that growth
+        // Reap first: drop past-grace rows whose URI still has a COMMITTED
+        // reference, so the eligibility scan below walks a set that does not
+        // accumulate. Nothing else ever removes such a row — the unlink path only
+        // deletes after a successful delete — so before this they sat in the
+        // expired range forever, and enqueue-only branch teardown made that growth
         // monotonic in "forks ever deleted". Whoever later drops the URI's last
-        // reference re-enqueues it, so reaping loses nothing.
+        // committed reference re-enqueues it, so reaping loses nothing. Rows
+        // pinned only by an in-flight snapshot's UNCOMMITTED carried refs are
+        // deliberately left alone; that path's cleanup does not enqueue.
         let reaped_count =
             penca_storage_meta::LifecycleManager::reap_referenced_segment_delete_set_rows(
                 pool,
