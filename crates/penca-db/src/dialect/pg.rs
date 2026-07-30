@@ -1330,20 +1330,54 @@ impl PgDialect {
     ///    (`ACCESS SHARE` from the reads, then `ACCESS EXCLUSIVE` from the
     ///    partition drops). Two concurrent `DeleteBranch` calls in one catalog
     ///    then deadlock — each holds share, each wants exclusive — where before
-    ///    they simply serialised. Same hazard for anything else that reads these
-    ///    parents and then locks them exclusively, e.g. branch-partition creation.
+    ///    they simply serialised. Same hazard for anything else that READS these
+    ///    parents and then locks them exclusively. Branch-partition creation is a
+    ///    different case, not this one: it never reads them, it locks them
+    ///    exclusively in its own order, which is why the lock list below has to
+    ///    match that order rather than merely be taken first.
     ///
     /// Parents, not partitions: dropping a partition takes `ACCESS EXCLUSIVE` on
     /// its parent too, and the parents are what the enumerating reads touch.
+    ///
+    /// EVERY parent [`Self::drop_branch_partitions`] will drop, in the order
+    /// `ensure_branch_partitions` creates them (tx-log family first, then the
+    /// metadata parents). Both halves matter and neither is optional:
+    ///
+    /// - **Completeness.** Locking only the parents the enumeration reads leaves
+    ///   the rest to be locked later by the drops, which reintroduces the upgrade
+    ///   for any parent an enumeration touches indirectly —
+    ///   `get_snapshot_segments_for_table` INNER JOINs `table_snapshot_metadata`,
+    ///   so a partial list leaves exactly the `ACCESS SHARE` → `ACCESS EXCLUSIVE`
+    ///   sequence this exists to remove.
+    /// - **Order.** `CreateBranch` takes these same parents exclusively while
+    ///   creating partitions, tx-log family first. A teardown that locked the
+    ///   metadata parents first and reached the tx-log parents only at the drops
+    ///   would form a circular wait with it — teardown holding metadata and
+    ///   wanting tx-log, creation holding tx-log and wanting metadata. Sharing
+    ///   one canonical acquisition order is what makes that impossible; taking
+    ///   the strongest lock first does not address it, since creation never reads
+    ///   these parents at all.
     pub async fn lock_branch_teardown_parents(
         driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
         catalog_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
         let parents = [
+            // tx-log family, in ensure_tx_log_branch_partitions' order.
+            naming::begin_tx_log_table(catalog_uuid),
+            naming::abort_tx_log_table(catalog_uuid),
+            naming::commit_tx_log_table(catalog_uuid),
+            naming::tx_table_log_table(catalog_uuid),
+            naming::commit_tx_log_seq_num_table(catalog_uuid),
+            naming::abort_seq_num_table(catalog_uuid),
+            // metadata parents, in ensure_metadata_branch_partitions' order.
+            naming::table_persist_metadata_table(catalog_uuid),
             naming::table_persist_segment_metadata_table(catalog_uuid),
+            naming::table_purge_metadata_table(catalog_uuid),
+            naming::table_snapshot_metadata_table(catalog_uuid),
             naming::table_snapshot_segment_metadata_table(catalog_uuid),
-            naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
             naming::compact_segment_metadata_table(catalog_uuid),
+            naming::table_snapshot_index_metadata_table(catalog_uuid),
+            naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
         ];
         let list = parents
             .iter()
