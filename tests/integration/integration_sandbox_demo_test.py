@@ -101,6 +101,30 @@ def _segment_stats(catalog_uuid: str, table_uuid: str) -> dict[str, tuple[int, i
     return {row[0]: (int(row[1]), int(row[2])) for row in rows}
 
 
+def _distinct_objects(catalog_uuid: str, table_uuid: str) -> set[str]:
+    """Every distinct cold object holding this table's rows, across all branches.
+
+    The catalog-wide companion to ``_segment_stats``, which groups per branch and
+    so cannot express "one copy" once more than one branch references the same
+    object. Since CHA-539 a fork carries copied persist rows pointing at the
+    parent's ``object_uri``, so a per-branch row count no longer distinguishes
+    "shares the parent's object" from "wrote its own" — the distinct URI set
+    does, and it is what the README's one-copy claim actually asserts.
+
+    Same committed-rows-only gate as ``_segment_stats``.
+    """
+    parent = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT DISTINCT object_uri FROM {tbl} "
+            "WHERE table_uuid = %s AND commit_micros IS NOT NULL"
+        ).format(tbl=Identifier(parent)),
+        (table_uuid,),
+    )
+
+    return {row[0] for row in rows}
+
+
 def _cleanup_branch(client, catalog_uuid: str, branch_uuid: str) -> None:
     """Best-effort, mirroring _cleanup_catalog: a cleanup failure must never
     become the test's failure, nor gate the cleanup that follows it."""
@@ -222,8 +246,12 @@ def test_forks_share_one_copy_of_the_seeded_data():
 
     CreateBranch flushes the *source* hot tier to cold once (CHA-273) and copies
     metadata only — never row data (CHA-178). So main's cold footprint is flat
-    across the second and third fork, each fork owns zero objects and zero bytes,
-    and all three still read the full seeded set.
+    across the second and third fork, no fork adds an object, and all three still
+    read the full seeded set.
+
+    Since CHA-539 a fork does hold persist *rows* for the seeded table — copied
+    at CreateBranch, pointing at main's `object_uri` — so the no-second-copy
+    claim is asserted on the distinct object set, not on a fork having no rows.
     """
     demo = _load_demo()
     client = make_client()
@@ -283,10 +311,24 @@ def test_forks_share_one_copy_of_the_seeded_data():
                     f"{main_footprint} -> {observed}"
                 )
 
+            # The one-copy claim, asserted on objects rather than on rows. Since
+            # CHA-539 each fork DOES hold persist rows for the seeded table —
+            # copied at CreateBranch and carrying main's `object_uri` — so "a
+            # fork has no segment rows" is no longer the right expression of
+            # "a fork stores no data of its own". The invariant that survives,
+            # and the one the README actually claims, is that no fork adds an
+            # object: every branch's rows resolve to the single object main
+            # flushed.
+            objects = _distinct_objects(prod.catalog_uuid, prod.creatives_table_uuid)
+            assert len(objects) == 1, (
+                f"forking must not add a second copy of the seeded rows; "
+                f"saw {len(objects)} distinct objects: {sorted(objects)}"
+            )
             for fork_uuid in fork_uuids:
-                assert fork_uuid not in stats, (
-                    f"fork {fork_uuid} must store zero segments of its own, "
-                    f"saw {stats[fork_uuid]}"
+                fork_stats = stats.get(fork_uuid)
+                assert fork_stats is None or fork_stats[0] == 1, (
+                    f"fork {fork_uuid} must reference exactly the one shared "
+                    f"object, never one of its own, saw {fork_stats}"
                 )
 
         for fork_uuid in fork_uuids:

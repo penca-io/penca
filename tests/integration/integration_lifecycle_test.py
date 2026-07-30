@@ -3852,20 +3852,45 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
 
             return uris
 
+        def _parent_branch(catalog_uuid: str, branch_uuid: str) -> str | None:
+            rows = get_pg_driver().execute(
+                SQL("SELECT parent_branch_uuid FROM {} WHERE branch_uuid = %s").format(
+                    Identifier(
+                        _per_catalog_metadata_table(catalog_uuid, "branch_store")
+                    )
+                ),
+                (branch_uuid,),
+            )
+
+            return str(rows[0][0]) if rows and rows[0][0] is not None else None
+
         all_uris = _segment_uris(cat_a) + _segment_uris(cat_b)
         assert all_uris, "test setup: no cold segments were persisted"
 
         # (a) Every URI matches {base_uri}/{catalog_uuid}/{branch_uuid}/...
         #     The base_uri itself is configuration-dependent; we assert
         #     the path-component invariant: catalog_uuid appears as a
-        #     segment, immediately followed by the row's branch_uuid.
+        #     segment, immediately followed by the WRITER's branch_uuid.
+        #
+        #     Writer, not the row's branch: since CHA-539 a fork's inherited
+        #     persist/snapshot rows carry the parent's `object_uri` verbatim, so
+        #     a child's row legitimately points into the parent's subtree. The
+        #     layout rule binds whoever wrote the object; a referencing row does
+        #     not move it. Accepting either branch keeps the rule exact without
+        #     re-deriving which rows were copied.
         for catalog_uuid, branch_uuid, uri in all_uris:
-            assert f"/{catalog_uuid}/{branch_uuid}/" in uri, (
+            writers = [branch_uuid]
+            parent = _parent_branch(catalog_uuid, branch_uuid)
+            if parent is not None:
+                writers.append(parent)
+
+            assert any(f"/{catalog_uuid}/{w}/" in uri for w in writers), (
                 f"object_uri {uri!r} must contain catalog+branch prefix"
-                f" /{catalog_uuid}/{branch_uuid}/ (CHA-203 layout)"
+                f" /{catalog_uuid}/{{{' | '.join(writers)}}}/ (CHA-203 layout)"
             )
             tail_re = re.compile(
-                rf"/{re.escape(catalog_uuid)}/{re.escape(branch_uuid)}/(persist|snapshot)/"
+                rf"/{re.escape(catalog_uuid)}/(?:{'|'.join(re.escape(w) for w in writers)})"
+                r"/(persist|snapshot)/"
             )
             assert tail_re.search(uri), (
                 f"object_uri {uri!r} must place 'persist' or 'snapshot' as the"
@@ -3880,17 +3905,33 @@ class TestColdSegmentPathsUnderCatalogBranchPrefix:
         assert main_a_uris and feat_a_uris, (
             "expected both branches of cat_a to have persisted segments"
         )
+        # main is never a fork, so every object it references it also wrote.
         for u in main_a_uris:
             assert feat_a_prefix not in u, (
                 f"main branch URI {u!r} leaked into feature branch subtree"
                 f" {feat_a_prefix}"
             )
 
-        for u in feat_a_uris:
-            assert main_a_prefix not in u, (
-                f"feature branch URI {u!r} leaked into main branch subtree"
-                f" {main_a_prefix}"
-            )
+        # The fork's rows split in two, and both halves are load-bearing: the
+        # table created ON the fork is written under the fork's own subtree, and
+        # the rows it inherited at CreateBranch reference the parent's subtree
+        # (CHA-539 — copied metadata, shared objects). Asserting both keeps the
+        # subtree rule meaningful for a fork; asserting only "no main prefix"
+        # would now be false, and dropping the check entirely would stop pinning
+        # that a fork's own writes land under its own prefix.
+        feat_own = [u for u in feat_a_uris if feat_a_prefix in u]
+        feat_inherited = [u for u in feat_a_uris if main_a_prefix in u]
+        assert feat_own, (
+            f"the table created on the feature branch must be written under"
+            f" {feat_a_prefix}, saw {feat_a_uris}"
+        )
+        assert feat_inherited, (
+            f"the feature branch must reference the parent's objects for the"
+            f" tables it inherited at fork time, saw {feat_a_uris}"
+        )
+        assert set(feat_own).isdisjoint(feat_inherited), (
+            "a URI cannot be both own-written and inherited"
+        )
 
         # (c) Two catalogs have disjoint top-level subtrees.
         cat_a_uris = [u for c, _b, u in all_uris if c == cat_a]
