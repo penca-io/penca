@@ -165,19 +165,21 @@ def test_profiling_build_profile_wired() -> None:
 
 
 def test_profiling_docs_present() -> None:
-    profiling = _md_section(_read("README.md"), "Profiling")
-    assert profiling, "README must have a Profiling section"
+    # Profiling is contributor-facing, so CHA-522 moved it out of the README and
+    # into the development guide along with the rest of the operational content.
+    profiling = _md_section(_read("docs/development.md"), "Profiling")
+    assert profiling, "docs/development.md must have a Profiling section"
     assert "perf-test --profile" in profiling, (
-        "README Profiling section must document the `just perf-test --profile` flag"
+        "Profiling section must document the `just perf-test --profile` flag"
     )
     assert "sudo" in profiling, (
-        "README Profiling section must document the passwordless-sudo prerequisite "
+        "Profiling section must document the passwordless-sudo prerequisite "
         "(the actual prereq — servicers run as root, so samply attaches via sudo)"
     )
     assert "perf_event_paranoid" in profiling, (
-        "README Profiling section must explain kernel.perf_event_paranoid "
+        "Profiling section must explain kernel.perf_event_paranoid "
         "(why root/sudo bypasses it, so no sysctl tuning is needed)"
     )
     assert ".perf/profile-" in profiling, (
-        "README Profiling section must document the .perf/profile-<svc>.json output location"
+        "Profiling section must document the .perf/profile-<svc>.json output location"
     )

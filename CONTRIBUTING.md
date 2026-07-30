@@ -19,6 +19,17 @@ This will likely change as the project matures. If you'd like to follow along,
 watch or star the repository for updates. Again, if you'd like to get involved
 in active development as a maintainer, please reach out to **info@penca.io**.
 
+## Building and running Penca
+
+Setup, local stack, testing, profiling, and configuration all live in
+[docs/development.md](docs/development.md). That is the source, and this file
+deliberately does not duplicate it. Start there whether you are evaluating Penca or
+joining as a maintainer.
+
+For how the system is put together, see
+[docs/architecture.md](docs/architecture.md); for driving it, see
+[docs/usage.md](docs/usage.md).
+
 ## Questions
 
 For questions or to reach the maintainers, email **info@penca.io**.

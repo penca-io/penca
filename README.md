@@ -7,176 +7,47 @@
 [![Rust](https://img.shields.io/badge/rust-1.94+-orange)](rust-toolchain.toml)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](pyproject.toml)
 
-An open-source lakebase that unifies production (OLTP) and analytical
-(OLAP) workloads on a single system. Self-hostable with minimal
-infrastructure (Postgres + object storage).
+# Branchable and versioned OLTP + OLAP on one open columnar copy of your data
 
-Penca runs as three gRPC microservices (query, write, lifecycle)
-fronting a shared Postgres + object storage stack,
-plus a Flight SQL gateway (`penca-sql-server`) that translates SQL
-into those gRPC calls and a lifecycle scheduler that drives the
-hot → cold → snapshot → purge pipeline forward on its own. The whole
-server is implemented in Rust (tonic + DataFusion). SQL clients (JDBC /
-ODBC / ADBC) connect to the Flight SQL gateway; programmatic clients
-connect to the gRPC services directly.
+**Open-source and self-hostable on object storage. No second system, no CDC, no ETL.**
 
-## Prerequisites
+## Introduction
 
-### To run
+Production writes to one database. Analytics and ML read from another. CDC stitches the two
+together, so you pay twice for storage and get paged when the pipeline breaks. Trying
+anything (a migration, an index, a model) means copying data and standing up an
+environment first, which quietly caps how many experiments run at once. And when something
+goes wrong there is no lineage to consult: you cannot see who changed what, and reverting is
+manual surgery.
 
-| Tool | Why | Install |
-|---|---|---|
-| [Docker](https://docs.docker.com/engine/install/) | Postgres + SeaweedFS + servicer containers for `just penca-up` | platform installer |
-| [`uv`](https://docs.astral.sh/uv/) | Python toolchain for the client + demo (Python 3.10+) | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| [`just`](https://github.com/casey/just) | Recipe runner (`just penca-up`, `just integration-test`, …) | `uv tool install rust-just` |
+Agents make it worse. Weekly refreshes were fine when an experiment took a quarter. Agents
+iterate by the minute, fork aggressively, read data they wrote seconds ago, and write
+without review. Same problems, at machine speed.
 
-### To develop
+Penca collapses the split. Your data lives once, in open columnar files on your own bucket,
+and both workloads run against that copy. You can fork it like a git branch, which gives you
+a full read-write database that copies no rows. Fork production, let something loose on it,
+compare what it did, discard it. Every mutation appends to an immutable log with an author
+and a timestamp, so any state stays auditable and readable as of any point in time.
 
-Install `just` (see [To run](#to-run)), then from the repo root run [`just bootstrap`](Justfile). Idempotent: re-running picks up where it left off (each step checks before installing), so it's safe after a binary upgrade or a config pull.
+Writes land in an internal Postgres hot tier under a real ACID transaction; a background
+pipeline moves them out to columnar files (Lance by default, Parquet supported). Reads merge
+both tiers, so a query sees committed writes immediately whichever tier they sit in. That
+merge is what makes fork → transact → read-it-back *interactive* rather than a batch job.
+Object storage is pluggable and the **only permanent home** for your table data; catalog and
+branch metadata is served from Postgres and stays that way, with object-storage checkpoints
+for recovery on the [roadmap](#roadmap).
 
-Go 1.26.3+ is the one prereq `bootstrap` does not auto-install — platform variance across `apt` / `brew` / tarball makes a single one-liner unreliable. Install from [go.dev/dl](https://go.dev/dl/) and re-run.
+The trade is real: Penca is not competitive with bare-metal Postgres on transaction latency,
+and its analytical side is young. [Current shortcomings](#current-shortcomings) is specific
+about where the edges are.
 
-#### What `just bootstrap` installs
+## See it work
 
-| Tool | Why |
-|---|---|
-| [Rust 1.94+](rust-toolchain.toml) | Build the server from source (Docker pulls a prebuilt image for the run path). `rust-toolchain.toml` pins the version. |
-| [`rust-analyzer`](https://rust-analyzer.github.io/) | Powers the `LSP` tool and the `language-server` MCP server for Claude Code agents (`goToDefinition`, `findReferences`, `rename_symbol`). |
-| [`mcp-language-server`](https://github.com/isaacphi/mcp-language-server) | MCP server registered in [`.mcp.json`](.mcp.json) that exposes rust-analyzer's `rename_symbol` and friends to agents. |
-| [`kata`](https://github.com/kenn-io/kata) | Per-ticket task queue used by `/do-issue` (plan → red → drain). |
-| [`roborev`](https://github.com/kenn-io/roborev) | Continuous post-commit reviewer; findings feed back into `kata` via the bridge in `scripts/roborev-kata-hook.sh`. |
-| [`headroom`](https://headroom-docs.vercel.app/docs) | Opt-in context-compression proxy for the Claude Code loop, **off by default** (see the opt-in section below). |
-
-Plus the wiring no contributor should have to remember: kata PATH symlink + daemon start + `penca` project binding, roborev daemon registration + `post-commit` hook, the per-repo memory symlink (ADR 0016), and pre-commit hooks for the `pre-commit` + `commit-msg` stages.
-
-#### Shared issue-graph client (experimental, opt-in)
-
-An experiment ([CHA-447](https://linear.app/chapala/issue/CHA-447)) toward letting `/do-issue` planning navigate the whole issue graph from a shared kata instance instead of paying a Linear round-trip per hop. **Off by default** — with the env below unset, the VM stays local-only and nothing changes.
-
-- `PENCA_KATA_GRAPH_URL` — base URL of the shared kata daemon (the issue corpus).
-- `PENCA_KATA_GRAPH_TOKEN` — this VM's identity token for it.
-- `PENCA_KATA_GRAPH_ALLOW_INSECURE` — set only for a dev-over-http instance.
-
-When `PENCA_KATA_GRAPH_URL` is set, `just bootstrap` (via `init-agent-tools`) probes the instance and reports reachability. Read the shared graph **only** through [`scripts/kata-issue-graph.sh`](scripts/kata-issue-graph.sh) (`show` / `list` / `search` / …) — a scoped, read-only wrapper. Scoping matters: kata's `KATA_SERVER` is process-global, so setting it globally (or dropping a repo-root `.kata.local.toml`) would also route the local `cha-NNN` task-queue drain to the shared daemon. The wrapper sets the remote env inline on exec only, keeping the **local task-queue daemon authoritative** and refusing any mutating subcommand.
-
-This scaffold is inert until the shared instance exists and is populated — tracked in [CHA-450](https://linear.app/chapala/issue/CHA-450) (stand up the daemon), [CHA-451](https://linear.app/chapala/issue/CHA-451) (Linear → kata sync), and [CHA-449](https://linear.app/chapala/issue/CHA-449) (wire `/do-issue` Step 1 to consume it).
-
-#### Headroom context-compression proxy (experimental, opt-in)
-
-[Headroom](https://headroom-docs.vercel.app/docs) ([CHA-465](https://linear.app/chapala/issue/CHA-465)) is a local proxy that compresses what an agent reads — tool outputs, file reads, query results — *before* it reaches the model, trading some risk for fewer tokens. `just bootstrap` installs it (`uv tool install "headroom-ai[proxy]"`) so it's available, but **off by default**: nothing redirects Claude Code until you opt in.
-
-To use it, launch the proxy and point Claude Code at it:
-
-```bash
-just headroom-proxy                                  # serves on :8787
-ANTHROPIC_BASE_URL=http://localhost:8787 claude      # in another shell
-```
-
-Two caveats to validate before trusting it for real work (tracked in [CHA-465](https://linear.app/chapala/issue/CHA-465)):
-
-- **Auth.** Headroom's docs don't specify whether the proxy forwards Claude Code's existing auth header or expects its own `ANTHROPIC_API_KEY`. Confirm your auth path (OAuth subscription vs. API key) survives the hop before relying on it.
-- **Prompt caching.** A proxy that rewrites request bodies can invalidate Anthropic's prompt cache, which would *raise* cost and latency — the opposite of the goal. Check that cache hit-rate doesn't regress under a real session before defaulting it on.
-
-## Quick start
-
-**Branchable OLTP + OLAP on one open columnar copy of your data.**
-Open-source and self-hostable on object storage — no second system, no ETL.
-
-```bash
-just penca-up                           # Postgres + SeaweedFS + 3 servicers + scheduler + Flight SQL gateway
-set -a && source docker/.client.env      # PENCA_*_URL for the PencaClient
-uv run python examples/sandbox_demo.py
-```
-
-Fixed ports (Postgres 5432, Flight SQL 50060), bound to loopback, so you can
-point any Flight SQL driver on this machine at it — drop the `127.0.0.1:` prefix
-in `docker/dev.env` if you want it reachable from your network. To keep your data across restarts, give it a directory — both
-Postgres and the object store write there, and it survives `just penca-down`:
-
-```bash
-just penca-up --db ~/.penca/data
-```
-
-## Examples
-
-Everything under `examples/` runs against a `just penca-up` stack with the
-client env sourced, and nothing else. One composite story, then a family of
-single-feature scripts you can read end to end in a minute:
-
-| Script | Shows |
-|---|---|
-| `examples/sandbox_demo.py` | The flagship. Fork a branch per agent, transact on each in place, compare them, throw them away — prod untouched. |
-| `examples/oltp_demo.py` | Fetching one row out of a large table on cold columnar storage, timed over the gRPC client and over Flight SQL — both of which resolve to the same keyed read. |
-| `examples/audit_demo.py` | Version history and time travel on one table: `read_data`, `audit_data`, and reading the table as it was at an earlier commit. |
-
-Each is standalone and copy-pasteable — they deliberately repeat their setup
-rather than sharing a helper module, so you can lift one file and run it.
-
-### `examples/sandbox_demo.py` — a disposable sandbox per agent
-
-**Give each agent its own copy of production, then throw it away.**
-
-Three agents need to try three different strategies against the same live data.
-You do not want three copies of the database, you do not want them touching prod,
-and you do want to compare what they actually did. So fork a branch per agent:
-each one reads and writes real committed state, in place, isolated from the
-others — and none of them copied any data to get it.
-
-The demo seeds a `prod` catalog with ad creatives and a running conversion tally,
-forks three branches off `main`, and drives **one** shared, deterministic visitor
-feed through all three. Each visitor's response to each creative is fixed up
-front, so the branches see identical traffic and can only diverge on what they
-*do* with it — which is what makes the final scoreboard a fair comparison of
-strategies rather than of luck.
-
-Each agent's loop is the shape agentic work actually takes: read the current
-state, decide, write, repeat — each round reading back the writes it *committed*
-a moment ago, on the same copy it is transacting against. (Committed, not
-uncommitted: the read is taken before the transaction opens. Nothing here relies
-on reading your own dirty writes.) That feedback loop is the thing you cannot get
-from a read replica or a nightly extract.
-
-The round loop is **ordinary SQL over Flight SQL** — each branch is one
-connection, and branch selection binds at handshake and is immutable for the
-connection's lifetime, the way a Postgres connection is to one database. So a
-branch is reachable as a plain SQL endpoint, and these are the statements any
-Flight SQL driver would send:
-
-```sql
--- 1. read this branch's own committed tallies (read-your-writes,
---    on the same copy it is about to transact against)
-SELECT creative_id, impressions, conversions FROM prod_a1b2c3d4.ads.creatives;
-
--- 2. the allocation policy picks creatives from what it just read, then:
-BEGIN;
-INSERT INTO prod_a1b2c3d4.ads.creatives (creative_id, headline, impressions, conversions)
-VALUES ('carousel', 'One copy of your data. Both workloads.', 425, 94)
-ON CONFLICT (creative_id) DO UPDATE
-  SET impressions = EXCLUDED.impressions, conversions = EXCLUDED.conversions;
-INSERT INTO prod_a1b2c3d4.ads.impressions (visitor_id, creative_id, converted)
-VALUES ('v000401', 'carousel', 1), ('v000402', 'carousel', 0);
-COMMIT;
-```
-
-The tally upsert and the log append share one transaction, so the two can never
-disagree. The `SELECT` is of committed state and sits just before `BEGIN`, not
-inside it; reading inside the open transaction would take a slower path and buy
-the demo nothing.
-
-Setup — creating the catalog, the tables and the three forks — uses the gRPC
-client, because forking pins to the seed's `commit_seq_num` and SQL does not
-hand that back. Everything in the loop above is SQL.
-
-Every branch reads its tallies each round — the tally is cumulative, so writing it
-is a read-modify-write. `even` is the foil because it ignores *what the read said*,
-splitting on the visitor index alone; `greedy` and `epsilon` reallocate from their
-own running results. Then a
-cross-branch scoreboard ranks all three, `delete_branch` throws every fork away,
-and `main` is shown untouched. One run, measured 2026-07-27 at the shipped
-defaults (3000 impressions, 25 per transaction, epsilon 0.15, seed
-20260727) — the run
-reproduces, but nothing pins these particular figures, so treat them as a dated
-transcript rather than a contract:
+Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a branch
+per agent off `main`, drives one shared deterministic visitor feed through all three, lets
+each steer on its own committed writes, then ranks them, deletes every fork and shows `main`
+untouched. Its scoreboard:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -184,579 +55,137 @@ transcript rather than a contract:
 | `epsilon` |        3000 |         383 | 12.77% |
 | `even`    |        3000 |         307 | 10.23% |
 
-Both reading policies beat the fixed split, because both steer on what they wrote
-— and neither finds the genuinely best creative. `greedy` and `epsilon` each
-converge on `story` (true rate 0.14) rather than `carousel` (0.22); `epsilon` spends
-158 of its 3000 impressions on `carousel` and still does not switch, and its extra
-exploration costs it slightly against pure `greedy`. That is what toy policies look
-like, and it is the honest version of the claim: the read-your-writes loop is what
-separates these branches from the foil, not the quality of the allocator. How fast
-greedy commits is also partly an artifact of `--round-size`, which sets decision
-granularity as well as write granularity — a round's picks are all evaluated
-against the read taken at its start.
+`greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even` splits
+on the visitor index and never reads. The policies are toy; the mechanic is the point.
+Figures are one seeded run on 2026-07-27, reproducible but not pinned. The forks copy no rows,
+which the demo asserts rather than prints: see
+[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
-**Forking does not copy your row data.** Measured on the seeded `creatives`
-table: after the three forks, `main` holds its rows in **exactly one** cold object,
-unchanged by the second and third fork, and each branch owns **zero** cold objects
-of its own — while all three read the full seeded set. (`create_branch` does copy
-per-branch *metadata* — schema and table entries — by design; what it never copies
-is the rows.)
-Those are the assertions in
-`tests/integration/integration_sandbox_demo_test.py::test_forks_share_one_copy_of_the_seeded_data`,
-and they are the "one copy" half of the headline. (Penca records an in-memory Arrow footprint per segment rather than the
-object's size on disk, so there is no stored-byte figure to quote here — the
-load-bearing claim is the object count.)
-
-Two honest caveats. The allocation policies are deliberately toy — the database
-mechanic is the point, not the bandit. And at this scale the fork itself is the
-hook: reading your transactional writes back *analytically* only outruns a
-row-store at real volume or on a query shape a row-store chokes on, which is not
-what a 3000-impression demo shows.
-
-### `examples/oltp_demo.py` — a point lookup that stays a point lookup
-
-**One row out of a hundred thousand, straight out of columnar files.**
+## Quick start
 
 ```bash
-uv run python examples/oltp_demo.py    # same sourced env, no extra setup
+just penca-up                            # Postgres + object store + servicers + Flight SQL gateway
+set -a && source docker/.client.env      # PENCA_*_URL for the client
+uv run python examples/sandbox_demo.py
 ```
 
-A columnar layout is built for scans, so the fair question to ask of a lakehouse
-is what happens to a single-row primary-key lookup once the data has left the
-hot tier. The script seeds a table, drives it all the way cold — persist,
-snapshot, **and purge**, because persist leaves the rows physically in hot and
-the plan attaches a hot arm while any remain; purge is the delete that makes the
-read all-cold — and only then times the lookup.
-
-It fetches the row two ways, and they converge. The gRPC arm sends `ids=`, a
-primary-key restriction the engine resolves to a row identity. The SQL arm sends
-`WHERE account_id = …` over Flight SQL, and the gateway extracts that
-primary-key equality into the **same** `ids` restriction — the `WHERE` fragment
-is then not pushed with the read, so nothing evaluates it over the columnar
-files — so both arms land on the same keyed read. Neither scans. What the SQL
-arm pays on top is parsing and planning on each execution, plus the driver's
-extra round trips.
-
-**No figures are printed here on purpose.** Every number the demo shows is
-measured on your machine when you run it — hardware, container limits and object
-store all move it. Run it and read your own.
-
-### `examples/audit_demo.py` — time travel and the audit trail
+You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
+and [`just`](https://github.com/casey/just). The first `just penca-up` compiles the server
+image from source, which takes a while; a prebuilt image is on the way. Ports are fixed
+(Postgres 5432, Flight SQL 50060) and bound to loopback. Data is ephemeral unless you ask
+for a directory, which survives `just penca-down`:
 
 ```bash
-uv run python examples/audit_demo.py    # same sourced env, no extra setup
+just penca-up --db ~/.penca/data
 ```
 
-`audit_demo.py` walks through Penca's auditable-store semantics on a
-fresh `users(name PK, value)` table:
+## How this differs
 
-1. Three transactions on `main`: `insert(alice, bob)` →
-   `upsert(alice=99, charlie)` → `delete(bob)`.
-2. **`read_data`** — current state (alice=99, charlie=30; bob gone).
-3. **`audit_data`** — full version history including the
-   tombstone for bob; `audit_data(after=tx1)` shows only the post-tx1
-   diff.
-4. **`read_data(as_of=tx1)`** — time-travel back to alice=10, bob=20
-   before the upsert + delete landed.
+The defensible claim is the *conjunction*, on one copy. Each alternative holds part of it:
 
-The same flow expressed as SQL through Flight SQL is the same wire
-calls under the hood — DML translates to `WriteService.WriteData`,
-SELECT goes through the merge-on-read planner. See
-[Connecting](#connecting).
+- **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
+  branch: queries run on the row store, at row-store cost.
+- **Dolt.** Branching, merge and audit, open source, but on a bespoke row-oriented
+  format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
+- **Iceberg / Nessie.** Branching over open columnar files, but no interactive
+  read-your-writes: you commit table snapshots, you do not transact.
+- **Databricks LTAP.** The closest peer by far.
+  [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage), built
+  on Lakebase and announced in June 2026, argues the same thing we do: the way out of the
+  split is storing the data once in open formats instead of syncing a second copy to read
+  it. We could not have asked for better validation. Where the two diverge is data
+  versioning. LTAP keeps intermediate row versions to preserve Postgres MVCC and
+  point-in-time recovery, but they stay invisible to Iceberg and Delta readers and are
+  garbage-collected in time. Branching there is metadata-only, as it is here. Penca is
+  Apache-2.0 and self-hostable rather than a managed service, and it makes that version
+  history a first-class queryable surface: a row-level audit trail and `as_of` reads today,
+  revert to come.
 
 ## Architecture
 
-Each microservice is a separate binary with its own config struct and
-scaling profile. Per-service design docs live under
-[`docs/services/`](docs/services/); architecture decisions in
-[`docs/decisions/`](docs/decisions/).
-
-| Service | Port | Purpose | Scaling profile |
-|---|---|---|---|
-| **query** | 50052 | Catalog / schema / table reads, branch / tx reads, `ReadData` + `AuditData` streaming reads | CPU-bound, stateless, horizontal |
-| **write** | 50053 | Catalog / schema / table DDL, branching, transactions, data mutations | IO-bound, Postgres transactions |
-| **lifecycle** | 50054 | Persist, snapshot, purge, compaction, tx-log GC, dirty-set discovery (`ListModifiedTables` / `ListPersistedTables`) | Mixed; CPU-spiky during snapshot |
-| **lifecycle-scheduler** | — | Drives `Persist → Snapshot → Purge` on a periodic tick so the hot → cold pipeline advances without an operator. Pure gRPC client of query / lifecycle — no listen port | Single replica (v0, no leader election) |
-| **penca-sql-server** | 50060 | Arrow Flight SQL endpoint — proxies query / write | CPU-bound (DataFusion planning), stateless, horizontal |
-
-The query and lifecycle services read Postgres and object storage
-directly. Read planning (deciding *what to read and where*) is an
-in-process library call (`penca-storage-meta`), not a service hop.
+Penca runs as three gRPC services behind two entry points: SQL clients connect to a
+Flight SQL gateway that translates SQL into those calls, programmatic clients call the
+services directly.
 
 ```
-                                       ┌──────────────────────────┐
-                                       │ SQL client (BI / ADBC /  │
-                                       │  Flight SQL driver)      │
-                                       └────────────┬─────────────┘
-                                                    │  Flight SQL
-                                                    ▼
- ┌──────────────────────────┐           ┌───────────────────────────┐
- │ Programmatic client      │           │ penca-sql-server          │
- │ (PencaClient, or any     │           │ (Flight SQL + DataFusion; │
- │  gRPC client built from  │           │  proxies query / write    │
- │  the proto files)        │           │  via gRPC)                │
- └────────────┬─────────────┘           └────────────┬──────────────┘
-              │ gRPC (3 channels)                    │ gRPC (2 channels:
-              │                                      │  query / write)
-              ▼                                      ▼
- ┌────────────────────────────────────────────────────────────────────┐
- │  query            write            lifecycle                       │
- │  :50052           :50053           :50054                          │
- └────────────────────────────────────────────────────────────────────┘
-                 ▲                                  │
-                 │ gRPC (internal)                  ▼
- ┌───────────────┴───────────────┐  Postgres (hot tier + system metadata)
- │ lifecycle-scheduler           │     +  object storage (cold tier)
- │ (tick loop, no listen port;   │
- │  Persist → Snapshot → Purge)  │
- └───────────────────────────────┘
+   SQL clients (JDBC / ODBC / ADBC)          programmatic clients
+                 │                                    │
+            Flight SQL                        gRPC (3 channels)
+                 ▼                                    ▼
+    ┌────────────────────────┐          ┌────────────────────────────┐
+    │ penca-sql-server :50060│─────────▶│ query · write · lifecycle  │
+    │ (DataFusion)           │   gRPC   │ :50052   :50053   :50054   │
+    └────────────────────────┘          └─────────────┬──────────────┘
+                                                      ▼
+                       Postgres (hot tier)  +  object storage (cold tier)
 ```
 
-### Storage tiers
-
-- **Hot (Postgres)** — recent unpersisted mutations. Low-latency reads
-  and ACID writes. The query engine reads and writes Postgres directly
-  via SQL.
-- **Cold (object storage)** — S3 / GCS / SeaweedFS / any S3-compatible
-  store. Holds the bulk of historical data as columnar files (Lance
-  default; Parquet supported, Vortex / Nimble pluggable). The query
-  engine reads files directly.
-
-Both tiers store the same auditable-store shape (upsert log + delete
-log), so log segments in either tier may carry tombstones and
-superseded versions. Reads resolve in two passes: a **per-tier
-merge** runs the same SQL in hot and cold to pick the latest version
-per row id and apply tombstones, then a **cross-tier merge** unions
-the two with hot taking precedence over cold. See
-[docs/algorithms.md](docs/algorithms.md#read-path).
-
-The in-process read planner (`penca-storage-meta`, `MetadataClient::plan`)
-is the index that knows where data lives across both tiers — it tells the
-query engine *what to read and where*, computed in-process rather than over
-a service hop, and never touches the data itself.
-
-## Concepts
-
-### Catalogs, branches, schemas, tables
-
-Data is organized in a four-level hierarchy — **catalog → branch →
-schema → table**:
-
-- **Catalog** — top-level organizational unit. Boundary for access
-  control, billing, and resource isolation. Typically a deployment
-  environment (dev / staging / prod). Per CHA-163, core metadata
-  (branches, tx logs, table metadata) lives at this level.
-- **Branch** — versioning layer beneath catalog, modeled after git.
-  A branch spans every schema in its catalog, so `BEGIN; INSERT
-  s1.t; INSERT s2.t; COMMIT` is a single multi-schema atomic
-  transaction. Every read and write targets exactly one branch;
-  cross-branch reads are never valid. Defaults to `main`,
-  auto-created at `CreateCatalog` time.
-- **Schema** — namespace beneath a branch. Pure Postgres-style
-  namespace; cheap to create / drop, no per-schema heavyweight infra.
-  `CreateCatalog` bootstraps two well-known schemas: `public` (the
-  default target for unqualified DML, mirroring Postgres convention)
-  and `__penca_system__` (reserved for Penca-internal metadata
-  surfaced as first-class tables — see CHA-164/CHA-177).
-- **Table** — Arrow-typed structured data. The unit the query engine
-  reads from and writes to.
-
-The primary value of branching is **read/write isolation** — giving
-agents and researchers safe access to production data without copying
-it or risking the live system. Branch concurrency is optimistic
-(last-writer-wins at the row level). `MergeBranch` resolves the
-source's current state via set-based SQL into the target's logs under
-one merge transaction. See
-[docs/algorithms.md](docs/algorithms.md#merge-branch).
-
-Deleting a branch immediately and permanently deletes all data on
-that branch (table metadata, tx history, per-branch data tables)
-atomically. No soft-delete, no undo.
-
-### Identity
-
-Every entity with an immutable key has a deterministic `xxh3_128`
-UUID derived from that key — `catalog_uuid = xxh3(catalog_name)`,
-`schema_uuid = xxh3(catalog_uuid:schema_name)`, and so on through
-table and branch. User-row UUIDs derive from `(table_uuid, pk_values)`;
-derived rows in the persist + snapshot family chain off their parent
-UUID via the recursive `row_uuid_for_pk` mechanism (ADR 0016). Each
-UUID transitively encodes its parent identity through its hash input.
-
-This means name → UUID is a pure computation: no database lookups, no
-caches, no staleness. The same entity on different branches has the
-same `table_uuid`; deleting and recreating produces the same UUID
-(the merge-on-read CTE handles re-insert-after-delete correctly via
-time-aware deletes).
-
-User-supplied keys — catalog / schema / table / branch names, primary
-keys — are **immutable** after creation. Changing them would
-invalidate UUID references throughout the system. Only `tx_uuid` uses
-a random UUID (events with no immutable key).
-
-API request messages accept human-readable names anywhere a UUID is
-expected — the server resolves names to UUIDs via pure hash
-computation. Per-message comments in the `.proto` files document
-which identifier combinations are sufficient for each RPC; when both
-a UUID and a name are supplied, the UUID always wins.
-
-### Tables: log vs store vs auditable store
-
-Every table in Penca — system or user — is one of two primitives:
-
-| Type | Mutations | Description |
-|---|---|---|
-| **Log** | Append only | Immutable once written. The substrate for auditable stores. |
-| **Store** | Insert / update / delete | Mutable current-state. No history. |
-
-User data tables and the system table-metadata table are **auditable
-stores** — a composition of an upsert log + delete log + transaction
-log that provides insert/update/delete semantics with full version
-history and time-travel. Reads execute a symmetric per-tier
-[merge-on-read](docs/algorithms.md#read-path) that resolves the
-latest committed upsert per row minus effective deletes. Storage
-shape rationale: [ADR 0001](docs/decisions/0001-unified-upsert-log.md),
-[ADR 0008](docs/decisions/0008-table-metadata-subpartitioning.md).
-
-Only committed transactions are persisted from hot to cold storage;
-transaction TTLs guarantee cold storage never contains uncommitted or
-expired data.
-
-### Retention
-
-`RetentionConfig` has two independent fields — a row version is
-eligible for removal during snapshot only when it exceeds *both*:
-
-- `retain_max_versions` — max historical versions per row.
-  `NULL` = keep all, `0` = current only, `N` = latest N.
-- `retention_duration_us` — max age in microseconds.
-  `NULL` = retain indefinitely.
-
-Configured at three levels: catalog (required), schema (optional
-override), table (optional override). The effective policy resolves
-per-field as `coalesce(table, schema, catalog)`, so changing a
-catalog default retroactively applies to every un-overridden table —
-no backfill needed.
-
-Retention is enforced at snapshot time, not at write time. All
-versions stay available for time-travel until a snapshot runs.
-
-### Partitioning and clustering
-
-- **Partition keys** — columns used for query pruning. Must be
-  string-representable (string / integer / date / timestamp / boolean)
-  so the snapshot writer can group rows by a text partition label;
-  per-segment column statistics carry the pruning bounds. Partition
-  keys do **not** affect the physical file layout — partitioning is a
-  metadata-level index (one snapshot-segment row per distinct
-  partition value, with offset + length into the snapshot file).
-- **Clustering keys** — columns used to sort data within each
-  partition. Improves scan efficiency for range queries and ordered
-  access.
-
-Both are specified at table creation and modifiable via `UpdateTable`
-(modification on a non-empty table may trigger background
-reorganization).
-
-### Data lifecycle
-
-Write → persist → compact → snapshot → purge. Writes land in Postgres
-(hot) under a penca tx; persist moves committed data to
-per-physical-table cold-storage segments under a two-phase, no-orphans
-protocol; compact merges small segments; snapshot materializes a
-read-optimized point-in-time view (applies tombstones, enforces
-retention); purge reclaims hot rows once they clear the universal grace
-window. The `lifecycle-scheduler` drives `persist → snapshot → purge`
-autonomously on a periodic tick ([ADR 0019](docs/decisions/0019-plan-time-pinning-and-universal-grace-window.md)).
-Full algorithms with crash-safety invariants:
-[docs/algorithms.md](docs/algorithms.md).
-
-## Connecting
-
-Two entry points front the same three microservices:
-
-- **Programmatic gRPC** — direct channels to `WriteService`,
-  `QueryService`, `LifecycleService` on
-  ports 50052–50054. Full surface: catalog / schema / table CRUD
-  (mutations on Write, reads on Query), branching, transactions,
-  data mutations, lifecycle ops, streaming reads (`ReadData`,
-  `AuditData`). The shipped Python `PencaClient` connects here; any
-  third-party client built from the `protos/` files works the same
-  way. `List*` RPCs are paginated with opaque base64 page tokens
-  (currently wrapping an offset, but the type is opaque so we can
-  switch to keyset pagination without breaking clients).
-- **Arrow Flight SQL** — port 50060, served by `penca-sql-server`.
-  Reads (`SELECT`), DML (`INSERT` / `UPDATE` / `DELETE`), and
-  transaction control (`BEGIN` / `COMMIT` / `ROLLBACK` via the Flight
-  SQL action endpoints) for BI / ADBC / JDBC / ODBC clients. SQL DML
-  translates to `WriteService.WriteData` under the hood; multi-table
-  atomic writes still go through the gRPC `Insert` / `Update` /
-  `Delete` primitives. See
-  [docs/services/penca-sql-server.md](docs/services/penca-sql-server.md)
-  for the session model, catalog pinning, and tx routing
-  ([ADR 0007](docs/decisions/0007-session-entity.md),
-  [ADR 0010](docs/decisions/0010-flight-sql-tx-pin-routing.md)).
-
-The Python `PencaClient` wraps both surfaces:
-`execute_query(sql)` / `execute_stream(sql)` / `execute_update(sql)`
-for SQL; `read_data` / `audit_data` / `write_data` / branch + tx
-methods for the gRPC surface.
-
-## Running locally
-
-`just penca-up` brings up the full stack — Postgres, SeaweedFS, the
-3 servicer containers, the lifecycle scheduler, and the Flight SQL
-gateway — via `docker/compose.yml`. A `bootstrap-init` one-shot service seeds the
-global Penca tables + the default catalog before the servicers bind
-their ports, and `just penca-up` writes `docker/.client.env` (the
-`PENCA_*_URL`s the client needs) + `docker/.baseline.env` (direct-
-Postgres URL for the integration suite's white-box assertions).
-Requires Docker.
-
-| Profile | Behavior |
-|---|---|
-| `test` (default) | Random host ports — parallel-worktree-safe |
-| `dev` | Fixed ports 50052–50055 + 50060 |
-
-Standalone deployments (your own Postgres + object store) bootstrap
-the database by running the same image the cluster runs — no version
-drift between operator's bootstrap and prod:
-
-```bash
-docker run --rm \
-  -e DATABASE_URL="postgres://penca:penca@PROD_PG_HOST:5432/penca" \
-  -e SQL_SERVER_DEFAULT_CATALOG=public \
-  ghcr.io/penca-io/penca-rust-server:latest \
-  penca-bootstrap
-```
-
-> The published `ghcr.io/penca-io/penca-rust-server:latest` image
-> arrives with [CHA-187](https://linear.app/chapala/issue/CHA-187);
-> until then, contributors building from source can use the `cargo
-> run` path documented under [Development](#development).
-
-## Repository structure
-
-```
-protos/                                 # Proto source definitions (.proto files)
-├── buf.yaml
-└── penca_proto/
-    ├── external/v1/                    # Public APIs
-    │   ├── common.proto                # Shared messages (Branch, Tx, Change, …)
-    │   ├── lifecycle.proto             # LifecycleService — persist, snapshot, purge, compact, sweep, tx-log GC
-    │   ├── query.proto                 # QueryService — catalog/schema/table reads, branch + tx reads, ReadData / AuditData
-    │   └── write.proto                 # WriteService — catalog/schema/table DDL, branching, transactions, mutations
-    │
-    │   # The read-plan + segment shapes are native penca_core types
-    │   # (no proto) since CHA-445 deleted StorageMetadataService.
-
-crates/                                 # Rust workspace (production server)
-├── penca-core/                        # Identity (xxh3 UUIDs), naming, error types, env-var loading
-├── penca-proto/                       # tonic-build + protox bindings of the .proto files
-├── penca-sql/                         # Tiny shared `Dialect` trait — peer dep of penca-db / penca-dl
-├── penca-db/                          # Hot-tier `DbDriver`/`Dialect` + Postgres impl (`PgDriver`, `PgTransactionDriver`)
-├── penca-dl/                          # Cold-tier `DlDriver`/`Dialect` + DataFusion impl (`DatafusionDlDriver`)
-├── penca-format/                      # Columnar reader/writer trait + Parquet & Lance impls
-├── penca-storage-hot/                 # Stateless `HotStorageClient` (Postgres upsert/delete logs)
-├── penca-storage-meta/                # Stateless `MetadataClient` (~50 methods: catalog/schema/table/branch/tx CRUD, segments, snapshots, plan)
-├── penca-storage-cold/                # Stateless `ColdStorageClient` (object-store list/get/put + format dispatch)
-├── penca-merge/                       # Symmetric per-tier merge-on-read SQL builder (`penca_merge::sql`)
-├── penca-datafusion/                  # `PencaCatalogProviderList` / `SchemaProvider` / `PencaTableProvider`; per-conn `ConnScope`
-├── penca-api/                         # Orchestration: `WriteManager`, `QueryManager`, `LifecycleManager`
-├── penca-observability/               # Shared `tracing` subscriber init (`init_tracing`) for every binary — RUST_LOG filter + opt-in span timing
-├── penca-server-grpc/                 # tonic gRPC servicers + 3 service binaries + `penca-bootstrap`
-├── penca-lifecycle-scheduler/         # Autonomous `Persist → Snapshot → Purge` tick loop (binary `penca-lifecycle-scheduler`) — pure gRPC client, no listen port
-└── penca-sql-server/                  # Flight SQL gateway binary (port 50060) — DataFusion + arrow-flight, per-connection plan cache, DML translator
-
-packages/                               # Python packages (workspace members)
-├── penca-proto/                       # Generated Python protobuf + grpc stubs (consumed by the client and the test suite)
-└── penca-client/
-    ├── src/penca_client/
-    │   ├── client.py                   # `PencaClient` — gRPC channels for the 3 services + ADBC Flight SQL for SQL DML/reads
-    │   ├── config.py                   # Pydantic BaseSettings for client env (PENCA_*_URL, PENCA_SQL_URL)
-    │   ├── status.py / types.py        # gRPC error mapping, typed catalog/schema/table response wrappers
-    │   └── arrow.py / naming.py / _time.py / errors.py    # Small client-side helpers (Arrow IPC, deterministic UUIDs mirrored from penca-core, time conversion, typed errors)
-    └── tests/
-        └── unit/                       # Pure-Python tests for the client helpers (no infra)
-
-tests/                                  # System-level tests of Penca end-to-end (the Python client is the test driver, not the subject)
-├── integration/                        # Runs against the Rust servers via gRPC + Flight SQL — correctness oracle (PG driver for white-box assertions inlined in `integration_helpers.py`)
-└── performance/                        # Throughput benchmarks against the Rust servers, with a direct-Postgres baseline
-
-docker/                                 # Postgres + SeaweedFS + Rust servicer containers (compose.yml, Dockerfile.rust-server, env templates)
-linear/                                 # Linear issue tracker integration (source of truth for labels/projects)
-scripts/                                # Dev tooling (commit-msg validation, blank-line check, sync_linear, roadmap)
-docs/                                   # Architecture docs, ADRs, style guide, performance numbers
-Justfile                                # Development recipes (`just lint`, `just penca-up`, `just integration-test`, …)
-```
-
-## Development
-
-Run `just` to list every recipe (Just installation is in
-[Prerequisites](#prerequisites)):
-
-| Recipe | Description |
-|--------|-------------|
-| `just install-tools` | Install dev-only tools not pinned in `Cargo.toml`/`pyproject.toml` (currently `samply` for profiling + `cargo-sweep` for build-tree GC). Run once after cloning. |
-| `just compile-protos` | Regenerate Python + Rust protobuf bindings from all `.proto` files |
-| `just lint` | Run ruff linter |
-| `just format` / `just format-check` | Run / check ruff formatter + blank-line fixer |
-| `just check` | Run Python lint + format check + unit tests + static checks, plus Rust clippy / fmt-check / test. Mirrors CI. |
-| `just penca-up [--profile P] [--db DIR]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `--profile` = `dev` (default: fixed ports, lifecycle scheduler running) or `test` (random ports so parallel worktrees don't collide, scheduler idle so it can't race the suites' manual lifecycle calls). `--db DIR` persists Postgres and the object store under a host directory, so the stack survives `penca-down`. Requires Docker. |
-| `just penca-down [profile]` | Stop servicers + infra and remove volumes. |
-| `just integration-test [services]` | Start infra, run integration tests against the Rust services, tear down. Pass service names to scope: `just integration-test lifecycle query`. Requires Docker. |
-| `just perf-test [paths]` | Start infra, run performance tests against the Rust services, tear down. `paths` scope the run to one or more dirs/files under `tests/performance/` (e.g. `grpc`, `grpc/oltp_test.py`); omit to run everything. Captures each run to `.perf/results.jsonl` and writes a static HTML report (`.perf/report-<run_id>.html`) comparing it to history; pass `--record` to also persist the run into the SQLite history. Sources `docker/.baseline.env` for the direct-Postgres baseline. Requires Docker. |
-| `just perf-trends` | Per-series markdown summary (regression flags) + trend PNGs over the SQLite perf history (`.perf/perf.db`). |
-| `just perf-dashboard [run_id]` | Launch the Streamlit dashboard over the SQLite perf history; pass a `run_id` to open the comparison view for that run. |
-| `just tdd` | Start infra, run TDD tests from `tests/tdd/` (gitignored), tear down. Requires Docker. |
-| `just sync-linear` | Sync to Linear (`--labels`, `--projects`, `--retag`). Requires `LINEAR_API_KEY`. |
-| `just roadmap` | Print open Linear issues, optionally filtered (`--project`, `--priority`, `--label`, `--query`). Requires `LINEAR_API_KEY`. |
-
-Coding conventions, TDD workflow, and architectural rationale:
-[docs/style-guide.md](docs/style-guide.md),
-[docs/development-methodology-guide.md](docs/development-methodology-guide.md),
-[docs/design-decisions.md](docs/design-decisions.md).
-
-Contributors building from source can run `penca-bootstrap` directly
-against a local Postgres without Docker:
-
-```bash
-DATABASE_URL=postgres://penca:penca@localhost:5432/penca \
-SQL_SERVER_DEFAULT_CATALOG=public \
-    cargo run -p penca-server-grpc --bin penca-bootstrap
-```
-
-This is the from-source path; the documented operator path is the
-`docker run` snippet under [Running locally](#running-locally).
-
-### Profiling
-
-Penca uses [`samply`](https://github.com/mstange/samply) for CPU
-profiling — both local benchmarks and attaching to running services.
-Install once with `just install-tools`.
-
-Profile a benchmark:
-
-```bash
-samply record cargo bench --bench <bench-name>
-```
-
-Profile a running service — find the PID with `docker top <container>`
-or `ps`, then attach:
-
-```bash
-samply record -p <PID>
-```
-
-`samply` opens [Firefox Profiler](https://profiler.firefox.com) in
-your browser with a local HTTP server as the data source, so profile
-data never leaves your machine. Firefox Profiler's call-tree, marker,
-and async-await visualizations are the canonical view for `samply`
-output.
-
-#### Profiling the perf suite (`just perf-test --profile`)
-
-`just perf-test --profile [paths...]` runs the performance suite as
-usual (JSONL capture + HTML report; add `--record` to persist to SQLite)
-while samply also records a CPU profile of each containerized servicer
-under load, attaching to the
-container's host PID (`samply record -p`). It is an opt-in flag — like
-`--trace` — so a plain `just perf-test` is never
-slowed. It profiles `query`, `write`, `lifecycle`,
-and `penca-sql-server`; path args narrow the *workload* the
-same way they do without the flag (e.g.
-`just perf-test --profile performance_query_test.py`).
-
-Profiles are written to the gitignored `.perf/` dir as
-`.perf/profile-<svc>.json`. Open one with:
-
-```bash
-samply load .perf/profile-<svc>.json
-```
-
-Prerequisites:
-
-- **Passwordless `sudo`.** The containerized servicers run as root, so
-  samply attaches as root (`CAP_PERFMON`): unprivileged
-  `perf_event_open` against another user's process is denied at *every*
-  `kernel.perf_event_paranoid` level, and root bypasses the paranoid
-  check, so no sysctl tuning is needed. `--profile` preflights `sudo -n`
-  and refuses to run without it.
-- **A profiling build.** `--profile` builds the servicer image with the
-  `[profile.profiling]` Cargo profile (full DWARF + frame pointers) by
-  exporting `CARGO_PROFILE=profiling` to the compose build; samply can
-  then symbolicate down to source lines and inlined frames. Normal
-  `just penca-up` / `just perf-test` runs stay on the lean `release`
-  image.
-
-### Configuration
-
-All values are required (no defaults) — knobs come from env vars
-injected by `docker/compose.yml`. Server-side configs live in
-[`crates/penca-server-grpc/src/config.rs`](crates/penca-server-grpc/src/config.rs)
-(per-microservice),
-[`crates/penca-sql-server/src/config.rs`](crates/penca-sql-server/src/config.rs)
-(Flight SQL gateway), and
-[`crates/penca-lifecycle-scheduler/src/config.rs`](crates/penca-lifecycle-scheduler/src/config.rs)
-(scheduler).
-
-| Env var | Used by | Purpose |
-|---|---|---|
-| `DATABASE_URL`, `PG_POOL_MIN`, `PG_POOL_MAX` | all 4 + sql-server | Postgres connection |
-| `BIND_ADDR` | all 4 + sql-server | gRPC / Flight SQL server bind (scheduler has no listen port) |
-| `RUST_LOG` | every binary | `tracing` `EnvFilter` directive; unset = ERROR-only (fails loud, no in-code default) |
-| `PENCA_SPAN_TIMING` | query, sql-server | Opt-in span busy/idle timing (`FmtSpan::CLOSE`); empty = off |
-| `OBJECT_STORAGE_PROVIDER`, `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_FORMAT`, `OBJECT_STORAGE_*` | query, write, lifecycle | Cold storage backend (`s3` / `local`; Lance or Parquet) |
-| `QUERY_DEFAULT_PAGE_SIZE`, `QUERY_DEFAULT_STREAM_BATCH_SIZE` | query | Pagination (catalog/schema/table reads + branch/tx reads) + streaming batch size |
-| `QUERY_SEGMENT_READ_CONCURRENCY` | query | Max in-flight cold-segment reads during `stream_merged` (memory-safety cap) |
-| `QUERY_SNAPSHOT_PRUNE_MIN_SEGMENTS` | query | Skip snapshot-segment pruning below this planned-segment count (CHA-353; `0` always prunes) |
-| `QUERY_INDEX_SEEK_MAX_PROBE_TUPLES` | query | Probe-tuple cartesian cap for covering-index selection (CHA-485; over-cap skips the index, `0` disables selection) |
-| `QUERY_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES` | query | Byte budget for the in-process snapshot-segment cache (CHA-252) |
-| `QUERY_SNAPSHOT_LIST_CACHE_TTL_SECONDS` | query | TTL for the snapshot-list cache (CHA-441); MUST be `<= min(snapshot interval, QUERY_TIMEOUT_SECONDS)` so a stale list never outlives the retired snapshot files it names |
-| `QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES` | query | Max `(catalog, branch, table)` snapshot lists held in the CHA-441 cache (`0` disables) |
-| `QUERY_TIMEOUT_SECONDS` | query, lifecycle, scheduler | Hard cap on `read_data`/`audit_data` runtime = universal destructive-op grace window; all three MUST agree ([ADR 0019](docs/decisions/0019-plan-time-pinning-and-universal-grace-window.md)) |
-| `WRITE_DEFAULT_TX_TIMEOUT_SECONDS`, `WRITE_MAX_TX_TIMEOUT_SECONDS` | write | Tx TTL bounds |
-| `LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES` | lifecycle | Compaction ceiling |
-| `LIFECYCLE_SEGMENT_READ_CONCURRENCY` | lifecycle | Max in-flight cold-segment reads during snapshot's merge_read (memory-safety cap) |
-| `HOT_PURGE_GRACE_SECONDS` | lifecycle | Hot-purge grace window; the expired-begin ledger GC waits `max(SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS, SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS, this)` before dropping a timed-out tx's ledger (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)). The max over both cadences is a conservative bound — Purge rides the snapshot loop today, but the loop-to-op assignment is not an invariant |
-| `QUERY_SERVICE_ADDR`, `WRITE_SERVICE_ADDR` | sql-server | Upstream gRPC addresses (Query for catalog/table metadata reads, Write for DML) |
-| `SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY` | sql-server | Per-connection Flight SQL logical-plan cache size (CHA-355; `0` disables) |
-| `SQL_SERVER_DEFAULT_CATALOG`, `SQL_SERVER_DEFAULT_SCHEMA`, `SQL_SERVER_DEFAULT_BRANCH` | sql-server | Per-session pinned catalog + unqualified-DML defaults |
-| `QUERY_SERVICE_ADDR`, `LIFECYCLE_SERVICE_ADDR` | scheduler | Upstream gRPC addresses for the autonomous tick loop |
-| `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Persist sweep cadence (**non-positive** = that loop boots then idles forever); lifecycle reads it too, to floor the expired-begin ledger-GC grace (CHA-444 / [ADR 0027](docs/decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)) — both services MUST agree |
-| `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Snapshot + Purge + tx-log GC sweep cadence (**non-positive** = that loop boots then idles forever); same ledger-GC floor contract, both services MUST agree |
-| `SCHEDULER_LIST_PAGE_SIZE` | scheduler | List-tables page size |
-
-The Python `PencaClient` reads the channel URLs:
-`PENCA_QUERY_URL`, `PENCA_WRITE_URL`,
-`PENCA_LIFECYCLE_URL`,
-`PENCA_SQL_URL`. `just penca-up` writes these to
-`docker/.client.env` (and `PENCA_DB_*` to `docker/.baseline.env` for
-white-box test access + the perf baseline); `just integration-test`
-and `just perf-test` source both files automatically.
-
-## Further reading
-
-- [docs/algorithms.md](docs/algorithms.md) — write path, read path,
-  branch merge with crash-safety invariants
-- [docs/services/](docs/services/) — per-service design docs (RPCs,
-  dependencies, failure modes)
-- [docs/decisions/](docs/decisions/) — accepted ADRs
-- [docs/schema-reference.md](docs/schema-reference.md) — system table
-  schemas (global storage metadata, per-catalog, per-table)
-- [docs/performance.md](docs/performance.md) — benchmarks across hot,
-  cold-snapshotted, and mixed states
-- Open work: [Linear roadmap](https://linear.app/chapala). `just
-  roadmap` prints a summary; `just roadmap --query "search terms"`
-  searches.
-
-## Status
-
-The Rust port ([CHA-103](https://linear.app/chapala/issue/CHA-103))
-is the production implementation. The Python gRPC + Flight SQL
-servers were decommissioned in
-[CHA-186](https://linear.app/chapala/issue/CHA-186); `packages/penca-client/`
-now ships only the Python client. The system-level test harness lives at
-the top level under [`tests/integration/`](tests/integration/), which
-talks pure gRPC + Flight SQL to the Rust services and stays as the
-correctness oracle.
+A fifth process, the lifecycle scheduler, drives `persist → snapshot → purge` on a tick
+so the pipeline advances with no operator. Read planning is in-process in the query
+service, not a service hop.
+
+A fork copies no rows: it records its position in the parent and reads the parent's cold
+files through it. Not free, though: creating a branch first flushes the parent's
+unpersisted writes to cold, so fork latency tracks what the parent has buffered, not what it
+holds. Detail in [docs/architecture.md](docs/architecture.md); algorithms and crash-safety
+invariants in [docs/algorithms.md](docs/algorithms.md).
+
+## Features
+
+- [x] Fork, merge and discard a branch (gRPC only, no SQL branch DDL exists)
+- [x] Fork copies no rows off `main`; read-your-writes on the branch, over SQL or gRPC
+- [x] Time travel: read any table as of an earlier commit
+- [x] Audit trail: full version history per row, including tombstones
+- [x] ACID transactions spanning every schema in a catalog
+- [x] SQL over Arrow Flight SQL (JDBC / ODBC / ADBC), and a full gRPC API
+- [x] Primary-key point lookups and secondary-index seeks pushed into the scan
+- [x] Lance and Parquet on any S3-compatible store, with an autonomous lifecycle scheduler
+- [ ] Branch `diff` and `revert`, and forking off a fork
+- [ ] Retention pruning
+- [ ] Authentication and authorization
+
+## Current shortcomings
+
+- **No authentication or authorization, at all.** No auth interceptor, no TLS, and the Flight
+  SQL handshake is unimplemented. Anything reaching the ports has full access, hence the
+  loopback bind. Do not expose Penca to a network you do not control.
+- **Branching is narrower than git.** You can fork `main`, not a fork, and merging back is
+  fast-forward only: if the target took a commit past your fork point the merge is refused
+  rather than reconciled. No conflict resolution, no `diff`, no `revert`.
+- **No configurable isolation level.** What you get is fixed per operation: a snapshot at
+  `BEGIN` for reads in a transaction, last-writer-wins for upserts, READ COMMITTED for
+  `UPDATE`/`DELETE`. There is no setting to choose, per catalog or at all.
+- **OLTP is passable, not competitive.** A point read or write is dominated by the fixed
+  per-statement pipeline rather than by the storage underneath it, and the SQL path pays
+  more of that than the gRPC one. Good enough to build on, not a swap for Postgres on
+  single-client transactional work. Measure it yourself with `examples/oltp_demo.py`.
+- **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
+  at small scale Postgres still wins the analytical query, a crossover rather than a wall
+  ([docs/performance.md](docs/performance.md)).
+- **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
+  files, but nothing publishes them as an Iceberg table.
+- **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
+  drivers cannot connect unmodified.
+- **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
+
+## Roadmap
+
+Everything above is the roadmap, in roughly that order. The shortcomings section is a plan
+stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot
+tier, so you can ingest existing data-lake files at full speed, and adopting an Iceberg
+table in place with no migration. Retention gains the pruning half it is missing and the
+scheduler gains leader election. A structured predicate on the read wire kills the
+SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog
+metadata gets checkpointed to object storage and reloaded into Postgres at startup, still
+served from Postgres in steady state but recoverable from the object store alone.
+
+## Documentation
+
+- [docs/usage.md](docs/usage.md): connecting, a first table over SQL and gRPC, the demos, DataGrip
+- [docs/architecture.md](docs/architecture.md): services, tiers, concepts · [docs/development.md](docs/development.md): build, run, test
+- [docs/algorithms.md](docs/algorithms.md): read/write/merge · [docs/performance.md](docs/performance.md): benchmarks · [docs/schema-reference.md](docs/schema-reference.md): system tables
+- [docs/decisions/](docs/decisions/) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
