@@ -992,25 +992,34 @@ impl QueryManager {
         Ok((upsert_segments, delete_segments))
     }
 
-    /// The `snapshotted_at_micros` of the snapshot a fork adopted at CreateBranch
-    /// — its own oldest committed snapshot, which for a seeded child IS the
-    /// inherited baseline.
+    /// The `commit_micros` at which a fork's OWN inherited coverage begins —
+    /// `MIN(min_tx_commit_micros)` over the persist segments `CreateBranch`
+    /// copied into the child. The audit base arm stops here (exclusively), so
+    /// the two arms meet exactly: the parent covers `[genesis, floor)` and the
+    /// child's copies cover `[floor, fork]`.
     ///
-    /// Bounded at the fork on the seq axis, which is what keeps the answer
-    /// stable. A child's own snapshots all commit above `fork_commit_seq_num`
-    /// (`seed_commit_seq_num_from_fork`), so without the bound an unqualified
-    /// `MIN` would return the child's FIRST OWN snapshot once it takes one —
-    /// well above the fork — and the base arm would re-select every pre-fork
-    /// parent segment the child already holds as a copy, duplicating every
-    /// inherited change row again.
+    /// Derived from the copied segments themselves rather than from the adopted
+    /// snapshot's `snapshotted_at_micros`, because those two do not have to
+    /// align. The copy is per-persist-*header*: a header whose
+    /// `persisted_at_micros` sits above the baseline is copied with all of its
+    /// segments, and such a segment carries every row of that persist run —
+    /// including rows committed at or below the baseline. `snapshotted_at_micros`
+    /// is caller-supplied on the public `Snapshot` RPC and
+    /// `compute_snapshot_window` takes `min(as_of, persisted_at)`, so a baseline
+    /// landing mid-run is directly reachable. Capping at `baseline + 1` then
+    /// leaves the parent re-emitting every row the straddling copied segment
+    /// already carries — observed as one inherited change row appearing three
+    /// times, once per overlapping parent segment plus the child's own copy.
     ///
-    /// `None` when the child holds no snapshot at or below the fork, which means
-    /// it inherited from genesis (the parent had no eligible snapshot there) and
-    /// its own persist rows cover the whole inherited history. The audit base arm uses
-    /// this to stop where the child's own coverage begins; without it the two
-    /// arms overlap and `audit_data`, which concatenates without dedup, emits
-    /// every inherited change row twice.
-    pub async fn inherited_baseline_watermark(
+    /// Bounded at the fork on the seq axis: the child's own post-fork segments
+    /// all sit above `fork_commit_seq_num`, so without the bound this `MIN`
+    /// would keep dropping as the child persists its own writes and the base
+    /// arm would widen back over ground the child already covers.
+    ///
+    /// `None` when the child copied no persist segments at all — there is then
+    /// no own-arm coverage to be disjoint from, so the base arm keeps the
+    /// caller's full window.
+    pub async fn inherited_own_arm_floor(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
@@ -1019,15 +1028,15 @@ impl QueryManager {
         fork_commit_seq_num: i64,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let snap = naming::table_snapshot_metadata_table(&catalog);
+        let seg = naming::table_persist_segment_metadata_table(&catalog);
         let rows = driver
             .execute_params(
                 &format!(
-                    "SELECT MIN(snapshotted_at_micros) AS baseline FROM {snap} \
+                    "SELECT MIN(min_tx_commit_micros) AS floor FROM {seg} \
                      WHERE branch_uuid = $1 AND table_uuid = $2 \
                        AND commit_micros IS NOT NULL \
-                       AND commit_seq_num <= $3",
-                    snap = qi(&snap),
+                       AND min_commit_seq_num <= $3",
+                    seg = qi(&seg),
                 ),
                 &[
                     SqlValue::uuid_str(branch_uuid)?,
@@ -1039,7 +1048,7 @@ impl QueryManager {
 
         Ok(rows
             .first()
-            .and_then(|row| row.try_get::<Option<i64>, _>("baseline").ok().flatten()))
+            .and_then(|row| row.try_get::<Option<i64>, _>("floor").ok().flatten()))
     }
 
     /// Read a branch's fork lineage from `branch_store` — the parent branch and

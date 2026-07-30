@@ -135,18 +135,18 @@ pub struct AuditPlan {
     /// segments = `min(seq_to, fork_seed + 1)`. `None` for a non-forked branch.
     base_seq_to: Option<i64>,
     /// Exclusive per-row `committed_at_micros` upper bound for the base
-    /// (parent) segments = `min(cold_to, inherited_watermark + 1)`, or
-    /// `i64::MIN` when the child inherited from genesis. `None` for a
-    /// non-forked branch.
+    /// (parent) segments = `min(cold_to, inherited_own_arm_floor)`. `None` for
+    /// a non-forked branch, or for a fork that copied no persist segments.
     ///
-    /// Load-bearing on the *row* axis, not just segment selection: the two
-    /// arms are only disjoint because the base arm stops at the watermark
-    /// where the child's own copied arm begins. Segment selection alone
-    /// cannot enforce that — a parent segment whose micros range straddles
-    /// the watermark is still selected (it overlaps the window), and then
-    /// contributes *all* of its rows unless this bound clips them. Passing
-    /// the uncapped `cold_to` here instead is what made a fork with a real
-    /// adopted baseline emit every inherited change row twice.
+    /// Load-bearing on the *row* axis, not just segment selection: the two arms
+    /// are only disjoint because the base arm stops exactly where the child's
+    /// own copied arm begins. Segment selection alone cannot enforce that — a
+    /// parent segment whose micros range straddles the floor is still selected
+    /// (it overlaps the window), and then contributes *all* of its rows unless
+    /// this bound clips them. Passing the uncapped `cold_to` here is what made
+    /// a fork with a real adopted baseline emit every inherited change row
+    /// twice; deriving the floor from the adopted snapshot's watermark rather
+    /// than from the copied segments left it emitting one of them three times.
     base_cold_to: Option<i64>,
     /// ids point-lookup restriction, decoded once here so both
     /// stream halves (upserts + deletes) share one derivation.
@@ -1793,24 +1793,12 @@ impl QueryManager {
             .await?
         {
             // CHA-539: the child's OWN persist rows now carry the parent's CDC
-            // down to the inherited snapshot's watermark, so enumerating the base
-            // arm over that same range would double-report every change row. Cap
-            // the base arm at the inherited watermark; below it the parent is
-            // still the only source. `None` (parent had no eligible snapshot at
-            // the fork) means the child owns the whole inherited history, so the
-            // arm is skipped entirely.
+            // from the fork back to wherever its copied segments start, so the
+            // base arm must stop exactly there or the overlap is double-reported
+            // — `audit_data` concatenates the two arms and does not dedup.
             Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
-                // The child's own arm already returns the inherited CDC down to
-                // the adopted baseline's watermark, so the base arm must stop
-                // there or every inherited change row is emitted twice —
-                // `audit_data` concatenates the two arms and does not dedup, and
-                // both clamp to the same ceiling, so the duplicates are exact.
-                //
-                // `None` means the child inherited from genesis (no eligible
-                // parent snapshot at the fork), so it owns the whole inherited
-                // history and the arm is skipped entirely.
-                let inherited_watermark = self
-                    .inherited_baseline_watermark(
+                let own_arm_floor = self
+                    .inherited_own_arm_floor(
                         pool,
                         &catalog_uuid_str,
                         &branch_uuid_str,
@@ -1818,14 +1806,16 @@ impl QueryManager {
                         fork_commit_seq_num,
                     )
                     .await?;
-                let base_cold_to = match inherited_watermark {
-                    Some(watermark) => {
-                        let cap = watermark.saturating_add(1);
-                        Some(cold_to.map_or(cap, |to| to.min(cap)))
-                    }
-                    // Inherited from genesis: the child's own arm covers
-                    // everything, so give the base arm an empty window.
-                    None => Some(i64::MIN),
+                let base_cold_to = match own_arm_floor {
+                    // Exclusive, with no `+ 1`: the child's own copied segments
+                    // start AT the floor, so the parent must stop strictly below
+                    // it. A genesis-inherit child copied everything, so its floor
+                    // is the earliest row overall and this window comes out empty
+                    // — the same outcome as skipping the arm, reached uniformly.
+                    Some(floor) => Some(cold_to.map_or(floor, |to| to.min(floor))),
+                    // The child copied no persist segments, so there is no own-arm
+                    // coverage to avoid overlapping: keep the caller's window.
+                    None => cold_to,
                 };
                 let (base_upserts, base_deletes) = self
                     .read_persist_segments_for_window(
