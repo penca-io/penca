@@ -198,10 +198,6 @@ fn validate_create_table_primary_keys(
     Ok(())
 }
 
-/// Map a sqlx error originating from a PG `UNIQUE` constraint
-/// violation onto [`ApiError::AlreadyExists`] with `entity` as the
-/// human-readable subject (e.g. "catalog", "branch"); pass everything
-/// else through unchanged. Name-uniqueness on catalog + branch rename relies
 /// Whether an error is PG telling us we lost a lock race, rather than anything
 /// about the work itself.
 ///
@@ -219,6 +215,10 @@ fn is_lock_contention(err: &ApiError) -> bool {
         .is_some_and(|code| code == "40P01" || code == "55P03")
 }
 
+/// Map a sqlx error originating from a PG `UNIQUE` constraint
+/// violation onto [`ApiError::AlreadyExists`] with `entity` as the
+/// human-readable subject (e.g. "catalog", "branch"); pass everything
+/// else through unchanged. Name-uniqueness on catalog + branch rename relies
 /// on PG `UNIQUE` constraints.
 fn map_unique_violation<T, E>(result: Result<T, E>, entity: &str) -> Result<T, ApiError>
 where
@@ -1056,20 +1056,6 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
 
-        // `schema_uuid = None` makes this the catalog-wide table list. Read
-        // outside the transaction because it is a schema-level read whose result
-        // the enqueue does not depend on being point-in-time with: a table
-        // created after this read has no cold segments on a branch being torn
-        // down, and one dropped before it has none either.
-        let table_uuid_strs = self
-            .query_manager
-            .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
-            .await?;
-
-        // Cold holds no commit_tx_log, so the touched set is just the data
-        // tables; snapshot segments key directly on `(branch, table)`.
-        let segment_table_uuids: Vec<&str> = table_uuid_strs.iter().map(String::as_str).collect();
-
         // Enumerate the files AND drop the metadata in one transaction. One
         // transaction because removing the references and queueing the files must
         // be a single fact: a crash between them leaves either an unreferenced
@@ -1077,18 +1063,19 @@ impl WriteManager {
         // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
         // already queued by another branch's retirement the later grace clock.
         //
-        // The enumeration is INSIDE the transaction and BEHIND the exclusive lock,
-        // in that order. Reading on `pool` left a window in which a concurrent
-        // lifecycle wave could commit new segment rows and cold files after the
-        // read; the CASCADE below then drops those rows, leaving a file both
-        // unreferenced and absent from `segment_delete_set` — permanently
-        // uncollectable, since enqueue-only teardown retired the orphan-scan
-        // fallback. Moving the reads into the transaction is NOT sufficient on its
-        // own: they take only ACCESS SHARE, which a wave's ROW EXCLUSIVE is
-        // compatible with, so the same interleaving survives. Taking the parents'
-        // ACCESS EXCLUSIVE first is what serialises the wave out — and it also
-        // avoids the lock upgrade that in-transaction reads would otherwise
-        // introduce, which deadlocks two concurrent DeleteBranch calls.
+        // Every enumeration is INSIDE the transaction and BEHIND the exclusive
+        // lock, in that order — including the table list they are all scoped by.
+        // Reading on `pool` left a window in which a concurrent lifecycle wave
+        // could commit new segment rows and cold files after the read; the CASCADE
+        // below then drops those rows, leaving a file both unreferenced and absent
+        // from `segment_delete_set` — permanently uncollectable, since
+        // enqueue-only teardown retired the orphan-scan fallback. Moving the reads
+        // into the transaction is NOT sufficient on its own: they take only ACCESS
+        // SHARE, which a wave's ROW EXCLUSIVE is compatible with, so the same
+        // interleaving survives. Taking the parents' ACCESS EXCLUSIVE first is what
+        // serialises the wave out — and it also avoids the lock upgrade that
+        // in-transaction reads would otherwise introduce, which deadlocks two
+        // concurrent DeleteBranch calls.
         // A lock loss is reported, not retried. Ordering the lock list against
         // `CreateBranch` removes that pairing but cannot remove the class: the
         // DDL path reads the metadata parents then writes the tx-log partitions,
@@ -1103,15 +1090,13 @@ impl WriteManager {
         // so reissuing DeleteBranch is safe — what the caller needs is to be able
         // to TELL a lock loss from a real failure, which is why this maps to
         // `Aborted` (retry at a higher level) rather than the default `Internal`.
-        Self::delete_branch_tx(
+        self.delete_branch_tx(
             pool,
             dl_driver,
             &catalog_uuid,
             &catalog_str,
             &branch_str,
             branch_uuid,
-            &table_uuid_strs,
-            &segment_table_uuids,
         )
         .await
         .map_err(|e| {
@@ -1129,32 +1114,48 @@ impl WriteManager {
         Ok(DeleteBranchResponse {})
     }
 
-    /// One attempt at the teardown transaction. Split out so the caller can
-    /// retry it wholesale — see the note at its call site.
-    #[allow(clippy::too_many_arguments)]
+    /// The teardown transaction. Split out from `delete_branch` so that
+    /// everything inside it runs behind `lock_branch_teardown_parents` by
+    /// construction — the resolution and `main` guard that precede it are
+    /// ordinary reads that must NOT hold the parents' ACCESS EXCLUSIVE. There is
+    /// no retry: see the note at its call site.
     async fn delete_branch_tx<L: DlDriver + ?Sized>(
+        &self,
         pool: &PgDriver,
-        _dl_driver: &L,
+        dl_driver: &L,
         catalog_uuid: &Uuid,
         catalog_str: &str,
         branch_str: &str,
         branch_uuid: Uuid,
-        table_uuid_strs: &[String],
-        segment_table_uuids: &[&str],
     ) -> Result<(), ApiError> {
         with_pg_tx(pool, async |tx| {
             PgDialect::lock_branch_teardown_parents(tx, catalog_uuid).await?;
+
+            // `schema_uuid = None` makes this the catalog-wide table list. Behind
+            // the lock like every enumeration it scopes: a `CreateTable` + persist
+            // wave committing between this read and the CASCADE would otherwise
+            // leave that table's file unreferenced and unqueued, and its hot data
+            // tables undropped.
+            let table_uuid_strs = self
+                .query_manager
+                .list_table_uuids_for_branch(tx, dl_driver, catalog_str, None, branch_str)
+                .await?;
+
+            // Cold holds no commit_tx_log, so the touched set is just the data
+            // tables; snapshot segments key directly on `(branch, table)`.
+            let segment_table_uuids: Vec<&str> =
+                table_uuid_strs.iter().map(String::as_str).collect();
 
             let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
                 tx,
                 catalog_str,
                 branch_str,
-                segment_table_uuids,
+                &segment_table_uuids,
             )
             .await?;
 
             let mut snap_segments: Vec<(String, String)> = Vec::new();
-            for table_uuid_str in table_uuid_strs {
+            for table_uuid_str in &table_uuid_strs {
                 let segs = LifecycleManager::get_snapshot_segments_for_table(
                     tx,
                     catalog_str,
@@ -1217,7 +1218,7 @@ impl WriteManager {
 
             let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
             if deleted {
-                for table_uuid_str in table_uuid_strs {
+                for table_uuid_str in &table_uuid_strs {
                     LifecycleManager::drop_data_tables(
                         tx,
                         table_uuid_str,
