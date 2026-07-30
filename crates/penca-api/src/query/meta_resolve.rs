@@ -1611,7 +1611,7 @@ mod tests {
     use penca_merge::ReadSnapshot;
     use sqlx::postgres::PgRow;
 
-    use super::{QueryManager, table_uuid_in_filter};
+    use super::{ApiError, QueryManager, table_uuid_in_filter};
 
     // Pins the exact residual shape: quoting, comma-join, `l.` alias.
     #[test]
@@ -1729,10 +1729,72 @@ mod tests {
         .await;
 
         assert!(
-            result.is_err(),
-            "a supplied-but-not-open open_tx_uuid must error, got {:?}",
-            result.ok()
+            matches!(result, Err(ApiError::NotFound(_))),
+            "a supplied-but-not-open open_tx_uuid must be NotFound, got {result:?}"
         );
+    }
+
+    // `open_tx_uuid` beside either as_of is rejected, not ranked: RYOW is anchored
+    // at the tx's own begin frontier, so an as_of pin beside it is a contradiction.
+    //
+    // These assert the VARIANT, not `is_err()`. The mutex check runs before the tx
+    // lookup, so if it were ever removed the lookup's `NotFound` would still
+    // satisfy `is_err()` and hide a check that never ran.
+    #[tokio::test]
+    async fn resolve_read_snapshot_rejects_open_tx_with_as_of_micros() {
+        let result = QueryManager::resolve_read_snapshot(
+            &NoopDriver,
+            &uuid::Uuid::nil().to_string(),
+            &uuid::Uuid::nil().to_string(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            Some(1_000),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "open_tx_uuid + as_of_micros must be InvalidRequest, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_read_snapshot_rejects_open_tx_with_as_of_seq() {
+        let result = QueryManager::resolve_read_snapshot(
+            &NoopDriver,
+            &uuid::Uuid::nil().to_string(),
+            &uuid::Uuid::nil().to_string(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            None,
+            Some(42),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "open_tx_uuid + as_of_seq must be InvalidRequest, got {result:?}"
+        );
+    }
+
+    // The surviving precedence: both as_of axes set is well-defined, not an error,
+    // because both pin the same committed history. Micros wins.
+    #[tokio::test]
+    async fn resolve_read_snapshot_both_as_of_axes_resolves_to_micros() {
+        let snapshot = QueryManager::resolve_read_snapshot(
+            &NoopDriver,
+            &uuid::Uuid::nil().to_string(),
+            &uuid::Uuid::nil().to_string(),
+            None,
+            Some(1_000),
+            Some(42),
+            None,
+        )
+        .await
+        .expect("both as_of axes together must resolve, not error");
+
+        assert_eq!(snapshot, ReadSnapshot::AsOfMicros(1_000));
     }
 
     // Regression guard: explicit `as_of_micros` resolves verbatim.
