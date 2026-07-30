@@ -427,6 +427,20 @@ impl LifecycleManager {
         // `persist_wm >= snapshotted_at_micros` so the pick succeeds. No segments
         // means nothing is double-counted against the snapshot that already
         // materializes those rows, and no extra parent files are pinned.
+        //
+        // The window's UPPER bound is the segment query, not a second micros
+        // predicate. Neither naive ceiling works: the fork-time `PersistBranch`
+        // flush writes a header stamped after `fork_commit_micros`, and a
+        // straddling run's header legitimately carries `commit_seq_num >
+        // fork_seq`, so bounding on either axis drops rows the child needs. A
+        // header earns its place by having at least one segment at or below the
+        // fork — which is exactly what makes it part of "the parent as-of this
+        // fork" — so the header is written only once its segments qualify.
+        // Skipping that check copied segment-less headers for parent runs
+        // entirely above the fork, which inflates the child's
+        // `latest_committed_table_persist_watermark` and, through
+        // `compute_snapshot_window`, stamps a freshly-forked child's first
+        // snapshot at the parent's latest persist time.
         let header_from = baseline_watermark.unwrap_or(i64::MIN);
         let segment_from = baseline_watermark.map_or(i64::MIN, |w| w.saturating_add(1));
 
@@ -459,6 +473,62 @@ impl LifecycleManager {
             let new_header =
                 naming::table_persist_uuid(catalog, child, table, persisted_at, log_kind);
 
+            // The baseline's own header is the one deliberate exception to
+            // "a header needs qualifying segments": it is copied bare, because
+            // the inherited snapshot already materializes its rows.
+            let is_baseline_header = persisted_at <= segment_from.saturating_sub(1);
+
+            // Derive every (new, old) uuid pair BEFORE writing the header — the
+            // pairs are `naming` derivations off `new_header`, which is itself a
+            // pure function of values already in hand, so nothing here needs the
+            // header row to exist. Deriving first is what lets an empty result
+            // skip the header instead of stranding a segment-less one.
+            let mut new_uuids: Vec<String> = Vec::new();
+            let mut old_uuids: Vec<String> = Vec::new();
+            if !is_baseline_header {
+                let segs = driver
+                    .execute_params(
+                        &format!(
+                            "SELECT table_persist_segment_uuid, chunk_idx FROM {seg} \
+                             WHERE branch_uuid = $1 AND table_persist_uuid = $2 \
+                               AND commit_micros IS NOT NULL \
+                               AND min_commit_seq_num <= $3 \
+                             ORDER BY chunk_idx",
+                            seg = qi(&persist_seg),
+                        ),
+                        &[
+                            SqlValue::uuid_str(parent_branch_uuid)?,
+                            SqlValue::Uuid(old_header),
+                            SqlValue::Int64(fork_commit_seq_num),
+                        ],
+                    )
+                    .await?;
+                new_uuids.reserve(segs.len());
+                old_uuids.reserve(segs.len());
+                for seg_row in &segs {
+                    let old_seg: Uuid = seg_row.get("table_persist_segment_uuid");
+                    let chunk_idx: i32 = seg_row.get("chunk_idx");
+                    // Err, not a sentinel: falling back to 0 would derive the uuid
+                    // the header's real chunk 0 already owns, and the INSERT's
+                    // ON CONFLICT DO NOTHING would then swallow the row — leaving
+                    // the child one inherited segment short with no error and no
+                    // signal, the worst failure mode for a copy whose job is
+                    // completeness.
+                    let chunk_idx = u32::try_from(chunk_idx).map_err(|_| {
+                        crate::MetadataError::Db(sqlx::Error::Protocol(format!(
+                            "table_persist_segment_metadata.chunk_idx out of range: {chunk_idx}"
+                        )))
+                    })?;
+                    new_uuids.push(
+                        naming::table_persist_segment_uuid(&new_header, chunk_idx).to_string(),
+                    );
+                    old_uuids.push(old_seg.to_string());
+                }
+                if new_uuids.is_empty() {
+                    continue;
+                }
+            }
+
             // 5. The header. Required, not decorative: the read path INNER JOINs
             //    segments up to it for `log_kind`, so a segment row without its
             //    header on the SAME branch is invisible rather than merely
@@ -488,53 +558,15 @@ impl LifecycleManager {
                 )
                 .await?;
 
-            // 6. Its segments — but not for the baseline's own header, whose rows
-            //    the inherited snapshot already materializes.
-            if persisted_at <= segment_from.saturating_sub(1) {
-                continue;
-            }
-            let segs = driver
-                .execute_params(
-                    &format!(
-                        "SELECT table_persist_segment_uuid, chunk_idx FROM {seg} \
-                         WHERE branch_uuid = $1 AND table_persist_uuid = $2 \
-                           AND commit_micros IS NOT NULL \
-                           AND min_commit_seq_num <= $3 \
-                         ORDER BY chunk_idx",
-                        seg = qi(&persist_seg),
-                    ),
-                    &[
-                        SqlValue::uuid_str(parent_branch_uuid)?,
-                        SqlValue::Uuid(old_header),
-                        SqlValue::Int64(fork_commit_seq_num),
-                    ],
-                )
-                .await?;
-
-            // Derive every (new, old) uuid pair first, then copy the whole
-            // header's segments in ONE statement. The old→new mapping lives in
-            // Rust (the uuids are `naming` derivations, not anything SQL can
-            // compute), which is the only reason this was ever a per-row loop —
-            // and it is expressible as a join against `unnest` of the two arrays.
-            let mut new_uuids: Vec<String> = Vec::with_capacity(segs.len());
-            let mut old_uuids: Vec<String> = Vec::with_capacity(segs.len());
-            for seg_row in &segs {
-                let old_seg: Uuid = seg_row.get("table_persist_segment_uuid");
-                let chunk_idx: i32 = seg_row.get("chunk_idx");
-                // Err, not a sentinel: falling back to 0 would derive the uuid
-                // the header's real chunk 0 already owns, and the INSERT's
-                // ON CONFLICT DO NOTHING would then swallow the row — leaving the
-                // child one inherited segment short with no error and no signal,
-                // the worst failure mode for a copy whose job is completeness.
-                let chunk_idx = u32::try_from(chunk_idx).map_err(|_| {
-                    crate::MetadataError::Db(sqlx::Error::Protocol(format!(
-                        "table_persist_segment_metadata.chunk_idx out of range: {chunk_idx}"
-                    )))
-                })?;
-                new_uuids
-                    .push(naming::table_persist_segment_uuid(&new_header, chunk_idx).to_string());
-                old_uuids.push(old_seg.to_string());
-            }
+            // 6. Its segments — copied in ONE statement per header. The old→new
+            //    mapping lives in Rust (the uuids are `naming` derivations, not
+            //    anything SQL can compute), which is the only reason this was ever
+            //    a per-row loop — and it is expressible as a join against `unnest`
+            //    of the two arrays.
+            //
+            //    Empty only for the baseline header, which is deliberately bare;
+            //    every other header without qualifying segments was skipped above
+            //    rather than written.
             if new_uuids.is_empty() {
                 continue;
             }
