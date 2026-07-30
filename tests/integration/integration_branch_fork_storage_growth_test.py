@@ -40,7 +40,9 @@ _FORKS = 3
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _distinct_slice_bytes(catalog_uuid, table_name=TABLE_SNAPSHOT_SEGMENT_METADATA):
+def _distinct_slice_bytes(
+    catalog_uuid, table_name=TABLE_SNAPSHOT_SEGMENT_METADATA, table_uuid=None
+):
     """``(distinct_file_count, total_bytes)`` over every committed segment row in
     ``table_name``, deduped by storage slice.
 
@@ -65,10 +67,11 @@ def _distinct_slice_bytes(catalog_uuid, table_name=TABLE_SNAPSHOT_SEGMENT_METADA
             "SELECT count(DISTINCT object_uri), coalesce(sum(bytes), 0) FROM ("
             '  SELECT object_uri, "offset", max(size_bytes) AS bytes FROM {tbl}'
             "  WHERE commit_micros IS NOT NULL"
-            '  GROUP BY object_uri, "offset"'
+            + ("  AND table_uuid = %s" if table_uuid is not None else "")
+            + '  GROUP BY object_uri, "offset"'
             ") f"
         ).format(tbl=Identifier(seg)),
-        (),
+        () if table_uuid is None else (table_uuid,),
     )
     return int(rows[0][0]), int(rows[0][1])
 
@@ -201,8 +204,12 @@ def test_fork_materializes_metadata_reference_rows_per_cold_segment():
     # assertion above by re-materializing the parent's persist segments under the
     # child's own per-branch prefix — O(N forks x persist bytes) of real storage —
     # and still report "unchanged".
+    # Scoped to the user table. Catalog-wide would also count the
+    # `__penca_system__` persist segments each fork's own CreateBranch flush
+    # writes for the schema/table DDL rows it materializes — real objects, but
+    # nothing to do with whether the fork copied this table's DATA.
     baseline = {
-        table_name: _distinct_slice_bytes(catalog_uuid, table_name)
+        table_name: _distinct_slice_bytes(catalog_uuid, table_name, table_uuid)
         for table_name in (
             TABLE_PERSIST_SEGMENT_METADATA,
             TABLE_SNAPSHOT_SEGMENT_METADATA,
@@ -240,7 +247,7 @@ def test_fork_materializes_metadata_reference_rows_per_cold_segment():
     # ...and the rows must be references, not copies: same slices, same bytes,
     # in EVERY tier the fork wrote a reference row for.
     for table_name, expected in baseline.items():
-        actual = _distinct_slice_bytes(catalog_uuid, table_name)
+        actual = _distinct_slice_bytes(catalog_uuid, table_name, table_uuid)
         assert actual == expected, (
             f"{_FORKS} forks changed {table_name} from {expected[0]} files /"
             f" {expected[1]} bytes to {actual[0]} / {actual[1]}. The fork copies"

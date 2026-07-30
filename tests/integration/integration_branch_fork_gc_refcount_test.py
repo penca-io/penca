@@ -200,6 +200,27 @@ def _enqueue_delete_set_row(catalog_uuid, uri, written_at):
     )
 
 
+def _drop_all_branch_references(catalog_uuid, branch_uuid):
+    """Drop EVERY cold reference row a branch holds, in both tiers plus sidecars.
+
+    The positive controls need zero remaining references to the file. Since
+    CHA-539 a fork also carries its own inherited reference rows from
+    `create_branch`, so dropping only the rows a test synthesized leaves the file
+    still referenced and the control silently stops controlling.
+    """
+    for table_name in (
+        TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
+        TABLE_SNAPSHOT_SEGMENT_METADATA,
+        TABLE_PERSIST_SEGMENT_METADATA,
+    ):
+        get_pg_driver().execute_no_result(
+            SQL("DELETE FROM {tbl} WHERE branch_uuid = %s").format(
+                tbl=Identifier(f"{catalog_uuid}_{table_name}")
+            ),
+            (branch_uuid,),
+        )
+
+
 def _drop_snapshot_rows(catalog_uuid, branch_uuid, snapshot_uuid):
     """Drop every row a snapshot owns, as retirement would.
 
@@ -327,7 +348,7 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
     # sweeping again isolates the child reference as the one thing
     # pinning the file: if the row drains now, the sweep was live and
     # willing to delete this URI all along.
-    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+    _drop_all_branch_references(catalog_uuid, child_branch)
     assert _segment_uris(catalog_uuid, child_branch, child_snap) == [], (
         "the control's setup did not take: the child's synthesized segment"
         " rows are still present, so a surviving delete-set row below would"
@@ -445,7 +466,7 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
 
     # Positive control: drop the child's copied sidecar and the file has
     # zero references left, so the same sweep drains it.
-    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+    _drop_all_branch_references(catalog_uuid, child_branch)
 
     client.sweep_segments(catalog_uuid=catalog_uuid)
 

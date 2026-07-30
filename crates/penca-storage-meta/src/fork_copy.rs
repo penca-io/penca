@@ -80,6 +80,36 @@ impl LifecycleManager {
         )
         .await?;
 
+        // Seed the child's purge watermark at the fork position.
+        //
+        // Load-bearing, not bookkeeping: the read plan's hot/cold fence is
+        // `max(Pu, W_snap)`, and cold serves `commit_seq_num <= fence`. A fresh
+        // fork has no purge and (when the parent's latest snapshot sits above the
+        // fork) no snapshot either, so the fence would be 0 and every inherited
+        // row would be filtered out of the cold tier — the copy would be present
+        // in metadata and invisible to reads.
+        //
+        // `Pu = fork_commit_seq_num` is also just true: `Pu` means "everything at
+        // or below this seq is out of hot and lives in cold", and for a fork
+        // everything at or below the fork edge is exactly that — inherited cold,
+        // never in the child's hot tier. The child's own writes start at
+        // `fork_seq + 1` (`seed_commit_seq_num_from_fork`), so the fence lands
+        // precisely on the tier boundary.
+        let purge_uuid =
+            naming::table_purge_uuid(&catalog, &child, &table, fork_commit_seq_num, 0);
+        Self::insert_table_purge(
+            driver,
+            catalog_uuid,
+            &purge_uuid.to_string(),
+            child_branch_uuid,
+            table_uuid,
+            Some(fork_commit_seq_num),
+            None,
+        )
+        .await?;
+        Self::commit_table_purge(driver, catalog_uuid, child_branch_uuid, &purge_uuid.to_string())
+            .await?;
+
         Ok(())
     }
 
