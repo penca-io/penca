@@ -81,12 +81,12 @@ The defensible claim is the *conjunction*, on one copy. Each alternative has a l
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie** — branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks Lakebase** — the closest peer, and self-hosting aside the real difference is
-  versioning, not storage. It reached the same storage conclusion independently — keep the
-  data once, in open formats — which we read as validation more than competition. But its
-  intermediate row versions exist to serve MVCC and point-in-time recovery: invisible to
-  lakehouse readers, collected in time. Penca's are a queryable row-level audit trail with
-  `as_of` reads over it. Branching is metadata-only in both.
+- **Databricks Lakebase** — the closest peer. Databricks reached the same *diagnosis*
+  independently, that the way out of the OLTP/OLAP split is keeping data once in open
+  formats, and we read that as validation more than competition. Their lakehouse copy still
+  arrives by managed sync, though, and their intermediate row versions serve MVCC and
+  point-in-time recovery: invisible to lakehouse readers, collected in time. Penca's are a
+  queryable row-level audit trail with `as_of` reads. Branching is metadata-only in both.
 
 ## Architecture
 
