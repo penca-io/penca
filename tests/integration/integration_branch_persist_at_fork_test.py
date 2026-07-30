@@ -836,24 +836,6 @@ def test_fork_audit_stays_deduped_after_the_child_snapshots():
         )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN DEFECT, introduced by CHA-539 and not yet fixed. This test is the "
-        "first coverage of the audit cap's Some(watermark) branch, and it FAILS: "
-        "audit_data on a fork with a real adopted baseline emits inherited change "
-        "rows more than once (observed ['base','tail','own','base','base','tail']). "
-        "The two sibling audit tests only ever built the genesis-inherit shape, "
-        "where the base arm is skipped rather than capped, so they pass either way "
-        "and hid this. Capping base_cold_to prunes SEGMENT SELECTION only — "
-        "AuditPlan carries no per-row equivalent, per-row filtering uses "
-        "cold_from/cold_to/base_seq_to — so an overlapping parent segment still "
-        "contributes all its in-window rows alongside the child's own copied arm. "
-        "Committed xfail rather than deleted so the reproduction is not lost. "
-        "Pre-CHA-539 a fork had no own-cold arm, so no overlap existed: this is a "
-        "regression this PR introduces on the forked audit path."
-    ),
-    strict=True,
-)
 def test_fork_audit_dedupes_against_a_real_adopted_baseline():
     """The audit cap's `Some(watermark)` branch — the one that actually caps.
 
@@ -904,10 +886,13 @@ def test_fork_audit_dedupes_against_a_real_adopted_baseline():
         ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_SNAPSHOT_METADATA}")),
         (child, table_uuid),
     )
-    assert inherited[0][0] > 0, (
-        "setup failed: the child adopted no baseline, so this exercises the skip "
-        "branch rather than the cap"
-    )
+    # A non-AssertionError so a rotted fixture can never be mistaken for the
+    # duplicate-row regression this test exists to pin.
+    if inherited[0][0] == 0:
+        raise RuntimeError(
+            "setup failed: the child adopted no baseline, so this exercises the "
+            "skip branch rather than the cap"
+        )
 
     # The child's own snapshot: what drags an unbounded MIN() above the fork.
     _write_committed_rows(

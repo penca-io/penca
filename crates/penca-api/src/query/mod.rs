@@ -121,7 +121,8 @@ pub struct AuditPlan {
     /// audit — so `audit_data` surfaces the inherited history. Empty for a
     /// non-forked branch. Streamed after the branch's own cold segments,
     /// capped per-row at `base_seq_to` so the child never audits the parent's
-    /// post-fork rows.
+    /// post-fork rows, and at `base_cold_to` so it never re-reports the rows
+    /// the child's own copied arm already carries.
     base_cold_upsert_segments: Vec<PersistSegment>,
     base_cold_delete_segments: Vec<PersistSegment>,
     /// The parent branch's committed cold `tx_log` segments, joined onto the
@@ -133,6 +134,20 @@ pub struct AuditPlan {
     /// Exclusive per-row `commit_seq_num` upper bound for the base (parent)
     /// segments = `min(seq_to, fork_seed + 1)`. `None` for a non-forked branch.
     base_seq_to: Option<i64>,
+    /// Exclusive per-row `committed_at_micros` upper bound for the base
+    /// (parent) segments = `min(cold_to, inherited_watermark + 1)`, or
+    /// `i64::MIN` when the child inherited from genesis. `None` for a
+    /// non-forked branch.
+    ///
+    /// Load-bearing on the *row* axis, not just segment selection: the two
+    /// arms are only disjoint because the base arm stops at the watermark
+    /// where the child's own copied arm begins. Segment selection alone
+    /// cannot enforce that — a parent segment whose micros range straddles
+    /// the watermark is still selected (it overlaps the window), and then
+    /// contributes *all* of its rows unless this bound clips them. Passing
+    /// the uncapped `cold_to` here instead is what made a fork with a real
+    /// adopted baseline emit every inherited change row twice.
+    base_cold_to: Option<i64>,
     /// ids point-lookup restriction, decoded once here so both
     /// stream halves (upserts + deletes) share one derivation.
     row_uuids: Option<Vec<uuid::Uuid>>,
@@ -1309,7 +1324,9 @@ impl QueryManager {
         )
         .await?;
         // The parent branch's inherited upsert history, capped per-row at the
-        // fork seq (`base_seq_to`).
+        // fork seq (`base_seq_to`) and at the inherited watermark on the micros
+        // axis (`base_cold_to`) — the latter is what keeps this arm disjoint
+        // from the child's own copied arm.
         let base_cold_batches = if plan.base_cold_upsert_segments.is_empty() {
             Vec::new()
         } else {
@@ -1330,7 +1347,7 @@ impl QueryManager {
                 &audit_schema,
                 plan.include_tx_metadata,
                 plan.cold_from,
-                plan.cold_to,
+                plan.base_cold_to,
                 seq_from,
                 plan.base_seq_to,
                 plan.row_uuids.as_deref(),
@@ -1447,7 +1464,8 @@ impl QueryManager {
         )
         .await?;
         // The parent branch's inherited delete history, capped per-row at the
-        // fork seq (`base_seq_to`).
+        // fork seq (`base_seq_to`) and at the inherited watermark on the micros
+        // axis (`base_cold_to`) — see the upsert side.
         let base_cold_batches = if plan.base_cold_delete_segments.is_empty() {
             Vec::new()
         } else {
@@ -1462,7 +1480,7 @@ impl QueryManager {
                 &plan.primary_keys,
                 plan.include_tx_metadata,
                 plan.cold_from,
-                plan.cold_to,
+                plan.base_cold_to,
                 seq_from,
                 plan.base_seq_to,
                 plan.row_uuids.as_deref(),
@@ -1757,8 +1775,9 @@ impl QueryManager {
 
         // For a forked branch, enumerate the parent's persist segments so
         // `audit_data` surfaces the inherited history. Capped at the fork seq
-        // at the segment level here and per-row via `base_seq_to` below, so the
-        // child never audits the parent's post-fork rows. Fetched
+        // at the segment level here and per-row via `base_seq_to` /
+        // `base_cold_to` below, so the child never audits the parent's
+        // post-fork rows and never re-reports what its own arm carries. Fetched
         // unconditionally, independent of the child's `hot_min == 0` skip — the
         // parent's history lives entirely in its cold tier. Its tx_log is read
         // too so the inherited rows reattach author/comment from the parent's
@@ -1768,6 +1787,7 @@ impl QueryManager {
             base_cold_delete_segments,
             base_tx_log_segments,
             base_seq_to,
+            base_cold_to,
         ) = match self
             .read_branch_lineage(pool, &catalog_uuid_str, &branch_uuid_str)
             .await?
@@ -1840,9 +1860,15 @@ impl QueryManager {
                 } else {
                     Vec::new()
                 };
-                (base_upserts, base_deletes, base_tx_log, base_seq_to)
+                (
+                    base_upserts,
+                    base_deletes,
+                    base_tx_log,
+                    base_seq_to,
+                    base_cold_to,
+                )
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), None),
+            None => (Vec::new(), Vec::new(), Vec::new(), None, None),
         };
 
         Ok(AuditPlan {
@@ -1865,6 +1891,7 @@ impl QueryManager {
             base_cold_delete_segments,
             base_tx_log_segments,
             base_seq_to,
+            base_cold_to,
             row_uuids,
             deadline,
         })
