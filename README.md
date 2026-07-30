@@ -26,7 +26,8 @@ transact → read-it-back loop *interactive* rather than a batch job.
 Object storage is pluggable, and the **only permanent home** for your table data: the hot
 tier buffers writes and purge reclaims rows once they are cold, leaving one set of open
 columnar files that anything reading Lance or Parquet can open. Catalog and branch metadata
-still lives in Postgres — moving it out is on the [roadmap](#roadmap).
+is served from Postgres and stays that way; checkpointing it to object storage so a cluster
+can reload it on startup is on the [roadmap](#roadmap).
 
 The honest trade: Penca is not competitive with bare-metal Postgres on transaction latency,
 and its analytical side is young. What you get is one copy of your data instead of two
@@ -45,12 +46,11 @@ every fork and shows `main` untouched. Its scoreboard:
 | `epsilon` |        3000 |         383 | 12.77% |
 | `even`    |        3000 |         307 | 10.23% |
 
-`greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even`
-splits on the visitor index and never reads — that read-your-writes loop on a branch is the
-pitch. The policies are toy; the mechanic is the point. Figures come from one seeded run on
-2026-07-27: reproducible, but not pinned. The forks copy no rows, which the demo asserts
-rather than prints — see
-[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
+`greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even` splits
+on the visitor index and never reads — that read-your-writes loop on a branch is the pitch.
+The policies are toy; the mechanic is the point. Figures are one seeded run on 2026-07-27:
+reproducible, not pinned. The forks copy no rows, which the demo asserts rather than prints
+— see [`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
 ## Quick start
 
@@ -81,8 +81,12 @@ The defensible claim is the *conjunction*, on one copy. Each alternative has a l
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie** — branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks Lakebase** — managed, with OLTP in a Postgres store that syncs to the
-  lakehouse. Penca is self-hostable and has no sync step: there is only one copy.
+- **Databricks Lakebase** — the closest peer, and self-hosting aside the real difference is
+  versioning, not storage. It reached the same storage conclusion independently — keep the
+  data once, in open formats — which we read as validation more than competition. But its
+  intermediate row versions exist to serve MVCC and point-in-time recovery: invisible to
+  lakehouse readers, collected in time. Penca's are a queryable row-level audit trail with
+  `as_of` reads over it. Branching is metadata-only in both.
 
 ## Architecture
 
@@ -109,9 +113,9 @@ service, not a service hop.
 
 A fork copies no rows: it records its position in the parent and reads the parent's cold
 files through it. Not free, though — creating a branch first flushes the parent's
-unpersisted writes to cold, so fork latency tracks what the parent has buffered, not what
-it holds. Detail in [docs/architecture.md](docs/architecture.md), algorithms and
-crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
+unpersisted writes to cold, so fork latency tracks what the parent has buffered, not what it
+holds. Detail in [docs/architecture.md](docs/architecture.md); algorithms and crash-safety
+invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Features
 
@@ -135,9 +139,9 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Current shortcomings
 
-- **No authentication or authorization, at all.** No auth interceptor, no TLS on any service,
-  and the Flight SQL handshake is unimplemented. Anything that reaches the ports has full
-  access — hence the loopback bind. Do not expose Penca to a network you do not control.
+- **No authentication or authorization, at all.** No auth interceptor, no TLS, and the Flight
+  SQL handshake is unimplemented. Anything reaching the ports has full access — hence the
+  loopback bind. Do not expose Penca to a network you do not control.
 - **Branching is narrower than git.** You can fork `main`, not a fork, and merging back is
   fast-forward only — if the target took a commit past your fork point the merge is refused
   rather than reconciled. No conflict resolution, no `diff`, no `revert`.
@@ -147,13 +151,13 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 - **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
   operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
   single-statement read-modify-write. TPC-B tracks the gap, not parity.
-- **OLAP is under-optimized.** Effort so far went into derisking transactions on a data lake;
-  at small scale Postgres still wins the analytical query — a crossover, not a wall. See
-  [docs/performance.md](docs/performance.md).
+- **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
+  at small scale Postgres still wins the analytical query — a crossover, not a wall
+  ([docs/performance.md](docs/performance.md)).
 - **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
   CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
 - **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
-  files, but nothing publishes them as an Iceberg table for a catalog to pick up.
+  files, but nothing publishes them as an Iceberg table.
 - **Arrow Flight SQL is the only SQL wire** — no pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
 - **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
@@ -161,12 +165,13 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 ## Roadmap
 
 Everything above is the roadmap, in roughly that order — the shortcomings section is a plan
-stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot tier, so you can ingest existing data-lake files
-at full speed, and adopting an Iceberg table in place with no migration. Retention gains the
-pruning half it is missing and the lifecycle scheduler gains leader election. A structured
-predicate on the read wire kills the SQL-string double parse, with aggregate / limit / TopN
-pushed into the scan. Catalog metadata moves to object storage, so the durable set becomes
-one set of files.
+stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot
+tier, so you can ingest existing data-lake files at full speed, and adopting an Iceberg
+table in place with no migration. Retention gains the pruning half it is missing and the
+scheduler gains leader election. A structured predicate on the read wire kills the
+SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog
+metadata gets checkpointed to object storage and reloaded into Postgres at startup — still
+served from Postgres in steady state, but recoverable from the object store alone.
 
 ## Documentation
 
