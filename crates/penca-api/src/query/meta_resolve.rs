@@ -644,15 +644,15 @@ impl QueryManager {
     ///    the seq axis so identifiers + data compose with the seq tier-fence.
     ///    `LatestSeq` (not `AsOfSeq`) flags this as the default current-time
     ///    resolution — a distinction the DataFusion-free seek bypass gates on.
-    ///    `default_frontier` lets a caller that needs one pin shared across
-    ///    several resolutions in the same RPC capture the frontier once and
-    ///    thread it in. **No production caller currently does** — every call site
+    ///    `default_frontier` would let a caller that needs one pin shared across
+    ///    several resolutions in the same RPC capture the frontier once and thread
+    ///    it in. **No production caller has ever done so** — every call site
     ///    passes `None` and lets this method self-capture
-    ///    [`Self::branch_seq_frontier`]. `read_data` used to thread it; it now
-    ///    resolves once and reuses `scope.snapshot`, which removed the only
-    ///    consumer. Kept because it costs one `Option` and a future multi-resolve
-    ///    caller would otherwise re-derive it, but treat it as unused: if you are
-    ///    reading this because nothing threads it, that is expected, not a bug.
+    ///    [`Self::branch_seq_frontier`]; only this module's own tests pass `Some`.
+    ///    Do not read the parameter as evidence that some caller needs it: the
+    ///    frontier-threading that did exist belonged to a separate, now-deleted
+    ///    resolver, not to this one. It is dead plumbing kept only because
+    ///    removing it touches four signatures and every call site; TODO(CHA-543).
     pub async fn resolve_read_snapshot(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,

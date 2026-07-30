@@ -68,10 +68,11 @@ class TestOpenTxResolutionCount:
     def test_open_tx_read_issues_one_begin_tx_log_lookup(self):
         """One open-tx read resolves the tx once, not twice.
 
-        Fail-first: ``resolve_base`` resolves it via the non-validating
-        ``get_open_tx_began_at_seq_num`` and ``read_data`` then re-resolves it via
-        the validating ``get_tx_status``, so the count is 2. Green once
-        ``read_data`` reuses the already-resolved ``scope.snapshot``.
+        Before the fix ``resolve_base`` resolved it via a bare unvalidated
+        ``begin_tx_log`` SELECT and ``read_data`` re-resolved it via the validating
+        ``get_tx_status``, so the count was 2. It is 1 now that
+        ``resolve_read_snapshot`` validates once and ``read_data`` reuses the
+        resulting ``scope.snapshot``.
         """
         client = make_client()
         ctx = setup_with_data(client)
