@@ -546,7 +546,7 @@ impl LifecycleManager {
                          (table_persist_uuid, branch_uuid, table_uuid, persisted_at_micros, \
                           commit_seq_num, log_kind, commit_micros) \
                          SELECT $1, $2, old.table_uuid, old.persisted_at_micros, \
-                                LEAST(old.commit_seq_num, $6), old.log_kind, $7 \
+                                LEAST(old.commit_seq_num, $5), old.log_kind, $6 \
                          FROM {meta} old \
                          WHERE old.branch_uuid = $3 AND old.table_persist_uuid = $4 \
                          ON CONFLICT (branch_uuid, table_persist_uuid) DO NOTHING",
@@ -557,7 +557,6 @@ impl LifecycleManager {
                         SqlValue::Uuid(*child),
                         SqlValue::uuid_str(parent_branch_uuid)?,
                         SqlValue::Uuid(old_header),
-                        SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(commit_micros),
                     ],
