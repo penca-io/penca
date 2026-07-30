@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::helpers::{parse_uuid, qi};
 use crate::{LifecycleManager, Result};
-use penca_db::driver::{DbDriver, SqlValue};
+use penca_db::driver::{DbDriver, SqlValue, format_sql_uuid_array};
 
 /// The parent's cold state at a fork edge, as the child will reference it.
 struct InheritedBaseline {
@@ -222,7 +222,24 @@ impl LifecycleManager {
                 chunk_idx,
             ));
         }
-        for (new_seg, old_seg, chunk_idx) in &seg_map {
+        // One statement for the whole snapshot's segments. The three arrays carry
+        // what SQL cannot derive: the new uuid (a `naming` derivation), the old
+        // uuid it copies from, and the re-densified `chunk_idx` — which is the
+        // enumeration position, NOT `old.chunk_idx`, so it has to travel with the
+        // pair rather than be read off the source row.
+        if !seg_map.is_empty() {
+            let new_uuids: Vec<String> = seg_map.iter().map(|(n, _, _)| n.to_string()).collect();
+            let old_uuids: Vec<String> = seg_map.iter().map(|(_, o, _)| o.to_string()).collect();
+            let new_refs: Vec<&str> = new_uuids.iter().map(String::as_str).collect();
+            let old_refs: Vec<&str> = old_uuids.iter().map(String::as_str).collect();
+            let chunk_arr = format!(
+                "ARRAY[{}]::int[]",
+                seg_map
+                    .iter()
+                    .map(|(_, _, c)| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             driver
                 .execute_no_result_params(
                     &format!(
@@ -230,21 +247,24 @@ impl LifecycleManager {
                          (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, \
                           table_uuid, chunk_idx, object_uri, \"offset\", length, size_bytes, \
                           format, metadata, statistics, row_count, commit_micros) \
-                         SELECT $1, $2, $3, old.table_uuid, $4, old.object_uri, \
+                         SELECT m.new_uuid, $1, $2, old.table_uuid, m.chunk_idx, old.object_uri, \
                                 old.\"offset\", old.length, old.size_bytes, old.format, \
-                                old.metadata, old.statistics, old.row_count, $7 \
+                                old.metadata, old.statistics, old.row_count, $4 \
                          FROM {seg} old \
-                         WHERE old.branch_uuid = $5 AND old.table_snapshot_segment_uuid = $6 \
+                         JOIN unnest({new_arr}, {old_arr}, {chunk_arr}) \
+                           AS m(new_uuid, old_uuid, chunk_idx) \
+                           ON old.table_snapshot_segment_uuid = m.old_uuid \
+                         WHERE old.branch_uuid = $3 \
                          ON CONFLICT (branch_uuid, table_snapshot_segment_uuid) DO NOTHING",
                         seg = qi(&snap_seg),
+                        new_arr = format_sql_uuid_array(&new_refs),
+                        old_arr = format_sql_uuid_array(&old_refs),
+                        chunk_arr = chunk_arr,
                     ),
                     &[
-                        SqlValue::Uuid(*new_seg),
                         SqlValue::Uuid(new_snap),
                         SqlValue::Uuid(*child),
-                        SqlValue::Int64(i64::from(*chunk_idx)),
                         SqlValue::uuid_str(parent_branch_uuid)?,
-                        SqlValue::Uuid(*old_seg),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -276,24 +296,32 @@ impl LifecycleManager {
             // (parent x segment) pair below — it is already in hand here.
             let slug = index_uuid.map_or_else(|| "row_uuid".to_string(), |u| u.to_string());
             parent_map.push((new_parent, old_parent, slug));
+        }
+        if !parent_map.is_empty() {
+            let new_p: Vec<String> = parent_map.iter().map(|(n, _, _)| n.to_string()).collect();
+            let old_p: Vec<String> = parent_map.iter().map(|(_, o, _)| o.to_string()).collect();
+            let new_refs: Vec<&str> = new_p.iter().map(String::as_str).collect();
+            let old_refs: Vec<&str> = old_p.iter().map(String::as_str).collect();
             driver
                 .execute_no_result_params(
                     &format!(
                         "INSERT INTO {idx} \
                          (table_snapshot_index_uuid, branch_uuid, table_snapshot_uuid, \
                           index_uuid, key_columns, commit_micros) \
-                         SELECT $1, $2, $3, old.index_uuid, old.key_columns, $6 \
+                         SELECT m.new_parent, $1, $2, old.index_uuid, old.key_columns, $4 \
                          FROM {idx} old \
-                         WHERE old.branch_uuid = $4 AND old.table_snapshot_index_uuid = $5 \
+                         JOIN unnest({new_arr}, {old_arr}) AS m(new_parent, old_parent) \
+                           ON old.table_snapshot_index_uuid = m.old_parent \
+                         WHERE old.branch_uuid = $3 \
                          ON CONFLICT (branch_uuid, table_snapshot_index_uuid) DO NOTHING",
                         idx = qi(&idx_meta),
+                        new_arr = format_sql_uuid_array(&new_refs),
+                        old_arr = format_sql_uuid_array(&old_refs),
                     ),
                     &[
-                        SqlValue::Uuid(new_parent),
                         SqlValue::Uuid(*child),
                         SqlValue::Uuid(new_snap),
                         SqlValue::uuid_str(parent_branch_uuid)?,
-                        SqlValue::Uuid(old_parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -306,37 +334,60 @@ impl LifecycleManager {
         //    `row_uuid_for_pk(new_seg, [index_slug])` — identical to what a fresh
         //    build of that segment produces for the same index, so build and copy
         //    agree.
+        // One statement for every (index parent x base segment) pair, which was
+        // the largest loop here. Five arrays because the join needs BOTH old keys
+        // and the row needs all three new ones; none of them are derivable in SQL
+        // (the sidecar id is `row_uuid_for_pk(new_seg, [slug])`, identical to what
+        // a fresh build of that segment produces, so build and copy agree).
+        let mut sc_new: Vec<String> = Vec::new();
+        let mut sc_new_seg: Vec<String> = Vec::new();
+        let mut sc_new_parent: Vec<String> = Vec::new();
+        let mut sc_old_seg: Vec<String> = Vec::new();
+        let mut sc_old_parent: Vec<String> = Vec::new();
         for (new_parent, old_parent, slug) in &parent_map {
             for (new_seg, old_seg, _) in &seg_map {
-                driver
-                    .execute_no_result_params(
-                        &format!(
-                            "INSERT INTO {sidecar} \
-                             (segment_index_uuid, branch_uuid, segment_uuid, \
-                              table_snapshot_index_uuid, object_uri, \"offset\", length, \
-                              format, size_bytes, statistics, commit_micros) \
-                             SELECT $1, $2, $3, $4, old.object_uri, old.\"offset\", \
-                                    old.length, old.format, old.size_bytes, old.statistics, $8 \
-                             FROM {sidecar} old \
-                             WHERE old.branch_uuid = $5 AND old.segment_uuid = $6 \
-                               AND old.table_snapshot_index_uuid = $7 \
-                               AND old.commit_micros IS NOT NULL \
-                             ON CONFLICT (branch_uuid, segment_index_uuid) DO NOTHING",
-                            sidecar = qi(&idx_seg),
-                        ),
-                        &[
-                            SqlValue::Uuid(naming::row_uuid_for_pk(new_seg, &[slug.as_str()])),
-                            SqlValue::Uuid(*child),
-                            SqlValue::Uuid(*new_seg),
-                            SqlValue::Uuid(*new_parent),
-                            SqlValue::uuid_str(parent_branch_uuid)?,
-                            SqlValue::Uuid(*old_seg),
-                            SqlValue::Uuid(*old_parent),
-                            SqlValue::Int64(commit_micros),
-                        ],
-                    )
-                    .await?;
+                sc_new.push(naming::row_uuid_for_pk(new_seg, &[slug.as_str()]).to_string());
+                sc_new_seg.push(new_seg.to_string());
+                sc_new_parent.push(new_parent.to_string());
+                sc_old_seg.push(old_seg.to_string());
+                sc_old_parent.push(old_parent.to_string());
             }
+        }
+        if !sc_new.is_empty() {
+            let a = |v: &Vec<String>| {
+                format_sql_uuid_array(&v.iter().map(String::as_str).collect::<Vec<_>>())
+            };
+            driver
+                .execute_no_result_params(
+                    &format!(
+                        "INSERT INTO {sidecar} \
+                         (segment_index_uuid, branch_uuid, segment_uuid, \
+                          table_snapshot_index_uuid, object_uri, \"offset\", length, \
+                          format, size_bytes, statistics, commit_micros) \
+                         SELECT m.new_sidecar, $1, m.new_seg, m.new_parent, old.object_uri, \
+                                old.\"offset\", old.length, old.format, old.size_bytes, \
+                                old.statistics, $3 \
+                         FROM {sidecar} old \
+                         JOIN unnest({a1}, {a2}, {a3}, {a4}, {a5}) \
+                           AS m(new_sidecar, new_seg, new_parent, old_seg, old_parent) \
+                           ON old.segment_uuid = m.old_seg \
+                          AND old.table_snapshot_index_uuid = m.old_parent \
+                         WHERE old.branch_uuid = $2 AND old.commit_micros IS NOT NULL \
+                         ON CONFLICT (branch_uuid, segment_index_uuid) DO NOTHING",
+                        sidecar = qi(&idx_seg),
+                        a1 = a(&sc_new),
+                        a2 = a(&sc_new_seg),
+                        a3 = a(&sc_new_parent),
+                        a4 = a(&sc_old_seg),
+                        a5 = a(&sc_old_parent),
+                    ),
+                    &[
+                        SqlValue::Uuid(*child),
+                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Int64(commit_micros),
+                    ],
+                )
+                .await?;
         }
 
         Ok(InheritedBaseline {
@@ -460,6 +511,13 @@ impl LifecycleManager {
                 )
                 .await?;
 
+            // Derive every (new, old) uuid pair first, then copy the whole
+            // header's segments in ONE statement. The old→new mapping lives in
+            // Rust (the uuids are `naming` derivations, not anything SQL can
+            // compute), which is the only reason this was ever a per-row loop —
+            // and it is expressible as a join against `unnest` of the two arrays.
+            let mut new_uuids: Vec<String> = Vec::with_capacity(segs.len());
+            let mut old_uuids: Vec<String> = Vec::with_capacity(segs.len());
             for seg_row in &segs {
                 let old_seg: Uuid = seg_row.get("table_persist_segment_uuid");
                 let chunk_idx: i32 = seg_row.get("chunk_idx");
@@ -473,52 +531,61 @@ impl LifecycleManager {
                         "table_persist_segment_metadata.chunk_idx out of range: {chunk_idx}"
                     )))
                 })?;
-                let new_seg = naming::table_persist_segment_uuid(&new_header, chunk_idx);
-
-                // `max_commit_seq_num = LEAST(old, fork_seq)` is the clamp the
-                // whole design rests on. A fork point is an arbitrary
-                // commit-order position, so a parent segment routinely straddles
-                // it, and a verbatim copy would expose the parent's post-fork
-                // rows to the child. The read paths honor this per-segment
-                // ceiling (`apply_segment_seq_ceiling`).
-                //
-                // `is_sealed = TRUE` keeps the row out of the child's compaction
-                // waves: the compact input query filters `is_sealed = FALSE`, and
-                // repacking an inherited reference would rewrite the parent's
-                // bytes under the child's prefix — turning a reference back into
-                // a copy and losing the O(1)-bytes fork guarantee.
-                driver
-                    .execute_no_result_params(
-                        &format!(
-                            "INSERT INTO {seg} \
-                             (table_persist_segment_uuid, table_persist_uuid, branch_uuid, \
-                              table_uuid, chunk_idx, min_tx_commit_micros, max_tx_commit_micros, \
-                              min_commit_seq_num, max_commit_seq_num, object_uri, \"offset\", \
-                              length, row_count, format, size_bytes, metadata, statistics, \
-                              is_sealed, commit_micros) \
-                             SELECT $1, $2, $3, old.table_uuid, old.chunk_idx, \
-                                    old.min_tx_commit_micros, old.max_tx_commit_micros, \
-                                    old.min_commit_seq_num, LEAST(old.max_commit_seq_num, $6), \
-                                    old.object_uri, old.\"offset\", old.length, old.row_count, \
-                                    old.format, old.size_bytes, old.metadata, old.statistics, \
-                                    TRUE, $7 \
-                             FROM {seg} old \
-                             WHERE old.branch_uuid = $4 AND old.table_persist_segment_uuid = $5 \
-                             ON CONFLICT (branch_uuid, table_persist_segment_uuid) DO NOTHING",
-                            seg = qi(&persist_seg),
-                        ),
-                        &[
-                            SqlValue::Uuid(new_seg),
-                            SqlValue::Uuid(new_header),
-                            SqlValue::Uuid(*child),
-                            SqlValue::uuid_str(parent_branch_uuid)?,
-                            SqlValue::Uuid(old_seg),
-                            SqlValue::Int64(fork_commit_seq_num),
-                            SqlValue::Int64(commit_micros),
-                        ],
-                    )
-                    .await?;
+                new_uuids
+                    .push(naming::table_persist_segment_uuid(&new_header, chunk_idx).to_string());
+                old_uuids.push(old_seg.to_string());
             }
+            if new_uuids.is_empty() {
+                continue;
+            }
+            let new_refs: Vec<&str> = new_uuids.iter().map(String::as_str).collect();
+            let old_refs: Vec<&str> = old_uuids.iter().map(String::as_str).collect();
+
+            // `max_commit_seq_num = LEAST(old, fork_seq)` is the clamp the whole
+            // design rests on. A fork point is an arbitrary commit-order
+            // position, so a parent segment routinely straddles it, and a
+            // verbatim copy would expose the parent's post-fork rows to the
+            // child. The read paths honor this per-segment ceiling
+            // (`apply_segment_seq_ceiling`).
+            //
+            // `is_sealed = TRUE` keeps the row out of the child's compaction
+            // waves: the compact input query filters `is_sealed = FALSE`, and
+            // repacking an inherited reference would rewrite the parent's bytes
+            // under the child's prefix — turning a reference back into a copy and
+            // losing the O(1)-bytes fork guarantee.
+            driver
+                .execute_no_result_params(
+                    &format!(
+                        "INSERT INTO {seg} \
+                         (table_persist_segment_uuid, table_persist_uuid, branch_uuid, \
+                          table_uuid, chunk_idx, min_tx_commit_micros, max_tx_commit_micros, \
+                          min_commit_seq_num, max_commit_seq_num, object_uri, \"offset\", \
+                          length, row_count, format, size_bytes, metadata, statistics, \
+                          is_sealed, commit_micros) \
+                         SELECT m.new_uuid, $1, $2, old.table_uuid, old.chunk_idx, \
+                                old.min_tx_commit_micros, old.max_tx_commit_micros, \
+                                old.min_commit_seq_num, LEAST(old.max_commit_seq_num, $4), \
+                                old.object_uri, old.\"offset\", old.length, old.row_count, \
+                                old.format, old.size_bytes, old.metadata, old.statistics, \
+                                TRUE, $5 \
+                         FROM {seg} old \
+                         JOIN unnest({new_arr}, {old_arr}) AS m(new_uuid, old_uuid) \
+                           ON old.table_persist_segment_uuid = m.old_uuid \
+                         WHERE old.branch_uuid = $3 \
+                         ON CONFLICT (branch_uuid, table_persist_segment_uuid) DO NOTHING",
+                        seg = qi(&persist_seg),
+                        new_arr = format_sql_uuid_array(&new_refs),
+                        old_arr = format_sql_uuid_array(&old_refs),
+                    ),
+                    &[
+                        SqlValue::Uuid(new_header),
+                        SqlValue::Uuid(*child),
+                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Int64(fork_commit_seq_num),
+                        SqlValue::Int64(commit_micros),
+                    ],
+                )
+                .await?;
         }
 
         Ok(())
