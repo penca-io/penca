@@ -160,7 +160,7 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 - **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
   at small scale Postgres still wins the analytical query, a crossover rather than a wall.
 - **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
-  files, but nothing publishes them as an Iceberg table.
+  files, but nothing registers them yet with an Iceberg REST catalog.
 - **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
 - **No full-text search and no vector indexes.** Secondary indexes are currently equality seeks only.
