@@ -1366,8 +1366,11 @@ impl PgDialect {
     /// all open with a `meta_get_*` read that plans over the metadata parents,
     /// and only then insert into the tx-log partitions. Whichever order teardown
     /// picks is inverted against one of them. So ordering is paired with a
-    /// bounded `lock_timeout` and a caller-side retry rather than relied on
-    /// alone.
+    /// bounded `lock_timeout`, and what is left is reported to the client as
+    /// `ApiError::Aborted` for it to reissue — there is deliberately no
+    /// in-process retry, since one without backoff turns a loud conflict into a
+    /// quiet livelock and the caller is the layer that knows whether a second
+    /// attempt is wanted.
     pub async fn lock_branch_teardown_parents(
         driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
         catalog_uuid: &Uuid,
