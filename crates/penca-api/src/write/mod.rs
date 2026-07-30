@@ -928,13 +928,7 @@ impl WriteManager {
             // rollback takes the whole copy with it.
             let inherited_tables = self
                 .query_manager
-                .list_table_uuids_for_branch(
-                    tx,
-                    dl_driver,
-                    &catalog_str,
-                    None,
-                    &source_branch_str,
-                )
+                .list_table_uuids_for_branch(tx, dl_driver, &catalog_str, None, &source_branch_str)
                 .await?;
             for inherited_table in &inherited_tables {
                 LifecycleManager::materialize_fork_cold_references(
@@ -1075,17 +1069,16 @@ impl WriteManager {
         // merely untidy.
         let snap_segment_uuids: Vec<String> =
             snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
-        let sidecar_uris: Vec<String> =
-            LifecycleManager::list_segment_index_metadata(
-                pool,
-                &catalog_str,
-                &branch_str,
-                &snap_segment_uuids,
-            )
-            .await?
-            .into_iter()
-            .map(|sidecar| sidecar.object_uri)
-            .collect();
+        let sidecar_uris: Vec<String> = LifecycleManager::list_segment_index_metadata(
+            pool,
+            &catalog_str,
+            &branch_str,
+            &snap_segment_uuids,
+        )
+        .await?
+        .into_iter()
+        .map(|sidecar| sidecar.object_uri)
+        .collect();
 
         // Also enumerate in-flight compact merged files tracked in
         // `compact_segment_metadata`. Two cases:

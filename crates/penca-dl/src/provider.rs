@@ -36,8 +36,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use futures::{StreamExt, TryStreamExt};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
-use penca_storage_cold::apply_segment_seq_ceiling;
 use penca_format::reader::FormatReader;
+use penca_storage_cold::apply_segment_seq_ceiling;
 
 use crate::cache::SegmentCache;
 use crate::driver::SegmentOrder;

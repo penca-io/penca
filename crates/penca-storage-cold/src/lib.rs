@@ -35,6 +35,8 @@ pub enum ColdStorageError {
 /// Each segment carries its own [`penca_core::Format`]; the client
 /// dispatches on its wire code to the matching `FormatReader` and streams
 /// results one batch per segment.
+pub struct ColdStorageClient;
+
 /// The per-row commit-order column a persist segment's ceiling is applied to.
 /// Named here because the read that fetches a batch and the filter that bounds
 /// it must agree on the column.
@@ -60,13 +62,16 @@ pub fn apply_segment_seq_ceiling(
     // always enforceable; reaching here without it means that contract broke, and
     // silently returning the unfiltered batch would leak the rows the ceiling
     // exists to hide.
-    let idx = batch.schema().index_of(COMMIT_SEQ_NUM_COLUMN).map_err(|_| {
-        ArrowError::SchemaError(format!(
-            "persist segment {} carries a commit_seq_num ceiling of {ceiling} but the \
+    let idx = batch
+        .schema()
+        .index_of(COMMIT_SEQ_NUM_COLUMN)
+        .map_err(|_| {
+            ArrowError::SchemaError(format!(
+                "persist segment {} carries a commit_seq_num ceiling of {ceiling} but the \
              batch has no commit_seq_num column to apply it to",
-            segment.segment_uuid
-        ))
-    })?;
+                segment.segment_uuid
+            ))
+        })?;
     let seqs = batch
         .column(idx)
         .as_any()
@@ -79,8 +84,6 @@ pub fn apply_segment_seq_ceiling(
 
     arrow::compute::filter_record_batch(batch, &keep)
 }
-
-pub struct ColdStorageClient;
 
 // Helper functions exist to work around async_stream's try_stream! macro
 // not being able to call async trait methods directly when the returned
@@ -120,16 +123,6 @@ async fn read_one_persist_segment(
 }
 
 impl ColdStorageClient {
-    /// Stream log segment data, yielding one `RecordBatch` per segment.
-    ///
-    /// Each individual segment file fits in memory (sizes are controlled at
-    /// persist/compact time), but the total set of segments for a query may
-    /// not. Streaming per-segment lets callers process incrementally.
-    ///
-    /// Empty segments (0 rows) are silently skipped. If no segments produce
-    /// rows, yields a single empty `RecordBatch` with the expected schema
-    /// so callers can infer the schema from the stream.
-    ///
     /// Like [`Self::read_persist_segments`], but clamps each segment to its own
     /// `max_commit_seq_num` ceiling before yielding.
     ///
@@ -193,6 +186,20 @@ impl ColdStorageClient {
         })
     }
 
+    /// Stream log segment data, yielding one `RecordBatch` per segment.
+    ///
+    /// Each individual segment file fits in memory (sizes are controlled at
+    /// persist/compact time), but the total set of segments for a query may
+    /// not. Streaming per-segment lets callers process incrementally.
+    ///
+    /// Empty segments (0 rows) are silently skipped. If no segments produce
+    /// rows, yields a single empty `RecordBatch` with the expected schema
+    /// so callers can infer the schema from the stream.
+    ///
+    /// Does NOT apply a segment's `max_commit_seq_num` ceiling — see
+    /// [`Self::read_persist_segments_bounded`] for the arm that does, and why
+    /// compaction must keep using this one.
+    ///
     /// `projection`, when `Some`, narrows each segment read to the named
     /// columns; see [`FormatReader::read_segment`].
     pub fn read_persist_segments<'a, R: FormatReader + 'a>(
@@ -484,8 +491,14 @@ mod ceiling_tests {
         // the bound is always enforceable, and passing the batch through here
         // would leak exactly the rows the ceiling exists to hide.
         let no_seq = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("row_uuid", DataType::Utf8, false)])),
-            vec![Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"]))],
+            Arc::new(Schema::new(vec![Field::new(
+                "row_uuid",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                "a", "b", "c",
+            ]))],
         )
         .unwrap();
         assert!(
@@ -500,5 +513,4 @@ mod ceiling_tests {
             3,
         );
     }
-
 }

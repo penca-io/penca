@@ -1248,6 +1248,10 @@ class PencaClient:
         CHA-184: catalog-scoped — DeleteBranch cleans cold storage and
         metadata for every schema's tables on the branch, so no
         per-schema identifier is accepted.
+
+        Raises ``InvalidRequestError`` when ``branch_uuid`` names the catalog's
+        ``main`` branch: deleting it leaves the catalog unusable, since every read
+        resolves main. Use ``delete_catalog`` to remove a catalog.
         """
         catalog_uuid, catalog_name = self._get_catalog(catalog_uuid, catalog_name)
         branch_uuid, branch_name = self._get_branch(branch_uuid, branch_name)

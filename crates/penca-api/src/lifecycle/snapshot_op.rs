@@ -22,8 +22,8 @@ use penca_core::naming::{
     table_snapshot_uuid,
 };
 use penca_core::{
-    ColdStoragePlan, CommittedAtBounds, Format, PersistPlan,
-    PersistSegment, Plan, SnapshotPlan, SnapshotSegment,
+    ColdStoragePlan, CommittedAtBounds, Format, PersistPlan, PersistSegment, Plan, SnapshotPlan,
+    SnapshotSegment,
 };
 use penca_db::driver::pg::PgDriver;
 use penca_dl::driver::DlDriver;

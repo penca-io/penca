@@ -736,9 +736,19 @@ def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
         before_seq=above_fork_seq + 100,
         **scope,
     )
-    names = set(upserts.column("name").to_pylist())
+    all_names = upserts.column("name").to_pylist()
+    names = set(all_names)
     assert "inside_lo" in names, (
         f"the child's audit must surface the inherited pre-fork history, saw {names}"
+    )
+    # COUNT, not membership. The child's own arm and the base-cold arm both cover
+    # the inherited range unless the base arm is capped at the adopted baseline,
+    # and `audit_data` concatenates them without dedup — so a missing cap shows up
+    # as exact duplicates that a set() assertion cannot see.
+    assert all_names.count("inside_lo") == 1, (
+        "the inherited change row was emitted "
+        f"{all_names.count('inside_lo')} times; the audit base arm is not capped at "
+        f"the inherited baseline. Full list: {all_names}"
     )
     assert "inside_hi" not in names, (
         "audit_data emitted the parent's POST-fork row: the per-segment "

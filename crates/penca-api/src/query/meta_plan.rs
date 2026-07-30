@@ -547,12 +547,9 @@ impl QueryManager {
                 let fork_commit_seq_num: i64 = r
                     .try_get("fork_commit_seq_num")
                     .map_err(MetadataError::Db)?;
-                let fork_commit_micros: i64 = r
-                    .try_get("fork_commit_micros")
-                    .map_err(MetadataError::Db)?;
-                parent.map(|parent| {
-                    (parent.to_string(), fork_commit_seq_num, fork_commit_micros)
-                })
+                let fork_commit_micros: i64 =
+                    r.try_get("fork_commit_micros").map_err(MetadataError::Db)?;
+                parent.map(|parent| (parent.to_string(), fork_commit_seq_num, fork_commit_micros))
             }
             None => None,
         };
@@ -993,6 +990,45 @@ impl QueryManager {
             )
             .await?;
         Ok((upsert_segments, delete_segments))
+    }
+
+    /// The `snapshotted_at_micros` of the snapshot a fork adopted at CreateBranch
+    /// — its own oldest committed snapshot, which for a seeded child IS the
+    /// inherited baseline.
+    ///
+    /// `None` when the child holds no snapshot, which means it inherited from
+    /// genesis (the parent had no eligible snapshot at the fork) and its own
+    /// persist rows cover the whole inherited history. The audit base arm uses
+    /// this to stop where the child's own coverage begins; without it the two
+    /// arms overlap and `audit_data`, which concatenates without dedup, emits
+    /// every inherited change row twice.
+    pub async fn inherited_baseline_watermark(
+        &self,
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+        table_uuid: &str,
+    ) -> Result<Option<i64>> {
+        let catalog = parse_uuid(catalog_uuid);
+        let snap = naming::table_snapshot_metadata_table(&catalog);
+        let rows = driver
+            .execute_params(
+                &format!(
+                    "SELECT MIN(snapshotted_at_micros) AS baseline FROM {snap} \
+                     WHERE branch_uuid = $1 AND table_uuid = $2 \
+                       AND commit_micros IS NOT NULL",
+                    snap = qi(&snap),
+                ),
+                &[
+                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::uuid_str(table_uuid)?,
+                ],
+            )
+            .await?;
+
+        Ok(rows
+            .first()
+            .and_then(|row| row.try_get::<Option<i64>, _>("baseline").ok().flatten()))
     }
 
     /// Read a branch's fork lineage from `branch_store` — the parent branch and

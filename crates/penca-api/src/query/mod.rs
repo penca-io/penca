@@ -1780,6 +1780,32 @@ impl QueryManager {
             // the fork) means the child owns the whole inherited history, so the
             // arm is skipped entirely.
             Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
+                // The child's own arm already returns the inherited CDC down to
+                // the adopted baseline's watermark, so the base arm must stop
+                // there or every inherited change row is emitted twice —
+                // `audit_data` concatenates the two arms and does not dedup, and
+                // both clamp to the same ceiling, so the duplicates are exact.
+                //
+                // `None` means the child inherited from genesis (no eligible
+                // parent snapshot at the fork), so it owns the whole inherited
+                // history and the arm is skipped entirely.
+                let inherited_watermark = self
+                    .inherited_baseline_watermark(
+                        pool,
+                        &catalog_uuid_str,
+                        &branch_uuid_str,
+                        &table_uuid_str,
+                    )
+                    .await?;
+                let base_cold_to = match inherited_watermark {
+                    Some(watermark) => {
+                        let cap = watermark.saturating_add(1);
+                        Some(cold_to.map_or(cap, |to| to.min(cap)))
+                    }
+                    // Inherited from genesis: the child's own arm covers
+                    // everything, so give the base arm an empty window.
+                    None => Some(i64::MIN),
+                };
                 let (base_upserts, base_deletes) = self
                     .read_persist_segments_for_window(
                         pool,
@@ -1787,7 +1813,7 @@ impl QueryManager {
                         &parent_branch_uuid,
                         &table_uuid_str,
                         cold_from,
-                        cold_to,
+                        base_cold_to,
                         Some(fork_commit_seq_num),
                     )
                     .await?;
@@ -2359,11 +2385,15 @@ async fn cold_upsert_audit_batches<R: FormatReader + 'static>(
         return Ok(Vec::new());
     }
     let cold_upsert_schema = penca_merge::cold_upsert_schema(user_schema);
-    let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments_bounded(readers, segments, &cold_upsert_schema, None)
-            .try_collect()
-            .await
-            .map_err(ApiError::ColdStorage)?;
+    let data_batches: Vec<RecordBatch> = ColdStorageClient::read_persist_segments_bounded(
+        readers,
+        segments,
+        &cold_upsert_schema,
+        None,
+    )
+    .try_collect()
+    .await
+    .map_err(ApiError::ColdStorage)?;
     let (tx_log_batches, tx_log_schema) =
         read_tx_log_batches(readers, tx_log_segments, include_tx_metadata).await?;
     penca_merge::cold_audit_batches(
@@ -2489,11 +2519,15 @@ async fn cold_delete_audit_batches<R: FormatReader + 'static>(
     }
     let audit_schema = audit_delete_schema(user_schema, primary_keys, include_tx_metadata)?;
     let cold_delete_schema = penca_merge::cold_delete_schema(user_schema, primary_keys)?;
-    let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments_bounded(readers, segments, &cold_delete_schema, None)
-            .try_collect()
-            .await
-            .map_err(ApiError::ColdStorage)?;
+    let data_batches: Vec<RecordBatch> = ColdStorageClient::read_persist_segments_bounded(
+        readers,
+        segments,
+        &cold_delete_schema,
+        None,
+    )
+    .try_collect()
+    .await
+    .map_err(ApiError::ColdStorage)?;
     let (tx_log_batches, tx_log_schema) =
         read_tx_log_batches(readers, tx_log_segments, include_tx_metadata).await?;
     penca_merge::cold_audit_batches(

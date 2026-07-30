@@ -23,7 +23,6 @@ pub const SNAPSHOT_TABLE: &str = "l";
 /// exclusion `MemTable` under (the anti-join target).
 pub const EXCLUSION_TABLE: &str = "exclusion";
 
-
 /// Arrow schemas for the two log tables (`upsert_log`, `delete_log`).
 ///
 /// commit_tx_log is hot-only — cold has no commit_tx_log table to register.

@@ -95,8 +95,7 @@ impl LifecycleManager {
         // never in the child's hot tier. The child's own writes start at
         // `fork_seq + 1` (`seed_commit_seq_num_from_fork`), so the fence lands
         // precisely on the tier boundary.
-        let purge_uuid =
-            naming::table_purge_uuid(&catalog, &child, &table, fork_commit_seq_num, 0);
+        let purge_uuid = naming::table_purge_uuid(&catalog, &child, &table, fork_commit_seq_num, 0);
         Self::insert_table_purge(
             driver,
             catalog_uuid,
@@ -107,8 +106,13 @@ impl LifecycleManager {
             None,
         )
         .await?;
-        Self::commit_table_purge(driver, catalog_uuid, child_branch_uuid, &purge_uuid.to_string())
-            .await?;
+        Self::commit_table_purge(
+            driver,
+            catalog_uuid,
+            child_branch_uuid,
+            &purge_uuid.to_string(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -263,12 +267,15 @@ impl LifecycleManager {
                 ],
             )
             .await?;
-        let mut parent_map: Vec<(Uuid, Uuid)> = Vec::with_capacity(idx_parents.len());
+        let mut parent_map: Vec<(Uuid, Uuid, String)> = Vec::with_capacity(idx_parents.len());
         for idx_row in &idx_parents {
             let old_parent: Uuid = idx_row.get("table_snapshot_index_uuid");
             let index_uuid: Option<Uuid> = idx_row.get("index_uuid");
             let new_parent = naming::table_snapshot_index_uuid(&new_snap, index_uuid.as_ref());
-            parent_map.push((new_parent, old_parent));
+            // Carry the slug forward rather than re-SELECTing it per
+            // (parent x segment) pair below — it is already in hand here.
+            let slug = index_uuid.map_or_else(|| "row_uuid".to_string(), |u| u.to_string());
+            parent_map.push((new_parent, old_parent, slug));
             driver
                 .execute_no_result_params(
                     &format!(
@@ -299,7 +306,7 @@ impl LifecycleManager {
         //    `row_uuid_for_pk(new_seg, [index_slug])` — identical to what a fresh
         //    build of that segment produces for the same index, so build and copy
         //    agree.
-        for (new_parent, old_parent) in &parent_map {
+        for (new_parent, old_parent, slug) in &parent_map {
             for (new_seg, old_seg, _) in &seg_map {
                 driver
                     .execute_no_result_params(
@@ -318,10 +325,7 @@ impl LifecycleManager {
                             sidecar = qi(&idx_seg),
                         ),
                         &[
-                            SqlValue::Uuid(naming::row_uuid_for_pk(
-                                new_seg,
-                                &[&Self::sidecar_slug(driver, catalog, old_parent).await?],
-                            )),
+                            SqlValue::Uuid(naming::row_uuid_for_pk(new_seg, &[slug.as_str()])),
                             SqlValue::Uuid(*child),
                             SqlValue::Uuid(*new_seg),
                             SqlValue::Uuid(*new_parent),
@@ -337,31 +341,6 @@ impl LifecycleManager {
 
         Ok(InheritedBaseline {
             snapshot: Some((new_snap, snapshotted_at)),
-        })
-    }
-
-    /// The per-index sidecar-id discriminator: `"row_uuid"` for the internal
-    /// identity index, the `index_uuid` string for a user secondary index.
-    async fn sidecar_slug(
-        driver: &impl DbDriver<Row = PgRow>,
-        catalog: &Uuid,
-        table_snapshot_index_uuid: &Uuid,
-    ) -> Result<String> {
-        let idx_meta = naming::table_snapshot_index_metadata_table(catalog);
-        let rows = driver
-            .execute_params(
-                &format!(
-                    "SELECT index_uuid FROM {idx} WHERE table_snapshot_index_uuid = $1 LIMIT 1",
-                    idx = qi(&idx_meta),
-                ),
-                &[SqlValue::Uuid(*table_snapshot_index_uuid)],
-            )
-            .await?;
-        let index_uuid: Option<Uuid> = rows.first().and_then(|r| r.get("index_uuid"));
-
-        Ok(match index_uuid {
-            Some(uuid) => uuid.to_string(),
-            None => "row_uuid".to_string(),
         })
     }
 

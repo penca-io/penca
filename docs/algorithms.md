@@ -1356,11 +1356,19 @@ whether any other branch still names it.
 That indirection is load-bearing (CHA-539). Since CHA-531 a carried row lives in
 one branch's partition while its `object_uri` names the file another branch
 wrote, so a teardown that unlinked whatever its own enumeration reached would
-destroy a sibling's data in *either* direction across a fork edge: deleting the
-child unlinks files its carried rows name (the parent's), and deleting the parent
-unlinks files the child reads. Handing the URIs to the gate instead of deleting
-them is what makes both safe, and it replaces the previous best-effort delete —
-a queued row that fails to collect is simply retried by the next sweep.
+destroy a sibling's data across a fork edge: deleting the child unlinks files its
+carried rows name — the parent's. Handing the URIs to the gate instead of
+deleting them is what makes that safe, and it replaces the previous best-effort
+delete: a queued row that fails to collect is simply retried by the next sweep.
+
+**`main` cannot be deleted.** The opposite direction — deleting the branch a fork
+inherits *from* — is rejected outright with `INVALID_ARGUMENT` rather than made
+safe. While forks are main-only (CHA-515) that always means deleting `main`,
+which leaves the catalog unusable for reasons unrelated to cold data: every read
+resolves the main branch. `DeleteCatalog` is the removal path. So the gate covers
+the child direction today; the parent direction becomes reachable, and the gate
+becomes the only thing behind it, once [CHA-509](https://linear.app/chapala/issue/CHA-509)
+allows a fork off a non-main branch.
 
 **Phase 1: Collect URIs.** Catalog-wide over the branch's tables:
 `table_persist_segment_metadata`, `table_snapshot_segment_metadata`, the
