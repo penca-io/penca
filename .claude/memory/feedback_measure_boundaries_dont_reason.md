@@ -15,10 +15,10 @@ clean, passed clippy, and passed a targeted test run:
 - which **tier** carries the data (persist vs snapshot — a fixture where the
   snapshot covered the whole persist)
 - **inclusive vs exclusive** (`watermark + 1` vs the copied segments' actual floor)
+- misreading a stated **prerequisite as a blocker**, and building the opposite
+  design to the one asked for
 - lock **order** vs lock **strength** vs lock **completeness** vs lock **scope**
   (`LOCK TABLE` vs `LOCK TABLE ONLY`)
-- **row identity vs slice identity** for a cache key, then a fingerprint that
-  wasn't **injective**
 - an error path whose `map_err` **erased the variant** the match keyed on, so the
   mechanism was dead on its main path
 

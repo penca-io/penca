@@ -2,14 +2,15 @@
 //!
 //! A repeat read of the same cold segment within the process lifetime is served
 //! as an `Arc::clone` of the already-decoded Arrow batches, skipping the S3 GET +
-//! Parquet/Lance decode. It holds snapshot segments, persist data segments and
-//! index sidecars under one byte budget, all keyed by the SLICE they name plus
-//! the schema they were decoded to (`slice_cache_key`). The slice is immutable,
-//! so the key→value mapping is stable and needs no invalidation: a given
-//! `uri[offset .. offset + length]` resolves to identical bytes for the life of
-//! the process, and although a *resolved persist tier* is mutable under
-//! retention compaction, an individual persist *file* is not. There is no TTL —
-//! immutability makes W-TinyLFU eviction the whole reclaim mechanism.
+//! Parquet/Lance decode. It holds both snapshot segments (keyed by
+//! `table_snapshot_segment_uuid`) and persist data segments (keyed by
+//! `segment_uuid`) under one byte budget. Each per-uuid segment file is
+//! immutable, so the key→value mapping is stable and needs no invalidation: a
+//! snapshot uuid resolves to identical bytes for the life of the process, and
+//! although a *resolved persist tier* is mutable under retention compaction, an
+//! individual persist *file* (keyed by uuid) is not. There is no TTL —
+//! immutability makes W-TinyLFU eviction the whole reclaim mechanism for both
+//! tiers.
 //!
 //! Eviction is W-TinyLFU (frequency-based, scan-resistant, aged) via `moka`,
 //! bounded by a byte budget: each entry is weighed by its segment's
@@ -30,24 +31,16 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use moka::sync::Cache;
 
-/// In-process W-TinyLFU cache of decoded cold segments, keyed by slice identity
-/// and bounded by a byte budget.
+/// In-process W-TinyLFU cache of decoded cold segments, keyed by segment uuid
+/// (`table_snapshot_segment_uuid` for snapshot, `segment_uuid` for persist) and
+/// bounded by a byte budget.
 ///
-/// The key is `uri#offset+length` plus a fingerprint of the schema the batch was
-/// decoded to — see `slice_cache_key`. NOT the row's uuid: carry-forward and
-/// CHA-539's fork copy both mint a fresh uuid for a slice another branch already
-/// holds, so uuid keying stored one entry per referencing branch of identical
-/// bytes. The decode schema is part of the identity because the cached batch is
-/// null-filled to the CALLER's schema, and two branches can diverge on a
-/// column's type while naming the same slice.
-///
-/// `format` is intentionally absent — it is functionally determined by the URI,
-/// and every value is a format-agnostic decoded [`RecordBatch`]; `format` is
-/// consulted only on the miss path (by the caller) to pick the reader.
-///
-/// Sidecars share this cache with base segments. They no longer occupy a
-/// separate uuid namespace, so the separation now rests on a URI invariant: a
-/// sidecar's `object_uri` (an `index/` path) is never a base segment's.
+/// The key is the segment uuid alone: it is globally unique, immutable, and
+/// resolves to identical bytes, so it fully identifies the decoded value.
+/// `format` is intentionally absent from the key — it is functionally
+/// determined by the uuid, and every value is a format-agnostic decoded
+/// [`RecordBatch`]; `format` is consulted only on the miss path (by the
+/// caller) to pick the reader.
 ///
 /// Cheaply cloneable: `moka::sync::Cache` is internally an `Arc`, so callers
 /// typically hold a `SegmentCache` behind one outer `Arc` shared
@@ -70,7 +63,7 @@ impl SegmentCache {
             .max_capacity(budget_bytes)
             // Weight in the same byte unit as `max_capacity` so the budget is a
             // real RAM bound; the stored `u32` is the entry's `size_bytes`.
-            .weigher(|_key: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
+            .weigher(|_uuid: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
             .build();
         Self {
             inner,
@@ -110,21 +103,21 @@ impl SegmentCache {
             && weight_bytes <= u32::MAX as u64
     }
 
-    /// Fetch a decoded segment by slice key, bumping its frequency estimate. A
-    /// hit is an `Arc::clone` — no buffer copy.
-    pub fn get(&self, key: &str) -> Option<Arc<RecordBatch>> {
-        self.inner.get(key).map(|(batch, _weight)| batch)
+    /// Fetch a decoded segment by uuid, bumping its frequency estimate. A hit
+    /// is an `Arc::clone` — no buffer copy.
+    pub fn get(&self, uuid: &str) -> Option<Arc<RecordBatch>> {
+        self.inner.get(uuid).map(|(batch, _weight)| batch)
     }
 
-    /// Insert a decoded segment under its slice key, charged `weight_bytes`
-    /// against the budget. No-op when the segment is not
-    /// [`admits`](Self::admits)-ible. moka enforces `max_capacity` via W-TinyLFU;
-    /// there is no manual eviction loop here.
-    pub fn insert(&self, key: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
+    /// Insert a decoded segment under its uuid, charged `weight_bytes` against
+    /// the budget. No-op when the segment is not [`admits`](Self::admits)-ible.
+    /// moka enforces `max_capacity` via W-TinyLFU; there is no manual eviction
+    /// loop here.
+    pub fn insert(&self, uuid: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
         if !self.admits(weight_bytes) {
             return;
         }
-        self.inner.insert(key, (batch, weight_bytes as u32));
+        self.inner.insert(uuid, (batch, weight_bytes as u32));
     }
 
     /// Force pending eviction/maintenance to run synchronously. moka does

@@ -231,12 +231,7 @@ async fn read_and_cache_full<R: FormatReader>(
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
     cache.insert(
-        slice_cache_key(
-            &segment.uri,
-            Some(segment.offset),
-            Some(segment.length),
-            full_schema,
-        ),
+        segment.table_snapshot_segment_uuid.clone(),
         Arc::clone(&batch),
         weight,
     );
@@ -277,65 +272,6 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
-/// Cache key for a decoded segment: the SLICE of bytes it names, not the row
-/// that names it.
-///
-/// A segment IS `uri[offset .. offset + length]`, and that triple is what the
-/// reader fetches — so two rows carrying the same triple decode to byte-identical
-/// batches. Row identity does not have that property: carry-forward and CHA-539's
-/// fork copy both mint a fresh uuid for a slice another branch already holds, so
-/// keying on the uuid stored one entry per referencing branch of the same bytes,
-/// competing for a single `reader_memory_budget`. N forks of a table meant up to
-/// N+1 copies of every segment — cache thrash, not incorrectness.
-///
-/// All three components, not the URI alone: the packer packs many partitions into
-/// one file, so a URI backs several distinct slices and keying on it would demand
-/// slicing a decoded batch by byte range, which is not a thing. Including offset
-/// and length keeps one entry per slice exactly as before, and merges only
-/// entries that were always identical.
-///
-/// Content-safe: the per-row seq ceiling is applied AFTER the read
-/// (`apply_segment_seq_ceiling`), so a cached entry never encodes a per-row
-/// bound that could differ between two rows naming the same slice.
-fn slice_cache_key(
-    uri: &str,
-    offset: Option<i64>,
-    length: Option<i64>,
-    decode_schema: &SchemaRef,
-) -> String {
-    let slice = match (offset, length) {
-        (Some(o), Some(l)) => format!("{uri}#{o}+{l}"),
-        // A segment that owns its whole object records no slice bounds.
-        _ => format!("{uri}#full"),
-    };
-    // The decode schema is part of the identity, because the cached value is NOT
-    // the file's native decode: `read_segment` null-fills to the CALLER's schema
-    // before returning. Under uuid keying an entry belonged to one branch's row,
-    // so its decode schema was that branch's table schema and this was implicit.
-    // Slice keying merges entries across branches — precisely where schemas can
-    // diverge, since a fork can ALTER independently of the parent while still
-    // naming the parent's slice. Without this, `main` adding `c BIGINT` and a
-    // fork adding `c TEXT` would have whichever missed first cache an all-null
-    // `c` of its own type, and the other branch's `project_batch_to_schema` would
-    // fail on the type mismatch — a cache-state-dependent error on a branch whose
-    // own metadata is consistent.
-    // Length-prefixed, because column names are permissive: `check_name` rejects
-    // only empty, over-long and control-character names, so `:`, `,` and `|` are
-    // all legal. A plain `name:type` join is therefore NOT injective —
-    // [("x", Utf8), ("y", Int64)] and [("x:Utf8,y", Int64)] render identically —
-    // and two schemas colliding here reopens exactly the cross-branch mismatch
-    // this fingerprint exists to close. Prefixing every part with its byte length
-    // makes the encoding unambiguous whatever the name contains.
-    let mut fp = String::new();
-    fp.push_str(&decode_schema.fields().len().to_string());
-    for f in decode_schema.fields() {
-        let name = f.name();
-        let dtype = f.data_type().to_string();
-        fp.push_str(&format!(":{}:{name}:{}:{dtype}", name.len(), dtype.len()));
-    }
-    format!("{slice}|{fp}")
-}
-
 /// Cache-aware read of a single snapshot segment. Returns the full decoded
 /// superset on hit / miss-cached, or the projected `out_schema` batch on the
 /// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
@@ -357,14 +293,9 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let key = slice_cache_key(
-        &segment.uri,
-        Some(segment.offset),
-        Some(segment.length),
-        full_schema,
-    );
+    let uuid = segment.table_snapshot_segment_uuid.as_str();
 
-    if let Some(full) = cache.get(&key) {
+    if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok((*full).clone());
@@ -413,11 +344,7 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(
-        slice_cache_key(&segment.uri, segment.offset, segment.length, full_schema),
-        Arc::clone(&batch),
-        weight,
-    );
+    cache.insert(segment.segment_uuid.clone(), Arc::clone(&batch), weight);
     tracing::debug!(
         rows = batch.num_rows(),
         "persist segment decoded and cached"
@@ -488,12 +415,14 @@ async fn read_projected_uncached_persist<R: FormatReader>(
 /// compaction, which is why the tier is re-resolved live on every read; the
 /// per-uuid *file bytes* this caches are not.)
 ///
-/// Keyed by slice identity plus decode schema, not by the row's uuid — see
-/// [`slice_cache_key`]. A fork's copied row names the same
-/// `(object_uri, offset, length)` the parent already holds, so row keying stored
-/// N+1 byte-identical entries for N forks. Content-safe because the per-row seq
-/// ceiling is applied after the read, so a cached entry never encodes it.
-/// Returns the full
+/// The key is row identity, NOT slice identity, and since CHA-539 those differ:
+/// a fork's copied segment row mints its own `segment_uuid` for the same
+/// `(object_uri, offset, length)` the parent already holds, so N forks of a
+/// table can hold N+1 cache entries of byte-identical content competing for one
+/// budget. Cache thrash, not incorrectness. Re-keying on the slice would fix it
+/// and is content-safe — the per-row seq ceiling is applied after the read, so a
+/// cached entry never encodes it — but that is a cache-design change, tracked
+/// separately rather than done here. Returns the full
 /// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
 /// the non-cacheable (oversized) path; the caller projects / null-fills
 /// downstream.
@@ -514,9 +443,9 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let key = slice_cache_key(&segment.uri, segment.offset, segment.length, full_schema);
+    let uuid = segment.segment_uuid.as_str();
 
-    if let Some(full) = cache.get(&key) {
+    if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return Ok((*full).clone());
@@ -541,14 +470,8 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache, keyed by slice identity plus decode schema like every other entry.
-///
-/// Separation from base segments is now a URI-namespace invariant, not a
-/// uuid-namespace one: a sidecar's `object_uri` is written under the snapshot's
-/// `index/` prefix and a base segment's never is, so the two cannot produce the
-/// same `uri#offset+length`. The key schema is the indexed columns' native
-/// types, so two callers wanting different key types for one file do not share
-/// an entry either.
+/// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
+/// namespace from the base segment uuid, so the two never collide in one cache.
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -564,19 +487,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    // The sidecar's key schema is the indexed columns' native types; the
-    // identity/name sidecars are the all-Utf8 special case. Derived BEFORE the
-    // lookup because it is part of the cache key — the cached batch is decoded
-    // to this schema, so two callers wanting different key types must not share
-    // an entry.
-    let schema = penca_format::index::segment_index_schema(key_types);
-    let key = slice_cache_key(
-        &sidecar.object_uri,
-        Some(sidecar.offset),
-        Some(sidecar.length),
-        &schema,
-    );
-    if let Some(batch) = cache.get(&key) {
+    if let Some(batch) = cache.get(&sidecar.segment_index_uuid) {
         span.record("cache", "hit");
         return Ok((*batch).clone());
     }
@@ -585,6 +496,9 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
+    // The sidecar's key schema is the indexed columns' native types; the
+    // identity/name sidecars are the all-Utf8 special case.
+    let schema = penca_format::index::segment_index_schema(key_types);
     let batch = reader
         .read_segment(
             &sidecar.object_uri,
@@ -598,7 +512,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let batch = Arc::new(batch);
     // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
     // decoded-but-not-cached rather than evicting the whole budget.
-    cache.insert(key, Arc::clone(&batch), sidecar.size_bytes.max(0) as u64);
+    cache.insert(
+        sidecar.segment_index_uuid.clone(),
+        Arc::clone(&batch),
+        sidecar.size_bytes.max(0) as u64,
+    );
     Ok((*batch).clone())
 }
 
@@ -1068,26 +986,10 @@ mod tests {
     fn segment(uuid: &str, size_bytes: i64) -> SnapshotSegment {
         SnapshotSegment {
             table_snapshot_segment_uuid: uuid.to_string(),
-            // A distinct URI per segment, because the cache keys on the SLICE
-            // (`uri#offset+length`) rather than the row's uuid. Leaving this at
-            // Default gave every fixture segment the same empty slice, so two
-            // "different" segments shared one entry and an eviction test could
-            // never re-read.
-            uri: format!("s3://test/{uuid}.parquet"),
             format: Format::Parquet,
             size_bytes,
             ..Default::default()
         }
-    }
-
-    /// The cache key `segment(uuid, _)` lands under.
-    fn seg_key(uuid: &str) -> String {
-        slice_cache_key(
-            &format!("s3://test/{uuid}.parquet"),
-            Some(0),
-            Some(0),
-            &test_schema(),
-        )
     }
 
     /// Driver whose single reader (Parquet) is a counting reader; returns the
@@ -1878,65 +1780,7 @@ mod tests {
             2,
             "oversized segment is never cached — both accesses re-read storage"
         );
-        assert!(
-            cache.get(&seg_key("big")).is_none(),
-            "oversized segment not stored"
-        );
-    }
-
-    #[test]
-    fn slice_cache_key_separates_diverging_decode_schemas() {
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        // Same slice, two branches whose tables diverged on column `c`'s type.
-        // Reachable since CHA-539: a fork's copied row names the parent's
-        // (uri, offset, length) while the fork can ALTER independently.
-        let bigint: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("c", DataType::Int64, true),
-        ]));
-        let text: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("c", DataType::Utf8, true),
-        ]));
-
-        let a = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &bigint);
-        let b = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &text);
-        assert_ne!(
-            a, b,
-            "two branches decoding one slice to different column types must not \
-             share a cache entry — the cached batch is null-filled to the \
-             CALLER's schema, so sharing it hands the other branch a column of \
-             the wrong type and fails its projection"
-        );
-
-        // The dedup the slice key exists for still holds: same slice, same
-        // schema, different rows naming it -> one entry.
-        let c = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &bigint);
-        assert_eq!(a, c, "one slice decoded one way is one cache entry");
-
-        // And distinct slices of one packed file stay distinct.
-        let d = slice_cache_key("s3://b/x.lance", Some(10), Some(10), &bigint);
-        assert_ne!(a, d, "the packer packs many partitions into one file");
-
-        // Injective under adversarial column names. `check_name` allows `:`,
-        // `,` and `|`, so a plain `name:type` join would render these two
-        // schemas identically and merge their entries.
-        let split: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Utf8, true),
-            Field::new("y", DataType::Int64, true),
-        ]));
-        let fused: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "x:Utf8,y",
-            DataType::Int64,
-            true,
-        )]));
-        assert_ne!(
-            slice_cache_key("s3://b/x.lance", Some(0), Some(10), &split),
-            slice_cache_key("s3://b/x.lance", Some(0), Some(10), &fused),
-            "a column name containing the fingerprint's own delimiters must not \
-             collide two different schemas onto one cache entry"
-        );
+        assert!(cache.get("big").is_none(), "oversized segment not stored");
     }
 
     #[tokio::test]
@@ -1956,11 +1800,7 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache.get(&seg_key("a")).is_none() {
-            "a"
-        } else {
-            "b"
-        };
+        let evicted = if cache.get("a").is_none() { "a" } else { "b" };
         read_seg(&dl, &segment(evicted, 150), &schema, &schema)
             .await
             .unwrap();
