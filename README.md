@@ -112,9 +112,9 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Features
 
-- [x] Fork a branch off `main` with no row copy
+- [x] Fork, merge and discard a branch — gRPC only, no SQL branch DDL exists
+- [x] Fork copies no rows off `main`
 - [x] Read-your-writes on a branch, over SQL or gRPC
-- [x] Branch merge, and branch delete/discard (gRPC only, not exposed in SQL)
 - [x] Time travel — read any table as of an earlier commit
 - [x] Audit trail — full version history per row, including tombstones
 - [x] ACID transactions spanning every schema in a catalog
