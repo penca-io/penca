@@ -14,6 +14,7 @@ mod compact;
 // `parse_uuid`/`qi`/`epoch`/`resolve_branch` call-site aliases.
 pub mod convert;
 mod ddl;
+mod fork_copy;
 pub mod helpers;
 mod index;
 mod lifecycle;

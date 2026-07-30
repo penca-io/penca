@@ -1660,6 +1660,7 @@ mod tests {
             statistics: Vec::new(),
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 

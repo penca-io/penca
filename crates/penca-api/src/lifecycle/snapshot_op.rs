@@ -22,14 +22,13 @@ use penca_core::naming::{
     table_snapshot_uuid,
 };
 use penca_core::{
-    BaseColdStorage, ColdStoragePlan, CommitSeqBounds, CommittedAtBounds, Format, PersistPlan,
+    ColdStoragePlan, CommittedAtBounds, Format, PersistPlan,
     PersistSegment, Plan, SnapshotPlan, SnapshotSegment,
 };
 use penca_db::driver::pg::PgDriver;
 use penca_dl::driver::DlDriver;
 use penca_format::reader::FormatReader;
 use penca_format::writer::FormatWriter;
-use penca_proto::external::v1::create_branch_request::ForkPoint;
 use penca_proto::external::v1::{Index, SnapshotRequest, SnapshotResponse};
 use penca_storage_cold::ColdStorageClient;
 use penca_storage_meta::watermarks::compute_snapshot_seq_watermark;
@@ -270,10 +269,6 @@ impl LifecycleManager {
     /// `(prev_snap_watermark + 1, snapshotted_at_micros + 1)` plus the
     /// prior snapshot (if any) as the cold baseline.
     ///
-    /// `fork_edge` is the caller's already-resolved lineage, passed in rather
-    /// than re-read here: both are gated on `prev_snap_watermark.is_none()`, so
-    /// re-deriving it would cost a second `branch_store` round-trip on every
-    /// table's first snapshot — forked or not (CHA-531).
     #[allow(clippy::too_many_arguments)]
     async fn assemble_cold_only_plan(
         &self,
@@ -284,7 +279,6 @@ impl LifecycleManager {
         snapshotted_at_micros: i64,
         prev_snap_watermark: Option<i64>,
         snapshot_segments: Vec<SnapshotSegment>,
-        fork_edge: Option<(&str, i64)>,
     ) -> Result<Plan, ApiError> {
         let from_micros = prev_snap_watermark.map(|s| s.saturating_add(1));
         let to_micros = Some(snapshotted_at_micros.saturating_add(1));
@@ -333,126 +327,17 @@ impl LifecycleManager {
             // not consulted on the snapshot-write merge.
             ..Default::default()
         });
-        // On a forked branch's FIRST snapshot, fold the parent's cold
-        // tier into the delta so the new baseline materializes
-        // parent-as-of-fork ∪ the branch's own writes — the mechanism that lets
-        // steady-state forked reads skip the base source (the read gate).
-        // Gated on `prev_snap_watermark.is_none()`: every later snapshot carries
-        // the prior snapshot as its cold baseline, which already folded the
-        // parent (any child snapshot seq > fork_seed, so it stays
-        // fork-covering), so re-folding would be pure redundant re-materialization
-        // of the whole parent cold tier. Ceiling = fork_seed (the snapshot
-        // captures the parent as-of the fork; there is no seq as_of to push it
-        // lower).
-        let base_cold_storage = if prev_snap_watermark.is_some() {
-            None
-        } else {
-            match fork_edge {
-                Some((parent_branch_uuid, fork_commit_seq_num)) => {
-                    self.query_manager
-                        .enumerate_base_cold_source(
-                            pool,
-                            catalog_str,
-                            parent_branch_uuid,
-                            table_str,
-                            snapshotted_at_micros,
-                            fork_commit_seq_num,
-                        )
-                        .await?
-                }
-                None => None,
-            }
-        };
         Ok(Plan {
             hot_storage: None,
             cold_storage: Some(ColdStoragePlan {
                 snapshot: cold_snapshot_plan,
                 persist: cold_persist_plan,
             }),
-            base_cold_storage,
+            // CHA-539: a seeded child's cold tier already holds the parent's
+            // state as-of the fork, so the snapshot write has no foreign source
+            // to fold — this is the same plan shape a non-forked branch produces.
+            base_cold_storage: None,
         })
-    }
-
-    /// The fork parent's persist tail, as a base cold source for the
-    /// carry-forward path's delta resolve (CHA-531). `None` off a fork edge,
-    /// and `None` when the parent persisted nothing after the carried
-    /// baseline.
-    ///
-    /// The carry-forward delta read is scoped to the CHILD's persist log while
-    /// the carried baseline is the PARENT's snapshot. Rows the parent persisted
-    /// after that snapshot and before the fork sit in neither, so they join the
-    /// delta here: their partitions land in `delta_groups`, get marked touched,
-    /// and are rewritten, while untouched partitions stay carried.
-    ///
-    /// The parent's SNAPSHOT is deliberately absent — it is the carried
-    /// baseline, not a merge input. Including it would materialize the whole
-    /// parent table into `delta_groups`, mark every partition touched, and
-    /// defeat the ticket.
-    ///
-    /// `baseline_watermark` is the watermark of the very snapshot whose
-    /// segments are being carried, NOT a fresh pick via
-    /// `QueryManager::enumerate_base_cold_source`. That helper re-picks the
-    /// parent's baseline to derive its own floor, and a second pick is not
-    /// guaranteed to land on the first one's snapshot: a parent snapshot whose
-    /// seq sits under the fork ceiling can still finish its two-phase commit
-    /// between the two reads, which are separate transactions. The carried
-    /// segments would then be the older snapshot's while the floor came from
-    /// the newer one, and every parent row committed between the two watermarks
-    /// would belong to neither the carried baseline nor this tail — silently
-    /// dropped. Deriving both from one read makes that unrepresentable.
-    ///
-    /// TODO(CHA-509): one hop only — this folds a single parent's tail and
-    /// applies that parent's tail deletes. Under a fork chain the tail spans
-    /// every hop between the nearest baked ancestor and this branch, folded in
-    /// shadow order (nearer shadows farther).
-    async fn assemble_fork_tail_base_cold(
-        &self,
-        pool: &PgDriver,
-        catalog_str: &str,
-        table_str: &str,
-        fork_edge: Option<(&str, i64)>,
-        baseline_watermark: Option<i64>,
-        snapshotted_at_micros: i64,
-    ) -> Result<Option<BaseColdStorage>, ApiError> {
-        let Some((parent_branch_uuid, fork_commit_seq_num)) = fork_edge else {
-            return Ok(None);
-        };
-        let from_micros = baseline_watermark.map(|ts| ts.saturating_add(1));
-        let (upsert_segments, delete_segments) = self
-            .query_manager
-            .read_persist_segments_for_window(
-                pool,
-                catalog_str,
-                parent_branch_uuid,
-                table_str,
-                from_micros,
-                // Inert on the read: the fork ceiling already excludes
-                // everything committed after the fork.
-                None,
-                Some(fork_commit_seq_num),
-            )
-            .await?;
-        if upsert_segments.is_empty() && delete_segments.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(BaseColdStorage {
-            cold: ColdStoragePlan {
-                snapshot: None,
-                persist: Some(PersistPlan {
-                    upsert_segments,
-                    delete_segments,
-                    committed_at: Some(CommittedAtBounds {
-                        min_micros: from_micros,
-                        max_micros: Some(snapshotted_at_micros.saturating_add(1)),
-                    }),
-                    commit_seq: Some(CommitSeqBounds {
-                        min_seq: None,
-                        max_seq: Some(fork_commit_seq_num),
-                    }),
-                }),
-            },
-            commit_seq_ceiling: fork_commit_seq_num,
-        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -544,52 +429,15 @@ impl LifecycleManager {
         // against a watermark from another branch's log.
         let prev_snap_watermark = snapshot_result.snapshotted_at_micros;
 
-        // CHA-531: a fork's first snapshot has no baseline of its own, so the
-        // carry-forward gate below would see an empty segment set and fall
-        // through to the CHA-404 full rewrite — O(table) bytes per fork. Adopt
-        // the parent's baseline at the fork edge and carry from that instead.
-        //
-        // The pick bound is the same `(snapshotted_at_micros,
-        // fork_commit_seq_num)` pair `enumerate_base_cold_source` uses on the
-        // full-rewrite fallback, so both paths inherit the same parent state by
-        // construction rather than by coincidence. This is also the ONLY pick
-        // the carry path makes: the parent's persist tail is windowed off the
-        // watermark it yields, never off a second read (see `base_cold` below).
-        //
-        // Single-level only: `read_branch_lineage` returns one immediate parent
-        // (CHA-509 tracks recursion, CHA-515 guards main-only forks).
-        let fork_edge = if prev_snap_watermark.is_some() {
-            None
-        } else {
-            self.query_manager
-                .read_branch_lineage(pool, &catalog_str, &branch_str)
-                .await?
-        };
-        let fork_base = match &fork_edge {
-            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
-                let base = self
-                    .query_manager
-                    .read_snapshot_segments_for_table(
-                        pool,
-                        &catalog_str,
-                        parent_branch_uuid,
-                        &table_str,
-                        Some(snapshotted_at_micros),
-                        Some(*fork_commit_seq_num),
-                        None,
-                    )
-                    .await?;
-                base.snapshotted_at_micros
-                    .map(|_| (parent_branch_uuid.clone(), base))
-            }
-            None => None,
-        };
-        // `source_branch` is the branch the carried rows are READ from; the new
-        // rows are always written under `branch_str`. The two differ only here.
-        let (source_branch, baseline) = match fork_base {
-            Some((parent_branch_uuid, base)) => (parent_branch_uuid, base),
-            None => (branch_str.clone(), snapshot_result),
-        };
+        // CHA-539 retired the fork-edge special case that used to live here. A
+        // fork now materializes the parent's cold references at CreateBranch, so
+        // `compute_snapshot_window` finds a prior snapshot of the child's OWN and
+        // this is an ordinary carry-forward — no baseline adoption, no
+        // cross-branch source, no dual-axis clamp. The parent's persist tail is
+        // likewise the child's own copied rows, so the ordinary delta window
+        // picks it up.
+        let baseline = snapshot_result;
+
         let SnapshotResult {
             // Planner-only field; the snapshot writer re-derives defs
             // from live index_metadata itself.
@@ -633,67 +481,7 @@ impl LifecycleManager {
                 Some(snapshotted_at_micros.saturating_add(1)),
             )
             .await?;
-        // CHA-531: on a fork's first snapshot the baseline is the parent's, so
-        // the new watermark bases at the PARENT's W_snap. Basing at the child's
-        // own (`None` → genesis) would stamp a watermark below the seq of rows
-        // the snapshot actually materializes.
-        //
-        // The parent's contribution joins the fold for the same reason.
-        // `segment_seq_max` is windowed over `branch_str` — the CHILD's persist
-        // log — so the parent tail this snapshot folds in between the parent's
-        // W_snap and the fork point contributes no seq of its own. The child's
-        // seqs are seeded one past the fork edge, so its own segments normally
-        // drag the fold above the fork point anyway; what defeats that is an
-        // `as_of` snapshot whose micros window closes before the child's persist
-        // but after the parent's tail, leaving the fold empty while the snapshot
-        // still materializes parent rows.
-        //
-        // Understating is not merely conservative. `meta_plan`'s base-cold gate
-        // is `child_snapshot_seq < fork_commit_seq_num`, so a watermark short of
-        // the fork point leaves that gate open forever and every read of the
-        // fork re-enumerates and re-folds the parent's base to dedup it against
-        // data the child's own snapshot already holds.
-        //
-        // But the fork edge is the wrong number to claim outright, because both
-        // plan paths clamp the parent on the MICROS axis as well as the seq one:
-        // carry-forward via `assemble_fork_tail_base_cold`'s `max_micros`, full
-        // rewrite via `enumerate_base_cold_source`'s. An `as_of` pin below a
-        // parent commit that still sits under the fork edge strands that commit
-        // — it is filtered out of what this snapshot materializes — and claiming
-        // the edge anyway would close the base-cold gate over it, losing those
-        // rows on the child for the life of the branch (no later snapshot
-        // re-folds the parent: `fork_edge` is gated on `prev_snap_watermark`).
-        //
-        // On the parent's own log seq order and micros order agree, so the
-        // parent's latest committed seq at or before the pin IS the ceiling this
-        // snapshot materializes. Claim the lesser of that and the fork edge. In
-        // the common no-`as_of` case the pin sits past the fork and the two
-        // coincide, so the plan-shape win is preserved. `resolve_committed_tx`
-        // waterfalls hot `commit_tx_log` → cold `tx_log`, so a PurgeTxLog'd
-        // position still resolves.
-        //
-        // TODO(CHA-500): once snapshot's as-of cutoff arrives as a
-        // `commit_seq_num` rather than micros, this whole block is
-        // `fold_seqs.push(fork_commit_seq_num.min(as_of_seq))` — the
-        // translation belongs at the API boundary, not here.
-        let mut fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
-        if let Some((parent_branch_uuid, fork_commit_seq_num, _)) = &fork_edge {
-            let parent_uuid = Uuid::parse_str(parent_branch_uuid)
-                .map_err(|e| ApiError::Internal(format!("invalid parent branch uuid: {e}")))?;
-            if let Some(pinned) = self
-                .query_manager
-                .resolve_committed_tx(
-                    pool,
-                    readers,
-                    &catalog_uuid,
-                    &parent_uuid,
-                    Some(&ForkPoint::CommitMicros(snapshotted_at_micros)),
-                )
-                .await?
-            {
-                fold_seqs.push((*fork_commit_seq_num).min(pinned.commit_seq_num));
-            }
-        }
+        let fold_seqs: Vec<i64> = segment_seq_max.into_iter().collect();
         let snapshot_commit_seq_num =
             compute_snapshot_seq_watermark(baseline_commit_seq_num, &fold_seqs);
 
@@ -753,7 +541,7 @@ impl LifecycleManager {
             table_uuid: &table_uuid,
             catalog_str: &catalog_str,
             branch_str: &branch_str,
-            source_branch_str: &source_branch,
+            source_branch_str: &branch_str,
             table_str: &table_str,
             snap_uuid: &snap_uuid,
             snap_str: &snap_str,
@@ -802,26 +590,6 @@ impl LifecycleManager {
             // joins that delta as a base source, so partitions the parent wrote
             // between its snapshot and the fork are rewritten rather than
             // carried stale.
-            let base_cold = self
-                .assemble_fork_tail_base_cold(
-                    pool,
-                    &catalog_str,
-                    &table_str,
-                    fork_edge
-                        .as_ref()
-                        .map(|(parent, seq, _micros)| (parent.as_str(), *seq)),
-                    baseline_watermark,
-                    snapshotted_at_micros,
-                )
-                .await?;
-            // Counted before the plan moves into the resolve. Whether the fork
-            // tail was folded is invisible in the counts below — a fork whose
-            // parent had no tail and a same-branch carry-forward log
-            // identically — so the acceptance seam needs its own field.
-            let fork_tail_segments = base_cold
-                .as_ref()
-                .and_then(|b| b.cold.persist.as_ref())
-                .map_or(0, |p| p.upsert_segments.len() + p.delete_segments.len());
             let (delta_groups, delete_segments, exclusion_set) = self
                 .resolve_windowed_delta(
                     pool,
@@ -834,7 +602,6 @@ impl LifecycleManager {
                     &merge_snapshot,
                     prev_snap_watermark,
                     snapshotted_at_micros,
-                    base_cold,
                 )
                 .await?;
 
@@ -902,7 +669,6 @@ impl LifecycleManager {
                 touched_partitions = touched_segments.len(),
                 carried_partitions = carried.len(),
                 delta_rows = delta_groups.iter().map(|(_, b)| b.num_rows()).sum::<usize>(),
-                fork_tail_segments,
                 "carry-forward engaged"
             );
 
@@ -968,9 +734,6 @@ impl LifecycleManager {
                     snapshotted_at_micros,
                     prev_snap_watermark,
                     snapshot_segments,
-                    fork_edge
-                        .as_ref()
-                        .map(|(parent, seq, _micros)| (parent.as_str(), *seq)),
                 )
                 .await?;
             let parts = penca_merge::stream_all_cold_parts(penca_merge::MergeReadRequest {
@@ -1056,11 +819,6 @@ impl LifecycleManager {
         merge_snapshot: &penca_merge::ReadSnapshot,
         prev_snap_watermark: Option<i64>,
         snapshotted_at_micros: i64,
-        // CHA-531: on a fork's first snapshot, the parent's post-snapshot
-        // persist tail (seq-capped at the fork) as a second source layered
-        // under this branch's own. `None` on every other snapshot, which keeps
-        // them byte-identical.
-        base_cold: Option<BaseColdStorage>,
     ) -> Result<
         (
             Vec<(Option<String>, RecordBatch)>,
@@ -1105,35 +863,13 @@ impl LifecycleManager {
                 commit_seq: None,
             })
         };
-        // CHA-531: the base's tombstones must reach the caller's touched-set
-        // attribution, and the fold cannot deliver them. The fold applies
-        // `filter_live_rows` to the base, so a parent tombstone never lands in
-        // `tiers.resolved` and therefore never lands in `delta_groups` — it
-        // survives only as an `exclusion_set` entry, and the exclusion set is
-        // applied to the touched prior stream, never to a partition carried by
-        // reference. Without this a row the parent deleted in its tail sits in
-        // an otherwise-untouched partition, that partition is carried from the
-        // parent's snapshot (which still holds the row), and the delete is
-        // undone. Returned for attribution only, deliberately NOT added to
-        // `persist_plan` above: the fold already reads the base's delete log
-        // as part of `base_cold_storage`, and replaying it as the CHILD's
-        // tombstones would apply the parent's deletes a second time over the
-        // child's own tier. Over-inclusion in the touched set is safe — an
-        // extra partition rewrite is byte-correct.
-        let attributable_deletes = match base_cold.as_ref().and_then(|b| b.cold.persist.as_ref()) {
-            None => delete_segments,
-            Some(base_persist) => delete_segments
-                .into_iter()
-                .chain(base_persist.delete_segments.iter().cloned())
-                .collect(),
-        };
         let delta_plan = Plan {
             hot_storage: None,
             cold_storage: Some(ColdStoragePlan {
                 snapshot: None,
                 persist: persist_plan,
             }),
-            base_cold_storage: base_cold,
+            base_cold_storage: None,
         };
         let tiers = penca_merge::resolve_log_tiers(&penca_merge::MergeReadRequest {
             plan: &delta_plan,
@@ -1151,7 +887,7 @@ impl LifecycleManager {
         .await
         .map_err(ApiError::Merge)?;
         let delta_groups = partition_record_batch(&tiers.resolved, partition_keys)?;
-        Ok((delta_groups, attributable_deletes, tiers.exclusion_set))
+        Ok((delta_groups, delete_segments, tiers.exclusion_set))
     }
 
     /// Distinct partition labels a window's cold delete-log attributes

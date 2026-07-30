@@ -914,6 +914,41 @@ impl WriteManager {
                 &request.comment,
             )
             .await?;
+
+            // CHA-539: make the fork's claim on the parent's cold files an
+            // EXPLICIT row in the child's own partition. Reaching across the fork
+            // edge at plan time left the claim invisible to the sweep's refcount
+            // gate, which is a `NOT EXISTS` probe over metadata tables — no row,
+            // no probe can find it. Metadata only: every copied row carries the
+            // parent's `object_uri`, so this is O(cold segments) in rows and O(1)
+            // in bytes.
+            //
+            // Same table list `materialize_metadata_from_source` walked, and in
+            // the same transaction, so `commit_micros` is stamped directly and a
+            // rollback takes the whole copy with it.
+            let inherited_tables = self
+                .query_manager
+                .list_table_uuids_for_branch(
+                    tx,
+                    dl_driver,
+                    &catalog_str,
+                    None,
+                    &source_branch_str,
+                )
+                .await?;
+            for inherited_table in &inherited_tables {
+                LifecycleManager::materialize_fork_cold_references(
+                    tx,
+                    &catalog_str,
+                    &branch_str,
+                    &source_branch_str,
+                    inherited_table,
+                    fork.commit_seq_num,
+                    fork.commit_micros,
+                    fork.commit_micros,
+                )
+                .await?;
+            }
             Ok(())
         })
         .await?;

@@ -423,7 +423,7 @@ mod tests {
 mod ceiling_tests {
     use super::*;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 

@@ -1772,6 +1772,13 @@ impl QueryManager {
             .read_branch_lineage(pool, &catalog_uuid_str, &branch_uuid_str)
             .await?
         {
+            // CHA-539: the child's OWN persist rows now carry the parent's CDC
+            // down to the inherited snapshot's watermark, so enumerating the base
+            // arm over that same range would double-report every change row. Cap
+            // the base arm at the inherited watermark; below it the parent is
+            // still the only source. `None` (parent had no eligible snapshot at
+            // the fork) means the child owns the whole inherited history, so the
+            // arm is skipped entirely.
             Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
                 let (base_upserts, base_deletes) = self
                     .read_persist_segments_for_window(

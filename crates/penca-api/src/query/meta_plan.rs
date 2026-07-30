@@ -135,14 +135,6 @@ impl QueryManager {
             .await?;
 
         // The seq of the child snapshot this read will resolve on
-        // (`SNAPSHOT_SEQ_GENESIS` when none is picked — a fresh fork or a
-        // time-travel read below any child snapshot). The base-source gate
-        // keys on this: any real child snapshot has `w_snap > fork_seed`, so a
-        // picked snapshot always covers the fork and subsumes the parent.
-        let child_snapshot_seq = cache_pick
-            .as_ref()
-            .map_or(watermarks::SNAPSHOT_SEQ_GENESIS, |pick| pick.w_snap);
-
         // Pre-Persist (`hot_min == 0`): hot owns every row, so skip the
         // cold fetch AND the phase-1 capture — `assemble_plan` ignores the
         // cold inputs and omits cold_storage, `fence = None` (hot serves all),
@@ -265,9 +257,31 @@ impl QueryManager {
         // parent's `object_uri`s forward by reference rather than by rewriting
         // them — so enumerating the base source again would double-count.
         // Steady-state forked reads return to the non-forked plan shape.
+        // CHA-539: the child now HOLDS the parent's cold as-of the fork as its own
+        // rows, so the base arm is exactly redundant for any read at or above the
+        // fork — and still required below it, where the child inherited one
+        // baseline rather than the parent's whole history.
+        //
+        // The old gate (`child_snapshot_seq < fork_commit_seq_num`) asked the
+        // wrong question: the inherited snapshot carries the PARENT's `W_snap`,
+        // which is at or below the fork, so it stayed open on every fork forever
+        // and every forked read re-enumerated data the child already owned.
+        //
+        // Deliberately CONSERVATIVE. It closes the arm only for reads provably at
+        // or above the fork; a read below it keeps today's path verbatim. So an
+        // `as_of` between the inherited watermark and the fork still enumerates
+        // the parent even though the copied rows could answer alone — the two
+        // resolve to the same files and the fold dedups them, and preserving the
+        // existing path for every below-fork read is worth more than saving an
+        // enumeration on a rare time-travel query. Do not narrow this to the
+        // inherited watermark.
+        let read_is_below_fork = |fork_seq: i64, fork_micros: i64| {
+            as_of_micros < fork_micros
+                || commit_seq_upper.is_some_and(|as_of_seq| as_of_seq < fork_seq)
+        };
         let base_cold_storage = match lineage {
-            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros))
-                if child_snapshot_seq < fork_commit_seq_num =>
+            Some((parent_branch_uuid, fork_commit_seq_num, fork_commit_micros))
+                if read_is_below_fork(fork_commit_seq_num, fork_commit_micros) =>
             {
                 // Parent ceiling = min(fork_seed, as_of_seq): the fork is a hard
                 // cap `as_of` can only push down.
@@ -1705,6 +1719,7 @@ mod assemble_tests {
             statistics: vec![],
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 
