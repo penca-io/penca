@@ -56,7 +56,7 @@ services:
       retries: 10
 
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.33
     profiles: [infra]
     command: server -s3 -s3.config=/etc/seaweedfs/s3.json -s3.ip.bind=0.0.0.0 -dir=/data
     ports:
@@ -64,14 +64,24 @@ services:
     volumes:
       - ${PENCA_S3_VOLUME:-seaweedfsdata}:/data
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    # start_period is the cold-start grace window: failures inside it don't
+    # count against `retries`, and the container flips healthy on the first
+    # success regardless of how much of the window is left — so a generous
+    # value costs a fast boot nothing. Without one the budget was
+    # interval x retries ~= 20s, and measured cold boot to a 200 on /status
+    # varies with host contention (2.6s / 10.3s / 2.4s on an idle 2-core VM,
+    # ~30s reported under load) — under 2x margin, which is why `penca-up`
+    # failed intermittently and machine-specifically. 60s covers the loaded
+    # case; `retries` stays a post-boot liveness budget. CHA-542.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status"]
       interval: 2s
       timeout: 5s
       retries: 10
+      start_period: 60s
 
   seaweedfs-init:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     profiles: [infra]
     depends_on:
       seaweedfs:
