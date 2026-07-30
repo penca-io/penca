@@ -4,7 +4,10 @@
 
 FROM python:3.10-slim AS build
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Pinned, not `:latest`: an unpinned tag lets a rebuild pick up a new uv
+# without a repo change, which is how the toolchain drifts silently between
+# CI and local. CHA-542.
+COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
