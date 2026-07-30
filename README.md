@@ -9,13 +9,13 @@
 
 # Branchable and versioned OLTP + OLAP on one open columnar copy of your data
 
-**Open-source and self-hostable on object storage — no second system, no CDC, no ETL.**
+**Open-source and self-hostable on object storage. No second system, no CDC, no ETL.**
 
 ## Introduction
 
 Production writes to one database. Analytics and ML read from another. CDC stitches the two
 together, so you pay twice for storage and get paged when the pipeline breaks. Trying
-anything — a migration, an index, a model — means copying data and standing up an
+anything (a migration, an index, a model) means copying data and standing up an
 environment first, which quietly caps how many experiments run at once. And when something
 goes wrong there is no lineage to consult: you cannot see who changed what, and reverting is
 manual surgery.
@@ -25,14 +25,14 @@ iterate by the minute, fork aggressively, read data they wrote seconds ago, and 
 without review. Same problems, at machine speed.
 
 Penca collapses the split. One copy of your data, in open columnar files on your own bucket,
-serves both workloads — and you can fork it like a git branch: a full read-write copy that
+serves both workloads, and you can fork it like a git branch: a full read-write copy that
 copies no rows. Fork production, let something loose on it, compare what it did, discard it.
 Every mutation appends to an immutable log with an author and a timestamp, so any state is
 auditable and readable as of any point in time.
 
 Writes land in an internal Postgres hot tier under a real ACID transaction; a background
 pipeline moves them out to columnar files (Lance by default, Parquet supported). Reads merge
-both tiers, so a query sees committed writes immediately whichever tier they sit in — that
+both tiers, so a query sees committed writes immediately whichever tier they sit in. That
 merge is what makes fork → transact → read-it-back *interactive* rather than a batch job.
 Object storage is pluggable and the **only permanent home** for your table data; catalog and
 branch metadata is served from Postgres and stays that way, with object-storage checkpoints
@@ -57,7 +57,7 @@ untouched. Its scoreboard:
 
 `greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even` splits
 on the visitor index and never reads. The policies are toy; the mechanic is the point.
-Figures are one seeded run on 2026-07-27 — reproducible, not pinned. The forks copy no rows,
+Figures are one seeded run on 2026-07-27, reproducible but not pinned. The forks copy no rows,
 which the demo asserts rather than prints: see
 [`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
@@ -83,18 +83,20 @@ just penca-up --db ~/.penca/data
 
 The defensible claim is the *conjunction*, on one copy. Each alternative holds a leg of it:
 
-- **Neon** — branchable Postgres. Branch plus OLTP, but no columnar analytics on the
+- **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
   branch: queries run on the row store, at row-store cost.
-- **Dolt** — branching, merge and audit, open source, but on a bespoke row-oriented
+- **Dolt.** Branching, merge and audit, open source, but on a bespoke row-oriented
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
-- **Iceberg / Nessie** — branching over open columnar files, but no interactive
+- **Iceberg / Nessie.** Branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks Lakebase** — the closest peer. Databricks reached the same *diagnosis*
-  independently, that the way out of the OLTP/OLAP split is keeping data once in open
-  formats, and we read that as validation more than competition. Their lakehouse copy still
-  arrives by managed sync, though, and their intermediate row versions serve MVCC and
-  point-in-time recovery: invisible to lakehouse readers, collected in time. Penca's are a
-  queryable row-level audit trail with `as_of` reads. Branching is metadata-only in both.
+- **Databricks Lakebase.** The closest peer. Databricks named the category
+  [LTAP](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-ltap-first-lake-transactionalanalytical),
+  and it argues the same thing we do: the way out of the split is storing the data once in
+  open formats instead of syncing a second copy to read it. We could not have asked for
+  better validation. Where the two diverge most is data versioning. LTAP keeps intermediate
+  row versions for Postgres MVCC and point-in-time recovery, but they stay invisible to
+  lakehouse readers and are garbage-collected in time. Branching there is metadata-only as
+  it is here, while the row-level audit trail and `as_of` queries have no counterpart.
 
 ## Architecture
 
@@ -120,17 +122,17 @@ so the pipeline advances with no operator. Read planning is in-process in the qu
 service, not a service hop.
 
 A fork copies no rows: it records its position in the parent and reads the parent's cold
-files through it. Not free, though — creating a branch first flushes the parent's
+files through it. Not free, though: creating a branch first flushes the parent's
 unpersisted writes to cold, so fork latency tracks what the parent has buffered, not what it
 holds. Detail in [docs/architecture.md](docs/architecture.md); algorithms and crash-safety
 invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Features
 
-- [x] Fork, merge and discard a branch — gRPC only, no SQL branch DDL exists
+- [x] Fork, merge and discard a branch (gRPC only, no SQL branch DDL exists)
 - [x] Fork copies no rows off `main`; read-your-writes on the branch, over SQL or gRPC
-- [x] Time travel — read any table as of an earlier commit
-- [x] Audit trail — full version history per row, including tombstones
+- [x] Time travel: read any table as of an earlier commit
+- [x] Audit trail: full version history per row, including tombstones
 - [x] ACID transactions spanning every schema in a catalog
 - [x] SQL over Arrow Flight SQL (JDBC / ODBC / ADBC), and a full gRPC API
 - [x] Primary-key point lookups and secondary-index seeks pushed into the scan
@@ -143,44 +145,45 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 ## Current shortcomings
 
 - **No authentication or authorization, at all.** No auth interceptor, no TLS, and the Flight
-  SQL handshake is unimplemented. Anything reaching the ports has full access — hence the
+  SQL handshake is unimplemented. Anything reaching the ports has full access, hence the
   loopback bind. Do not expose Penca to a network you do not control.
 - **Branching is narrower than git.** You can fork `main`, not a fork, and merging back is
-  fast-forward only — if the target took a commit past your fork point the merge is refused
+  fast-forward only: if the target took a commit past your fork point the merge is refused
   rather than reconciled. No conflict resolution, no `diff`, no `revert`.
-- **No configurable isolation level.** What you get is fixed per operation — a snapshot at
+- **No configurable isolation level.** What you get is fixed per operation: a snapshot at
   `BEGIN` for reads in a transaction, last-writer-wins for upserts, READ COMMITTED for
-  `UPDATE`/`DELETE` — with no setting to choose, per catalog or at all.
+  `UPDATE`/`DELETE`. There is no setting to choose, per catalog or at all.
 - **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
   operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
   single-statement read-modify-write. TPC-B tracks the gap, not parity.
 - **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
-  at small scale Postgres still wins the analytical query — a crossover, not a wall
+  at small scale Postgres still wins the analytical query, a crossover rather than a wall
   ([docs/performance.md](docs/performance.md)).
 - **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
   CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
 - **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
   files, but nothing publishes them as an Iceberg table.
-- **Arrow Flight SQL is the only SQL wire** — no pgwire gateway, so Postgres clients and
+- **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
 - **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
 
 ## Roadmap
 
-Everything above is the roadmap, in roughly that order — the shortcomings section is a plan
+Everything above is the roadmap, in roughly that order. The shortcomings section is a plan
 stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot
 tier, so you can ingest existing data-lake files at full speed, and adopting an Iceberg
 table in place with no migration. Retention gains the pruning half it is missing and the
 scheduler gains leader election. A structured predicate on the read wire kills the
 SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog
-metadata gets checkpointed to object storage and reloaded into Postgres at startup — still
-served from Postgres in steady state, but recoverable from the object store alone.
+metadata gets checkpointed to object storage and reloaded into Postgres at startup, still
+served from Postgres in steady state but recoverable from the object store alone.
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md) — connecting, a first table over SQL and gRPC, the demos, DataGrip · [docs/development.md](docs/development.md) — build, run, test
-- [docs/architecture.md](docs/architecture.md) — services, tiers, concepts · [docs/algorithms.md](docs/algorithms.md) — read/write/merge · [docs/performance.md](docs/performance.md) — benchmarks
-- [docs/schema-reference.md](docs/schema-reference.md) — system tables · [docs/decisions/](docs/decisions/) — ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
+- [docs/usage.md](docs/usage.md): connecting, a first table over SQL and gRPC, the demos, DataGrip
+- [docs/architecture.md](docs/architecture.md): services, tiers, concepts · [docs/development.md](docs/development.md): build, run, test
+- [docs/algorithms.md](docs/algorithms.md): read/write/merge · [docs/performance.md](docs/performance.md): benchmarks · [docs/schema-reference.md](docs/schema-reference.md): system tables
+- [docs/decisions/](docs/decisions/) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## License
 

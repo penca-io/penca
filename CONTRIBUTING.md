@@ -22,7 +22,7 @@ in active development as a maintainer, please reach out to **info@penca.io**.
 ## Building and running Penca
 
 Setup, local stack, testing, profiling, and configuration all live in
-[docs/development.md](docs/development.md) — that is the source, and this file
+[docs/development.md](docs/development.md). That is the source, and this file
 deliberately does not duplicate it. Start there whether you are evaluating Penca or
 joining as a maintainer.
 
