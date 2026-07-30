@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use arrow::array::{BooleanArray, Int64Array};
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use futures_core::Stream;
 use penca_core::{IndexSidecar, PersistSegment};
@@ -33,6 +35,51 @@ pub enum ColdStorageError {
 /// Each segment carries its own [`penca_core::Format`]; the client
 /// dispatches on its wire code to the matching `FormatReader` and streams
 /// results one batch per segment.
+/// The per-row commit-order column a persist segment's ceiling is applied to.
+/// Named here because the read that fetches a batch and the filter that bounds
+/// it must agree on the column.
+pub const COMMIT_SEQ_NUM_COLUMN: &str = "commit_seq_num";
+
+/// Clamp a persist segment's batch to its own `max_commit_seq_num` ceiling.
+///
+/// A no-op for every ordinarily-written segment — the recorded maximum IS the
+/// file's largest `commit_seq_num` — and for the cold tx_log carriers, which set
+/// no ceiling. It bites only on a row that deliberately claims less than its file
+/// holds: a fork's inherited persist references, clamped to the fork position
+/// (CHA-539).
+pub fn apply_segment_seq_ceiling(
+    batch: &RecordBatch,
+    segment: &PersistSegment,
+) -> Result<RecordBatch, ArrowError> {
+    let Some(ceiling) = segment.max_commit_seq_num else {
+        // No ceiling: the tx_log carriers. The only legitimate pass-through.
+        return Ok(batch.clone());
+    };
+    // A ceiling that cannot be applied is an error, never a pass-through. Read
+    // paths widen their projection to keep this column precisely so the bound is
+    // always enforceable; reaching here without it means that contract broke, and
+    // silently returning the unfiltered batch would leak the rows the ceiling
+    // exists to hide.
+    let idx = batch.schema().index_of(COMMIT_SEQ_NUM_COLUMN).map_err(|_| {
+        ArrowError::SchemaError(format!(
+            "persist segment {} carries a commit_seq_num ceiling of {ceiling} but the \
+             batch has no commit_seq_num column to apply it to",
+            segment.segment_uuid
+        ))
+    })?;
+    let seqs = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| ArrowError::SchemaError("commit_seq_num is not Int64".into()))?;
+    let keep: BooleanArray = seqs
+        .iter()
+        .map(|v| Some(v.is_some_and(|seq| seq <= ceiling)))
+        .collect();
+
+    arrow::compute::filter_record_batch(batch, &keep)
+}
+
 pub struct ColdStorageClient;
 
 // Helper functions exist to work around async_stream's try_stream! macro
@@ -83,6 +130,69 @@ impl ColdStorageClient {
     /// rows, yields a single empty `RecordBatch` with the expected schema
     /// so callers can infer the schema from the stream.
     ///
+    /// Like [`Self::read_persist_segments`], but clamps each segment to its own
+    /// `max_commit_seq_num` ceiling before yielding.
+    ///
+    /// A **sibling** rather than a flag on the unbounded reader, because the two
+    /// callers need genuinely different behavior and a bool toggling distinct
+    /// code paths is what `docs/style-guide.md` says to split:
+    ///
+    /// - `audit_data` must clamp. After CHA-539 a fork's own
+    ///   `cold_upsert_segments` include inherited rows clamped to the fork
+    ///   position, so an audit window reaching past the fork would otherwise
+    ///   emit the parent's post-fork history.
+    /// - **Compaction must NOT clamp.** Its slice arithmetic walks
+    ///   `cumulative += row_count` to assign each input's `(offset, length)` in
+    ///   the merged file, so a short read would misalign every downstream slice.
+    ///   That is safe only because a fork's inherited rows are written
+    ///   `is_sealed = TRUE` and the compact input query filters
+    ///   `is_sealed = FALSE`, so a clamped row is never a compaction input.
+    ///   Those two decisions hold each other up; changing either requires
+    ///   revisiting this split.
+    ///
+    /// The clamp is applied INSIDE the loop, not by zipping the output against
+    /// `segments`: this stream skips empty batches, so its output is not
+    /// positionally 1:1 with the input and a zip would attribute one segment's
+    /// ceiling to another's rows.
+    pub fn read_persist_segments_bounded<'a, R: FormatReader + 'a>(
+        readers: &'a HashMap<i32, R>,
+        segments: &'a [PersistSegment],
+        schema: &'a SchemaRef,
+        projection: Option<&'a [&'a str]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch, ColdStorageError>> + Send + 'a>> {
+        Box::pin(async_stream::try_stream! {
+            let mut yielded = false;
+            let mut total_rows: u64 = 0;
+
+            for segment in segments {
+                let code = segment.format.as_wire_code();
+                let reader = readers
+                    .get(&code)
+                    .ok_or(ColdStorageError::UnknownFormat(code))?;
+
+                let batch = read_one_persist_segment(reader, segment, schema, projection).await?;
+                let batch = apply_segment_seq_ceiling(&batch, segment)
+                    .map_err(|e| ColdStorageError::from(FormatError::Arrow(e)))?;
+
+                if batch.num_rows() > 0 {
+                    yielded = true;
+                    total_rows += batch.num_rows() as u64;
+                    yield batch;
+                }
+            }
+
+            tracing::debug!(
+                num_segments = segments.len(),
+                total_rows,
+                "cold.read_persist_segments_bounded complete",
+            );
+
+            if !yielded {
+                yield empty_batch(schema);
+            }
+        })
+    }
+
     /// `projection`, when `Some`, narrows each segment read to the named
     /// columns; see [`FormatReader::read_segment`].
     pub fn read_persist_segments<'a, R: FormatReader + 'a>(
@@ -307,4 +417,88 @@ mod tests {
             "expected UnknownFormat, got {err:?}",
         );
     }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// The ceiling is prescriptive: a row claiming less than its file holds must
+    /// emit only the rows at or below it. Covers the three reachable shapes —
+    /// clamped (below content), inert (at content), and unbounded (`None`, the
+    /// tx_log carriers) — plus the projected-away case, which is why the filter
+    /// runs on the full schema.
+    #[test]
+    fn segment_seq_ceiling_clamps_only_when_it_claims_less() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("commit_seq_num", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let seg = |ceiling| PersistSegment {
+            max_commit_seq_num: ceiling,
+            ..PersistSegment::default()
+        };
+
+        // Clamped below the file's content: only rows at or below survive.
+        let clamped = apply_segment_seq_ceiling(&batch, &seg(Some(20))).unwrap();
+        assert_eq!(clamped.num_rows(), 2, "ceiling 20 must drop the seq-30 row");
+
+        // Inert: the recorded max IS the file's max, the ordinary case.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(Some(30)))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+
+        // Unbounded — the tx_log carriers, built via `..default()`.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(None))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+
+        // Below every row: an empty batch, not an error.
+        assert_eq!(
+            apply_segment_seq_ceiling(&batch, &seg(Some(0)))
+                .unwrap()
+                .num_rows(),
+            0,
+        );
+
+        // A ceiling that cannot be applied is an ERROR, not a pass-through: the
+        // read path widens the projection to keep `commit_seq_num` precisely so
+        // the bound is always enforceable, and passing the batch through here
+        // would leak exactly the rows the ceiling exists to hide.
+        let no_seq = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("row_uuid", DataType::Utf8, false)])),
+            vec![Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        assert!(
+            apply_segment_seq_ceiling(&no_seq, &seg(Some(0))).is_err(),
+            "an unenforceable ceiling must fail loudly, not silently pass rows through",
+        );
+        // ...but a carrier with no ceiling still passes through unfiltered.
+        assert_eq!(
+            apply_segment_seq_ceiling(&no_seq, &seg(None))
+                .unwrap()
+                .num_rows(),
+            3,
+        );
+    }
+
 }

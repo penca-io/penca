@@ -1313,8 +1313,16 @@ impl QueryManager {
         let base_cold_batches = if plan.base_cold_upsert_segments.is_empty() {
             Vec::new()
         } else {
+            // Its OWN session, not `cold_session`. `cold_audit_batches`
+            // registers its MemTable under the fixed name `d`, so two non-empty
+            // arms on one context collide with "The table d already exists" — a
+            // hard error, not wrong rows. Unreachable while a fork's own cold arm
+            // is always empty; CHA-539's fork copy makes both arms non-empty on
+            // every fork. Gating the base arm off for at-or-above-fork reads does
+            // NOT cover this: a below-fork as-of read keeps both arms by design.
+            let base_cold_session = penca_dl::derive_cold_session(&self.session_template);
             cold_upsert_audit_batches(
-                &cold_session,
+                &base_cold_session,
                 readers.as_ref(),
                 &plan.base_cold_upsert_segments,
                 &plan.base_tx_log_segments,
@@ -1443,8 +1451,10 @@ impl QueryManager {
         let base_cold_batches = if plan.base_cold_delete_segments.is_empty() {
             Vec::new()
         } else {
+            // Its own session — same fixed-name collision as the upsert side.
+            let base_cold_session = penca_dl::derive_cold_session(&self.session_template);
             cold_delete_audit_batches(
-                &cold_session,
+                &base_cold_session,
                 readers.as_ref(),
                 &plan.base_cold_delete_segments,
                 &plan.base_tx_log_segments,
@@ -2343,7 +2353,7 @@ async fn cold_upsert_audit_batches<R: FormatReader + 'static>(
     }
     let cold_upsert_schema = penca_merge::cold_upsert_schema(user_schema);
     let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, segments, &cold_upsert_schema, None)
+        ColdStorageClient::read_persist_segments_bounded(readers, segments, &cold_upsert_schema, None)
             .try_collect()
             .await
             .map_err(ApiError::ColdStorage)?;
@@ -2473,7 +2483,7 @@ async fn cold_delete_audit_batches<R: FormatReader + 'static>(
     let audit_schema = audit_delete_schema(user_schema, primary_keys, include_tx_metadata)?;
     let cold_delete_schema = penca_merge::cold_delete_schema(user_schema, primary_keys)?;
     let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, segments, &cold_delete_schema, None)
+        ColdStorageClient::read_persist_segments_bounded(readers, segments, &cold_delete_schema, None)
             .try_collect()
             .await
             .map_err(ApiError::ColdStorage)?;

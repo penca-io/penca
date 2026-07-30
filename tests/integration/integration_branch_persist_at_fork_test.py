@@ -612,3 +612,135 @@ def test_fork_at_historical_seq_hides_parents_post_fork_rows():
         "the child must inherit only the parent rows at or below the fork seq; "
         f"saw {names}"
     )
+
+
+def _column_names(table_name):
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = %s ORDER BY ordinal_position"
+        ),
+        (table_name,),
+    )
+
+    return [r[0] for r in rows]
+
+
+def _copy_rows_to_branch(table_name, *, where, params, overrides):
+    """``INSERT INTO t (cols) SELECT cols-with-overrides FROM t WHERE ...``
+
+    Copying by live column list rather than spelling the storage columns out
+    keeps this from drifting whenever a segment schema gains a column — the same
+    idiom ``integration_branch_fork_gc_refcount_test.py`` uses to synthesize a
+    cross-branch reference independent of the writer that will produce it.
+    """
+    cols = _column_names(table_name)
+    select_items, values = [], []
+    for col in cols:
+        if col in overrides:
+            select_items.append(SQL("%s"))
+            values.append(overrides[col])
+        else:
+            select_items.append(Identifier(col))
+
+    get_pg_driver().execute_no_result(
+        SQL(
+            "INSERT INTO {tbl} ({cols}) SELECT {vals} FROM {tbl} WHERE " + where
+        ).format(
+            tbl=Identifier(table_name),
+            cols=SQL(", ").join(Identifier(c) for c in cols),
+            vals=SQL(", ").join(select_items),
+        ),
+        (*values, *params),
+    )
+
+
+def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
+    """``audit_data`` must honor the per-segment ceiling, not just ``read_data``.
+
+    `read_data` enforces it in `PersistPartitionStream`; `audit_data` reads the
+    same segment list through `ColdStorageClient`, which ignored
+    `max_commit_seq_num` entirely. Today that is masked by the separate
+    `base_cold_*` arm, which caps the parent at the fork seq — so once CHA-539's
+    copy puts clamped rows in the child's OWN `cold_upsert_segments`, an audit
+    window reaching past the fork would emit the parent's post-fork rows.
+
+    The child's clamped rows are synthesized with direct SQL rather than waited
+    on from the fork copy, so this pins the audit read path on its own — and,
+    unlike a guard that only bites once the copy lands, it distinguishes now.
+    Both the header and the segment row are copied: the audit read INNER JOINs
+    segments up to `table_persist_metadata` for `log_kind`, so a segment row
+    without its header is invisible rather than merely unclamped.
+    """
+    client = make_client()
+    scope, main_branch_uuid, fork_seq, above_fork_seq = _seed_straddling_parent(client)
+    catalog_uuid = scope["catalog_uuid"]
+
+    child = client.create_branch(
+        "child", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    )
+
+    # The parent's straddling segment and its header, as CHA-539's copy will
+    # write them: same object_uri, clamped to the fork seq, sealed.
+    # ONE header per log_kind, latest first. `table_persist_uuid` is derived from
+    # `(branch, table, persisted_at, log_kind)`, so two headers sharing that tuple
+    # on one branch is a state the real writer cannot produce — its derivation
+    # would collide and collapse via ON CONFLICT. Copying every parent header
+    # (CreateBranch's own PersistBranch adds a second run) synthesized exactly
+    # that impossible state, and the audit read failed on a duplicate DataFusion
+    # registration rather than on anything this test is about.
+    header = get_pg_driver().execute(
+        SQL(
+            "SELECT DISTINCT ON (log_kind) table_persist_uuid::text, log_kind FROM {tbl}"
+            " WHERE branch_uuid = %s AND table_uuid = %s AND commit_micros IS NOT NULL"
+            " ORDER BY log_kind, persisted_at_micros DESC"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_PERSIST_METADATA}")),
+        (main_branch_uuid, scope["table_uuid"]),
+    )
+    assert header, "setup failed: the parent must hold a committed persist header"
+
+    for parent_persist_uuid, _log_kind in header:
+        child_persist_uuid = str(uuid4())
+        _copy_rows_to_branch(
+            f"{catalog_uuid}_{TABLE_PERSIST_METADATA}",
+            where="branch_uuid = %s AND table_persist_uuid = %s",
+            params=(main_branch_uuid, parent_persist_uuid),
+            overrides={
+                "branch_uuid": child.branch_uuid,
+                "table_persist_uuid": child_persist_uuid,
+            },
+        )
+        _copy_rows_to_branch(
+            f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}",
+            where="branch_uuid = %s AND table_persist_uuid = %s",
+            params=(main_branch_uuid, parent_persist_uuid),
+            overrides={
+                "branch_uuid": child.branch_uuid,
+                "table_persist_uuid": child_persist_uuid,
+                "table_persist_segment_uuid": str(uuid4()),
+                "max_commit_seq_num": fork_seq,
+                "is_sealed": True,
+            },
+        )
+
+    child_max = _max_copied_persist_seq(catalog_uuid, child.branch_uuid)
+    assert child_max == fork_seq, (
+        f"setup failed: the child's clamped rows should cap at {fork_seq}, saw {child_max}"
+    )
+
+    # Window reaches PAST the fork, so only the ceiling can exclude the
+    # parent's post-fork row.
+    upserts, _deletes = client.audit_data(
+        branch_uuid=child.branch_uuid,
+        after_seq=0,
+        before_seq=above_fork_seq + 100,
+        **scope,
+    )
+    names = set(upserts.column("name").to_pylist())
+    assert "inside_lo" in names, (
+        f"the child's audit must surface the inherited pre-fork history, saw {names}"
+    )
+    assert "inside_hi" not in names, (
+        "audit_data emitted the parent's POST-fork row: the per-segment "
+        f"max_commit_seq_num ceiling is not applied on the audit read path. Saw {names}"
+    )

@@ -141,6 +141,20 @@ impl<'a> PersistScope<'a> {
             // Carried through the merge rather than dropped: a compact input
             // whose row claims less than its file holds must not have that
             // ceiling widened by being repacked.
+            //
+            // The compaction READ deliberately does not apply it —
+            // `read_persist_segments`, not the `_bounded` sibling. The slice
+            // arithmetic below walks `cumulative += row_count` to assign each
+            // input its `(offset, length)` in the merged file, so a clamped short
+            // read would misalign every downstream slice.
+            //
+            // That is safe only because a fork's inherited persist rows are
+            // written `is_sealed = TRUE` (CHA-539) and this scope's input query
+            // filters `is_sealed = FALSE`, so a clamped row is never a compaction
+            // input in the first place. The two decisions hold each other up: if
+            // inherited rows ever become compactable, this read has to start
+            // honoring the ceiling AND the slice arithmetic has to be reworked
+            // for short reads.
             max_commit_seq_num: Some(row.get("max_commit_seq_num")),
         })
     }

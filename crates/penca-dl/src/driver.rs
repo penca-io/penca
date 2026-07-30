@@ -20,13 +20,13 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::{SessionContext, SessionState};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
 use penca_format::reader::{FormatError, FormatReader};
-use penca_storage_cold::ColdStorageError;
+use penca_storage_cold::{COMMIT_SEQ_NUM_COLUMN, ColdStorageError};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::cache::SegmentCache;
 use crate::provider::{build_persist_session, build_snapshot_session};
-use crate::schema::{COMMIT_SEQ_NUM_COLUMN, LogSchemas};
+use crate::schema::LogSchemas;
 use crate::session_template::derive_cold_session;
 
 /// Errors raised by [`DlDriver`] implementations.
