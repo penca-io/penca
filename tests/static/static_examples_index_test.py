@@ -1,4 +1,4 @@
-"""The README's examples index names every script in ``examples/`` (CHA-527).
+"""The usage guide's examples index names every script in ``examples/`` (CHA-527).
 
 ``examples/`` is a *family* of single-feature scripts plus one composite
 flagship, and the index is how a reader asking "how do I do a point lookup?"
@@ -25,15 +25,18 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _EXAMPLES_DIR = _REPO_ROOT / "examples"
-_README = _REPO_ROOT / "README.md"
+# The index lives in the usage guide, not the README: CHA-522 split the
+# landing page apart, and the examples family is user-facing reference rather
+# than front-page copy.
+_INDEX_DOC = _REPO_ROOT / "docs/usage.md"
 
-# The index section's heading. The test and the README have to agree on this
+# The index section's heading. The test and the doc have to agree on this
 # anchor, so it is pinned in one place and every assertion reads it.
 _INDEX_HEADING = "## Examples"
 
 # Anchored to a line start, because a plain substring search for "## Examples"
-# also matches inside "### Examples" — and the README's per-script sections are
-# h3s in exactly this space, so that collision is likely rather than theoretical.
+# also matches inside "### Examples" — and the per-script sections are h3s in
+# exactly this space, so that collision is likely rather than theoretical.
 _INDEX_START = re.compile(rf"^{re.escape(_INDEX_HEADING)}\s*$", re.MULTILINE)
 # Ends at the next h2 OR h3. Stopping only at the h2 swallowed every per-script
 # `### examples/<name>.py` deep-dive that sits under this heading, so a script
@@ -59,15 +62,15 @@ _FENCED_BLOCK = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 _EXAMPLE_MENTION = re.compile(r"examples/([\w.-]+\.py)")
 
 
-def _read_readme() -> str:
-    return _README.read_text(encoding="utf-8")
+def _read_index_doc() -> str:
+    return _INDEX_DOC.read_text(encoding="utf-8")
 
 
-def _index_section(readme: str) -> str:
-    """The README's index section — the entries themselves, prose only.
+def _index_section(doc: str) -> str:
+    """The index section — the entries themselves, prose only.
 
-    Scoped to the section rather than searched over the whole README: a script
-    named in some unrelated paragraph (the Quick start's run command, say) would
+    Scoped to the section rather than searched over the whole doc: a script
+    named in some unrelated paragraph (a run command, say) would
     otherwise satisfy the index assertion without the index listing it at all.
     And scoped to stop at the first per-script `###`, so that a script's own
     deep-dive section cannot stand in for an index entry.
@@ -80,10 +83,10 @@ def _index_section(readme: str) -> str:
     # inside an earlier fenced block would anchor the search in the wrong place,
     # and a `## ` inside a fence within the section would cut it mid-block,
     # stranding an unbalanced fence that can no longer be stripped.
-    stripped = _FENCED_BLOCK.sub("", readme)
+    stripped = _FENCED_BLOCK.sub("", doc)
     start = _INDEX_START.search(stripped)
     assert start is not None, (
-        f"README.md has no examples index section. Expected a line that is "
+        f"docs/usage.md has no examples index section. Expected a line that is "
         f"exactly {_INDEX_HEADING!r}, with nothing after it. It is the entry "
         f"point for the examples family — see CHA-527."
     )
@@ -115,14 +118,14 @@ def _discovered_examples() -> set[str]:
 
 
 def _indexed_examples() -> set[str]:
-    """Every example the README's index section names, unfiltered.
+    """Every example the index section names, unfiltered.
 
     Deliberately NOT filtered by `_is_runnable_example`: filtering here would
     drop a private-module entry from the stale check entirely, so an index
     pointing at an `examples/_helpers.py` that does not exist could never be
     reported. The private-module skip belongs on the *required* side only.
     """
-    return set(_EXAMPLE_MENTION.findall(_index_section(_read_readme())))
+    return set(_EXAMPLE_MENTION.findall(_index_section(_read_index_doc())))
 
 
 def test_index_section_stops_before_the_per_script_sections():
@@ -134,11 +137,11 @@ def test_index_section_stops_before_the_per_script_sections():
     strength of its own section alone — which is exactly the silent omission
     the module docstring says this file exists to prevent.
 
-    Synthetic rather than the real README on purpose: the failure needs a
-    script that is sectioned but unlisted, and the README must never actually
-    be in that state.
+    Synthetic rather than the real doc on purpose: the failure needs a script
+    that is sectioned but unlisted, and the doc must never actually be in that
+    state.
     """
-    readme = (
+    doc = (
         "## Examples\n\n"
         "| Script | Shows |\n|---|---|\n"
         "| `examples/listed.py` | named in the index |\n\n"
@@ -146,7 +149,7 @@ def test_index_section_stops_before_the_per_script_sections():
         "Prose that mentions examples/sectioned.py the way a deep-dive would.\n\n"
         "## Architecture\n"
     )
-    named = set(_EXAMPLE_MENTION.findall(_index_section(readme)))
+    named = set(_EXAMPLE_MENTION.findall(_index_section(doc)))
     assert named == {"listed.py"}, (
         f"the index section must stop before the per-script sections, so a "
         f"sectioned-but-unlisted script does not count as indexed; saw {named}"
@@ -165,13 +168,13 @@ def test_examples_dir_is_not_empty():
 
 
 def test_index_names_every_example():
-    """Every script in examples/ appears in the README's index section."""
+    """Every script in examples/ appears in the usage guide's index section."""
     discovered = _discovered_examples()
     indexed = _indexed_examples()
 
     missing = discovered - indexed
     assert not missing, (
-        f"these examples are not named in the README's {_INDEX_HEADING!r} section: "
+        f"these examples are not named in the usage guide's {_INDEX_HEADING!r} section: "
         f"{sorted(missing)}. Add each as `examples/<name>.py` with a one-line "
         f"description of the single feature it demonstrates."
     )
@@ -190,6 +193,6 @@ def test_index_names_no_missing_example():
     # while one naming a file that is gone is exactly what this catches.
     stale = indexed - _files_on_disk()
     assert not stale, (
-        f"the README's {_INDEX_HEADING!r} section names examples that do not exist: "
+        f"the usage guide's {_INDEX_HEADING!r} section names examples that do not exist: "
         f"{sorted(stale)}. Remove the entry or restore the script."
     )
