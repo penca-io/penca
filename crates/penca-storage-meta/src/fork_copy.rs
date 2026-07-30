@@ -450,7 +450,8 @@ impl LifecycleManager {
                     "SELECT table_persist_uuid, persisted_at_micros, log_kind FROM {meta} \
                      WHERE branch_uuid = $1 AND table_uuid = $2 \
                        AND commit_micros IS NOT NULL \
-                       AND persisted_at_micros >= $3",
+                       AND persisted_at_micros >= $3 \
+                     ORDER BY persisted_at_micros",
                     meta = qi(&persist_meta),
                 ),
                 &[
@@ -460,6 +461,11 @@ impl LifecycleManager {
                 ],
             )
             .await?;
+
+        // Whether the loop wrote anything. A child that adopted a baseline
+        // snapshot but ends with NO persist header collapses the snapshot pick
+        // bound to -1 and reads zero rows — see the fallback below.
+        let mut wrote_any_header = false;
 
         for header in &headers {
             let old_header: Uuid = header.get("table_persist_uuid");
@@ -557,6 +563,7 @@ impl LifecycleManager {
                     ],
                 )
                 .await?;
+            wrote_any_header = true;
 
             // 6. Its segments — copied in ONE statement per header. The old→new
             //    mapping lives in Rust (the uuids are `naming` derivations, not
@@ -618,6 +625,37 @@ impl LifecycleManager {
                     ],
                 )
                 .await?;
+        }
+
+        // A child that adopted a baseline but holds NO persist header cannot read
+        // its own inherited data: `persist_wm` is NULL, so the snapshot pick's
+        // `snapshotted_at_micros <= LEAST(as_of, COALESCE(persist_wm, -1))` bound
+        // collapses to -1 and the inherited snapshot is never picked. Zero rows,
+        // silently — the same failure the inclusive baseline header above exists
+        // to prevent, which is why it is worth a check rather than a comment.
+        //
+        // Believed unreachable, and the reason is a property of persist rather
+        // than of this copy: a persist run's window is bounded below by the PURGE
+        // watermark, not by the previous run, so a run above the fork re-packs
+        // the pre-fork rows too and carries `min_commit_seq_num <= fork_seq`.
+        // Measured on a real fork — two runs over one table came out as
+        // `[min_seq 4, max_seq 4]` and `[min_seq 4, max_seq 6]` across a fork at
+        // seq 5, so the later run qualified on the earlier run's rows. Reaching
+        // the empty case needs the parent purged past the fork point, which is
+        // exactly what cross-branch retention preservation prevents.
+        //
+        // So this is an invariant check, not a fallback path: failing the fork
+        // loudly beats writing a child that reads as empty, and a speculative
+        // repair branch here could never be tested.
+        if !wrote_any_header && baseline_watermark.is_some() {
+            return Err(crate::MetadataError::Db(sqlx::Error::Protocol(format!(
+                "fork copy for table {table} adopted a baseline snapshot at \
+                 watermark {watermark:?} but copied no persist header; the child \
+                 would read zero rows. Every parent persist run at or above the \
+                 baseline carried only post-fork data, which implies the parent \
+                 was purged past fork seq {fork_commit_seq_num}",
+                watermark = baseline_watermark,
+            ))));
         }
 
         Ok(())
