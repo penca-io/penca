@@ -1106,3 +1106,92 @@ def test_fork_audit_does_not_double_match_a_straddling_parent_tx_log():
             f"{post_fork!r} was committed on main above the fork and must not "
             f"appear in the child's audit. Full list: {names}"
         )
+
+
+def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
+    """Two branches whose schemas diverged must not share a cached decode.
+
+    The segment cache keys on the SLICE (`uri#offset+length`) so a fork's copied
+    row and the parent's row for the same bytes share one entry — that is the
+    point, since a fork's cold footprint is mostly the parent's files. But the
+    cached value is not the file's native decode: `read_segment` null-fills to
+    the CALLER's schema, so an entry carries the schema of whichever branch
+    decoded it first.
+
+    Since CHA-539 the fork names the parent's `(uri, offset, length)` while
+    ALTERing independently, so that entry can be handed to a branch expecting a
+    different type for the same column. Before the decode schema became part of
+    the key, whichever branch missed first cached `extra` as an all-null array of
+    its own type and the other branch's projection failed on the mismatch — a
+    query error driven by cache state, on a branch whose own metadata is
+    perfectly consistent.
+
+    Both read orders matter: the bug is "whoever misses first wins", so a test
+    that only ever reads one branch first would pass with the fix reverted half
+    the time.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    fork_seq = _write_committed_rows(
+        client,
+        branch_uuid=main_branch,
+        rows={"name": ["shared"], "value": [1]},
+        **scope,
+    )
+    client.persist(branch_uuid=main_branch, **scope)
+    client.snapshot(branch_uuid=main_branch, **scope)
+
+    child = client.create_branch(
+        "kid", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    ).branch_uuid
+
+    # Same new column, incompatible types, one on each branch — over the single
+    # base slice the fork inherited by reference.
+    parent_schema = pa.schema(
+        [*list(USER_SCHEMA), pa.field("extra", pa.int64(), nullable=True)]
+    )
+    child_schema = pa.schema(
+        [*list(USER_SCHEMA), pa.field("extra", pa.string(), nullable=True)]
+    )
+    client.update_table(
+        parent_schema,
+        branch_uuid=main_branch,
+        primary_keys=["name"],
+        author="test",
+        comment="parent adds extra BIGINT",
+        **scope,
+    )
+    client.update_table(
+        child_schema,
+        branch_uuid=child,
+        primary_keys=["name"],
+        author="test",
+        comment="fork adds extra TEXT",
+        **scope,
+    )
+
+    # Child first, then parent: the child's decode populates the cache and the
+    # parent must not be served it.
+    child_rows = client.read_data(branch_uuid=child, **scope)
+    parent_rows = client.read_data(branch_uuid=main_branch, **scope)
+
+    assert child_rows.column("name").to_pylist() == ["shared"], (
+        "the fork lost its inherited row"
+    )
+    assert parent_rows.column("name").to_pylist() == ["shared"], (
+        "the parent lost its own row"
+    )
+    assert pa.types.is_string(child_rows.schema.field("extra").type), (
+        "the fork's read must honour ITS schema for the diverged column, not the "
+        f"branch that decoded the shared slice first: {child_rows.schema}"
+    )
+    assert pa.types.is_int64(parent_rows.schema.field("extra").type), (
+        "the parent's read must honour ITS schema for the diverged column, not "
+        f"the branch that decoded the shared slice first: {parent_rows.schema}"
+    )
