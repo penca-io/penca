@@ -672,10 +672,18 @@ def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
     copy puts clamped rows in the child's OWN `cold_upsert_segments`, an audit
     window reaching past the fork would emit the parent's post-fork rows.
 
-    Asserted on the COUNT, not on set membership: the child's own arm and the
-    base-cold arm both cover the inherited range unless the base arm is capped at
-    the adopted baseline, and `audit_data` concatenates them without dedup, so a
-    missing cap shows up as exact duplicates a set() assertion cannot see.
+    This fixture is the GENESIS-INHERIT shape: `_seed_straddling_parent`
+    snapshots the parent after both commits, so that snapshot commits above the
+    fork, `copy_inherited_snapshot`'s pick finds nothing, and
+    `inherited_baseline_watermark` returns `None`. The base arm is therefore
+    SKIPPED, not capped, and `inside_lo` comes solely from the child's own copied
+    arm — so this guards the skip branch and a wholly un-windowed base arm. The
+    `Some(watermark)` branch is covered by
+    `test_fork_audit_dedupes_against_a_real_adopted_baseline` below.
+
+    Asserted on the COUNT, not set membership: `audit_data` concatenates the two
+    arms without dedup, so an overlap shows up as exact duplicates a set()
+    assertion cannot see.
 
     Uses the real fork copy rather than synthesizing the child's rows. An earlier
     draft copied header + segment rows in by hand, which was necessary before
@@ -778,11 +786,9 @@ def test_fork_reads_when_the_parents_snapshot_covers_its_whole_persist():
 def test_fork_audit_stays_deduped_after_the_child_snapshots():
     """The audit base-arm cap must survive the child taking its own snapshot.
 
-    `inherited_baseline_watermark` is bounded at the fork on the seq axis. Without
-    that bound an unqualified `MIN(snapshotted_at_micros)` returns the child's
-    FIRST OWN snapshot once it takes one — well above the fork — and the base arm
-    re-selects every pre-fork parent segment the child already holds as a copy,
-    duplicating every inherited change row again.
+    Companion to the adopted-baseline test below: this one keeps the child's own
+    snapshot in the picture on an ordinary `write_cycle` parent, so the audit stays
+    deduped once the child has a snapshot of its own at all.
     """
     client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
         setup_partitioned_table("pf_dedup")
@@ -827,4 +833,96 @@ def test_fork_audit_stays_deduped_after_the_child_snapshots():
             f"inherited change row {inherited!r} emitted {names.count(inherited)} "
             "times after the child snapshotted: the baseline-watermark pick is not "
             f"bounded at the fork. Full list: {names}"
+        )
+
+
+@pytest.mark.xfail(
+    reason=(
+        "KNOWN DEFECT, introduced by CHA-539 and not yet fixed. This test is the "
+        "first coverage of the audit cap's Some(watermark) branch, and it FAILS: "
+        "audit_data on a fork with a real adopted baseline emits inherited change "
+        "rows more than once (observed ['base','tail','own','base','base','tail']). "
+        "The two sibling audit tests only ever built the genesis-inherit shape, "
+        "where the base arm is skipped rather than capped, so they pass either way "
+        "and hid this. Capping base_cold_to prunes SEGMENT SELECTION only — "
+        "AuditPlan carries no per-row equivalent, per-row filtering uses "
+        "cold_from/cold_to/base_seq_to — so an overlapping parent segment still "
+        "contributes all its in-window rows alongside the child's own copied arm. "
+        "Committed xfail rather than deleted so the reproduction is not lost. "
+        "Pre-CHA-539 a fork had no own-cold arm, so no overlap existed: this is a "
+        "regression this PR introduces on the forked audit path."
+    ),
+    strict=True,
+)
+def test_fork_audit_dedupes_against_a_real_adopted_baseline():
+    """The audit cap's `Some(watermark)` branch — the one that actually caps.
+
+    Both sibling audit tests build the genesis-inherit shape, where the parent's
+    snapshot commits above the fork so no baseline is adopted and the base arm is
+    skipped outright. They pass with or without the fork bound on
+    `inherited_baseline_watermark`, which left the live branch uncovered.
+
+    This fixture forces a real adoption: commit -> persist -> snapshot puts the
+    parent's snapshot at or below the fork, then a further commit -> persist moves
+    the head, and the fork takes the head. `copy_inherited_snapshot` picks that
+    snapshot, so the child holds an inherited baseline and the watermark is
+    `Some`. The child then snapshots, which is what drags an unbounded
+    `MIN(snapshotted_at_micros)` above the fork and makes the base arm re-select
+    every pre-fork parent segment the child already owns as a copy.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    _write_committed_rows(
+        client, branch_uuid=main_branch, rows={"name": ["base"], "value": [1]}, **scope
+    )
+    client.persist(branch_uuid=main_branch, **scope)
+    # Snapshot BEFORE the fork position, so its commit_seq_num lands at or below
+    # the fork and `copy_inherited_snapshot` adopts it.
+    client.snapshot(branch_uuid=main_branch, **scope)
+
+    fork_seq = _write_committed_rows(
+        client, branch_uuid=main_branch, rows={"name": ["tail"], "value": [2]}, **scope
+    )
+    client.persist(branch_uuid=main_branch, **scope)
+
+    child = client.create_branch(
+        "kid", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    ).branch_uuid
+
+    # Setup check: a baseline really was adopted, or this degenerates into the
+    # genesis-inherit case the siblings already cover.
+    inherited = get_pg_driver().execute(
+        SQL(
+            "SELECT count(*) FROM {tbl} WHERE branch_uuid = %s AND table_uuid = %s"
+            " AND commit_micros IS NOT NULL"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_SNAPSHOT_METADATA}")),
+        (child, table_uuid),
+    )
+    assert inherited[0][0] > 0, (
+        "setup failed: the child adopted no baseline, so this exercises the skip "
+        "branch rather than the cap"
+    )
+
+    # The child's own snapshot: what drags an unbounded MIN() above the fork.
+    _write_committed_rows(
+        client, branch_uuid=child, rows={"name": ["own"], "value": [3]}, **scope
+    )
+    client.persist(branch_uuid=child, **scope)
+    client.snapshot(branch_uuid=child, **scope)
+
+    upserts, _deletes = client.audit_data(
+        branch_uuid=child, after_seq=0, before_seq=10_000, **scope
+    )
+    names = upserts.column("name").to_pylist()
+    for inherited_name in ("base", "tail"):
+        assert names.count(inherited_name) == 1, (
+            f"inherited change row {inherited_name!r} emitted "
+            f"{names.count(inherited_name)} times: the audit base arm is not capped "
+            f"at the adopted baseline. Full list: {names}"
         )
