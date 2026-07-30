@@ -1354,9 +1354,20 @@ impl PgDialect {
     ///   metadata parents first and reached the tx-log parents only at the drops
     ///   would form a circular wait with it — teardown holding metadata and
     ///   wanting tx-log, creation holding tx-log and wanting metadata. Sharing
-    ///   one canonical acquisition order is what makes that impossible; taking
-    ///   the strongest lock first does not address it, since creation never reads
-    ///   these parents at all.
+    ///   one canonical acquisition order removes THAT pairing; taking the
+    ///   strongest lock first does not, since creation never reads these parents
+    ///   at all.
+    ///
+    /// The order claim is scoped to `CreateBranch` deliberately, because no
+    /// single ordering of these parents can remove the class outright: the two
+    /// counterparty families genuinely disagree. Lifecycle transactions read
+    /// tx-log then write metadata (purge phase 2, persist); DDL transactions do
+    /// the reverse — `create_table` / `create_index` / `alter` / `create_schema`
+    /// all open with a `meta_get_*` read that plans over the metadata parents,
+    /// and only then insert into the tx-log partitions. Whichever order teardown
+    /// picks is inverted against one of them. So ordering is paired with a
+    /// bounded `lock_timeout` and a caller-side retry rather than relied on
+    /// alone.
     pub async fn lock_branch_teardown_parents(
         driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
         catalog_uuid: &Uuid,
@@ -1384,6 +1395,14 @@ impl PgDialect {
             .map(|t| Self::quote_identifier(t))
             .collect::<Vec<_>>()
             .join(", ");
+        // Bounded wait, so a teardown that loses a lock race fails fast with
+        // 55P03 for the caller to retry rather than parking on the lock. Ordering
+        // alone cannot remove every deadlock class here (see the note above), so
+        // the caller pairs this with a retry.
+        driver
+            .execute_no_result("SET LOCAL lock_timeout = '5s'")
+            .await
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         driver
             .execute_no_result(&format!("LOCK TABLE ONLY {list} IN ACCESS EXCLUSIVE MODE"))
             .await

@@ -202,6 +202,23 @@ fn validate_create_table_primary_keys(
 /// violation onto [`ApiError::AlreadyExists`] with `entity` as the
 /// human-readable subject (e.g. "catalog", "branch"); pass everything
 /// else through unchanged. Name-uniqueness on catalog + branch rename relies
+/// Whether an error is PG telling us we lost a lock race, rather than anything
+/// about the work itself.
+///
+/// `40P01` deadlock_detected and `55P03` lock_not_available (what a
+/// `lock_timeout` raises). Both mean "try again"; neither says the transaction
+/// was wrong. Matched on SQLSTATE rather than message text so a PG wording
+/// change cannot silently turn a retry into a surfaced error.
+fn is_lock_contention(err: &ApiError) -> bool {
+    let ApiError::Metadata(penca_storage_meta::MetadataError::Db(sqlx_err)) = err else {
+        return false;
+    };
+    sqlx_err
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()))
+        .is_some_and(|code| code == "40P01" || code == "55P03")
+}
+
 /// on PG `UNIQUE` constraints.
 fn map_unique_violation<T, E>(result: Result<T, E>, entity: &str) -> Result<T, ApiError>
 where
@@ -1072,23 +1089,71 @@ impl WriteManager {
         // ACCESS EXCLUSIVE first is what serialises the wave out — and it also
         // avoids the lock upgrade that in-transaction reads would otherwise
         // introduce, which deadlocks two concurrent DeleteBranch calls.
+        // Retry the whole transaction on a lock loss. Ordering the lock list
+        // against `CreateBranch` removes that pairing, but it cannot remove the
+        // class: the DDL path reads the metadata parents then writes the tx-log
+        // partitions, while lifecycle transactions do the reverse, so whichever
+        // order teardown picks is inverted against one of them. Rather than
+        // surface a deadlock to the caller, lose fast (the `lock_timeout` inside
+        // the lock helper) and start over — teardown is idempotent, and every
+        // statement in the transaction is inside it, so a retry re-reads and
+        // re-enqueues from scratch rather than resuming partial work.
+        let mut attempt = 0;
+        loop {
+            let result = Self::delete_branch_tx(
+                pool,
+                dl_driver,
+                &catalog_uuid,
+                &catalog_str,
+                &branch_str,
+                branch_uuid,
+                &table_uuid_strs,
+                &segment_table_uuids,
+            )
+            .await;
+            match result {
+                Ok(()) => break,
+                Err(e) if attempt < 4 && is_lock_contention(&e) => {
+                    attempt += 1;
+                    tracing::debug!(attempt, "branch teardown lost a lock race, retrying");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(DeleteBranchResponse {})
+    }
+
+    /// One attempt at the teardown transaction. Split out so the caller can
+    /// retry it wholesale — see the note at its call site.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_branch_tx<L: DlDriver + ?Sized>(
+        pool: &PgDriver,
+        _dl_driver: &L,
+        catalog_uuid: &Uuid,
+        catalog_str: &str,
+        branch_str: &str,
+        branch_uuid: Uuid,
+        table_uuid_strs: &[String],
+        segment_table_uuids: &[&str],
+    ) -> Result<(), ApiError> {
         with_pg_tx(pool, async |tx| {
-            PgDialect::lock_branch_teardown_parents(tx, &catalog_uuid).await?;
+            PgDialect::lock_branch_teardown_parents(tx, catalog_uuid).await?;
 
             let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
                 tx,
-                &catalog_str,
-                &branch_str,
-                &segment_table_uuids,
+                catalog_str,
+                branch_str,
+                segment_table_uuids,
             )
             .await?;
 
             let mut snap_segments: Vec<(String, String)> = Vec::new();
-            for table_uuid_str in &table_uuid_strs {
+            for table_uuid_str in table_uuid_strs {
                 let segs = LifecycleManager::get_snapshot_segments_for_table(
                     tx,
-                    &catalog_str,
-                    &branch_str,
+                    catalog_str,
+                    branch_str,
                     table_uuid_str,
                 )
                 .await?;
@@ -1111,8 +1176,8 @@ impl WriteManager {
                 snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
             let sidecar_uris: Vec<String> = LifecycleManager::list_all_segment_index_uris(
                 tx,
-                &catalog_str,
-                &branch_str,
+                catalog_str,
+                branch_str,
                 &snap_segment_uuids,
             )
             .await?;
@@ -1127,12 +1192,9 @@ impl WriteManager {
             //     metadata points at the merged file, so without this
             //     enumeration the file would leak past the partition
             //     CASCADE below.
-            let compact_uris = LifecycleManager::get_compact_segment_uris_for_branch(
-                tx,
-                &catalog_str,
-                &branch_str,
-            )
-            .await?;
+            let compact_uris =
+                LifecycleManager::get_compact_segment_uris_for_branch(tx, catalog_str, branch_str)
+                    .await?;
 
             // Every URI the branch referenced, queued as one set. Deduped because
             // one physical file legitimately backs several rows (the packer packs
@@ -1148,9 +1210,9 @@ impl WriteManager {
                 .into_iter()
                 .collect();
 
-            let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
+            let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
             if deleted {
-                for table_uuid_str in &table_uuid_strs {
+                for table_uuid_str in table_uuid_strs {
                     LifecycleManager::drop_data_tables(
                         tx,
                         table_uuid_str,
@@ -1168,7 +1230,7 @@ impl WriteManager {
                 // what makes the enqueued files unreferenced, which is what
                 // lets the sweep's refcount gate collect them. Only the
                 // data-table drops above are tier-specific and stay here.
-                LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
+                LifecycleManager::drop_branch_partitions(tx, catalog_str, branch_str).await?;
 
                 // Delete-set LAST, after the partition drops, per the ordering
                 // invariant on `insert_segment_delete_set_rows`. Dropping a
@@ -1178,14 +1240,12 @@ impl WriteManager {
                 // teardown must not be holding a delete-set row while it waits
                 // for the parent. Still one transaction, so removing the
                 // references and queueing the files remain one atomic fact.
-                LifecycleManager::insert_segment_delete_set_rows(tx, &catalog_str, &queued_uris)
+                LifecycleManager::insert_segment_delete_set_rows(tx, catalog_str, &queued_uris)
                     .await?;
             }
             Ok(())
         })
-        .await?;
-
-        Ok(DeleteBranchResponse {})
+        .await
     }
 
     /// Rename a branch. Branches are catalog-scoped; the

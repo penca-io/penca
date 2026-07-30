@@ -479,14 +479,12 @@ async fn read_projected_uncached_persist<R: FormatReader>(
 /// compaction, which is why the tier is re-resolved live on every read; the
 /// per-uuid *file bytes* this caches are not.)
 ///
-/// The key is row identity, NOT slice identity, and since CHA-539 those differ:
-/// a fork's copied segment row mints its own `segment_uuid` for the same
-/// `(object_uri, offset, length)` the parent already holds, so N forks of a
-/// table can hold N+1 cache entries of byte-identical content competing for one
-/// budget. Cache thrash, not incorrectness. Re-keying on the slice would fix it
-/// and is content-safe — the per-row seq ceiling is applied after the read, so a
-/// cached entry never encodes it — but that is a cache-design change, tracked
-/// separately rather than done here. Returns the full
+/// Keyed by slice identity plus decode schema, not by the row's uuid — see
+/// [`slice_cache_key`]. A fork's copied row names the same
+/// `(object_uri, offset, length)` the parent already holds, so row keying stored
+/// N+1 byte-identical entries for N forks. Content-safe because the per-row seq
+/// ceiling is applied after the read, so a cached entry never encodes it.
+/// Returns the full
 /// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
 /// the non-cacheable (oversized) path; the caller projects / null-fills
 /// downstream.
@@ -534,8 +532,14 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
-/// namespace from the base segment uuid, so the two never collide in one cache.
+/// cache, keyed by slice identity plus decode schema like every other entry.
+///
+/// Separation from base segments is now a URI-namespace invariant, not a
+/// uuid-namespace one: a sidecar's `object_uri` is written under the snapshot's
+/// `index/` prefix and a base segment's never is, so the two cannot produce the
+/// same `uri#offset+length`. The key schema is the indexed columns' native
+/// types, so two callers wanting different key types for one file do not share
+/// an entry either.
 #[tracing::instrument(
     level = "debug",
     skip_all,
