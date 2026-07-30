@@ -141,7 +141,6 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 - [ ] Branch `diff` and `revert`, and forking off a fork
 - [ ] Retention pruning
 - [ ] Authentication and authorization
-- [ ] Highly-available lifecycle scheduler, and per-branch compute isolation
 
 ## Current shortcomings
 
@@ -161,8 +160,6 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 - **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
   at small scale Postgres still wins the analytical query, a crossover rather than a wall
   ([docs/performance.md](docs/performance.md)).
-- **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
-  CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
 - **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
   files, but nothing publishes them as an Iceberg table.
 - **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
