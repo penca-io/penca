@@ -441,9 +441,12 @@ impl LifecycleManager {
     }
 
     /// Drop delete-set rows whose URI is past the grace window but STILL
-    /// referenced, returning how many were reaped. The complement of
-    /// [`Self::eligible_segment_delete_set_rows`]: between them the two cover
-    /// every past-grace row, so nothing accumulates.
+    /// referenced, returning how many were reaped. Together with
+    /// [`Self::eligible_segment_delete_set_rows`] every row is eventually claimed
+    /// by one of the two, so the set does not grow without bound. Not a partition
+    /// of the past-grace set at any single instant — the two run on different
+    /// horizons, so a still-referenced row spends the gap in neither, which is
+    /// deliberate; see the horizon note below.
     ///
     /// Without this the set only ever shrinks by a successful unlink, so a
     /// refcount-pinned row sits in the expired range forever and is re-scanned by
