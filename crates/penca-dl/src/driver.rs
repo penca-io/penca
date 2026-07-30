@@ -231,7 +231,7 @@ async fn read_and_cache_full<R: FormatReader>(
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
     cache.insert(
-        segment.table_snapshot_segment_uuid.clone(),
+        slice_cache_key(&segment.uri, Some(segment.offset), Some(segment.length)),
         Arc::clone(&batch),
         weight,
     );
@@ -272,6 +272,34 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
+/// Cache key for a decoded segment: the SLICE of bytes it names, not the row
+/// that names it.
+///
+/// A segment IS `uri[offset .. offset + length]`, and that triple is what the
+/// reader fetches — so two rows carrying the same triple decode to byte-identical
+/// batches. Row identity does not have that property: carry-forward and CHA-539's
+/// fork copy both mint a fresh uuid for a slice another branch already holds, so
+/// keying on the uuid stored one entry per referencing branch of the same bytes,
+/// competing for a single `reader_memory_budget`. N forks of a table meant up to
+/// N+1 copies of every segment — cache thrash, not incorrectness.
+///
+/// All three components, not the URI alone: the packer packs many partitions into
+/// one file, so a URI backs several distinct slices and keying on it would demand
+/// slicing a decoded batch by byte range, which is not a thing. Including offset
+/// and length keeps one entry per slice exactly as before, and merges only
+/// entries that were always identical.
+///
+/// Content-safe: the per-row seq ceiling is applied AFTER the read
+/// (`apply_segment_seq_ceiling`), so a cached entry never encodes a per-row
+/// bound that could differ between two rows naming the same slice.
+fn slice_cache_key(uri: &str, offset: Option<i64>, length: Option<i64>) -> String {
+    match (offset, length) {
+        (Some(o), Some(l)) => format!("{uri}#{o}+{l}"),
+        // A segment that owns its whole object records no slice bounds.
+        _ => format!("{uri}#full"),
+    }
+}
+
 /// Cache-aware read of a single snapshot segment. Returns the full decoded
 /// superset on hit / miss-cached, or the projected `out_schema` batch on the
 /// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
@@ -293,9 +321,9 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.table_snapshot_segment_uuid.as_str();
+    let key = slice_cache_key(&segment.uri, Some(segment.offset), Some(segment.length));
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok((*full).clone());
@@ -344,7 +372,11 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(segment.segment_uuid.clone(), Arc::clone(&batch), weight);
+    cache.insert(
+        slice_cache_key(&segment.uri, segment.offset, segment.length),
+        Arc::clone(&batch),
+        weight,
+    );
     tracing::debug!(
         rows = batch.num_rows(),
         "persist segment decoded and cached"
@@ -443,9 +475,9 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.segment_uuid.as_str();
+    let key = slice_cache_key(&segment.uri, segment.offset, segment.length);
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return Ok((*full).clone());
@@ -487,7 +519,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    if let Some(batch) = cache.get(&sidecar.segment_index_uuid) {
+    if let Some(batch) = cache.get(&slice_cache_key(
+        &sidecar.object_uri,
+        Some(sidecar.offset),
+        Some(sidecar.length),
+    )) {
         span.record("cache", "hit");
         return Ok((*batch).clone());
     }
@@ -513,7 +549,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
     // decoded-but-not-cached rather than evicting the whole budget.
     cache.insert(
-        sidecar.segment_index_uuid.clone(),
+        slice_cache_key(
+            &sidecar.object_uri,
+            Some(sidecar.offset),
+            Some(sidecar.length),
+        ),
         Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
     );
@@ -986,10 +1026,21 @@ mod tests {
     fn segment(uuid: &str, size_bytes: i64) -> SnapshotSegment {
         SnapshotSegment {
             table_snapshot_segment_uuid: uuid.to_string(),
+            // A distinct URI per segment, because the cache keys on the SLICE
+            // (`uri#offset+length`) rather than the row's uuid. Leaving this at
+            // Default gave every fixture segment the same empty slice, so two
+            // "different" segments shared one entry and an eviction test could
+            // never re-read.
+            uri: format!("s3://test/{uuid}.parquet"),
             format: Format::Parquet,
             size_bytes,
             ..Default::default()
         }
+    }
+
+    /// The cache key `segment(uuid, _)` lands under.
+    fn seg_key(uuid: &str) -> String {
+        slice_cache_key(&format!("s3://test/{uuid}.parquet"), Some(0), Some(0))
     }
 
     /// Driver whose single reader (Parquet) is a counting reader; returns the
@@ -1780,7 +1831,10 @@ mod tests {
             2,
             "oversized segment is never cached — both accesses re-read storage"
         );
-        assert!(cache.get("big").is_none(), "oversized segment not stored");
+        assert!(
+            cache.get(&seg_key("big")).is_none(),
+            "oversized segment not stored"
+        );
     }
 
     #[tokio::test]
@@ -1800,7 +1854,11 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache.get("a").is_none() { "a" } else { "b" };
+        let evicted = if cache.get(&seg_key("a")).is_none() {
+            "a"
+        } else {
+            "b"
+        };
         read_seg(&dl, &segment(evicted, 150), &schema, &schema)
             .await
             .unwrap();
