@@ -319,12 +319,21 @@ fn slice_cache_key(
     // `c` of its own type, and the other branch's `project_batch_to_schema` would
     // fail on the type mismatch — a cache-state-dependent error on a branch whose
     // own metadata is consistent.
-    let fields: Vec<String> = decode_schema
-        .fields()
-        .iter()
-        .map(|f| format!("{}:{}", f.name(), f.data_type()))
-        .collect();
-    format!("{slice}|{}", fields.join(","))
+    // Length-prefixed, because column names are permissive: `check_name` rejects
+    // only empty, over-long and control-character names, so `:`, `,` and `|` are
+    // all legal. A plain `name:type` join is therefore NOT injective —
+    // [("x", Utf8), ("y", Int64)] and [("x:Utf8,y", Int64)] render identically —
+    // and two schemas colliding here reopens exactly the cross-branch mismatch
+    // this fingerprint exists to close. Prefixing every part with its byte length
+    // makes the encoding unambiguous whatever the name contains.
+    let mut fp = String::new();
+    fp.push_str(&decode_schema.fields().len().to_string());
+    for f in decode_schema.fields() {
+        let name = f.name();
+        let dtype = f.data_type().to_string();
+        fp.push_str(&format!(":{}:{name}:{}:{dtype}", name.len(), dtype.len()));
+    }
+    format!("{slice}|{fp}")
 }
 
 /// Cache-aware read of a single snapshot segment. Returns the full decoded
@@ -1909,6 +1918,25 @@ mod tests {
         // And distinct slices of one packed file stay distinct.
         let d = slice_cache_key("s3://b/x.lance", Some(10), Some(10), &bigint);
         assert_ne!(a, d, "the packer packs many partitions into one file");
+
+        // Injective under adversarial column names. `check_name` allows `:`,
+        // `,` and `|`, so a plain `name:type` join would render these two
+        // schemas identically and merge their entries.
+        let split: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Utf8, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+        let fused: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "x:Utf8,y",
+            DataType::Int64,
+            true,
+        )]));
+        assert_ne!(
+            slice_cache_key("s3://b/x.lance", Some(0), Some(10), &split),
+            slice_cache_key("s3://b/x.lance", Some(0), Some(10), &fused),
+            "a column name containing the fingerprint's own delimiters must not \
+             collide two different schemas onto one cache entry"
+        );
     }
 
     #[tokio::test]

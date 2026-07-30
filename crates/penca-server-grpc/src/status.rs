@@ -16,6 +16,10 @@ pub fn api_error_to_status(err: ApiError) -> Status {
         // the message body already names `query_timeout_seconds` and
         // the retry pattern.
         ApiError::QueryTimeout(_) => Status::resource_exhausted(err.to_string()),
+        // `Aborted` is the canonical "concurrency conflict, retry at a higher
+        // level" code — the distinction a caller needs to tell a lost lock race
+        // from a genuine failure.
+        ApiError::Aborted(_) => Status::aborted(err.to_string()),
         _ => Status::internal(err.to_string()),
     }
 }

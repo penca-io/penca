@@ -1126,9 +1126,14 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
     query error driven by cache state, on a branch whose own metadata is
     perfectly consistent.
 
-    Both read orders matter: the bug is "whoever misses first wins", so a test
-    that only ever reads one branch first would pass with the fix reverted half
-    the time.
+    Reads child-then-parent, and that one order is sufficient AND deterministic:
+    within a process the child misses, caches `extra` as Utf8, and the parent's
+    read is the hit that used to fail with "expected Int64 but found Utf8". Only
+    the PARENT assertion is the regression guard — the child's read is always the
+    miss, so its assertion holds with or without the fix and is a sanity check.
+    The reverse direction (parent poisons child) is not covered here; it needs a
+    second fixture on a fresh catalog, since after this pair entries exist under
+    both fingerprints.
     """
     client = make_client()
     schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
@@ -1175,6 +1180,25 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
         comment="fork adds extra TEXT",
         **scope,
     )
+
+    # The precondition the scenario rests on: the fork's cold row and the
+    # parent's must name the SAME slice, or the two branches decode
+    # independently, every assertion below still passes, and this test covers
+    # nothing. Metadata-only, so it does not warm the cache it is about to probe.
+    shared_slices = get_pg_driver().execute(
+        SQL(
+            "SELECT count(*) FROM {tbl} p JOIN {tbl} c"
+            ' ON p.object_uri = c.object_uri AND p."offset" IS NOT DISTINCT FROM c."offset"'
+            " WHERE p.branch_uuid = %s AND c.branch_uuid = %s AND p.table_uuid = %s"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}")),
+        (main_branch, child, table_uuid),
+    )
+    if shared_slices[0][0] == 0:
+        raise RuntimeError(
+            "setup failed: the fork holds no persist row naming the parent's "
+            "slice, so both branches would decode independently and the "
+            "cross-branch cache sharing this test pins is unreachable"
+        )
 
     # Child first, then parent: the child's decode populates the cache and the
     # parent must not be served it.

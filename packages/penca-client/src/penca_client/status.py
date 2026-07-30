@@ -12,6 +12,7 @@ from __future__ import annotations
 from grpc import RpcError, StatusCode
 
 from penca_client.errors import (
+    AbortedError,
     AlreadyExistsError,
     ApiError,
     FailedPreconditionError,
@@ -54,6 +55,12 @@ def rpc_error_to_api_error(err: RpcError) -> Exception:
     # ``query_timeout_seconds`` surfaces as ``RESOURCE_EXHAUSTED``;
     # mirror the Rust ``ApiError::QueryTimeout`` variant so callers
     # can catch a typed Python exception.
+    # ABORTED is the concurrency-conflict code: the operation made no changes,
+    # so reissuing is safe. Mapped to its own class so a caller can retry it
+    # without also swallowing genuine failures.
+    if code == StatusCode.ABORTED:
+        return AbortedError(detail)
+
     if code == StatusCode.RESOURCE_EXHAUSTED:
         return QueryTimeoutError(detail)
 

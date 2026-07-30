@@ -1089,37 +1089,42 @@ impl WriteManager {
         // ACCESS EXCLUSIVE first is what serialises the wave out — and it also
         // avoids the lock upgrade that in-transaction reads would otherwise
         // introduce, which deadlocks two concurrent DeleteBranch calls.
-        // Retry the whole transaction on a lock loss. Ordering the lock list
-        // against `CreateBranch` removes that pairing, but it cannot remove the
-        // class: the DDL path reads the metadata parents then writes the tx-log
-        // partitions, while lifecycle transactions do the reverse, so whichever
-        // order teardown picks is inverted against one of them. Rather than
-        // surface a deadlock to the caller, lose fast (the `lock_timeout` inside
-        // the lock helper) and start over — teardown is idempotent, and every
-        // statement in the transaction is inside it, so a retry re-reads and
-        // re-enqueues from scratch rather than resuming partial work.
-        let mut attempt = 0;
-        loop {
-            let result = Self::delete_branch_tx(
-                pool,
-                dl_driver,
-                &catalog_uuid,
-                &catalog_str,
-                &branch_str,
-                branch_uuid,
-                &table_uuid_strs,
-                &segment_table_uuids,
-            )
-            .await;
-            match result {
-                Ok(()) => break,
-                Err(e) if attempt < 4 && is_lock_contention(&e) => {
-                    attempt += 1;
-                    tracing::debug!(attempt, "branch teardown lost a lock race, retrying");
-                }
-                Err(e) => return Err(e),
+        // A lock loss is reported, not retried. Ordering the lock list against
+        // `CreateBranch` removes that pairing but cannot remove the class: the
+        // DDL path reads the metadata parents then writes the tx-log partitions,
+        // while lifecycle transactions do the reverse, so whichever order
+        // teardown picks is inverted against one of them. The `lock_timeout` in
+        // the lock helper makes that lose fast rather than park.
+        //
+        // Retrying here would be the wrong layer: the caller knows whether a
+        // second attempt is wanted, and a server-side loop with no backoff turns
+        // a loud deadlock into a quiet livelock while charging the request up to
+        // lock_timeout x attempts of latency. The whole transaction rolls back,
+        // so reissuing DeleteBranch is safe — what the caller needs is to be able
+        // to TELL a lock loss from a real failure, which is why this maps to
+        // `Aborted` (retry at a higher level) rather than the default `Internal`.
+        Self::delete_branch_tx(
+            pool,
+            dl_driver,
+            &catalog_uuid,
+            &catalog_str,
+            &branch_str,
+            branch_uuid,
+            &table_uuid_strs,
+            &segment_table_uuids,
+        )
+        .await
+        .map_err(|e| {
+            if is_lock_contention(&e) {
+                ApiError::Aborted(format!(
+                    "branch teardown lost a lock race with a concurrent \
+                     catalog operation and made no changes; retry the request \
+                     ({e})"
+                ))
+            } else {
+                e
             }
-        }
+        })?;
 
         Ok(DeleteBranchResponse {})
     }
