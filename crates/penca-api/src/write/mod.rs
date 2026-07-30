@@ -5,6 +5,7 @@
 //! return proto messages directly.
 
 use crate::query::QueryManager;
+use crate::query::meta_resolve::resolve_tx;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -373,8 +374,7 @@ async fn resolve_or_auto_commit_tx(
             // (begun, not aborted/expired/committed) before writing rows
             // that reference it, so an append against a non-open tx fails
             // fast instead of silently writing orphaned log rows.
-            crate::query::meta_resolve::resolve_tx(driver, catalog_uuid, branch_uuid, tx)
-                .await?;
+            resolve_tx(driver, catalog_uuid, branch_uuid, tx).await?;
             Ok((tx.to_string(), None))
         }
         None => {
