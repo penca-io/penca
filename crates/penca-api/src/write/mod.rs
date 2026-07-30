@@ -1063,33 +1063,38 @@ impl WriteManager {
         // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
         // already queued by another branch's retirement the later grace clock.
         //
-        // Every enumeration is INSIDE the transaction and BEHIND the exclusive
-        // lock, in that order — including the table list they are all scoped by.
-        // Reading on `pool` left a window in which a concurrent lifecycle wave
-        // could commit new segment rows and cold files after the read; the CASCADE
-        // below then drops those rows, leaving a file both unreferenced and absent
-        // from `segment_delete_set` — permanently uncollectable, since
-        // enqueue-only teardown retired the orphan-scan fallback. Moving the reads
-        // into the transaction is NOT sufficient on its own: they take only ACCESS
-        // SHARE, which a wave's ROW EXCLUSIVE is compatible with, so the same
-        // interleaving survives. Taking the parents' ACCESS EXCLUSIVE first is what
-        // serialises the wave out — and it also avoids the lock upgrade that
-        // in-transaction reads would otherwise introduce, which deadlocks two
-        // concurrent DeleteBranch calls.
-        // A lock loss is reported, not retried. Ordering the lock list against
-        // `CreateBranch` removes that pairing but cannot remove the class: the
-        // DDL path reads the metadata parents then writes the tx-log partitions,
-        // while lifecycle transactions do the reverse, so whichever order
-        // teardown picks is inverted against one of them. The `lock_timeout` in
-        // the lock helper makes that lose fast rather than park.
+        // Every SEGMENT enumeration is inside the transaction and behind the
+        // lock, and none is scoped by a table list — they read the branch's own
+        // partitions directly. That is what closes the leak: a lifecycle wave
+        // committing new segment rows after a table-list read used to leave a
+        // file both unreferenced and absent from `segment_delete_set`, which
+        // enqueue-only teardown makes permanent since it retired the orphan-scan
+        // fallback. Removing the dependency is what fixes it; the reads being
+        // inside the transaction was never sufficient on its own, because plain
+        // `SELECT`s take only ACCESS SHARE and a wave's ROW EXCLUSIVE is
+        // compatible with it.
         //
-        // Retrying here would be the wrong layer: the caller knows whether a
-        // second attempt is wanted, and a server-side loop with no backoff turns
-        // a loud deadlock into a quiet livelock while charging the request up to
-        // lock_timeout x attempts of latency. The whole transaction rolls back,
-        // so reissuing DeleteBranch is safe — what the caller needs is to be able
-        // to TELL a lock loss from a real failure, which is why this maps to
-        // `Aborted` (retry at a higher level) rather than the default `Internal`.
+        // The lock is EXCLUSIVE on this branch's 14 partitions — never the
+        // catalog-wide parents, which would stall every other branch for the
+        // length of teardown. See `lock_branch_teardown_partitions`.
+        //
+        // A lock loss is reported, not retried. Retrying here would be the wrong
+        // layer: the caller knows whether a second attempt is wanted, and a
+        // server-side loop with no backoff turns a loud conflict into a quiet
+        // livelock while charging the request up to lock_timeout x attempts of
+        // latency. The whole transaction rolls back, so reissuing DeleteBranch is
+        // safe — what the caller needs is to TELL a lock loss from a real failure,
+        // which is why this maps to `Aborted` rather than the default `Internal`.
+        //
+        // One conflict ordering cannot remove, TODO(CHA-546): a lifecycle write
+        // names the catalog-wide PARENT, so it holds ROW EXCLUSIVE there while
+        // waiting on this branch's leaf, and the drops below need ACCESS
+        // EXCLUSIVE on that same parent — a cycle, measured, which Postgres
+        // resolves by killing teardown. Rare (it needs a metadata write on this
+        // branch inside teardown's window) and clean (full rollback, reported as
+        // `Aborted`, succeeds on reissue). CHA-546 converts those writes to name
+        // the partition, as the tx-log family already does, which removes it.
+        //
         // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
         // resolved BEFORE the teardown transaction and used only for their drops.
         //
@@ -1121,47 +1126,41 @@ impl WriteManager {
             .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
             .await?;
 
-        self.delete_branch_tx(
-            pool,
-            &catalog_uuid,
-            &catalog_str,
-            &branch_str,
-            branch_uuid,
-            &table_uuid_strs,
-        )
-        .await
-        .map_err(|e| {
-            if is_lock_contention(&e) {
-                ApiError::Aborted(format!(
-                    "branch teardown lost a lock race with a concurrent \
+        self.delete_branch_tx(pool, &catalog_uuid, &branch_uuid, &table_uuid_strs)
+            .await
+            .map_err(|e| {
+                if is_lock_contention(&e) {
+                    ApiError::Aborted(format!(
+                        "branch teardown lost a lock race with a concurrent \
                      catalog operation and made no changes; retry the request \
                      ({e})"
-                ))
-            } else {
-                e
-            }
-        })?;
+                    ))
+                } else {
+                    e
+                }
+            })?;
 
         Ok(DeleteBranchResponse {})
     }
 
     /// The teardown transaction. Split out from `delete_branch` so that
     /// everything inside it runs behind `lock_branch_teardown_partitions` by
-    /// construction — the resolution and `main` guard that precede it are
-    /// ordinary reads that must NOT hold the parents' ACCESS EXCLUSIVE. There is
+    /// construction — the resolution, `main` guard and table-list read that
+    /// precede it are ordinary reads that must not run under the lock. There is
     /// no retry: see the note at its call site.
-    #[allow(clippy::too_many_arguments)]
     async fn delete_branch_tx(
         &self,
         pool: &PgDriver,
         catalog_uuid: &Uuid,
-        catalog_str: &str,
-        branch_str: &str,
-        branch_uuid: Uuid,
+        branch_uuid: &Uuid,
         table_uuid_strs: &[String],
     ) -> Result<(), ApiError> {
+        // `PgDialect` helpers take `&Uuid`, `LifecycleManager` helpers take
+        // `&str`. Converting once here beats threading each identifier twice.
+        let catalog_str = &catalog_uuid.to_string();
+        let branch_str = &branch_uuid.to_string();
         with_pg_tx(pool, async |tx| {
-            PgDialect::lock_branch_teardown_partitions(tx, catalog_uuid, &branch_uuid).await?;
+            PgDialect::lock_branch_teardown_partitions(tx, catalog_uuid, branch_uuid).await?;
 
             // Every enumeration below reads the branch's own PARTITION by name,
             // never the catalog-wide parent. Reading through the parent would take
@@ -1234,12 +1233,7 @@ impl WriteManager {
             let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
             if deleted {
                 for table_uuid_str in table_uuid_strs {
-                    LifecycleManager::drop_data_tables(
-                        tx,
-                        table_uuid_str,
-                        &branch_uuid.to_string(),
-                    )
-                    .await?;
+                    LifecycleManager::drop_data_tables(tx, table_uuid_str, branch_str).await?;
                 }
 
                 // drop_branch_partitions removes the per-branch
