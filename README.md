@@ -34,20 +34,21 @@ systems and a pipeline between them — [shortcomings](#current-shortcomings) ha
 Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a
 branch per agent off `main`, drives one shared deterministic visitor feed through all
 three, lets each read back its own committed writes to steer its next move, then ranks
-them, deletes every fork and shows `main` untouched.
+them, deletes every fork and shows `main` untouched. Its closing scoreboard:
 
-```
-branch      impressions   conversions   rate
-greedy             3000           417   13.90%
-epsilon            3000           383   12.77%
-even               3000           307   10.23%
-
-one copy: main holds its rows in 1 cold object, each branch owns 0; main unchanged
-```
+| branch    | impressions | conversions | rate   |
+|:----------|------------:|------------:|:-------|
+| `greedy`  |        3000 |         417 | 13.90% |
+| `epsilon` |        3000 |         383 | 12.77% |
+| `even`    |        3000 |         307 | 10.23% |
 
 `greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even`
-splits on the visitor index and never reads. That read-your-writes loop on a branch is
-the pitch, and the forks copied no rows. The policies are toy; the mechanic is the point.
+splits on the visitor index and never reads — that read-your-writes loop on a branch is
+the pitch. The policies are toy; the mechanic is the point. Figures come from one seeded
+run on 2026-07-27: reproducible, but not pinned. The forks copy no rows, which the demo
+asserts rather than prints — see
+[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py),
+where `main` keeps its rows in exactly one cold object and each branch owns zero.
 
 ## Quick start
 
@@ -82,8 +83,8 @@ The defensible claim is the *conjunction*, on one copy. Each alternative has a l
 
 ## Architecture
 
-Penca runs as three gRPC services behind two entry points. SQL clients connect to a
-Flight SQL gateway that translates SQL into those calls; programmatic clients call the
+Penca runs as three gRPC services behind two entry points: SQL clients connect to a
+Flight SQL gateway that translates SQL into those calls, programmatic clients call the
 services directly.
 
 ```
@@ -135,8 +136,7 @@ A limitation you find yourself after a rosy README costs more than one you read 
   has full access — hence the loopback bind. Do not expose Penca to a network you do not
   control.
 - **Branches share compute.** Only storage is isolated; every branch runs on the same
-  stack's CPU, so concurrent multi-branch load contends. A deployment boundary rather
-  than a branching one, but know it before you benchmark it.
+  stack's CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
 - **Single-level branching.** You can fork `main`, not a fork — the attempt is rejected
   rather than silently returning incomplete data.
 - **Retention is configured but never prunes.** Reads below the floor are refused so
