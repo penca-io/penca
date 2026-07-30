@@ -882,29 +882,6 @@ impl QueryManager {
     {
         // Pin to pg_now rather than an unbounded read.
         let snapshot = LifecycleManager::now_snapshot(driver).await?;
-        self.list_table_uuids_for_branch_at(
-            driver,
-            dl,
-            catalog_uuid,
-            schema_uuid,
-            branch_uuid,
-            &snapshot,
-        )
-        .await
-    }
-
-    async fn list_table_uuids_for_branch_at<L>(
-        &self,
-        driver: &impl DbDriver<Row = PgRow>,
-        dl: &L,
-        catalog_uuid: &str,
-        schema_uuid: Option<&str>,
-        branch_uuid: &str,
-        snapshot: &ReadSnapshot,
-    ) -> Result<Vec<String>>
-    where
-        L: DlDriver + ?Sized,
-    {
         let batches = self
             .resolve_table_metadata(
                 driver,
@@ -916,7 +893,7 @@ impl QueryManager {
                 // List read (catalog/schema-wide) — no single row_uuid.
                 None,
                 None,
-                snapshot,
+                &snapshot,
             )
             .await?;
         let mut out: Vec<String> = Vec::new();
