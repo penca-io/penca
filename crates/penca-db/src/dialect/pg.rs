@@ -1311,6 +1311,52 @@ impl PgDialect {
         Ok(())
     }
 
+    /// Take `ACCESS EXCLUSIVE` on the partitioned parents branch teardown will
+    /// enumerate and then drop partitions of. Must be the FIRST statement of the
+    /// teardown transaction, before any enumerating `SELECT`.
+    ///
+    /// Two reasons, both about lock ORDER rather than lock strength:
+    ///
+    /// 1. Enumerating first does not close the race it looks like it closes. The
+    ///    enumerating reads are plain `SELECT`s taking only `ACCESS SHARE`, which
+    ///    is compatible with a lifecycle wave's `ROW EXCLUSIVE` — so under READ
+    ///    COMMITTED a wave can insert segment rows and write a cold file after
+    ///    those reads, commit before the drops, and have its rows removed by the
+    ///    CASCADE. That leaves exactly the unreferenced-and-unqueued file
+    ///    enqueue-only teardown must never produce. `drop_branch_partitions`'
+    ///    exclusive lock only serialises such a wave out if it is held before the
+    ///    reads.
+    /// 2. Reading first turns teardown into a lock UPGRADE on these parents
+    ///    (`ACCESS SHARE` from the reads, then `ACCESS EXCLUSIVE` from the
+    ///    partition drops). Two concurrent `DeleteBranch` calls in one catalog
+    ///    then deadlock — each holds share, each wants exclusive — where before
+    ///    they simply serialised. Same hazard for anything else that reads these
+    ///    parents and then locks them exclusively, e.g. branch-partition creation.
+    ///
+    /// Parents, not partitions: dropping a partition takes `ACCESS EXCLUSIVE` on
+    /// its parent too, and the parents are what the enumerating reads touch.
+    pub async fn lock_branch_teardown_parents(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let parents = [
+            naming::table_persist_segment_metadata_table(catalog_uuid),
+            naming::table_snapshot_segment_metadata_table(catalog_uuid),
+            naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
+            naming::compact_segment_metadata_table(catalog_uuid),
+        ];
+        let list = parents
+            .iter()
+            .map(|t| Self::quote_identifier(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        driver
+            .execute_no_result(&format!("LOCK TABLE {list} IN ACCESS EXCLUSIVE MODE"))
+            .await
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
     /// Drop per-catalog log partitions + system-table data tables for a branch.
     #[tracing::instrument(
         level = "info",

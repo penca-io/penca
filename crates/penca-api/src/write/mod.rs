@@ -1060,17 +1060,21 @@ impl WriteManager {
         // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
         // already queued by another branch's retirement the later grace clock.
         //
-        // The enumeration is INSIDE the transaction, not before it. Reading on
-        // `pool` first left a window in which a concurrent lifecycle wave on this
-        // branch could commit new segment rows and cold files after the read: the
-        // CASCADE below then drops those rows, leaving a file that is both
+        // The enumeration is INSIDE the transaction and BEHIND the exclusive lock,
+        // in that order. Reading on `pool` left a window in which a concurrent
+        // lifecycle wave could commit new segment rows and cold files after the
+        // read; the CASCADE below then drops those rows, leaving a file both
         // unreferenced and absent from `segment_delete_set` — permanently
         // uncollectable, since enqueue-only teardown retired the orphan-scan
-        // fallback that used to cover it. `drop_branch_partitions` takes
-        // partition-level ACCESS EXCLUSIVE, which serialises such a wave out, so
-        // enumerating in the same transaction closes the window instead of
-        // merely narrowing it.
+        // fallback. Moving the reads into the transaction is NOT sufficient on its
+        // own: they take only ACCESS SHARE, which a wave's ROW EXCLUSIVE is
+        // compatible with, so the same interleaving survives. Taking the parents'
+        // ACCESS EXCLUSIVE first is what serialises the wave out — and it also
+        // avoids the lock upgrade that in-transaction reads would otherwise
+        // introduce, which deadlocks two concurrent DeleteBranch calls.
         with_pg_tx(pool, async |tx| {
+            PgDialect::lock_branch_teardown_parents(tx, &catalog_uuid).await?;
+
             let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
                 tx,
                 &catalog_str,
