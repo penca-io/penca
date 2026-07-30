@@ -6,6 +6,7 @@
 
 use crate::query::QueryManager;
 use crate::query::meta_resolve::resolve_tx;
+use penca_merge::ReadSnapshot;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1414,6 +1415,19 @@ impl WriteManager {
         // managed by `create_catalog_tables`, and the whole catalog physicals
         // get CASCADE-dropped below anyway.
         let system_schema_str = system_schema_uuid(&catalog_uuid).to_string();
+        // Resolved once for the whole cascade rather than per schema: this is a
+        // catalog teardown with no open tx, so every iteration would otherwise
+        // re-derive the identical committed frontier.
+        let cascade_snapshot = QueryManager::resolve_read_snapshot(
+            driver,
+            &catalog_str,
+            &main_branch_str,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
         for schema_uuid in &schema_uuids {
             if schema_uuid == &system_schema_str {
                 continue;
@@ -1427,6 +1441,7 @@ impl WriteManager {
                 None,
                 Some("DeleteCatalog cascade"),
                 Some("system"),
+                &cascade_snapshot,
             )
             .await?;
         }
@@ -1748,6 +1763,7 @@ impl WriteManager {
                 request.tx_uuid.as_deref(),
                 request.author.as_deref(),
                 request.comment.as_deref(),
+                &scope.snapshot,
             )
             .await?;
             Ok(())
@@ -1770,19 +1786,15 @@ impl WriteManager {
         request_tx_uuid: Option<&str>,
         request_author: Option<&str>,
         request_comment: Option<&str>,
+        // The caller already resolved this from the same request, and this read
+        // happens BEFORE any write here, so re-resolving would repeat the
+        // `get_tx_status` join for an answer it holds. (Contrast the post-write
+        // RYOW re-reads in `update_schema` / `update_table`, where the
+        // auto-commit arm genuinely needs a frontier captured after the write.)
+        read_snapshot: &ReadSnapshot,
     ) -> Result<(), ApiError> {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
-        let read_snapshot = QueryManager::resolve_read_snapshot(
-            driver,
-            &catalog_str,
-            &branch_str,
-            request_tx_uuid,
-            None,
-            None, // as_of_seq
-            None,
-        )
-        .await?;
         let tables = self
             .query_manager
             .meta_list_tables(
@@ -1791,7 +1803,7 @@ impl WriteManager {
                 &catalog_str,
                 schema_uuid,
                 Some(&branch_str),
-                &read_snapshot,
+                read_snapshot,
             )
             .await?;
 
