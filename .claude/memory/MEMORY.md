@@ -13,6 +13,7 @@
 - [feedback_never_merge_pr.md](feedback_never_merge_pr.md) — NEVER merge a PR; "get it merged" = finalize, report ready-to-merge, STOP.
 - [feedback_no_subagents.md](feedback_no_subagents.md) — Don't delegate via the Agent tool. EXCEPTION: /do-issue `orch:spawn-review` — DO spawn the Opus `/review-pr` subagent.
 - [feedback_autonomous_drain_no_checkins.md](feedback_autonomous_drain_no_checkins.md) — During an autonomous drain, bank task after task; halt only for course-changing issues.
+- [feedback_never_self_flip_plan_approval.md](feedback_never_self_flip_plan_approval.md) — "keep going until approved" = drive /plan-reviewer to APPROVED then STOP; never self-flip plan-draft→approved.
 - [feedback_poll_roborev_after_any_commits.md](feedback_poll_roborev_after_any_commits.md) — roborev fires on EVERY commit; poll to quiet + drain kata findings before declaring done.
 - [reference_roborev_kata_bridge_needs_cha_branch.md](reference_roborev_kata_bridge_needs_cha_branch.md) — The kata bridge only enqueues on `cha-NNN` branches; elsewhere an empty queue is NOT a clean review — read `roborev show` by hand.
 - [reference_roborev_severity_threshold_met_is_clean.md](reference_roborev_severity_threshold_met_is_clean.md) — `SEVERITY_THRESHOLD_MET` means CLEAN; trust `.verdict_bool` (1=clean), not the string.
