@@ -1660,24 +1660,31 @@ impl WriteManager {
             )
             .await?;
 
-            // Pass the REQUEST's tx, not the resolved one. On the auto-commit
-            // path `resolve_or_auto_commit_tx` mints an already-committed tx that
-            // has no `begin_tx_log` row (`auto_commit_tx` writes only
-            // `commit_tx_log`), so resolving it as an open tx is NotFound. `None`
-            // is the correct input there: it pins the committed frontier, and
-            // `auto_commit_tx` already bumped the counter inside this same Pg tx,
-            // so the row just written is visible at committed-latest. When the
-            // caller did supply a tx the two are identical.
-            let ryow_snapshot = QueryManager::resolve_read_snapshot(
-                tx,
-                &catalog_str,
-                &branch_str,
-                request.tx_uuid.as_deref(),
-                None,
-                None, // as_of_seq — inert on the OpenTx (RYOW) arm
-                None,
-            )
-            .await?;
+            // On the explicit-tx path `write_snapshot` is ALREADY
+            // `OpenTx { began_at_seq_num, tx_uuid }` for this same tx — it was
+            // resolved from `request.tx_uuid` at the top of this method — so
+            // re-resolving would repeat the `get_tx_status` join for an answer we
+            // hold. Clone it.
+            //
+            // The auto-commit branch must genuinely re-read: it needs the
+            // `commit_tx_log_seq_num` counter that `auto_commit_tx` bumped inside
+            // this Pg tx, which `write_snapshot` predates. `None` is the correct
+            // input there — the minted tx is already committed and has no
+            // `begin_tx_log` row, so resolving it as open would be NotFound.
+            let ryow_snapshot = if request.tx_uuid.is_some() {
+                write_snapshot.clone()
+            } else {
+                QueryManager::resolve_read_snapshot(
+                    tx,
+                    &catalog_str,
+                    &branch_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+            };
             let schema = self
                 .query_manager
                 .meta_get_schema(
@@ -2445,18 +2452,22 @@ impl WriteManager {
             )
             .await?;
 
-            // The request's tx, not the resolved one — see the matching comment in
-            // `update_schema` for why an auto-committed tx must resolve as `None`.
-            let ryow_snapshot = QueryManager::resolve_read_snapshot(
-                tx,
-                &catalog_uuid_str,
-                &branch_uuid_str,
-                request.tx_uuid.as_deref(),
-                None,
-                None, // as_of_seq — inert on the OpenTx (RYOW) arm
-                None,
-            )
-            .await?;
+            // Reuse the already-resolved snapshot on the explicit-tx path; re-read
+            // only for auto-commit. See the matching comment in `update_schema`.
+            let ryow_snapshot = if request.tx_uuid.is_some() {
+                write_snapshot.clone()
+            } else {
+                QueryManager::resolve_read_snapshot(
+                    tx,
+                    &catalog_uuid_str,
+                    &branch_uuid_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+            };
             let table = self
                 .query_manager
                 .meta_get_table(
