@@ -113,9 +113,14 @@ pub struct AuditPlan {
     /// When set, `audit_data` reattaches per-tx `author`/`comment` by joining
     /// the cold `tx_log`; when unset those columns are omitted.
     include_tx_metadata: bool,
-    /// The branch's committed cold `tx_log` segments (the commit map), read
-    /// once here and joined by the cold audit builders on `commit_seq_num`
-    /// when `include_tx_metadata` is set. Empty when the flag is off.
+    /// The commit map the branch's OWN cold arm joins on `commit_seq_num` when
+    /// `include_tx_metadata` is set. Empty when the flag is off.
+    ///
+    /// For a fork this is the branch's own committed cold `tx_log` segments
+    /// UNION the parent's, bounded at the fork: since the fork copy, the own arm
+    /// serves the inherited range, whose commits are recorded in the parent's map
+    /// and not the child's. The union is unambiguous because the parent's half
+    /// stops at the fork and the child's own commits start above it.
     tx_log_segments: Vec<PersistSegment>,
     /// The parent branch's persist segments, for a forked branch's
     /// audit — so `audit_data` surfaces the inherited history. Empty for a
@@ -1758,7 +1763,7 @@ impl QueryManager {
         // The cold audit builders reattach author/comment via a
         // commit_seq_num join against these.
         let include_tx_metadata = request.include_tx_metadata;
-        let tx_log_segments = if include_tx_metadata && hot_min != 0 {
+        let mut tx_log_segments = if include_tx_metadata && hot_min != 0 {
             tx_log_persist_segments(
                 pool,
                 &catalog_uuid_str,
@@ -1831,12 +1836,15 @@ impl QueryManager {
                 // Exclusive per-row cap: parent rows must be <= fork_seed,
                 // tightened by any audit seq-window upper.
                 let base_seq_to = Some(base_audit_seq_cap(seq_to, fork_commit_seq_num));
-                // Only fetch the parent tx_log when it will actually be joined:
-                // the audit builders short-circuit on empty base segments, so a
-                // parent with no persisted history in the window needs no read.
-                let base_tx_log = if include_tx_metadata
-                    && !(base_upserts.is_empty() && base_deletes.is_empty())
-                {
+                // Fetched whenever metadata is requested on a fork, NOT only when
+                // the base arm is non-empty. Since the fork copy, the child's OWN
+                // arm serves the inherited range, and that arm joins the child's
+                // tx_log — which holds no row for any inherited commit_seq_num,
+                // because `seed_commit_seq_num_from_fork` puts the child's own
+                // commits strictly above the fork. `build_cold_audit_sql` uses a
+                // LEFT JOIN, so a miss nulls author/comment silently rather than
+                // erroring. Both arms therefore need the parent's map.
+                let base_tx_log = if include_tx_metadata {
                     tx_log_persist_segments(
                         pool,
                         &catalog_uuid_str,
@@ -1860,6 +1868,13 @@ impl QueryManager {
             }
             None => (Vec::new(), Vec::new(), Vec::new(), None, None),
         };
+
+        // The own arm joins this, and since the fork copy it serves the inherited
+        // range — whose commits live in the PARENT's map. Unambiguous to union:
+        // `base_seq_to` caps the parent's contribution at the fork, and the
+        // child's own commits start strictly above it, so no `commit_seq_num`
+        // appears in both halves and the join cannot mis-attribute an author.
+        tx_log_segments.extend(base_tx_log_segments.iter().cloned());
 
         Ok(AuditPlan {
             catalog_uuid,

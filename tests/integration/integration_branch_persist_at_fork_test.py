@@ -911,3 +911,94 @@ def test_fork_audit_dedupes_against_a_real_adopted_baseline():
             f"{names.count(inherited_name)} times: the audit base arm is not capped "
             f"at the adopted baseline. Full list: {names}"
         )
+
+
+def _commit_with_author(
+    client, *, catalog_uuid, schema_uuid, branch_uuid, table_uuid, rows, author, comment
+) -> int:
+    """`_write_committed_rows`, but recording author/comment on the tx.
+
+    Separate from the shared helper so adding tx metadata to one test cannot
+    change what the other thirteen in this file record.
+    """
+    tx = client.begin_tx(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+        author=author,
+        comment=comment,
+    )
+    client.write_data(
+        tx.tx_uuid,
+        Mutation(table_uuid=table_uuid, upserts=pa.table(rows, schema=USER_SCHEMA)),
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        branch_uuid=branch_uuid,
+    )
+
+    return client.commit_tx(
+        tx.tx_uuid, catalog_uuid=catalog_uuid, branch_uuid=branch_uuid
+    ).commit_seq_num
+
+
+def test_fork_audit_reattaches_the_parents_author_for_inherited_rows():
+    """A fork's inherited change rows keep the author/comment of the parent's tx.
+
+    The assertion that distinguishes "the inherited range is served by the right
+    arm" from "it is served by an arm that joins the wrong commit map". Since the
+    fork copy, the child's OWN arm serves the inherited range, but a commit's
+    author lives in the tx_log of the branch that made it — the parent's. The
+    child's own tx_log holds no row for any inherited `commit_seq_num`, because
+    `seed_commit_seq_num_from_fork` starts the child's commits above the fork.
+
+    `build_cold_audit_sql` joins with a LEFT JOIN, so getting this wrong nulls
+    author/comment silently instead of erroring — which is why it needs a
+    positive assertion on the value and not merely on the column's presence.
+    Every other fork-audit test here leaves `include_tx_metadata` at False.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    fork_seq = _commit_with_author(
+        client,
+        branch_uuid=main_branch,
+        rows={"name": ["inherited"], "value": [1]},
+        author="ada",
+        comment="on the parent",
+        **scope,
+    )
+    client.persist(branch_uuid=main_branch, **scope)
+    client.snapshot(branch_uuid=main_branch, **scope)
+
+    child = client.create_branch(
+        "kid", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    ).branch_uuid
+
+    upserts, _deletes = client.audit_data(
+        branch_uuid=child,
+        after_seq=0,
+        before_seq=10_000,
+        include_tx_metadata=True,
+        **scope,
+    )
+    assert "author" in upserts.schema.names, (
+        "include_tx_metadata=True must reattach author on a fork's audit"
+    )
+    by_name = {
+        n: (a, c)
+        for n, a, c in zip(
+            upserts.column("name").to_pylist(),
+            upserts.column("author").to_pylist(),
+            upserts.column("comment").to_pylist(),
+            strict=True,
+        )
+    }
+    assert by_name["inherited"] == ("ada", "on the parent"), (
+        "the inherited row must carry the parent tx's author/comment, not NULL: "
+        f"the child's own arm serves it but joins its own tx_log. Saw {by_name}"
+    )
