@@ -671,6 +671,9 @@ impl QueryManager {
             ));
         }
         if let Some(tx_str) = open_tx_uuid {
+            // TODO(CHA-544): `parse_uuid` panics on malformed input and
+            // `resolve_tx` parses `tx_str` again, so its `InvalidRequest` arm is
+            // unreachable. Thread the parsed `Uuid` once the panic is replaced.
             let tx_uuid = parse_uuid(tx_str);
             let catalog = parse_uuid(catalog_uuid);
             let branch = parse_uuid(branch_uuid);

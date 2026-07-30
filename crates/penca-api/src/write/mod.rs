@@ -1788,7 +1788,14 @@ impl WriteManager {
         request_comment: Option<&str>,
         // The caller already resolved this from the same request, and this read
         // happens BEFORE any write here, so re-resolving would repeat the
-        // `get_tx_status` join for an answer it holds. (Contrast the post-write
+        // `get_tx_status` join for an answer it holds.
+        //
+        // Asymmetry worth knowing: on the explicit-tx arm this is exactly
+        // equivalent, because `OpenTx` carries the tx's immutable BEGIN frontier
+        // and resolve timing cannot change it. On the auto-commit arm the
+        // `LatestSeq` frontier is now captured a couple of round trips earlier
+        // than the in-cascade resolve captured it, which marginally widens the
+        // pre-existing window in which a concurrent commit lands above the pin. (Contrast the post-write
         // RYOW re-reads in `update_schema` / `update_table`, where the
         // auto-commit arm genuinely needs a frontier captured after the write.)
         read_snapshot: &ReadSnapshot,
