@@ -134,7 +134,6 @@ impl QueryManager {
             )
             .await?;
 
-        // The seq of the child snapshot this read will resolve on
         // Pre-Persist (`hot_min == 0`): hot owns every row, so skip the
         // cold fetch AND the phase-1 capture — `assemble_plan` ignores the
         // cold inputs and omits cold_storage, `fence = None` (hot serves all),

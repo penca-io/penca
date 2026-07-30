@@ -408,12 +408,21 @@ async fn read_projected_uncached_persist<R: FormatReader>(
 }
 
 /// Cache-aware read of a single persist segment. A persist segment file is
-/// immutable once written and keyed by its globally-unique `segment_uuid`, so it
-/// shares the process-lifetime [`SegmentCache`] with snapshot segments under one
-/// byte budget, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate
-/// is the whole mechanism. (The *resolved* persist tier is mutable under
-/// retention compaction, which is why the tier is re-resolved live on every
-/// read; the per-uuid *file bytes* this caches are not.) Returns the full
+/// immutable once written and keyed by its `segment_uuid`, so it shares the
+/// process-lifetime [`SegmentCache`] with snapshot segments under one byte
+/// budget, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate is the
+/// whole mechanism. (The *resolved* persist tier is mutable under retention
+/// compaction, which is why the tier is re-resolved live on every read; the
+/// per-uuid *file bytes* this caches are not.)
+///
+/// The key is row identity, NOT slice identity, and since CHA-539 those differ:
+/// a fork's copied segment row mints its own `segment_uuid` for the same
+/// `(object_uri, offset, length)` the parent already holds, so N forks of a
+/// table can hold N+1 cache entries of byte-identical content competing for one
+/// budget. Cache thrash, not incorrectness. Re-keying on the slice would fix it
+/// and is content-safe — the per-row seq ceiling is applied after the read, so a
+/// cached entry never encodes it — but that is a cache-design change, tracked
+/// separately rather than done here. Returns the full
 /// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
 /// the non-cacheable (oversized) path; the caller projects / null-fills
 /// downstream.

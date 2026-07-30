@@ -347,22 +347,13 @@ impl LifecycleManager {
         let sql = format!(
             "SELECT object_uri FROM {table} sds \
              WHERE sds.written_at_micros < $1 \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {seg_table} seg \
-                 WHERE seg.object_uri = sds.object_uri\
-               ) \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {seg_index_table} six \
-                 WHERE six.object_uri = sds.object_uri\
-               ) \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {persist_seg_table} pseg \
-                 WHERE pseg.object_uri = sds.object_uri\
-               )",
+               AND NOT ({referenced})",
             table = qi(&table),
-            seg_table = qi(&seg_table),
-            seg_index_table = qi(&seg_index_table),
-            persist_seg_table = qi(&persist_seg_table),
+            referenced = Self::segment_delete_set_referenced_predicate(
+                &seg_table,
+                &seg_index_table,
+                &persist_seg_table,
+            ),
         );
         let rows = driver
             .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
@@ -371,6 +362,93 @@ impl LifecycleManager {
             .iter()
             .map(|r| r.get::<String, _>("object_uri"))
             .collect())
+    }
+
+    /// The "some row still references this URI" disjunction, shared verbatim by
+    /// the eligibility gate (negated) and the reaper (asserted).
+    ///
+    /// One source for both because they must stay exact complements. If a fourth
+    /// referencing table were added to the gate but not to the reaper, the reaper
+    /// would drop delete-set rows for URIs that table still references — and
+    /// nothing would re-enqueue them until some *other* reference was dropped.
+    /// Sharing the text makes that class of drift impossible rather than merely
+    /// unlikely.
+    fn segment_delete_set_referenced_predicate(
+        seg_table: &str,
+        seg_index_table: &str,
+        persist_seg_table: &str,
+    ) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM {seg} seg WHERE seg.object_uri = sds.object_uri) \
+             OR EXISTS (SELECT 1 FROM {six} six WHERE six.object_uri = sds.object_uri) \
+             OR EXISTS (SELECT 1 FROM {pseg} pseg WHERE pseg.object_uri = sds.object_uri)",
+            seg = qi(seg_table),
+            six = qi(seg_index_table),
+            pseg = qi(persist_seg_table),
+        )
+    }
+
+    /// Drop delete-set rows whose URI is past the grace window but STILL
+    /// referenced, returning how many were reaped. The complement of
+    /// [`Self::eligible_segment_delete_set_rows`]: between them the two cover
+    /// every past-grace row, so nothing accumulates.
+    ///
+    /// Without this the set only ever shrinks by a successful unlink, so a
+    /// refcount-pinned row sits in the expired range forever and is re-scanned by
+    /// every sweep. Enqueue-only branch teardown is what makes that unbounded
+    /// rather than merely untidy: a fork's cold footprint is mostly the PARENT's
+    /// files and `main` keeps its rows for the life of the catalog, so every fork
+    /// teardown permanently added ~O(parent cold segments) rows no sweep could
+    /// drain. For an agentic-branch workload that is the dominant term, and the
+    /// growth is irreversible once the rows exist.
+    ///
+    /// Safe to drop a row that is still referenced because every transition of a
+    /// URI from referenced to unreferenced enqueues it: `retire` on retirement,
+    /// `compact` on superseding an input, and branch teardown on dropping the
+    /// branch's rows — each in the same transaction that removes the references.
+    /// So a reaped row is re-created by whoever later drops the LAST reference,
+    /// and the enqueue's `ON CONFLICT` refresh gives it a fresh grace clock.
+    ///
+    /// Carries the SAME `written_at_micros` guard as the gate, so it can never
+    /// reap a row racing an in-flight reader. No table lock is needed despite the
+    /// two statements not being atomic with each other: a reaped-then-dereferenced
+    /// URI is re-enqueued per the invariant above, and the opposite direction
+    /// cannot happen — a new reference to an unreferenced URI would have to be
+    /// copied from an existing row, and by definition there is none.
+    ///
+    /// 1 SQL query.
+    pub async fn reap_referenced_segment_delete_set_rows(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        now_micros: i64,
+        query_timeout_micros: i64,
+    ) -> Result<u64> {
+        let catalog = parse_uuid(catalog_uuid);
+        let table = naming::segment_delete_set_table(&catalog);
+        let seg_table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let persist_seg_table = naming::table_persist_segment_metadata_table(&catalog);
+        let sql = format!(
+            // RETURNING so the count is real: `execute_params` surfaces returned
+            // rows, not an affected-row tally, and a silent 0 here would read as
+            // "nothing to reap" — the exact signal the sweep needs to be honest
+            // about.
+            "DELETE FROM {table} sds \
+             WHERE sds.written_at_micros < $1 \
+               AND ({referenced}) \
+             RETURNING sds.object_uri",
+            table = qi(&table),
+            referenced = Self::segment_delete_set_referenced_predicate(
+                &seg_table,
+                &seg_index_table,
+                &persist_seg_table,
+            ),
+        );
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
+            .await?;
+
+        Ok(rows.len() as u64)
     }
 
     /// Delete one `segment_delete_set` row by its `object_uri` PK.

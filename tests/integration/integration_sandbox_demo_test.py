@@ -326,7 +326,11 @@ def test_forks_share_one_copy_of_the_seeded_data():
             )
             for fork_uuid in fork_uuids:
                 fork_stats = stats.get(fork_uuid)
-                assert fork_stats is None or fork_stats[0] == 1, (
+                # `is not None`, not `is None or …`: since CHA-539 a fork always
+                # holds copied rows for the seeded table, so an absent entry means
+                # the copy silently stopped happening — the one thing this must not
+                # tolerate.
+                assert fork_stats is not None and fork_stats[0] == 1, (
                     f"fork {fork_uuid} must reference exactly the one shared "
                     f"object, never one of its own, saw {fork_stats}"
                 )

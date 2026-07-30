@@ -463,10 +463,17 @@ impl LifecycleManager {
             for seg_row in &segs {
                 let old_seg: Uuid = seg_row.get("table_persist_segment_uuid");
                 let chunk_idx: i32 = seg_row.get("chunk_idx");
-                let new_seg = naming::table_persist_segment_uuid(
-                    &new_header,
-                    u32::try_from(chunk_idx).unwrap_or(0),
-                );
+                // Err, not a sentinel: falling back to 0 would derive the uuid
+                // the header's real chunk 0 already owns, and the INSERT's
+                // ON CONFLICT DO NOTHING would then swallow the row — leaving the
+                // child one inherited segment short with no error and no signal,
+                // the worst failure mode for a copy whose job is completeness.
+                let chunk_idx = u32::try_from(chunk_idx).map_err(|_| {
+                    crate::MetadataError::Db(sqlx::Error::Protocol(format!(
+                        "table_persist_segment_metadata.chunk_idx out of range: {chunk_idx}"
+                    )))
+                })?;
+                let new_seg = naming::table_persist_segment_uuid(&new_header, chunk_idx);
 
                 // `max_commit_seq_num = LEAST(old, fork_seq)` is the clamp the
                 // whole design rests on. A fork point is an arbitrary

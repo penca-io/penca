@@ -138,9 +138,12 @@ impl<'a> PersistScope<'a> {
             statistics: Vec::new(),
             offset,
             length,
-            // Carried through the merge rather than dropped: a compact input
-            // whose row claims less than its file holds must not have that
-            // ceiling widened by being repacked.
+            // Populated to build a well-formed `PersistSegment`, and then
+            // deliberately unused. Nothing is threaded through the merge: a
+            // compaction input's recorded ceiling survives because
+            // `repoint_table_persist_segment` never writes the column, not
+            // because this value flows anywhere. Said plainly so nobody "fixes"
+            // the repoint to preserve something it never dropped.
             //
             // The compaction READ deliberately does not apply it —
             // `read_persist_segments`, not the `_bounded` sibling. The slice

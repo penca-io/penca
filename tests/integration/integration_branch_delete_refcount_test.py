@@ -150,14 +150,21 @@ def test_branch_teardown_queues_its_files_and_the_gate_spares_shared_ones():
     A snapshotted fork's URIs split two ways, which gives the survival assertion
     and its positive control in ONE sweep:
 
-    * **carried** (shared with the parent) — must survive, the parent still
-      names them;
+    * **carried** (shared with the parent) — the FILE must survive, the parent
+      still names it;
     * **child-only** (the partition the child rewrote) — must be collected,
       nothing names them once the child's rows are gone.
 
     Both halves matter. Survival alone is also what a sweep that never considered
     the URIs eligible looks like, and collection alone would not show the gate
     protecting anything.
+
+    Survival is asserted on the file, via a parent read, not on the delete-set
+    row: the sweep now reaps a past-grace row whose URI is still referenced, so
+    both halves end with no row and only the file tells them apart. Reaping is
+    what keeps the set from growing without bound once teardown is enqueue-only,
+    and it loses nothing because whoever later drops the URI's last reference
+    re-enqueues it.
     """
     client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
         setup_partitioned_table("bdr_tear")
@@ -209,10 +216,30 @@ def test_branch_teardown_queues_its_files_and_the_gate_spares_shared_ones():
     _age_queued_rows(catalog_uuid, child_uris)
     client.sweep_segments(catalog_uuid=catalog_uuid)
 
-    survived = _queued_uris(catalog_uuid, shared)
-    assert survived == shared, (
-        "the sweep collected files the PARENT still references; the refcount gate "
-        f"did not see its rows. Swept: {sorted(shared - survived)}"
+    # Both sets end this sweep with no delete-set row, for opposite reasons — the
+    # shared ones were REAPED (still referenced, so the sweep must not unlink
+    # them), the child-only ones were COLLECTED. So row presence no longer
+    # separates spared from collected; the file does, which is what the parent
+    # read below establishes. The reaper cannot be what emptied `child_only`: it
+    # only deletes rows whose URI is still referenced, and nothing references
+    # those once the child's rows are gone.
+    assert _queued_uris(catalog_uuid, shared) == set(), (
+        "a past-grace row whose URI the parent still references must be reaped "
+        "from segment_delete_set — retaining it is what made the set grow without "
+        "bound, one undrainable row per inherited segment per deleted fork"
+    )
+    # First read of main in this test: the query service's decoded-segment cache
+    # is process-lifetime and untimed, so an earlier read would serve this from
+    # memory and hide a deleted file (see the module docstring).
+    got = client.read_data(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+    )
+    assert set(got.column("name").to_pylist()) == _SEED_NAMES, (
+        "the sweep unlinked files the PARENT still references; the refcount gate "
+        f"did not see its rows. Saw {sorted(got.column('name').to_pylist())}"
     )
     assert _queued_uris(catalog_uuid, child_only) == set(), (
         "the child-only URIs survived a sweep with zero remaining references, so "
