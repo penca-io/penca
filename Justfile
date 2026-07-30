@@ -702,6 +702,31 @@ penca-down profile="dev":
     printf '└─────────────────────────────────────────────────────────────────────\n\n'
     docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend down -v
 
+    # `compose down` returns once the containers are gone, but the daemon can
+    # keep the published host ports bound for seconds afterwards. A `penca-down
+    # && penca-up` chain then dies with "address already in use" even though
+    # teardown reported success — the same user-visible cold-start failure as
+    # the seaweedfs healthcheck bug, from an unrelated cause. Measured ~11s of
+    # lag on this VM. Block until the ports this project actually publishes are
+    # free so the recipe's exit means "safe to bring up again". CHA-542.
+    mapfile -t published < <(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json \
+        | jq -r '[.services[].ports[]? | select(.published) | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]')
+    deadline=$(( SECONDS + 60 ))
+    while :; do
+        listening=$(ss -ltnH 2>/dev/null | awk '{print $4}')
+        busy=()
+        for hp in "${published[@]}"; do
+            grep -qxF "$hp" <<< "$listening" && busy+=("$hp")
+        done
+        (( ${#busy[@]} == 0 )) && break
+        if (( SECONDS >= deadline )); then
+            printf 'penca-down: host ports still bound after 60s: %s\n' "${busy[*]}" >&2
+            printf 'penca-down: something outside this compose project is holding them.\n' >&2
+            exit 1
+        fi
+        sleep 0.2
+    done
+
 # Tail logs from services started by `penca-up` (follows by default).
 # With no service arg, follows every service; pass one or more service names
 # (e.g. `just penca-logs query write`) to filter. Service names:
