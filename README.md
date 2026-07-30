@@ -13,34 +13,27 @@
 
 ## Introduction
 
-Production writes to one database. Analytics and ML read from another. CDC stitches the two
-together, so you pay twice for storage and get paged when the pipeline breaks. Trying
-anything (a migration, an index, a model) means copying data and standing up an
-environment first, which quietly caps how many experiments run at once. And when something
-goes wrong there is no lineage to consult: you cannot see who changed what, and reverting is
-manual surgery.
+Penca is a database that serves transactional and analytical queries from one copy of your
+data, stored as open columnar files on object storage. Unlike a split OLTP/OLAP stack there
+is no second system and no CDC pipeline between them: the files an analytical query reads
+are the files production wrote. The trade-off is that a single-row transaction costs more
+than it would on a local-disk row store.
 
-Agents make it worse. Weekly refreshes were fine when an experiment took a quarter. Agents
-iterate by the minute, fork aggressively, read data they wrote seconds ago, and write
-without review. Same problems, at machine speed.
+To keep transactional latency workable, writes land in an internal Postgres hot tier under a
+real ACID transaction. A background pipeline persists, snapshots and purges them out to
+columnar files (Lance by default, Parquet supported). Reads merge both tiers, so a query
+sees committed writes immediately whichever tier they sit in.
 
-Penca collapses the split. Your data lives once, in open columnar files on your own bucket,
-and both workloads run against that copy. You can fork it like a git branch, which gives you
-a full read-write database that copies no rows. Fork production, let something loose on it,
-compare what it did, discard it. Every mutation appends to an immutable log with an author
-and a timestamp, so any state stays auditable and readable as of any point in time.
-
-Writes land in an internal Postgres hot tier under a real ACID transaction; a background
-pipeline moves them out to columnar files (Lance by default, Parquet supported). Reads merge
-both tiers, so a query sees committed writes immediately whichever tier they sit in. That
-merge is what makes fork → transact → read-it-back *interactive* rather than a batch job.
-Object storage is pluggable and the **only permanent home** for your table data; catalog and
+Object storage is pluggable and the only permanent home for your table data. Catalog and
 branch metadata is served from Postgres and stays that way, with object-storage checkpoints
 for recovery on the [roadmap](#roadmap).
 
-The trade is real: Penca is not competitive with bare-metal Postgres on transaction latency,
-and its analytical side is young. [Current shortcomings](#current-shortcomings) is specific
-about where the edges are.
+A branch is a full read-write copy that copies no rows, so forking production is cheap
+enough to do per experiment. Every mutation appends to an immutable log carrying an author
+and a timestamp, so any state is auditable and readable as of an earlier commit.
+
+See [docs/architecture.md](docs/architecture.md) for the full design, and
+[Current shortcomings](#current-shortcomings) for where the edges are.
 
 ## See it work
 
