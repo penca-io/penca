@@ -14,8 +14,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use penca_core::naming::{
-    self, abort_tx_log_partition, commit_tx_log_partition,
-    delete_log_table, system_indexes_table_uuid, system_schema_uuid, system_schemas_table_uuid,
+    self, abort_tx_log_partition, commit_tx_log_partition, delete_log_table,
+    system_indexes_table_uuid, system_schema_uuid, system_schemas_table_uuid,
     system_tables_table_uuid, tx_table_log_partition, upsert_log_table,
 };
 use penca_db::dialect::Dialect;
