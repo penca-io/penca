@@ -882,6 +882,69 @@ impl QueryManager {
     {
         // Pin to pg_now rather than an unbounded read.
         let snapshot = LifecycleManager::now_snapshot(driver).await?;
+        self.list_table_uuids_for_branch_at(
+            driver,
+            dl,
+            catalog_uuid,
+            schema_uuid,
+            branch_uuid,
+            &snapshot,
+        )
+        .await
+    }
+
+    /// Every `table_uuid` the branch has EVER had, at no point in time.
+    ///
+    /// Branch teardown's read, and deliberately unfiltered for the same reason
+    /// [`LifecycleManager::list_all_segment_index_uris`] is: teardown's `DROP
+    /// TABLE … CASCADE` removes rows regardless of commit state or commit time,
+    /// so anything a time-pinned read cannot see is dropped without its URI ever
+    /// reaching `segment_delete_set` — and with the best-effort unlink retired,
+    /// permanently uncollectable.
+    ///
+    /// `now_snapshot` is specifically wrong here, and positioning the call after
+    /// `lock_branch_teardown_parents` does not fix it. It resolves through
+    /// `now()`, which in PG is `transaction_timestamp()` — fixed at the
+    /// transaction's FIRST statement, before the exclusive lock is granted. A
+    /// `CreateTable` that commits while teardown waits out its `lock_timeout`
+    /// therefore carries a `commit_micros` above that pin and stays invisible,
+    /// even though every enumeration this list scopes reads with no commit-time
+    /// filter at all. The lock closes the window in wall-clock terms; only an
+    /// unbounded snapshot closes it in visibility terms.
+    pub async fn list_all_table_uuids_for_branch<L>(
+        &self,
+        driver: &impl DbDriver<Row = PgRow>,
+        dl: &L,
+        catalog_uuid: &str,
+        schema_uuid: Option<&str>,
+        branch_uuid: &str,
+    ) -> Result<Vec<String>>
+    where
+        L: DlDriver + ?Sized,
+    {
+        self.list_table_uuids_for_branch_at(
+            driver,
+            dl,
+            catalog_uuid,
+            schema_uuid,
+            branch_uuid,
+            &ReadSnapshot::AsOfMicros(i64::MAX),
+        )
+        .await
+    }
+
+    async fn list_table_uuids_for_branch_at<L>(
+        &self,
+        driver: &impl DbDriver<Row = PgRow>,
+        dl: &L,
+        catalog_uuid: &str,
+        schema_uuid: Option<&str>,
+        branch_uuid: &str,
+        snapshot: &ReadSnapshot,
+    ) -> Result<Vec<String>>
+    where
+        L: DlDriver + ?Sized,
+    {
         let batches = self
             .resolve_table_metadata(
                 driver,
@@ -893,7 +956,7 @@ impl QueryManager {
                 // List read (catalog/schema-wide) — no single row_uuid.
                 None,
                 None,
-                &snapshot,
+                snapshot,
             )
             .await?;
         let mut out: Vec<String> = Vec::new();

@@ -744,6 +744,37 @@ impl LifecycleManager {
     /// owns.
     ///
     /// 1 SQL query.
+    /// Every persist segment on a branch, across all tables.
+    ///
+    /// Branch teardown's enumeration — see
+    /// [`Self::get_snapshot_segments_for_branch`] for why teardown scopes by
+    /// branch rather than by a resolved table list.
+    pub async fn get_table_persist_segments_for_branch(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let sql = format!(
+            "SELECT table_persist_segment_uuid, object_uri \
+             FROM {table} WHERE branch_uuid = $1",
+            table = qi(&table),
+        );
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let uuid: Uuid = r.get("table_persist_segment_uuid");
+                let uri: String = r.get("object_uri");
+                (uuid.to_string(), uri)
+            })
+            .collect())
+    }
+
     pub async fn get_table_persist_segments_for_tables(
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,

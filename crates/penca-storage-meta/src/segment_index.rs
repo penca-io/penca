@@ -304,7 +304,8 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
         let uuid_refs: Vec<&str> = segment_uuids.iter().map(String::as_str).collect();
         let arr = format_sql_uuid_array(&uuid_refs);
         let sql = format!(

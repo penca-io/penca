@@ -1311,91 +1311,76 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Take `ACCESS EXCLUSIVE` on the partitioned parents branch teardown will
-    /// enumerate and then drop partitions of. Must be the FIRST statement of the
-    /// teardown transaction, before any enumerating `SELECT`.
+    /// Take `EXCLUSIVE` on the 14 partitions branch teardown will enumerate and
+    /// then drop. Must be the FIRST statement of the teardown transaction, before
+    /// any enumerating `SELECT`.
     ///
-    /// Two reasons, both about lock ORDER rather than lock strength:
+    /// # Why before the reads
     ///
-    /// 1. Enumerating first does not close the race it looks like it closes. The
-    ///    enumerating reads are plain `SELECT`s taking only `ACCESS SHARE`, which
-    ///    is compatible with a lifecycle wave's `ROW EXCLUSIVE` — so under READ
-    ///    COMMITTED a wave can insert segment rows and write a cold file after
-    ///    those reads, commit before the drops, and have its rows removed by the
-    ///    CASCADE. That leaves exactly the unreferenced-and-unqueued file
-    ///    enqueue-only teardown must never produce. `drop_branch_partitions`'
-    ///    exclusive lock only serialises such a wave out if it is held before the
-    ///    reads.
-    /// 2. Reading first turns teardown into a lock UPGRADE on these parents
-    ///    (`ACCESS SHARE` from the reads, then `ACCESS EXCLUSIVE` from the
-    ///    partition drops). Two concurrent `DeleteBranch` calls in one catalog
-    ///    then deadlock — each holds share, each wants exclusive — where before
-    ///    they simply serialised. Same hazard for anything else that READS these
-    ///    parents and then locks them exclusively. Branch-partition creation is a
-    ///    different case, not this one: it never reads them, it locks them
-    ///    exclusively in its own order, which is why the lock list below has to
-    ///    match that order rather than merely be taken first.
+    /// Enumerating first does not close the race it looks like it closes. The
+    /// enumerating reads are plain `SELECT`s taking only `ACCESS SHARE`, which is
+    /// compatible with a lifecycle wave's `ROW EXCLUSIVE` — so under READ
+    /// COMMITTED a wave can insert segment rows and write a cold file after those
+    /// reads, commit before the drops, and have its rows removed by the CASCADE.
+    /// That is the unreferenced-and-unqueued file enqueue-only teardown must never
+    /// produce, and with the best-effort unlink retired there is no orphan scan
+    /// left to find it.
     ///
-    /// Parents, not partitions: dropping a partition takes `ACCESS EXCLUSIVE` on
-    /// its parent too, and the parents are what the enumerating reads touch.
+    /// # Why the PARTITIONS, not the parents
     ///
-    /// EVERY parent [`Self::drop_branch_partitions`] will drop, in the order
-    /// `ensure_branch_partitions` creates them (tx-log family first, then the
-    /// metadata parents) — both derived from [`Self::branch_partition_pairs`]
-    /// rather than restated, so neither property can drift. Both halves matter
-    /// and neither is optional:
+    /// The parents are catalog-wide. Locking them exclusively stalls commits and
+    /// lifecycle waves on EVERY branch in the catalog for as long as teardown
+    /// runs — branches must not operationally impact each other beyond CPU
+    /// contention, so that is not an acceptable cost for deleting one of them.
     ///
-    /// - **Completeness.** Locking only the parents the enumeration reads leaves
-    ///   the rest to be locked later by the drops, which reintroduces the upgrade
-    ///   for any parent an enumeration touches indirectly —
-    ///   `get_snapshot_segments_for_table` INNER JOINs `table_snapshot_metadata`,
-    ///   so a partial list leaves exactly the `ACCESS SHARE` → `ACCESS EXCLUSIVE`
-    ///   sequence this exists to remove.
-    /// - **Order.** `CreateBranch` takes these same parents exclusively while
-    ///   creating partitions, tx-log family first. A teardown that locked the
-    ///   metadata parents first and reached the tx-log parents only at the drops
-    ///   would form a circular wait with it — teardown holding metadata and
-    ///   wanting tx-log, creation holding tx-log and wanting metadata. Sharing
-    ///   one canonical acquisition order removes THAT pairing; taking the
-    ///   strongest lock first does not, since creation never reads these parents
-    ///   at all.
+    /// All 14 are LIST-partitioned on `branch_uuid`, so the isolation is already
+    /// structural in the schema: a lifecycle write routed through the parent name
+    /// takes its lock on the TARGET branch's leaf, and a write for branch C never
+    /// touches B's. Locking B's leaves blocks exactly the writers that could add a
+    /// row to B, and nothing else.
     ///
-    /// The order claim is scoped to `CreateBranch` deliberately, because no
-    /// single ordering of these parents can remove the class outright: the two
-    /// counterparty families genuinely disagree. Lifecycle transactions read
-    /// tx-log then write metadata (purge phase 2, persist); DDL transactions do
-    /// the reverse — `create_table` / `create_index` / `alter` / `create_schema`
-    /// all open with a `meta_get_*` read that plans over the metadata parents,
-    /// and only then insert into the tx-log partitions. Whichever order teardown
-    /// picks is inverted against one of them. So ordering is paired with a
-    /// bounded `lock_timeout`, and what is left is reported to the client as
-    /// `ApiError::Aborted` for it to reissue — there is deliberately no
-    /// in-process retry, since one without backoff turns a loud conflict into a
-    /// quiet livelock and the caller is the layer that knows whether a second
-    /// attempt is wanted.
-    pub async fn lock_branch_teardown_parents(
+    /// The set is exactly what [`Self::drop_branch_partitions`] drops, and both
+    /// derive from [`Self::branch_partition_pairs`] rather than restating it. Two
+    /// roles, and dropping either half reopens the race:
+    ///
+    /// - the **6 tx-log** partitions stop new commits — and uncommitted writes,
+    ///   which is what keeps the hot tier from leaking rows past the drop;
+    /// - the **8 metadata** partitions stop persist / snapshot / compact / purge
+    ///   from inserting segment rows after the enumeration. Blocking commits does
+    ///   NOT cover these: lifecycle waves write segment metadata without going
+    ///   through the tx log.
+    ///
+    /// Per-(table, branch) advisory locks cannot serve this role. `persist:`,
+    /// `purge:` and `snapshot:` are keyed by table, so taking them requires a
+    /// table list first — and a table created concurrently has no entry in it and
+    /// therefore no lock to take, which is the same leak by another route. A
+    /// partition is the one thing a not-yet-known table's rows still land in.
+    ///
+    /// # Why `EXCLUSIVE` rather than `ACCESS EXCLUSIVE`
+    ///
+    /// `EXCLUSIVE` conflicts with `ROW EXCLUSIVE`, so it blocks every writer,
+    /// while still admitting `ACCESS SHARE` — plain `SELECT`s on the branch keep
+    /// working until the drops. Blocking writers is the entire requirement; taking
+    /// the stronger mode would block readers of B for no correctness gain. The
+    /// drops upgrade to `ACCESS EXCLUSIVE` on their own, which is unavoidable
+    /// (removing a partition rewrites the parent's descriptor) and brief.
+    pub async fn lock_branch_teardown_partitions(
         driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
         catalog_uuid: &Uuid,
         branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        // Derived from the same pair list `ensure_branch_partitions` creates from
-        // and `drop_branch_partitions` drops, rather than restated here. Both
-        // "every parent" and "in creation order" are then true by construction —
-        // a hand-maintained copy is what produced the incomplete list and the
-        // inverted order this function went through.
-        let parents: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
+        let partitions: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
             .into_iter()
-            .map(|(_, parent)| parent)
+            .map(|(partition, _)| partition)
             .collect();
-        let list = parents
+        let list = partitions
             .iter()
             .map(|t| Self::quote_identifier(t))
             .collect::<Vec<_>>()
             .join(", ");
-        // Bounded wait, so a teardown that loses a lock race fails fast with
-        // 55P03 rather than parking on the lock. Ordering alone cannot remove
-        // every deadlock class here (see the note above), so the caller reports
-        // what is left as `Aborted` for the client to reissue.
+        // Bounded wait, so a teardown that loses a lock race fails fast rather
+        // than parking on the lock. The caller reports what is left as `Aborted`
+        // for the client to reissue.
         //
         // Both errors propagate UNWRAPPED. Re-wrapping as `sqlx::Error::Protocol`
         // would erase the `Error::Database` variant, and `as_database_error()`
@@ -1406,7 +1391,7 @@ impl PgDialect {
             .execute_no_result("SET LOCAL lock_timeout = '5s'")
             .await?;
         driver
-            .execute_no_result(&format!("LOCK TABLE ONLY {list} IN ACCESS EXCLUSIVE MODE"))
+            .execute_no_result(&format!("LOCK TABLE {list} IN EXCLUSIVE MODE"))
             .await?;
         Ok(())
     }
@@ -1423,10 +1408,14 @@ impl PgDialect {
         branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
         // Same pair list `ensure_branch_partitions` creates and
-        // `lock_branch_teardown_parents` locks, so "every partition this branch
+        // `lock_branch_teardown_partitions` locks, so "every partition this branch
         // has" needs no second enumeration to stay in step with the first.
-        // Drop order is free here: the teardown transaction already holds
-        // `ACCESS EXCLUSIVE` on every parent, so no drop can wait on anything.
+        //
+        // Each DROP upgrades its partition's `EXCLUSIVE` to `ACCESS EXCLUSIVE` and
+        // takes `ACCESS EXCLUSIVE` on the parent to rewrite its descriptor. That
+        // parent lock is catalog-wide and unavoidable, which is why it is taken
+        // HERE and not around the enumeration: the stall is the drops only, not
+        // the whole teardown.
         let tx_partitions: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
             .into_iter()
             .map(|(partition, _)| partition)
@@ -1450,7 +1439,7 @@ impl PgDialect {
     /// then the metadata parents.
     ///
     /// The single source for the three sites that must agree on this set —
-    /// creation, [`Self::lock_branch_teardown_parents`], and
+    /// creation, [`Self::lock_branch_teardown_partitions`], and
     /// [`Self::drop_branch_partitions`]. They were three hand-maintained lists,
     /// which is precisely how the lock list came to be missing a parent and
     /// ordered against creation. Derivation makes both properties structural, so

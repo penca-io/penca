@@ -161,7 +161,8 @@ impl LifecycleManager {
         branch_uuid: &str,
     ) -> Result<Vec<String>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::compact_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::compact_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT object_uri FROM {table} WHERE branch_uuid = $1",
             table = qi(&table),

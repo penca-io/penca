@@ -1115,7 +1115,7 @@ impl WriteManager {
     }
 
     /// The teardown transaction. Split out from `delete_branch` so that
-    /// everything inside it runs behind `lock_branch_teardown_parents` by
+    /// everything inside it runs behind `lock_branch_teardown_partitions` by
     /// construction — the resolution and `main` guard that precede it are
     /// ordinary reads that must NOT hold the parents' ACCESS EXCLUSIVE. There is
     /// no retry: see the note at its call site.
@@ -1129,42 +1129,25 @@ impl WriteManager {
         branch_uuid: Uuid,
     ) -> Result<(), ApiError> {
         with_pg_tx(pool, async |tx| {
-            PgDialect::lock_branch_teardown_parents(tx, catalog_uuid, &branch_uuid).await?;
+            PgDialect::lock_branch_teardown_partitions(tx, catalog_uuid, &branch_uuid).await?;
 
-            // `schema_uuid = None` makes this the catalog-wide table list. Behind
-            // the lock like every enumeration it scopes: a `CreateTable` + persist
-            // wave committing between this read and the CASCADE would otherwise
-            // leave that table's file unreferenced and unqueued, and its hot data
-            // tables undropped.
-            let table_uuid_strs = self
-                .query_manager
-                .list_table_uuids_for_branch(tx, dl_driver, catalog_str, None, branch_str)
-                .await?;
-
-            // Cold holds no commit_tx_log, so the touched set is just the data
-            // tables; snapshot segments key directly on `(branch, table)`.
-            let segment_table_uuids: Vec<&str> =
-                table_uuid_strs.iter().map(String::as_str).collect();
-
-            let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
+            // Every enumeration below reads the branch's own PARTITION by name,
+            // never the catalog-wide parent. Reading through the parent would take
+            // `ACCESS SHARE` on it, which both contends with every other branch in
+            // the catalog and sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
+            // upgrade at the drops that deadlocks two concurrent teardowns.
+            // Partition-scoped reads keep teardown's footprint to this branch
+            // until `drop_branch_partitions` takes the parent locks at the end.
+            let persist_segments = LifecycleManager::get_table_persist_segments_for_branch(
                 tx,
                 catalog_str,
                 branch_str,
-                &segment_table_uuids,
             )
             .await?;
 
-            let mut snap_segments: Vec<(String, String)> = Vec::new();
-            for table_uuid_str in &table_uuid_strs {
-                let segs = LifecycleManager::get_snapshot_segments_for_table(
-                    tx,
-                    catalog_str,
-                    branch_str,
-                    table_uuid_str,
-                )
-                .await?;
-                snap_segments.extend(segs);
-            }
+            let snap_segments =
+                LifecycleManager::get_snapshot_segments_for_branch(tx, catalog_str, branch_str)
+                    .await?;
 
             // Cold-index sidecars are their own files and their own delete-set
             // participants (ADR 0026 §5), but they are not reachable from the base
@@ -1216,6 +1199,33 @@ impl WriteManager {
                 .into_iter()
                 .collect();
 
+            // The branch's HOT data tables. `schema_uuid = None` makes the
+            // list catalog-wide.
+            //
+            // Resolved HERE — behind the lock, and with an unbounded snapshot
+            // — because both matter and each covers a different failure. A
+            // table created before the lock but after a pre-lock read would
+            // be missed, and once `branch_store` loses its row nothing ever
+            // returns to drop its `upsert_log` / `delete_log` relations: a
+            // permanent leak, not untidiness. And `now_snapshot` would not
+            // fix it, since PG's `now()` is `transaction_timestamp()`, fixed
+            // at this transaction's FIRST statement — before the lock was
+            // granted — so a `CreateTable` committing while we waited out
+            // `lock_timeout` stays invisible to a time-pinned read.
+            //
+            // Safe under the lock now only because the lock is
+            // partition-scoped: this is a merge read that can reach cold
+            // storage, and stalling on object-store I/O holds `EXCLUSIVE` on
+            // nothing but the branch being deleted.
+            //
+            // Before `delete_branch`, not after: resolving a table list plans
+            // through the branch's lineage in `branch_store`, so once that row
+            // is gone the read comes back with a NULL `fork_commit_seq_num` and
+            // fails to decode.
+            let table_uuid_strs = self
+                .query_manager
+                .list_all_table_uuids_for_branch(tx, dl_driver, catalog_str, None, branch_str)
+                .await?;
             let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
             if deleted {
                 for table_uuid_str in &table_uuid_strs {
