@@ -512,8 +512,7 @@ impl LifecycleManager {
                 true,
             ),
         );
-        let horizon =
-            now_micros - query_timeout_micros.saturating_mul(REAP_GRACE_MULTIPLE);
+        let horizon = now_micros - query_timeout_micros.saturating_mul(REAP_GRACE_MULTIPLE);
         let rows = driver
             .execute_params(&sql, &[SqlValue::Int64(horizon)])
             .await?;

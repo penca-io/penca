@@ -23,6 +23,7 @@ Run via ``just integration-test branch_delete_refcount``.
 
 from __future__ import annotations
 
+import os
 import time
 from uuid import uuid4
 
@@ -84,6 +85,18 @@ def _age_queued_rows(catalog_uuid, uris):
         ).format(tbl=Identifier(tbl)),
         (int(time.time() * 1_000_000) - 10_000_000, list(uris)),
     )
+
+
+# The sweep reaps a refcount-pinned row only once it is older than
+# REAP_GRACE_MULTIPLE x the query timeout — a horizon deliberately longer than
+# the gate's grace window, so a spared row stays observable as evidence. Derived
+# from the same env var the containers read rather than hard-coded, so the two
+# cannot drift apart silently.
+_QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT_SECONDS", "2"))
+_REAP_GRACE_MULTIPLE = 10
+_PAST_REAP_HORIZON_MICROS = int(
+    _QUERY_TIMEOUT_SECONDS * _REAP_GRACE_MULTIPLE * 1.5 * 1_000_000
+)
 
 
 def _drop_reference_rows(catalog_uuid, branch_uuid):
@@ -309,4 +322,81 @@ def test_delete_child_after_snapshot_preserves_parent_reads():
         "deleting the fork destroyed the PARENT's data: the child's carried"
         " snapshot rows name files the parent wrote, and Phase 2 unlinks every"
         " URI its enumeration reaches"
+    )
+
+
+def test_sweep_reaps_a_durably_pinned_row_without_deleting_its_file():
+    """Past the reap horizon, a still-referenced row leaves the SET, not the disk.
+
+    The only coverage of the reap path. Its sibling above asserts the opposite
+    end of the same mechanism — a row aged past the GATE's grace but not past the
+    reap horizon survives — so between them they pin both thresholds and the gap
+    that separates them. Without this case a reaper that silently deleted nothing,
+    a broken `REAP_GRACE_MULTIPLE`, or a regressed committed-only predicate would
+    leave the whole suite green while the unbounded growth it exists to remove
+    came back in full.
+
+    Both halves asserted, as on the survival side: the row is gone AND the parent
+    can still read the file. Checking only the row's absence would pass on a sweep
+    that unlinked the file too, which is the one outcome that must never happen.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("bdr_reap")
+    )
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=_SEED,
+    )
+    child = client.create_branch(
+        f"bdr_reap_kid_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-539",
+    ).branch_uuid
+
+    # Metadata only before the destructive step — never warm the decoded-segment
+    # cache on a branch whose files this test could lose (see module docstring).
+    shared = _snapshot_uris(catalog_uuid, main_branch)
+    assert shared, "setup: main must hold committed cold references"
+
+    # Teardown queues URIs main still references: the durably-pinned shape, via
+    # the ordinary path rather than by hand.
+    client.delete_branch(branch_uuid=child, catalog_uuid=catalog_uuid)
+    assert _queued_uris(catalog_uuid, shared) == shared, (
+        "setup: teardown must have queued the URIs main still references"
+    )
+
+    # Past the REAP horizon, not merely past the gate's grace window — that gap
+    # is the whole point of the two thresholds.
+    tbl = f"{catalog_uuid}_{SEGMENT_DELETE_SET}"
+    get_pg_driver().execute_no_result(
+        SQL(
+            "UPDATE {tbl} SET written_at_micros = %s WHERE object_uri = ANY(%s)"
+        ).format(tbl=Identifier(tbl)),
+        (
+            int(time.time() * 1_000_000) - _PAST_REAP_HORIZON_MICROS,
+            list(shared),
+        ),
+    )
+
+    client.sweep_segments(catalog_uuid=catalog_uuid)
+
+    assert _queued_uris(catalog_uuid, shared) == set(), (
+        "a durably-pinned row must be reaped from segment_delete_set; retaining "
+        "it is what made the set grow without bound, one undrainable row per "
+        "inherited segment per deleted fork"
+    )
+    got = client.read_data(
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+    )
+    assert set(got.column("name").to_pylist()) == _SEED_NAMES, (
+        "the sweep reaped the queued rows but also unlinked files main still "
+        f"references, saw {sorted(got.column('name').to_pylist())}"
     )
