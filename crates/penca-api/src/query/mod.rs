@@ -2456,7 +2456,6 @@ mod tests {
         // Head takes the greatest seq.
         assert_eq!(seek(None), Some((7, 700)));
     }
-    use penca_db::driver::SqlValue;
 
     #[test]
     fn base_audit_seq_cap_bounds_parent_at_fork() {
@@ -2485,53 +2484,6 @@ mod tests {
             combine_filters(Some("a = 1".into()), Some("b = 2")),
             Some("(a = 1) AND (b = 2)".into())
         );
-    }
-
-    // No-op driver: the no-tx / no-as_of and explicit-as_of resolution
-    // paths never touch the database, so every method can return empty.
-    struct NoopDriver;
-
-    impl DbDriver for NoopDriver {
-        type Row = PgRow;
-
-        async fn execute(&self, _query: &str) -> Result<Vec<PgRow>, sqlx::Error> {
-            Ok(vec![])
-        }
-        async fn execute_no_result(&self, _query: &str) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn execute_many(&self, _queries: &[String]) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn execute_params(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<Vec<PgRow>, sqlx::Error> {
-            Ok(vec![])
-        }
-        async fn execute_no_result_params(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn fetch_optional(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<Option<PgRow>, sqlx::Error> {
-            Ok(None)
-        }
-        async fn close(&self) {}
-        fn fetch_stream<'a>(
-            &'a self,
-            _query: &'a str,
-            _params: &'a [SqlValue],
-        ) -> Pin<Box<dyn Stream<Item = Result<PgRow, sqlx::Error>> + Send + 'a>> {
-            Box::pin(futures_util::stream::empty())
-        }
     }
 
     /// Pins the three-way dispatch contract over the four plan shapes,
