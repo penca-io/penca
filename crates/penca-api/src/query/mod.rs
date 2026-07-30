@@ -1870,11 +1870,24 @@ impl QueryManager {
         };
 
         // The own arm joins this, and since the fork copy it serves the inherited
-        // range — whose commits live in the PARENT's map. Unambiguous to union:
-        // `base_seq_to` caps the parent's contribution at the fork, and the
-        // child's own commits start strictly above it, so no `commit_seq_num`
-        // appears in both halves and the join cannot mis-attribute an author.
-        tx_log_segments.extend(base_tx_log_segments.iter().cloned());
+        // range — whose commits live in the PARENT's map, so the parent's segments
+        // are unioned in.
+        //
+        // Each carries a per-row `max_commit_seq_num` ceiling rather than relying
+        // on the segment-level prune. `base_seq_to` bounds segment SELECTION and
+        // the data side of the join; the tx_log side has no predicate at all, so a
+        // parent segment straddling the fork (`min <= fork_seq < max`) is admitted
+        // whole. Its post-fork `commit_seq_num`s are exactly the values the child's
+        // own commits use — both counters continue from `fork_seq` — so one own-arm
+        // row would match two `t` rows and come out twice, one copy carrying the
+        // parent's author. Reachable whenever the fork-time flush does not re-cut
+        // the segment at the fork: an exact-seq ForkPoint below head no-ops the
+        // flush, and the same-micros leak does it even at head.
+        let base_tx_log_ceiling = base_seq_to.map(|to| to.saturating_sub(1));
+        tx_log_segments.extend(base_tx_log_segments.iter().map(|seg| PersistSegment {
+            max_commit_seq_num: base_tx_log_ceiling,
+            ..seg.clone()
+        }));
 
         Ok(AuditPlan {
             catalog_uuid,
@@ -2458,8 +2471,18 @@ async fn read_tx_log_batches<R: FormatReader + 'static>(
     if !include_tx_metadata || tx_log_segments.is_empty() {
         return Ok((Vec::new(), schema));
     }
+    // `_bounded`, so a segment carrying `max_commit_seq_num` has its rows clipped
+    // to that ceiling. Load-bearing for a fork: the parent's tx_log is unioned
+    // into the child's own arm to recover inherited authors, and
+    // `build_cold_audit_sql` puts NO predicate on the tx_log side of the join —
+    // so a parent segment straddling the fork would contribute its post-fork rows
+    // to `t`. Those collide by construction: the child's own commits and the
+    // parent's post-fork commits both continue from `fork_seq`, so one own-arm
+    // data row would match two `t` rows and be emitted twice, one copy carrying
+    // the parent's author. The child's own segments carry no ceiling and pass
+    // through untouched.
     let batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, tx_log_segments, &schema, None)
+        ColdStorageClient::read_persist_segments_bounded(readers, tx_log_segments, &schema, None)
             .try_collect()
             .await
             .map_err(ApiError::ColdStorage)?;

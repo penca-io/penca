@@ -1002,3 +1002,107 @@ def test_fork_audit_reattaches_the_parents_author_for_inherited_rows():
         "the inherited row must carry the parent tx's author/comment, not NULL: "
         f"the child's own arm serves it but joins its own tx_log. Saw {by_name}"
     )
+
+
+def test_fork_audit_does_not_double_match_a_straddling_parent_tx_log():
+    """A parent tx_log segment spanning the fork must not attribute twice.
+
+    The parent's map is unioned into the child's own audit arm so inherited rows
+    recover their author. `build_cold_audit_sql` puts no predicate on the tx_log
+    side of the join, so bounding segment SELECTION and the data side is not
+    enough: a parent segment straddling the fork is admitted whole, and its
+    post-fork `commit_seq_num`s are exactly the values the child's own commits
+    use — both counters continue from the fork. One own-arm row would then match
+    two `t` rows and be emitted twice, one copy carrying the PARENT's author.
+
+    Built in the shape that reaches it: an exact-seq ForkPoint below head, where
+    the fork-time flush no-ops (`target <= w_txlog`) and so never re-cuts the
+    segment at the fork. The sibling fork-audit tests all fork at head after a
+    single commit, where the parent's segment happens to end exactly at the fork
+    and the straddle cannot occur.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    # Five commits on main under one author, then ONE persist — so the parent's
+    # cold tx_log is a single segment spanning every seq, fork included.
+    fork_seq = None
+    for i in range(1, 6):
+        seq = _commit_with_author(
+            client,
+            branch_uuid=main_branch,
+            rows={"name": [f"p{i}"], "value": [i]},
+            author="ada",
+            comment="on the parent",
+            **scope,
+        )
+        if i == 3:
+            fork_seq = seq
+
+    client.persist(branch_uuid=main_branch, **scope)
+    client.snapshot(branch_uuid=main_branch, **scope)
+
+    # The fixture is only meaningful if the parent's cold tx_log really does span
+    # the fork. A RuntimeError, not an assert: a fixture that stopped reaching the
+    # straddle would otherwise read as the behaviour under test passing, which is
+    # the failure mode this whole test exists to rule out.
+    straddling = get_pg_driver().execute(
+        SQL(
+            "SELECT count(*) FROM {tbl} WHERE branch_uuid = %s"
+            " AND min_commit_seq_num <= %s AND max_commit_seq_num > %s"
+        ).format(tbl=Identifier(f"{catalog_uuid}_tx_log_persist_segment_metadata")),
+        (main_branch, fork_seq, fork_seq),
+    )
+    if straddling[0][0] == 0:
+        raise RuntimeError(
+            "setup failed: no parent cold tx_log segment spans the fork seq "
+            f"({fork_seq}), so the double-match this test pins is unreachable — "
+            "the fork-time flush must have re-cut the segment"
+        )
+
+    child = client.create_branch(
+        "kid", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    ).branch_uuid
+    _commit_with_author(
+        client,
+        branch_uuid=child,
+        rows={"name": ["own"], "value": [99]},
+        author="kid",
+        comment="on the child",
+        **scope,
+    )
+    client.persist(branch_uuid=child, **scope)
+
+    upserts, _deletes = client.audit_data(
+        branch_uuid=child,
+        after_seq=0,
+        before_seq=10_000,
+        include_tx_metadata=True,
+        **scope,
+    )
+    names = upserts.column("name").to_pylist()
+    authors = upserts.column("author").to_pylist()
+
+    # The child's own row: exactly once, and attributed to the CHILD. Twice, or
+    # once with author "ada", is the straddle leaking through.
+    assert names.count("own") == 1, (
+        f"the child's own change row was emitted {names.count('own')} times: a "
+        f"straddling parent tx_log segment double-matched it. Full list: {names}"
+    )
+    own_authors = {a for n, a in zip(names, authors, strict=True) if n == "own"}
+    assert own_authors == {"kid"}, (
+        f"the child's own row was attributed to the parent's tx at the same "
+        f"commit_seq_num, saw {own_authors}"
+    )
+
+    # And the parent's post-fork commits stay invisible, on both axes.
+    for post_fork in ("p4", "p5"):
+        assert post_fork not in names, (
+            f"{post_fork!r} was committed on main above the fork and must not "
+            f"appear in the child's audit. Full list: {names}"
+        )
