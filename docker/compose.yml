@@ -80,25 +80,20 @@ services:
       retries: 10
       start_period: 60s
 
-  # Reuses the seaweedfs image rather than an S3 CLI from a third-party
-  # image: one fewer pull on the cold-start path, one fewer tag that can
-  # drift, and no second copy of the credentials. `weed shell` reaches the
-  # master directly, so it bypasses the S3 gateway's SigV4 auth entirely.
-  # `s3.bucket.create` is idempotent — re-creating an existing bucket exits
-  # 0 — which is what `mc mb --ignore-existing` was doing here.
+  # Reuses the seaweedfs image rather than a third-party S3 CLI: one fewer
+  # pull on the cold-start path, one fewer tag that can drift, and no second
+  # copy of the credentials — `weed shell` reaches the master directly,
+  # bypassing the S3 gateway's SigV4 auth.
   #
-  # The second command is load-bearing, not a belt-and-braces check.
-  # `weed shell` is a REPL: it prints `error: ...` for a failed sub-command
-  # and still exits 0, and it blocks in a connect-retry loop (exiting 0 even
-  # when killed) if the master is unreachable. So the create alone can never
-  # fail this container, while three services gate on
-  # `service_completed_successfully` — a silent failure would start the whole
+  # The `s3.bucket.list` assertion is load-bearing, not belt-and-braces.
+  # `weed shell` is a REPL: it exits 0 even on `error: ...`, and on an
+  # unreachable master it hangs, still exiting 0 when killed. So the create
+  # alone can never fail this container — yet three services gate on
+  # `service_completed_successfully`, so a silent failure would start the
   # backend against a nonexistent bucket and surface as opaque NoSuchBucket
-  # errors from the query/write/lifecycle S3 paths. Asserting the end state
-  # positively is what restores the fail-fast the `mc mb` exit code gave us.
-  # `awk` on an exact field, not `grep -w`, because `-w` treats `-` as a word
-  # boundary and would accept a stray `penca-foo` as proof of `penca`. The
-  # `timeout` bounds the unreachable-master hang. CHA-542.
+  # errors. Asserting the end state restores the fail-fast `mc mb` gave us.
+  # `awk` on an exact field rather than `grep -w`, which treats `-` as a word
+  # boundary and would accept a stray `penca-foo` as proof of `penca`. CHA-542.
   seaweedfs-init:
     image: chrislusf/seaweedfs:4.33
     profiles: [infra]

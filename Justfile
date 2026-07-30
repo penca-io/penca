@@ -703,17 +703,15 @@ penca-down profile="dev":
     docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend down -v
 
     # `compose down` returns once the containers are gone, but the daemon can
-    # keep the published host ports bound for seconds afterwards. A `penca-down
-    # && penca-up` chain then dies with "address already in use" even though
-    # teardown reported success — the same user-visible cold-start failure as
-    # the seaweedfs healthcheck bug, from an unrelated cause. Measured ~11s of
-    # lag on this VM. Block until the ports this project actually publishes are
-    # free so the recipe's exit means "safe to bring up again". CHA-542.
-    # `compose config` is captured into a variable rather than read straight
-    # from a process substitution: a substitution's exit status is invisible to
-    # both `set -e` and `pipefail`, so a failing config render would yield an
-    # empty port list and silently skip the wait — reintroducing the very race
-    # this guard exists to close, with no signal that it was skipped.
+    # hold the published host ports for seconds afterwards (~11s measured), so
+    # a `penca-down && penca-up` chain dies with "address already in use"
+    # despite teardown reporting success. Block until they're free, so exiting
+    # 0 means "safe to bring up again". CHA-542.
+    #
+    # Captured to a variable rather than read straight from a process
+    # substitution, whose exit status neither `set -e` nor `pipefail` observes:
+    # a failing render would yield an empty port list and skip the wait
+    # silently, restoring the race this guard exists to close.
     ports_json=$(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json)
     mapfile -t published < <(jq -r '[.services[].ports[]? | select(.published) | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]' <<< "$ports_json")
     if (( ${#published[@]} == 0 )); then
