@@ -484,9 +484,11 @@ cargo-build:
 cargo-test:
     cargo test --workspace
 
-# Run clippy lints on all Rust crates
+# Run clippy lints on all Rust crates. `--all-targets` is load-bearing: without
+# it clippy skips `#[cfg(test)]` code, so an orphaned test helper or an unused
+# test-only import passes this gate and only surfaces on a `cargo test` build.
 cargo-clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check Rust formatting
 cargo-fmt-check:
