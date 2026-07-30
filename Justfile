@@ -709,23 +709,38 @@ penca-down profile="dev":
     # the seaweedfs healthcheck bug, from an unrelated cause. Measured ~11s of
     # lag on this VM. Block until the ports this project actually publishes are
     # free so the recipe's exit means "safe to bring up again". CHA-542.
-    mapfile -t published < <(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json \
-        | jq -r '[.services[].ports[]? | select(.published) | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]')
-    deadline=$(( SECONDS + 60 ))
-    while :; do
-        listening=$(ss -ltnH 2>/dev/null | awk '{print $4}')
-        busy=()
-        for hp in "${published[@]}"; do
-            grep -qxF "$hp" <<< "$listening" && busy+=("$hp")
+    # `compose config` is captured into a variable rather than read straight
+    # from a process substitution: a substitution's exit status is invisible to
+    # both `set -e` and `pipefail`, so a failing config render would yield an
+    # empty port list and silently skip the wait — reintroducing the very race
+    # this guard exists to close, with no signal that it was skipped.
+    ports_json=$(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json)
+    mapfile -t published < <(jq -r '[.services[].ports[]? | select(.published) | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]' <<< "$ports_json")
+    if (( ${#published[@]} == 0 )); then
+        printf 'penca-down: compose config lists no published host ports; skipping wait\n' >&2
+    elif ! command -v ss > /dev/null; then
+        # Probed once, with a message. Left bare, a missing `ss` aborts the
+        # recipe at status 127 with no output — and three integration recipes
+        # call penca-down from an EXIT trap, so a green suite would end in an
+        # unexplained failure pointing nowhere.
+        printf 'penca-down: ss (iproute2) not found; skipping host-port release wait\n' >&2
+    else
+        deadline=$(( SECONDS + 60 ))
+        while :; do
+            listening=$(ss -ltnH | awk '{print $4}')
+            busy=()
+            for hp in "${published[@]}"; do
+                grep -qxF "$hp" <<< "$listening" && busy+=("$hp")
+            done
+            (( ${#busy[@]} == 0 )) && break
+            if (( SECONDS >= deadline )); then
+                printf 'penca-down: host ports still bound after 60s: %s\n' "${busy[*]}" >&2
+                printf 'penca-down: something outside this compose project is holding them.\n' >&2
+                exit 1
+            fi
+            sleep 0.2
         done
-        (( ${#busy[@]} == 0 )) && break
-        if (( SECONDS >= deadline )); then
-            printf 'penca-down: host ports still bound after 60s: %s\n' "${busy[*]}" >&2
-            printf 'penca-down: something outside this compose project is holding them.\n' >&2
-            exit 1
-        fi
-        sleep 0.2
-    done
+    fi
 
 # Tail logs from services started by `penca-up` (follows by default).
 # With no service arg, follows every service; pass one or more service names
