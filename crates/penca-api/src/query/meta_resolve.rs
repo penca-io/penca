@@ -69,6 +69,16 @@ use super::cold_read::stream_cold_read;
 /// `begin_tx_log` on this advisory fast-fail would only serialize concurrent
 /// appends to the same tx without buying any correctness — `CommitTx` is the
 /// authoritative gate.
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    fields(
+        catalog = %catalog_uuid,
+        branch = %branch_uuid,
+        tx = %tx_uuid,
+        began_at_seq_num = tracing::field::Empty,
+    ),
+)]
 pub(crate) async fn resolve_tx(
     driver: &impl DbDriver<Row = PgRow>,
     catalog_uuid: &Uuid,
@@ -102,7 +112,10 @@ pub(crate) async fn resolve_tx(
     match status {
         penca_storage_hot::TxStatus::Open {
             began_at_seq_num, ..
-        } => Ok(began_at_seq_num),
+        } => {
+            tracing::Span::current().record("began_at_seq_num", began_at_seq_num);
+            Ok(began_at_seq_num)
+        }
         penca_storage_hot::TxStatus::Aborted {
             aborted_at_micros, ..
         } => Err(ApiError::FailedPrecondition(format!(
