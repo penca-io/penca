@@ -1192,15 +1192,8 @@ impl WriteManager {
             // phase-2 stamp had not landed would lose its row without its URI ever
             // being queued. Matches the two sibling enumerations above, neither of
             // which filters on `commit_micros`.
-            let snap_segment_uuids: Vec<String> =
-                snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
-            let sidecar_uris: Vec<String> = LifecycleManager::list_all_segment_index_uris(
-                tx,
-                catalog_str,
-                branch_str,
-                &snap_segment_uuids,
-            )
-            .await?;
+            let sidecar_uris: Vec<String> =
+                LifecycleManager::list_all_segment_index_uris(tx, catalog_str, branch_str).await?;
 
             // Also enumerate in-flight compact merged files tracked in
             // `compact_segment_metadata`. Two cases:

@@ -453,11 +453,7 @@ impl LifecycleManager {
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
         branch_uuid: &str,
-        segment_uuids: &[String],
     ) -> Result<Vec<String>> {
-        if segment_uuids.is_empty() {
-            return Ok(Vec::new());
-        }
         let catalog = parse_uuid(catalog_uuid);
         let branch = parse_uuid(branch_uuid);
         // The branch's own partition, like teardown's three sibling
@@ -466,11 +462,16 @@ impl LifecycleManager {
         // `ACCESS EXCLUSIVE` on, which is the upgrade two concurrent teardowns
         // deadlock over.
         let table = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
-        let uuid_refs: Vec<&str> = segment_uuids.iter().map(String::as_str).collect();
-        let arr = format_sql_uuid_array(&uuid_refs);
+        // No `segment_uuid` filter. Keying off the snapshot segments teardown
+        // enumerated leaves behind any sidecar whose segment row is already gone
+        // — reachable through the snapshot failure path, which deletes carried
+        // segment rows before their sidecars on separate best-effort statements.
+        // Such a sidecar's URI would never reach `segment_delete_set`, which
+        // enqueue-only teardown makes permanent. The partition holds exactly this
+        // branch's sidecars, so dropping the filter is both complete and cheaper
+        // than inlining an O(cold segments) uuid array into the statement text.
         let sql = format!(
-            "SELECT object_uri FROM {table} \
-             WHERE branch_uuid = $1 AND segment_uuid = ANY({arr})",
+            "SELECT object_uri FROM {table} WHERE branch_uuid = $1",
             table = qi(&table),
         );
         let rows = driver
