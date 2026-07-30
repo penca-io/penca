@@ -304,8 +304,7 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let branch = parse_uuid(branch_uuid);
-        let table = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
+        let table = naming::table_snapshot_segment_index_metadata_table(&catalog);
         let uuid_refs: Vec<&str> = segment_uuids.iter().map(String::as_str).collect();
         let arr = format_sql_uuid_array(&uuid_refs);
         let sql = format!(
@@ -460,7 +459,13 @@ impl LifecycleManager {
             return Ok(Vec::new());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        // The branch's own partition, like teardown's three sibling
+        // enumerations: naming the parent would take `ACCESS SHARE` on a
+        // catalog-wide relation that `drop_branch_partitions` later needs
+        // `ACCESS EXCLUSIVE` on, which is the upgrade two concurrent teardowns
+        // deadlock over.
+        let table = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
         let uuid_refs: Vec<&str> = segment_uuids.iter().map(String::as_str).collect();
         let arr = format_sql_uuid_array(&uuid_refs);
         let sql = format!(
