@@ -21,20 +21,20 @@ Writes land in an internal Postgres hot tier under a real ACID transaction; a ba
 pipeline persists, snapshots and purges them out to columnar files on object storage
 (Lance by default, Parquet supported). Reads merge both tiers on the fly, so a query
 sees committed writes immediately whichever tier they sit in. That merge is what makes
-the fork → transact → read-it-back loop *interactive* rather than a batch job. Object
-storage is the only infrastructure you supply — Postgres is a component inside the Penca
-stack, not a second database you operate.
+the fork → transact → read-it-back loop *interactive* rather than a batch job. The
+Postgres tier ships inside the stack and Penca bootstraps it for you; object storage is
+the substrate you point it at.
 
 The honest trade: Penca is not competitive with Postgres on transaction latency, and its
-analytical side is young. What you get for it is one copy of your data instead of two
-systems and a pipeline between them — [shortcomings](#current-shortcomings) has the edges.
+analytical side is young. What you get is one copy of your data instead of two systems and
+a pipeline between them — [shortcomings](#current-shortcomings) has the edges.
 
 ## See it work
 
 Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a
 branch per agent off `main`, drives one shared deterministic visitor feed through all
 three, lets each read back its own committed writes to steer its next move, then ranks
-them, deletes every fork and shows `main` untouched. Its closing scoreboard:
+them, deletes every fork and shows `main` untouched. Its scoreboard:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -47,8 +47,7 @@ splits on the visitor index and never reads — that read-your-writes loop on a 
 the pitch. The policies are toy; the mechanic is the point. Figures come from one seeded
 run on 2026-07-27: reproducible, but not pinned. The forks copy no rows, which the demo
 asserts rather than prints — see
-[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py),
-where `main` keeps its rows in exactly one cold object and each branch owns zero.
+[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
 ## Quick start
 
@@ -62,8 +61,8 @@ You need [Docker](https://docs.docker.com/engine/install/),
 [`uv`](https://docs.astral.sh/uv/) and [`just`](https://github.com/casey/just). The first
 `just penca-up` compiles the server image from source, which takes a while; a prebuilt
 image is on the way. Ports are fixed (Postgres 5432, Flight SQL 50060) and bound to
-loopback, so any Flight SQL driver on this machine can point at it. Data is ephemeral
-unless you ask for a directory, which survives `just penca-down`:
+loopback. Data is ephemeral unless you ask for a directory, which survives
+`just penca-down`:
 
 ```bash
 just penca-up --db ~/.penca/data
@@ -73,9 +72,10 @@ just penca-up --db ~/.penca/data
 
 The defensible claim is the *conjunction*, on one copy. Each alternative has a leg of it:
 
-- **Neon** — branchable Postgres. Branch plus OLTP, but no OLAP on the branch.
-- **Dolt** — branching, merge and audit on a row store in a closed format. Analytical
-  queries pay row-store costs, and other tools cannot read the bytes.
+- **Neon** — branchable Postgres. Branch plus OLTP, but no columnar analytics on the
+  branch: queries run on the row store, at row-store cost.
+- **Dolt** — branching, merge and audit, open source, but on a bespoke row-oriented
+  format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie** — branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
 - **Databricks Lakebase** — managed, with OLTP in a Postgres store that syncs to the
@@ -100,18 +100,21 @@ services directly.
                        Postgres (hot tier)  +  object storage (cold tier)
 ```
 
-A fourth process, the lifecycle scheduler, drives `persist → snapshot → purge` on a tick
-so the pipeline advances with no operator. Read planning is in-process inside the query
-service, not a service hop. Branching is a metadata operation: a fork records its position
-in the parent and reads the parent's cold files through it, which is why no rows are
-copied. Detail in [docs/architecture.md](docs/architecture.md), algorithms and
+A fifth process, the lifecycle scheduler, drives `persist → snapshot → purge` on a tick
+so the pipeline advances with no operator. Read planning is in-process in the query
+service, not a service hop.
+
+A fork copies no rows: it records its position in the parent and reads the parent's cold
+files through it. Not free, though — creating a branch first flushes the parent's
+unpersisted writes to cold, so fork latency tracks what the parent has buffered, not what
+it holds. Detail in [docs/architecture.md](docs/architecture.md), algorithms and
 crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Features
 
 - [x] Fork a branch off `main` with no row copy
 - [x] Read-your-writes on a branch, over SQL or gRPC
-- [x] Branch merge, and branch delete/discard
+- [x] Branch merge, and branch delete/discard (gRPC only, not exposed in SQL)
 - [x] Time travel — read any table as of an earlier commit
 - [x] Audit trail — full version history per row, including tombstones
 - [x] ACID transactions spanning every schema in a catalog
@@ -140,40 +143,37 @@ A limitation you find yourself after a rosy README costs more than one you read 
 - **Single-level branching.** You can fork `main`, not a fork — the attempt is rejected
   rather than silently returning incomplete data.
 - **Retention is configured but never prunes.** Reads below the floor are refused so
-  nothing serves partial history, but nothing reclaims it either, and the window is
-  immutable once set.
+  nothing serves partial history, but nothing reclaims it, and the window is immutable
+  once set.
 - **The lifecycle scheduler is v0** — single replica, no leader election.
 - **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates
   point operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms
-  for a single-statement read-modify-write. The TPC-B numbers track that gap rather than
-  claim parity.
+  for a single-statement read-modify-write. TPC-B tracks the gap, not parity.
 - **OLAP is under-optimized.** Effort so far went into derisking transactions on a data
-  lake; at small scale Postgres still wins the analytical query — a crossover, not a
-  wall. See [docs/performance.md](docs/performance.md).
+  lake; at small scale Postgres still wins the analytical query — a crossover, not a wall.
+  See [docs/performance.md](docs/performance.md).
 
 ## Roadmap
 
 Branching gets deeper: forking a fork, at arbitrary depth. Retention gets its other half
-— policies you can update, and pruning that actually reclaims. Isolation gets stronger,
-with true snapshot isolation and configurable levels per catalog. On the way in and out:
-bulk load that bypasses the hot tier, so you can ingest existing data-lake files at full
-speed, and Iceberg interop both directions — export committed snapshots, or adopt an
-existing table in place with no migration.
+— policies you can update, and pruning that reclaims. Isolation gets stronger, with true
+snapshot isolation and configurable levels per catalog. On the way in and out: bulk load
+that bypasses the hot tier, so you can ingest existing data-lake files at full speed, and
+Iceberg interop both directions — export committed snapshots, or adopt a table in place.
 
 On performance: a structured predicate on the read wire to kill the SQL-string double
-parse, aggregate / limit / TopN pushed into the scan, a broad band of low-hanging fruit
-on the Flight SQL path, and metadata itself moving to object storage. Further out:
-full-text and vector indexes, a pgwire gateway so Postgres clients connect unmodified,
-and the authentication story the shortcomings section is missing.
+parse, aggregate / limit / TopN pushed into the scan, low-hanging fruit on the Flight SQL
+path, and metadata itself moving to object storage. Further out: full-text and vector
+indexes, a pgwire gateway so Postgres clients connect unmodified, and the authentication
+story the shortcomings section is missing.
 
 ## Documentation
 
 - [docs/usage.md](docs/usage.md) — connecting, a first table over SQL and gRPC, the demos, DataGrip
-- [docs/architecture.md](docs/architecture.md) — services, storage tiers, concepts
-- [docs/development.md](docs/development.md) — build, run, test, profile, configure
-- [docs/algorithms.md](docs/algorithms.md) — write path, read path, branch merge
-- [docs/performance.md](docs/performance.md) — benchmarks across hot, cold and mixed
-- [docs/decisions/](docs/decisions/) — accepted ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
+- [docs/architecture.md](docs/architecture.md) — services, storage tiers, concepts · [docs/development.md](docs/development.md) — build, run, test
+- [docs/algorithms.md](docs/algorithms.md) — write path, read path, branch merge · [docs/performance.md](docs/performance.md) — benchmarks
+- [docs/schema-reference.md](docs/schema-reference.md) — system table schemas
+- [docs/decisions/](docs/decisions/) — ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## License
 

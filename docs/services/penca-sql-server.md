@@ -417,11 +417,14 @@ exists purely for the strict-INSERT serialisation in `dml.rs`.
 
 ## Branch selection
 
-Server-global, configured via `SQL_SERVER_DEFAULT_BRANCH`. Per-session
-branch selection (`SET branch = ...`) is tracked in
-[CHA-119](https://linear.app/chapala/issue/CHA-119); until then, reading
-other branches means a second deployment with a different startup flag
-or hitting the `query` gRPC API directly.
+Per-connection, resolved at handshake from the `x-penca-branch` header and
+frozen on the session for its lifetime (`session.rs`), falling back to
+`SQL_SERVER_DEFAULT_BRANCH` when the header is absent. So one branch is one
+connection, the way a Postgres connection is bound to one database, and
+reading two branches means two connections rather than two deployments.
+
+Mutating it mid-session is still rejected: `SET branch = ...` returns
+`FAILED_PRECONDITION` with the handshake-pinned wording (`set.rs`).
 
 ## Auth
 

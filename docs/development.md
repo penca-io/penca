@@ -24,7 +24,7 @@ Go 1.26.3+ is the one prereq `bootstrap` does not auto-install — platform vari
 
 | Tool | Why |
 |---|---|
-| [Rust 1.94+](../rust-toolchain.toml) | Build the server from source (Docker pulls a prebuilt image for the run path). `rust-toolchain.toml` pins the version. |
+| [Rust 1.94+](../rust-toolchain.toml) | Build the server. Note that `just penca-up` also builds the servicer image from source today — the `x-rust-build` anchor in `docker/compose.yml` applies to every service — so the first run compiles regardless. `rust-toolchain.toml` pins the version. |
 | [`rust-analyzer`](https://rust-analyzer.github.io/) | Powers the `LSP` tool and the `language-server` MCP server for Claude Code agents (`goToDefinition`, `findReferences`, `rename_symbol`). |
 | [`mcp-language-server`](https://github.com/isaacphi/mcp-language-server) | MCP server registered in [`.mcp.json`](../.mcp.json) that exposes rust-analyzer's `rename_symbol` and friends to agents. |
 | [`kata`](https://github.com/kenn-io/kata) | Per-ticket task queue used by `/do-issue` (plan → red → drain). |
@@ -74,7 +74,7 @@ Requires Docker.
 
 | Profile | Behavior |
 |---|---|
-| `dev` (default) | Fixed ports 50052–50055 + 50060, lifecycle scheduler running |
+| `dev` (default) | Fixed ports 50052–50054 + 50060, lifecycle scheduler running |
 | `test` | Random host ports — parallel-worktree-safe; scheduler idle so it can't race a suite's manual lifecycle calls |
 
 To keep your data across restarts, give it a directory — both Postgres and the object
@@ -301,13 +301,15 @@ injected by `docker/compose.yml`. Server-side configs live in
 | `QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES` | query | Max `(catalog, branch, table)` snapshot lists held in the CHA-441 cache (`0` disables) |
 | `QUERY_TIMEOUT_SECONDS` | query, lifecycle, scheduler | Hard cap on `read_data`/`audit_data` runtime = universal destructive-op grace window; all three MUST agree ([ADR 0019](decisions/0019-plan-time-pinning-and-universal-grace-window.md)) |
 | `WRITE_DEFAULT_TX_TIMEOUT_SECONDS`, `WRITE_MAX_TX_TIMEOUT_SECONDS` | write | Tx TTL bounds |
+| `WRITE_SNAPSHOT_SEGMENT_CACHE_BUDGET_BYTES`, `WRITE_SNAPSHOT_LIST_CACHE_TTL_SECONDS`, `WRITE_SNAPSHOT_LIST_CACHE_MAX_ENTRIES` | write | Write-side mirrors of the query snapshot caches; same contracts as the `QUERY_*` rows above |
 | `LIFECYCLE_DEFAULT_MAX_SEGMENT_BYTES` | lifecycle | Compaction ceiling |
 | `LIFECYCLE_SEGMENT_READ_CONCURRENCY` | lifecycle | Max in-flight cold-segment reads during snapshot's merge_read (memory-safety cap) |
 | `HOT_PURGE_GRACE_SECONDS` | lifecycle | Hot-purge grace window; the expired-begin ledger GC waits `max(SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS, SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS, this)` before dropping a timed-out tx's ledger (CHA-444 / [ADR 0027](decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)). The max over both cadences is a conservative bound — Purge rides the snapshot loop today, but the loop-to-op assignment is not an invariant |
 | `QUERY_SERVICE_ADDR`, `WRITE_SERVICE_ADDR` | sql-server | Upstream gRPC addresses (Query for catalog/table metadata reads, Write for DML) |
 | `SQL_SERVER_FLIGHT_STATEMENT_CACHE_CAPACITY` | sql-server | Per-connection Flight SQL logical-plan cache size (CHA-355; `0` disables) |
 | `SQL_SERVER_DEFAULT_CATALOG`, `SQL_SERVER_DEFAULT_SCHEMA`, `SQL_SERVER_DEFAULT_BRANCH` | sql-server | Per-session pinned catalog + unqualified-DML defaults |
-| `QUERY_SERVICE_ADDR`, `LIFECYCLE_SERVICE_ADDR` | scheduler | Upstream gRPC addresses for the autonomous tick loop |
+| `LIFECYCLE_SERVICE_ADDR` | write, scheduler | Upstream lifecycle address — the write service calls `PersistBranch` at fork time; the scheduler drives the tick loop |
+| `QUERY_SERVICE_ADDR` | sql-server, scheduler | Upstream query address for the autonomous tick loop |
 | `SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Persist sweep cadence (**non-positive** = that loop boots then idles forever); lifecycle reads it too, to floor the expired-begin ledger-GC grace (CHA-444 / [ADR 0027](decisions/0027-decoupled-purge-seq-cutoff-and-split-grace.md)) — both services MUST agree |
 | `SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS` | scheduler, lifecycle | Snapshot + Purge + tx-log GC sweep cadence (**non-positive** = that loop boots then idles forever); same ledger-GC floor contract, both services MUST agree |
 | `SCHEDULER_LIST_PAGE_SIZE` | scheduler | List-tables page size |

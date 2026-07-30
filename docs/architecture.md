@@ -58,10 +58,12 @@ in-process call inside the query service, not a service hop.
 - **Hot (Postgres)** — recent unpersisted mutations. Low-latency reads
   and ACID writes. The query engine reads and writes Postgres directly
   via SQL.
-- **Cold (object storage)** — S3 / GCS / SeaweedFS / any S3-compatible
-  store. Holds the bulk of historical data as columnar files (Lance
-  default; Parquet supported, Vortex / Nimble pluggable). The query
-  engine reads files directly.
+- **Cold (object storage)** — any S3-compatible store (SeaweedFS in the
+  shipped stack), or a local filesystem path; `OBJECT_STORAGE_PROVIDER`
+  accepts `s3` and `local`. Holds the bulk of historical data as
+  columnar files — Lance by default, Parquet supported, and the
+  reader/writer trait in `penca-format` is where a third format would
+  go. The query engine reads files directly.
 
 Both tiers store the same auditable-store shape (upsert log + delete
 log), so log segments in either tier may carry tombstones and
@@ -110,6 +112,12 @@ it or risking the live system. Branch concurrency is optimistic
 source's current state via set-based SQL into the target's logs under
 one merge transaction. See
 [algorithms.md](algorithms.md#merge-branch).
+
+Creating a fork is not purely bookkeeping: `create_branch` first drives a
+`PersistBranch` on the **source**, flushing its committed-but-unpersisted rows to cold,
+so that everything at or before the fork point is durable in the cold tier the child
+reads through. Fork latency therefore tracks the parent's unpersisted backlog, not its
+total size.
 
 Forking is single-level today: a branch may only be forked from its catalog's `main`.
 The read planner enumerates one immediate parent and does not recurse, so a fork off a
@@ -234,4 +242,5 @@ read-optimized point-in-time view; purge reclaims hot rows once they clear the u
 grace window. The `lifecycle-scheduler` drives `persist → snapshot → purge`
 autonomously on a periodic tick ([ADR 0019](decisions/0019-plan-time-pinning-and-universal-grace-window.md)).
 Full algorithms with crash-safety invariants:
-[algorithms.md](algorithms.md).
+[algorithms.md](algorithms.md). System table shapes:
+[schema-reference.md](schema-reference.md).
