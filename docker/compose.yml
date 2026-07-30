@@ -85,17 +85,33 @@ services:
   # drift, and no second copy of the credentials. `weed shell` reaches the
   # master directly, so it bypasses the S3 gateway's SigV4 auth entirely.
   # `s3.bucket.create` is idempotent — re-creating an existing bucket exits
-  # 0 — which is what `mc mb --ignore-existing` was doing here. CHA-542.
+  # 0 — which is what `mc mb --ignore-existing` was doing here.
+  #
+  # The second command is load-bearing, not a belt-and-braces check.
+  # `weed shell` is a REPL: it prints `error: ...` for a failed sub-command
+  # and still exits 0, and it blocks in a connect-retry loop (exiting 0 even
+  # when killed) if the master is unreachable. So the create alone can never
+  # fail this container, while three services gate on
+  # `service_completed_successfully` — a silent failure would start the whole
+  # backend against a nonexistent bucket and surface as opaque NoSuchBucket
+  # errors from the query/write/lifecycle S3 paths. Asserting the end state
+  # positively is what restores the fail-fast the `mc mb` exit code gave us.
+  # `awk` on an exact field, not `grep -w`, because `-w` treats `-` as a word
+  # boundary and would accept a stray `penca-foo` as proof of `penca`. The
+  # `timeout` bounds the unreachable-master hang. CHA-542.
   seaweedfs-init:
     image: chrislusf/seaweedfs:4.33
     profiles: [infra]
     depends_on:
       seaweedfs:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      echo 's3.bucket.create -name penca' | weed shell -master=seaweedfs:9333
-      "
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo 's3.bucket.create -name penca' | timeout 60 weed shell -master=seaweedfs:9333
+        echo 's3.bucket.list' | timeout 60 weed shell -master=seaweedfs:9333 \
+          | awk '$1 == "penca" { found = 1 } END { exit !found }'
 
   # One-shot init job: seeds global Penca tables + the default catalog
   # row that SQL_SERVER_DEFAULT_CATALOG resolves against. All runtime
