@@ -23,9 +23,10 @@ by default, Parquet supported). Reads merge both tiers on the fly, so a query se
 writes immediately whichever tier they sit in — that merge is what makes the fork →
 transact → read-it-back loop *interactive* rather than a batch job.
 
-Object storage is pluggable, and the **only permanent home** for your data: the hot tier
-is a write buffer that purge reclaims once rows are cold. What you keep is one set of open
-columnar files, readable by anything that reads Lance or Parquet.
+Object storage is pluggable, and the **only permanent home** for your table data: the hot
+tier buffers writes and purge reclaims rows once they are cold, leaving one set of open
+columnar files that anything reading Lance or Parquet can open. Catalog and branch metadata
+still lives in Postgres — moving it out is on the [roadmap](#roadmap).
 
 The honest trade: Penca is not competitive with bare-metal Postgres on transaction latency,
 and its analytical side is young. What you get is one copy of your data instead of two
@@ -33,10 +34,10 @@ systems and a pipeline between them — [shortcomings](#current-shortcomings) ha
 
 ## See it work
 
-Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a
-branch per agent off `main`, drives one shared deterministic visitor feed through all three,
-lets each read back its own committed writes to steer its next move, then ranks them,
-deletes every fork and shows `main` untouched. Its scoreboard:
+Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a branch
+per agent off `main`, drives one shared deterministic visitor feed through all three, lets
+each read back its own committed writes to steer its next move, then ranks them, deletes
+every fork and shows `main` untouched. Its scoreboard:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -134,39 +135,37 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 
 ## Current shortcomings
 
-A limitation you find yourself after a rosy README costs more than one you read up front.
-
-- **No authentication or authorization, at all.** No auth interceptor, no TLS on any
-  service, and the Flight SQL handshake is unimplemented. Anything that reaches the ports
-  has full access — hence the loopback bind. Do not expose Penca to a network you do not
-  control.
-- **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
-  CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
-- **Single-level branching.** You can fork `main`, not a fork — the attempt is rejected
-  rather than silently returning incomplete data.
-- **Retention is configured but never prunes.** Reads below the floor are refused so nothing
-  serves partial history, but nothing reclaims it, and the window is immutable once set.
-- **The lifecycle scheduler is v0** — single replica, no leader election.
+- **No authentication or authorization, at all.** No auth interceptor, no TLS on any service,
+  and the Flight SQL handshake is unimplemented. Anything that reaches the ports has full
+  access — hence the loopback bind. Do not expose Penca to a network you do not control.
+- **Branching is narrower than git.** You can fork `main`, not a fork, and merging back is
+  fast-forward only — if the target took a commit past your fork point the merge is refused
+  rather than reconciled. No conflict resolution, no `diff`, no `revert`.
+- **Last-write-wins is the only isolation level.** Branch concurrency resolves per row by
+  latest writer; there is no snapshot-isolation setting to choose, per catalog or at all.
 - **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
   operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
   single-statement read-modify-write. TPC-B tracks the gap, not parity.
-- **OLAP is under-optimized.** Effort so far went into derisking transactions on a data
-  lake; at small scale Postgres still wins the analytical query — a crossover, not a wall.
-  See [docs/performance.md](docs/performance.md).
+- **OLAP is under-optimized.** Effort so far went into derisking transactions on a data lake;
+  at small scale Postgres still wins the analytical query — a crossover, not a wall. See
+  [docs/performance.md](docs/performance.md).
+- **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
+  CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
+- **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
+  files, but nothing publishes them as an Iceberg table for a catalog to pick up.
+- **Arrow Flight SQL is the only SQL wire** — no pgwire gateway, so Postgres clients and
+  drivers cannot connect unmodified.
+- **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
 
 ## Roadmap
 
-Branching gets deeper: forking a fork, at arbitrary depth. Retention gets its other half
-— policies you can update, and pruning that reclaims. Isolation gets stronger, with true
-snapshot isolation and configurable levels per catalog. On the way in and out: bulk load
-that bypasses the hot tier, so you can ingest existing data-lake files at full speed, and
-Iceberg interop both directions — export committed snapshots, or adopt a table in place.
-
-On performance: a structured predicate on the read wire to kill the SQL-string double
-parse, aggregate / limit / TopN pushed into the scan, low-hanging fruit on the Flight SQL
-path, and metadata itself moving to object storage. Further out: full-text and vector
-indexes, a pgwire gateway so Postgres clients connect unmodified, and the authentication
-story the shortcomings section is missing.
+Everything above is the roadmap, in roughly that order — the shortcomings section is a plan
+stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot tier, so you can ingest existing data-lake files
+at full speed, and adopting an Iceberg table in place with no migration. Retention gains the
+pruning half it is missing and the lifecycle scheduler gains leader election. A structured
+predicate on the read wire kills the SQL-string double parse, with aggregate / limit / TopN
+pushed into the scan. Catalog metadata moves to object storage, so the durable set becomes
+one set of files.
 
 ## Documentation
 
