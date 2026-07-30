@@ -501,9 +501,11 @@ cargo-fmt:
 # Full Rust check: clippy + fmt + test
 cargo-check: cargo-clippy cargo-fmt-check cargo-test
 
-# Auto-fix Rust lints and formatting
+# Auto-fix Rust lints and formatting. `--all-targets` matches `cargo-clippy`: a
+# fixer that cannot reach what the gate flags is a worse trap than one that
+# rewrites test code, which `--allow-dirty` already warns it will do.
 cargo-fix:
-    cargo clippy --workspace --fix --allow-dirty
+    cargo clippy --workspace --all-targets --fix --allow-dirty
     cargo fmt --all
 
 # Ensure Docker Engine is running and accessible.
