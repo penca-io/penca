@@ -43,6 +43,30 @@ The Python `PencaClient` wraps both surfaces:
 for SQL; `read_data` / `audit_data` / `write_data` / branch + tx
 methods for the gRPC surface.
 
+### You do not need the client
+
+`PencaClient` is a convenience, not a requirement. The SQL side is plain Arrow Flight
+SQL, so ADBC directly, SQLAlchemy, JDBC and ODBC all connect to port 50060 without it;
+the gRPC side is plain gRPC, so any client generated from `protos/` works. The client
+itself is just an ADBC consumer:
+[`_flight_sql_cursor`](../packages/penca-client/src/penca_client/client.py#L2077) opens
+`adbc_driver_flightsql.dbapi.connect` against `grpc://<host>:50060` and nothing more
+exotic.
+
+What it does do is set three connection options you would otherwise have to set
+yourself, so it is worth copying that function rather than starting from scratch:
+
+- `adbc.flight.sql.rpc.with_cookie_middleware=true`, so the server's `penca-session-id`
+  `Set-Cookie` / `Cookie` round-trip binds successive statements to one session. Without
+  it a multi-statement `BEGIN` / `INSERT` / `COMMIT` will not hold together
+  ([ADR 0007](decisions/0007-session-entity.md)).
+- `adbc.flight.sql.rpc.call_header.x-penca-branch` and `…x-penca-catalog`, the headers
+  the server reads at session-mint time to pin the connection's branch and catalog. Both
+  are immutable for the session's lifetime.
+- `autocommit=True`. The DB-API default of `False` sends a `BeginTransaction` on connect,
+  which then collides with an explicit SQL `BEGIN`; Penca's transaction surface is the
+  explicit Postgres-style `BEGIN` / `COMMIT` / `ROLLBACK`.
+
 ## Your first table
 
 One table, written over both surfaces. The gRPC arm below appends to the *same* table
