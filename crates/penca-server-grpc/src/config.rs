@@ -243,7 +243,7 @@ impl LifecycleServiceConfig {
     }
 }
 
-/// S3-compatible backend config (also used for SeaweedFS, MinIO).
+/// S3-compatible backend config (also used for SeaweedFS).
 pub struct S3BackendConfig {
     pub bucket: String,
     pub access_key: String,
@@ -261,7 +261,7 @@ pub enum StorageBackend {
 
 /// Object storage configuration (mirrors Python ObjectStorageSettings).
 ///
-/// Supports S3-compatible (including SeaweedFS, MinIO) and local filesystem.
+/// Supports S3-compatible (including SeaweedFS) and local filesystem.
 /// Builds both `object_store::ObjectStore` (for Parquet) and
 /// `lance_io::object_store::ObjectStore` (for Lance) from the same config.
 pub struct ObjectStorageConfig {
