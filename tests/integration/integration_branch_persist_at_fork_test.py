@@ -665,12 +665,15 @@ def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
     copy puts clamped rows in the child's OWN `cold_upsert_segments`, an audit
     window reaching past the fork would emit the parent's post-fork rows.
 
-    The child's clamped rows are synthesized with direct SQL rather than waited
-    on from the fork copy, so this pins the audit read path on its own — and,
-    unlike a guard that only bites once the copy lands, it distinguishes now.
-    Both the header and the segment row are copied: the audit read INNER JOINs
-    segments up to `table_persist_metadata` for `log_kind`, so a segment row
-    without its header is invisible rather than merely unclamped.
+    Asserted on the COUNT, not on set membership: the child's own arm and the
+    base-cold arm both cover the inherited range unless the base arm is capped at
+    the adopted baseline, and `audit_data` concatenates them without dedup, so a
+    missing cap shows up as exact duplicates a set() assertion cannot see.
+
+    Uses the real fork copy rather than synthesizing the child's rows. An earlier
+    draft copied header + segment rows in by hand, which was necessary before
+    `create_branch` did it — and became a double-count once it did, since the
+    child then held two row sets naming one file.
     """
     client = make_client()
     scope, main_branch_uuid, fork_seq, above_fork_seq = _seed_straddling_parent(client)
@@ -682,47 +685,6 @@ def test_fork_audit_spanning_the_fork_hides_parents_post_fork_rows():
 
     # The parent's straddling segment and its header, as CHA-539's copy will
     # write them: same object_uri, clamped to the fork seq, sealed.
-    # ONE header per log_kind, latest first. `table_persist_uuid` is derived from
-    # `(branch, table, persisted_at, log_kind)`, so two headers sharing that tuple
-    # on one branch is a state the real writer cannot produce — its derivation
-    # would collide and collapse via ON CONFLICT. Copying every parent header
-    # (CreateBranch's own PersistBranch adds a second run) synthesized exactly
-    # that impossible state, and the audit read failed on a duplicate DataFusion
-    # registration rather than on anything this test is about.
-    header = get_pg_driver().execute(
-        SQL(
-            "SELECT DISTINCT ON (log_kind) table_persist_uuid::text, log_kind FROM {tbl}"
-            " WHERE branch_uuid = %s AND table_uuid = %s AND commit_micros IS NOT NULL"
-            " ORDER BY log_kind, persisted_at_micros DESC"
-        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_PERSIST_METADATA}")),
-        (main_branch_uuid, scope["table_uuid"]),
-    )
-    assert header, "setup failed: the parent must hold a committed persist header"
-
-    for parent_persist_uuid, _log_kind in header:
-        child_persist_uuid = str(uuid4())
-        _copy_rows_to_branch(
-            f"{catalog_uuid}_{TABLE_PERSIST_METADATA}",
-            where="branch_uuid = %s AND table_persist_uuid = %s",
-            params=(main_branch_uuid, parent_persist_uuid),
-            overrides={
-                "branch_uuid": child.branch_uuid,
-                "table_persist_uuid": child_persist_uuid,
-            },
-        )
-        _copy_rows_to_branch(
-            f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}",
-            where="branch_uuid = %s AND table_persist_uuid = %s",
-            params=(main_branch_uuid, parent_persist_uuid),
-            overrides={
-                "branch_uuid": child.branch_uuid,
-                "table_persist_uuid": child_persist_uuid,
-                "table_persist_segment_uuid": str(uuid4()),
-                "max_commit_seq_num": fork_seq,
-                "is_sealed": True,
-            },
-        )
-
     child_max = _max_copied_persist_seq(catalog_uuid, child.branch_uuid)
     assert child_max == fork_seq, (
         f"setup failed: the child's clamped rows should cap at {fork_seq}, saw {child_max}"
