@@ -93,10 +93,11 @@ The defensible claim is the *conjunction*, on one copy. Each alternative holds a
   [LTAP](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-ltap-first-lake-transactionalanalytical),
   and it argues the same thing we do: the way out of the split is storing the data once in
   open formats instead of syncing a second copy to read it. We could not have asked for
-  better validation. Where the two diverge most is data versioning. LTAP keeps intermediate
-  row versions for Postgres MVCC and point-in-time recovery, but they stay invisible to
-  lakehouse readers and are garbage-collected in time. Branching there is metadata-only as
-  it is here, while the row-level audit trail and `as_of` queries have no counterpart.
+  better validation. Two things land differently. Their lakehouse copy still arrives by
+  managed sync, and on versioning, LTAP keeps intermediate row versions for Postgres MVCC
+  and point-in-time recovery, but they stay invisible to lakehouse readers and are
+  garbage-collected in time. Branching there is metadata-only as it is here, while the
+  row-level audit trail and `as_of` queries have no counterpart.
 
 ## Architecture
 
