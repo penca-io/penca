@@ -1129,7 +1129,7 @@ impl WriteManager {
         branch_uuid: Uuid,
     ) -> Result<(), ApiError> {
         with_pg_tx(pool, async |tx| {
-            PgDialect::lock_branch_teardown_parents(tx, catalog_uuid).await?;
+            PgDialect::lock_branch_teardown_parents(tx, catalog_uuid, &branch_uuid).await?;
 
             // `schema_uuid = None` makes this the catalog-wide table list. Behind
             // the lock like every enumeration it scopes: a `CreateTable` + persist

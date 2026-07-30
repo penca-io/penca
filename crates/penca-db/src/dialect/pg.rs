@@ -1341,7 +1341,9 @@ impl PgDialect {
     ///
     /// EVERY parent [`Self::drop_branch_partitions`] will drop, in the order
     /// `ensure_branch_partitions` creates them (tx-log family first, then the
-    /// metadata parents). Both halves matter and neither is optional:
+    /// metadata parents) — both derived from [`Self::branch_partition_pairs`]
+    /// rather than restated, so neither property can drift. Both halves matter
+    /// and neither is optional:
     ///
     /// - **Completeness.** Locking only the parents the enumeration reads leaves
     ///   the rest to be locked later by the drops, which reintroduces the upgrade
@@ -1374,25 +1376,17 @@ impl PgDialect {
     pub async fn lock_branch_teardown_parents(
         driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
         catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        let parents = [
-            // tx-log family, in ensure_tx_log_branch_partitions' order.
-            naming::begin_tx_log_table(catalog_uuid),
-            naming::abort_tx_log_table(catalog_uuid),
-            naming::commit_tx_log_table(catalog_uuid),
-            naming::tx_table_log_table(catalog_uuid),
-            naming::commit_tx_log_seq_num_table(catalog_uuid),
-            naming::abort_seq_num_table(catalog_uuid),
-            // metadata parents, in ensure_metadata_branch_partitions' order.
-            naming::table_persist_metadata_table(catalog_uuid),
-            naming::table_persist_segment_metadata_table(catalog_uuid),
-            naming::table_purge_metadata_table(catalog_uuid),
-            naming::table_snapshot_metadata_table(catalog_uuid),
-            naming::table_snapshot_segment_metadata_table(catalog_uuid),
-            naming::compact_segment_metadata_table(catalog_uuid),
-            naming::table_snapshot_index_metadata_table(catalog_uuid),
-            naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
-        ];
+        // Derived from the same pair list `ensure_branch_partitions` creates from
+        // and `drop_branch_partitions` drops, rather than restated here. Both
+        // "every parent" and "in creation order" are then true by construction —
+        // a hand-maintained copy is what produced the incomplete list and the
+        // inverted order this function went through.
+        let parents: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .map(|(_, parent)| parent)
+            .collect();
         let list = parents
             .iter()
             .map(|t| Self::quote_identifier(t))
@@ -1428,25 +1422,15 @@ impl PgDialect {
         catalog_uuid: &Uuid,
         branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        let tx_partitions = [
-            naming::tx_table_log_partition(catalog_uuid, branch_uuid),
-            naming::abort_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::commit_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::begin_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::commit_tx_log_seq_num_partition(catalog_uuid, branch_uuid),
-            naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
-            // The persist + snapshot metadata partitions hang under the same
-            // per-catalog parents, so they drop in this same CASCADE loop and
-            // DeleteBranch leaves no residue.
-            naming::table_snapshot_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_purge_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_persist_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
-            naming::compact_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
-        ];
+        // Same pair list `ensure_branch_partitions` creates and
+        // `lock_branch_teardown_parents` locks, so "every partition this branch
+        // has" needs no second enumeration to stay in step with the first.
+        // Drop order is free here: the teardown transaction already holds
+        // `ACCESS EXCLUSIVE` on every parent, so no drop can wait on anything.
+        let tx_partitions: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .map(|(partition, _)| partition)
+            .collect();
         // `segment_delete_set` is deliberately absent: it is catalog-wide and
         // unpartitioned (CHA-531). Dropping the two snapshot-segment partitions
         // above removes this branch's references to any queued file, so the
@@ -1461,16 +1445,25 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the tx-log-family branch partitions for a branch.
+    /// Every `(partition, parent)` pair a branch owns, in the order
+    /// [`Self::ensure_branch_partitions`] creates them: the tx-log family first,
+    /// then the metadata parents.
     ///
-    /// Covers begin_tx_log / abort_tx_log / commit_tx_log / tx_table_log —
-    /// single-axis LIST partitions on `branch_uuid`. Idempotent.
-    async fn ensure_tx_log_branch_partitions(
-        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
-        catalog_uuid: &Uuid,
-        branch_uuid: &Uuid,
-    ) -> Result<(), sqlx::Error> {
-        let partitions: [(String, String); 6] = [
+    /// The single source for the three sites that must agree on this set —
+    /// creation, [`Self::lock_branch_teardown_parents`], and
+    /// [`Self::drop_branch_partitions`]. They were three hand-maintained lists,
+    /// which is precisely how the lock list came to be missing a parent and
+    /// ordered against creation. Derivation makes both properties structural, so
+    /// adding a partitioned table here reaches all three at once.
+    fn branch_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> Vec<(String, String)> {
+        Self::tx_log_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .chain(Self::metadata_partition_pairs(catalog_uuid, branch_uuid))
+            .collect()
+    }
+
+    fn tx_log_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> [(String, String); 6] {
+        [
             (
                 naming::begin_tx_log_partition(catalog_uuid, branch_uuid),
                 naming::begin_tx_log_table(catalog_uuid),
@@ -1495,7 +1488,19 @@ impl PgDialect {
                 naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
                 naming::abort_seq_num_table(catalog_uuid),
             ),
-        ];
+        ]
+    }
+
+    /// Create the tx-log-family branch partitions for a branch.
+    ///
+    /// Covers begin_tx_log / abort_tx_log / commit_tx_log / tx_table_log —
+    /// single-axis LIST partitions on `branch_uuid`. Idempotent.
+    async fn ensure_tx_log_branch_partitions(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let partitions = Self::tx_log_partition_pairs(catalog_uuid, branch_uuid);
 
         Self::ensure_list_partitions(driver, branch_uuid, &partitions).await?;
 
@@ -1519,19 +1524,8 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the persist + snapshot metadata branch partitions for a branch.
-    ///
-    /// Covers table_persist_metadata / table_persist_segment_metadata /
-    /// table_purge_metadata / table_snapshot_metadata /
-    /// table_snapshot_segment_metadata / compact_segment_metadata — all
-    /// single-axis LIST partitions on `branch_uuid`, same shape as
-    /// [`Self::ensure_tx_log_branch_partitions`]. Idempotent.
-    async fn ensure_metadata_branch_partitions(
-        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
-        catalog_uuid: &Uuid,
-        branch_uuid: &Uuid,
-    ) -> Result<(), sqlx::Error> {
-        let partitions: [(String, String); 8] = [
+    fn metadata_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> [(String, String); 8] {
+        [
             (
                 naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_persist_metadata_table(catalog_uuid),
@@ -1564,7 +1558,22 @@ impl PgDialect {
                 naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
             ),
-        ];
+        ]
+    }
+
+    /// Create the persist + snapshot metadata branch partitions for a branch.
+    ///
+    /// Covers table_persist_metadata / table_persist_segment_metadata /
+    /// table_purge_metadata / table_snapshot_metadata /
+    /// table_snapshot_segment_metadata / compact_segment_metadata — all
+    /// single-axis LIST partitions on `branch_uuid`, same shape as
+    /// [`Self::ensure_tx_log_branch_partitions`]. Idempotent.
+    async fn ensure_metadata_branch_partitions(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let partitions = Self::metadata_partition_pairs(catalog_uuid, branch_uuid);
 
         Self::ensure_list_partitions(driver, branch_uuid, &partitions).await
     }
