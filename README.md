@@ -13,32 +13,41 @@
 
 ## Introduction
 
-Penca is a database you can fork like a git branch. A fork is a full read-write copy of your
-data that copies no rows, and you can run transactions *and* analytical queries against it.
-Fork production, let something loose on it, compare what it did, discard it.
+Production writes to one database. Analytics and ML read from another. CDC stitches the two
+together, so you pay twice for storage and get paged when the pipeline breaks. Trying
+anything — a migration, an index, a model — means copying data and standing up an
+environment first, which quietly caps how many experiments run at once. And when something
+goes wrong there is no lineage to consult: you cannot see who changed what, and reverting is
+manual surgery.
+
+Agents make it worse. Weekly refreshes were fine when an experiment took a quarter. Agents
+iterate by the minute, fork aggressively, read data they wrote seconds ago, and write
+without review. Same problems, at machine speed.
+
+Penca collapses the split. One copy of your data, in open columnar files on your own bucket,
+serves both workloads — and you can fork it like a git branch: a full read-write copy that
+copies no rows. Fork production, let something loose on it, compare what it did, discard it.
+Every mutation appends to an immutable log with an author and a timestamp, so any state is
+auditable and readable as of any point in time.
 
 Writes land in an internal Postgres hot tier under a real ACID transaction; a background
-pipeline persists, snapshots and purges them out to columnar files on object storage (Lance
-by default, Parquet supported). Reads merge both tiers on the fly, so a query sees committed
-writes immediately whichever tier they sit in — that merge is what makes the fork →
-transact → read-it-back loop *interactive* rather than a batch job.
+pipeline moves them out to columnar files (Lance by default, Parquet supported). Reads merge
+both tiers, so a query sees committed writes immediately whichever tier they sit in — that
+merge is what makes fork → transact → read-it-back *interactive* rather than a batch job.
+Object storage is pluggable and the **only permanent home** for your table data; catalog and
+branch metadata is served from Postgres and stays that way, with object-storage checkpoints
+for recovery on the [roadmap](#roadmap).
 
-Object storage is pluggable, and the **only permanent home** for your table data: the hot
-tier buffers writes and purge reclaims rows once they are cold, leaving one set of open
-columnar files that anything reading Lance or Parquet can open. Catalog and branch metadata
-is served from Postgres and stays that way; checkpointing it to object storage so a cluster
-can reload it on startup is on the [roadmap](#roadmap).
-
-The honest trade: Penca is not competitive with bare-metal Postgres on transaction latency,
-and its analytical side is young. What you get is one copy of your data instead of two
-systems and a pipeline between them — [shortcomings](#current-shortcomings) has the edges.
+The trade is real: Penca is not competitive with bare-metal Postgres on transaction latency,
+and its analytical side is young. [Current shortcomings](#current-shortcomings) is specific
+about where the edges are.
 
 ## See it work
 
 Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a branch
 per agent off `main`, drives one shared deterministic visitor feed through all three, lets
-each read back its own committed writes to steer its next move, then ranks them, deletes
-every fork and shows `main` untouched. Its scoreboard:
+each steer on its own committed writes, then ranks them, deletes every fork and shows `main`
+untouched. Its scoreboard:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -47,10 +56,10 @@ every fork and shows `main` untouched. Its scoreboard:
 | `even`    |        3000 |         307 | 10.23% |
 
 `greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even` splits
-on the visitor index and never reads — that read-your-writes loop on a branch is the pitch.
-The policies are toy; the mechanic is the point. Figures are one seeded run on 2026-07-27:
-reproducible, not pinned. The forks copy no rows, which the demo asserts rather than prints
-— see [`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
+on the visitor index and never reads. The policies are toy; the mechanic is the point.
+Figures are one seeded run on 2026-07-27 — reproducible, not pinned. The forks copy no rows,
+which the demo asserts rather than prints: see
+[`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
 ## Quick start
 
@@ -60,12 +69,11 @@ set -a && source docker/.client.env      # PENCA_*_URL for the client
 uv run python examples/sandbox_demo.py
 ```
 
-You need [Docker](https://docs.docker.com/engine/install/),
-[`uv`](https://docs.astral.sh/uv/) and [`just`](https://github.com/casey/just). The first
-`just penca-up` compiles the server image from source, which takes a while; a prebuilt
-image is on the way. Ports are fixed (Postgres 5432, Flight SQL 50060) and bound to
-loopback. Data is ephemeral unless you ask for a directory, which survives
-`just penca-down`:
+You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
+and [`just`](https://github.com/casey/just). The first `just penca-up` compiles the server
+image from source, which takes a while; a prebuilt image is on the way. Ports are fixed
+(Postgres 5432, Flight SQL 50060) and bound to loopback. Data is ephemeral unless you ask
+for a directory, which survives `just penca-down`:
 
 ```bash
 just penca-up --db ~/.penca/data
@@ -73,7 +81,7 @@ just penca-up --db ~/.penca/data
 
 ## How this differs
 
-The defensible claim is the *conjunction*, on one copy. Each alternative has a leg of it:
+The defensible claim is the *conjunction*, on one copy. Each alternative holds a leg of it:
 
 - **Neon** — branchable Postgres. Branch plus OLTP, but no columnar analytics on the
   branch: queries run on the row store, at row-store cost.
@@ -120,22 +128,17 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 ## Features
 
 - [x] Fork, merge and discard a branch — gRPC only, no SQL branch DDL exists
-- [x] Fork copies no rows off `main`
-- [x] Read-your-writes on a branch, over SQL or gRPC
+- [x] Fork copies no rows off `main`; read-your-writes on the branch, over SQL or gRPC
 - [x] Time travel — read any table as of an earlier commit
 - [x] Audit trail — full version history per row, including tombstones
 - [x] ACID transactions spanning every schema in a catalog
-- [x] SQL over Arrow Flight SQL (JDBC / ODBC / ADBC)
-- [x] gRPC API for catalog, schema, table, branch, transaction and data operations
+- [x] SQL over Arrow Flight SQL (JDBC / ODBC / ADBC), and a full gRPC API
 - [x] Primary-key point lookups and secondary-index seeks pushed into the scan
-- [x] Lance and Parquet cold-tier formats on any S3-compatible store
-- [x] Autonomous persist / snapshot / purge scheduler
-- [ ] Branch `diff` and `revert`
-- [ ] Forking off a fork
+- [x] Lance and Parquet on any S3-compatible store, with an autonomous lifecycle scheduler
+- [ ] Branch `diff` and `revert`, and forking off a fork
 - [ ] Retention pruning
 - [ ] Authentication and authorization
-- [ ] Highly-available lifecycle scheduler
-- [ ] Per-branch compute isolation
+- [ ] Highly-available lifecycle scheduler, and per-branch compute isolation
 
 ## Current shortcomings
 
@@ -175,9 +178,8 @@ served from Postgres in steady state, but recoverable from the object store alon
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md) — connecting, a first table over SQL and gRPC, the demos, DataGrip
-- [docs/architecture.md](docs/architecture.md) — services, storage tiers, concepts · [docs/development.md](docs/development.md) — build, run, test
-- [docs/algorithms.md](docs/algorithms.md) — write path, read path, branch merge · [docs/performance.md](docs/performance.md) — benchmarks
+- [docs/usage.md](docs/usage.md) — connecting, a first table over SQL and gRPC, the demos, DataGrip · [docs/development.md](docs/development.md) — build, run, test
+- [docs/architecture.md](docs/architecture.md) — services, tiers, concepts · [docs/algorithms.md](docs/algorithms.md) — read/write/merge · [docs/performance.md](docs/performance.md) — benchmarks
 - [docs/schema-reference.md](docs/schema-reference.md) — system tables · [docs/decisions/](docs/decisions/) — ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## License
