@@ -973,6 +973,27 @@ impl WriteManager {
         .await?;
         let branch_uuid = parse_resolved_uuid(&branch.branch_uuid, "branch_uuid")?;
 
+        // `main` is the catalog's root, not a branch you can tear down. Deleting
+        // it leaves the catalog unusable for reasons unrelated to cold data —
+        // every read resolves the main branch, so subsequent requests fail with
+        // "main branch missing for catalog" — and `DeleteCatalog` is the
+        // operation for removing a catalog.
+        //
+        // Not a substitute for the refcount gate, which is what actually makes
+        // cross-fork teardown safe. This only removes a case that was never
+        // coherent: while forks are main-only (CHA-515), "delete the branch a
+        // fork inherits from" always means deleting `main`, so there is no
+        // legitimate caller. TODO(CHA-509): once a fork can be a non-main
+        // branch, deleting an intermediate parent becomes legitimate and the
+        // gate is the only thing standing behind it.
+        let main_branch_uuid = resolve_main_branch_uuid(pool, &catalog_uuid).await?;
+        if branch_uuid == main_branch_uuid {
+            return Err(ApiError::InvalidRequest(format!(
+                "cannot delete the catalog's main branch ({branch_uuid}); \
+                 use DeleteCatalog to remove the catalog"
+            )));
+        }
+
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
         span.record("branch_uuid", tracing::field::display(&branch_uuid));
