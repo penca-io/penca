@@ -51,16 +51,16 @@ def rpc_error_to_api_error(err: RpcError) -> Exception:
     if code == StatusCode.UNIMPLEMENTED:
         return NotImplementedError(detail)
 
-    # ADR 0019 / CHA-233: `read_data` / `audit_data` past
-    # ``query_timeout_seconds`` surfaces as ``RESOURCE_EXHAUSTED``;
-    # mirror the Rust ``ApiError::QueryTimeout`` variant so callers
-    # can catch a typed Python exception.
     # ABORTED is the concurrency-conflict code: the operation made no changes,
     # so reissuing is safe. Mapped to its own class so a caller can retry it
     # without also swallowing genuine failures.
     if code == StatusCode.ABORTED:
         return AbortedError(detail)
 
+    # ADR 0019 / CHA-233: `read_data` / `audit_data` past
+    # ``query_timeout_seconds`` surfaces as ``RESOURCE_EXHAUSTED``;
+    # mirror the Rust ``ApiError::QueryTimeout`` variant so callers
+    # can catch a typed Python exception.
     if code == StatusCode.RESOURCE_EXHAUSTED:
         return QueryTimeoutError(detail)
 
