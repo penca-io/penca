@@ -930,6 +930,15 @@ impl WriteManager {
                 .query_manager
                 .list_table_uuids_for_branch(tx, dl_driver, &catalog_str, None, &source_branch_str)
                 .await?;
+            // Two distinct axes, so two distinct values. `fork.commit_micros` is
+            // the fork POSITION; the copied rows' `commit_micros` is a phase-2
+            // commit stamp answering "when did this row become visible", which is
+            // now — stamping the fork position there would date the stamp before
+            // the transaction that wrote the row. Inert while every consumer
+            // treats the column as an IS NOT NULL visibility flag, but the column
+            // has to keep meaning what it says for the next comparative reader.
+            // Atomicity comes from this transaction, not from the value.
+            let copy_commit_micros = LifecycleManager::now_micros(tx).await?;
             for inherited_table in &inherited_tables {
                 LifecycleManager::materialize_fork_cold_references(
                     tx,
@@ -939,7 +948,7 @@ impl WriteManager {
                     inherited_table,
                     fork.commit_seq_num,
                     fork.commit_micros,
-                    fork.commit_micros,
+                    copy_commit_micros,
                 )
                 .await?;
             }
@@ -1030,8 +1039,11 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
 
-        // Phase 1: collect all cold storage file URIs. `schema_uuid = None`
-        // makes this the catalog-wide table list.
+        // `schema_uuid = None` makes this the catalog-wide table list. Read
+        // outside the transaction because it is a schema-level read whose result
+        // the enqueue does not depend on being point-in-time with: a table
+        // created after this read has no cold segments on a branch being torn
+        // down, and one dropped before it has none either.
         let table_uuid_strs = self
             .query_manager
             .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
@@ -1041,80 +1053,97 @@ impl WriteManager {
         // tables; snapshot segments key directly on `(branch, table)`.
         let segment_table_uuids: Vec<&str> = table_uuid_strs.iter().map(String::as_str).collect();
 
-        let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
-            pool,
-            &catalog_str,
-            &branch_str,
-            &segment_table_uuids,
-        )
-        .await?;
-
-        let mut snap_segments: Vec<(String, String)> = Vec::new();
-        for table_uuid_str in &table_uuid_strs {
-            let segs = LifecycleManager::get_snapshot_segments_for_table(
-                pool,
-                &catalog_str,
-                &branch_str,
-                table_uuid_str,
-            )
-            .await?;
-            snap_segments.extend(segs);
-        }
-
-        // Cold-index sidecars are their own files and their own delete-set
-        // participants (ADR 0026 §5), but they are not reachable from the base
-        // segment enumeration above — they hang off an index header. Without
-        // this they would leak past the partition CASCADE below, and an
-        // enqueue-only teardown would make that leak permanent rather than
-        // merely untidy.
-        let snap_segment_uuids: Vec<String> =
-            snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
-        let sidecar_uris: Vec<String> = LifecycleManager::list_segment_index_metadata(
-            pool,
-            &catalog_str,
-            &branch_str,
-            &snap_segment_uuids,
-        )
-        .await?
-        .into_iter()
-        .map(|sidecar| sidecar.object_uri)
-        .collect();
-
-        // Also enumerate in-flight compact merged files tracked in
-        // `compact_segment_metadata`. Two cases:
-        //   - committed rows: the merged file is still referenced by
-        //     `table_*_segment_metadata` rows on the branch and is
-        //     covered by the persist/snap enumerations above. The
-        //     overlap is harmless — `writer.delete` is idempotent.
-        //   - NULL rows (crashed-mid-compact orphans): no segment
-        //     metadata points at the merged file, so without this
-        //     enumeration the file would leak past the partition
-        //     CASCADE in Phase 3.
-        let compact_uris =
-            LifecycleManager::get_compact_segment_uris_for_branch(pool, &catalog_str, &branch_str)
-                .await?;
-
-        // Every URI the branch referenced, queued as one set. Deduped because
-        // one physical file legitimately backs several rows (the packer packs
-        // many partitions into one file) and `segment_delete_set` holds one row
-        // per file.
-        let queued_uris: Vec<String> = persist_segments
-            .into_iter()
-            .map(|(_, uri)| uri)
-            .chain(snap_segments.into_iter().map(|(_, uri)| uri))
-            .chain(compact_uris)
-            .chain(sidecar_uris)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Phase 2: queue the files and drop the metadata, atomically. One
+        // Enumerate the files AND drop the metadata in one transaction. One
         // transaction because removing the references and queueing the files must
         // be a single fact: a crash between them leaves either an unreferenced
         // file nothing will ever collect, or a queued file still referenced with
         // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
         // already queued by another branch's retirement the later grace clock.
+        //
+        // The enumeration is INSIDE the transaction, not before it. Reading on
+        // `pool` first left a window in which a concurrent lifecycle wave on this
+        // branch could commit new segment rows and cold files after the read: the
+        // CASCADE below then drops those rows, leaving a file that is both
+        // unreferenced and absent from `segment_delete_set` — permanently
+        // uncollectable, since enqueue-only teardown retired the orphan-scan
+        // fallback that used to cover it. `drop_branch_partitions` takes
+        // partition-level ACCESS EXCLUSIVE, which serialises such a wave out, so
+        // enumerating in the same transaction closes the window instead of
+        // merely narrowing it.
         with_pg_tx(pool, async |tx| {
+            let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
+                tx,
+                &catalog_str,
+                &branch_str,
+                &segment_table_uuids,
+            )
+            .await?;
+
+            let mut snap_segments: Vec<(String, String)> = Vec::new();
+            for table_uuid_str in &table_uuid_strs {
+                let segs = LifecycleManager::get_snapshot_segments_for_table(
+                    tx,
+                    &catalog_str,
+                    &branch_str,
+                    table_uuid_str,
+                )
+                .await?;
+                snap_segments.extend(segs);
+            }
+
+            // Cold-index sidecars are their own files and their own delete-set
+            // participants (ADR 0026 §5), but they are not reachable from the base
+            // segment enumeration above — they hang off an index header. Without
+            // this they would leak past the partition CASCADE below, and an
+            // enqueue-only teardown would make that leak permanent rather than
+            // merely untidy.
+            //
+            // `list_all_segment_index_uris`, not the committed-only planning read:
+            // the CASCADE drops uncommitted sidecar rows too, so a sidecar whose
+            // phase-2 stamp had not landed would lose its row without its URI ever
+            // being queued. Matches the two sibling enumerations above, neither of
+            // which filters on `commit_micros`.
+            let snap_segment_uuids: Vec<String> =
+                snap_segments.iter().map(|(uuid, _)| uuid.clone()).collect();
+            let sidecar_uris: Vec<String> = LifecycleManager::list_all_segment_index_uris(
+                tx,
+                &catalog_str,
+                &branch_str,
+                &snap_segment_uuids,
+            )
+            .await?;
+
+            // Also enumerate in-flight compact merged files tracked in
+            // `compact_segment_metadata`. Two cases:
+            //   - committed rows: the merged file is still referenced by
+            //     `table_*_segment_metadata` rows on the branch and is
+            //     covered by the persist/snap enumerations above. The
+            //     overlap is harmless — the delete set holds one row per file.
+            //   - NULL rows (crashed-mid-compact orphans): no segment
+            //     metadata points at the merged file, so without this
+            //     enumeration the file would leak past the partition
+            //     CASCADE below.
+            let compact_uris = LifecycleManager::get_compact_segment_uris_for_branch(
+                tx,
+                &catalog_str,
+                &branch_str,
+            )
+            .await?;
+
+            // Every URI the branch referenced, queued as one set. Deduped because
+            // one physical file legitimately backs several rows (the packer packs
+            // many partitions into one file) and `segment_delete_set` holds one row
+            // per file.
+            let queued_uris: Vec<String> = persist_segments
+                .into_iter()
+                .map(|(_, uri)| uri)
+                .chain(snap_segments.into_iter().map(|(_, uri)| uri))
+                .chain(compact_uris)
+                .chain(sidecar_uris)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
             let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
             if deleted {
                 for table_uuid_str in &table_uuid_strs {
@@ -1131,9 +1160,10 @@ impl WriteManager {
                 // table_persist_segment_metadata, table_snapshot_metadata,
                 // and table_snapshot_segment_metadata via DROP TABLE
                 // CASCADE — so explicit per-row DELETEs against those
-                // parents would be redundant. Only the cold-storage file
-                // deletes (Phase 2 above) and the data-table drops above
-                // are tier-specific and stay here.
+                // parents would be redundant. Dropping those rows is exactly
+                // what makes the enqueued files unreferenced, which is what
+                // lets the sweep's refcount gate collect them. Only the
+                // data-table drops above are tier-specific and stay here.
                 LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
 
                 // Delete-set LAST, after the partition drops, per the ordering

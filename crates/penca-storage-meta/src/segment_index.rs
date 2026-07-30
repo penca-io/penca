@@ -431,6 +431,48 @@ impl LifecycleManager {
             .collect())
     }
 
+    /// Every sidecar `object_uri` for a set of base segments — committed AND
+    /// uncommitted — for branch teardown's delete-set enqueue.
+    ///
+    /// Deliberately unfiltered, unlike [`Self::list_segment_index_metadata`].
+    /// Teardown's `DROP TABLE … CASCADE` removes a branch's sidecar rows
+    /// regardless of their commit state, so a sidecar whose phase-2 stamp had
+    /// not landed loses its row; under enqueue-only teardown, a URI that never
+    /// reached `segment_delete_set` is never collected by anything. The two
+    /// sibling enumerations teardown pairs this with
+    /// ([`Self::get_table_persist_segments_for_tables`],
+    /// [`Self::get_snapshot_segments_for_table`]) carry no commit predicate for
+    /// the same reason.
+    ///
+    /// This is the read-side counterpart of the asymmetry `retire` already
+    /// handles on the write side, where a committed-only list is paired with an
+    /// unconditional `delete_segment_index_metadata_for_segments`.
+    ///
+    /// 1 SQL query (no-op on empty input).
+    pub async fn list_all_segment_index_uris(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+        segment_uuids: &[String],
+    ) -> Result<Vec<String>> {
+        if segment_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = parse_uuid(catalog_uuid);
+        let table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let uuid_refs: Vec<&str> = segment_uuids.iter().map(String::as_str).collect();
+        let arr = format_sql_uuid_array(&uuid_refs);
+        let sql = format!(
+            "SELECT object_uri FROM {table} \
+             WHERE branch_uuid = $1 AND segment_uuid = ANY({arr})",
+            table = qi(&table),
+        );
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .await?;
+        Ok(rows.iter().map(|r| r.get("object_uri")).collect())
+    }
+
     /// Carry forward the internal `row_uuid` sidecar of each carried base
     /// segment (CHA-406): for each `(new_seg ← prior_seg)` pair, copy the prior
     /// segment's committed sidecar to a new row under the new segment, NULL-
