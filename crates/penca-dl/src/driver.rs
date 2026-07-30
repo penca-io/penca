@@ -231,7 +231,12 @@ async fn read_and_cache_full<R: FormatReader>(
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
     cache.insert(
-        slice_cache_key(&segment.uri, Some(segment.offset), Some(segment.length)),
+        slice_cache_key(
+            &segment.uri,
+            Some(segment.offset),
+            Some(segment.length),
+            full_schema,
+        ),
         Arc::clone(&batch),
         weight,
     );
@@ -292,12 +297,34 @@ async fn read_projected_uncached<R: FormatReader>(
 /// Content-safe: the per-row seq ceiling is applied AFTER the read
 /// (`apply_segment_seq_ceiling`), so a cached entry never encodes a per-row
 /// bound that could differ between two rows naming the same slice.
-fn slice_cache_key(uri: &str, offset: Option<i64>, length: Option<i64>) -> String {
-    match (offset, length) {
+fn slice_cache_key(
+    uri: &str,
+    offset: Option<i64>,
+    length: Option<i64>,
+    decode_schema: &SchemaRef,
+) -> String {
+    let slice = match (offset, length) {
         (Some(o), Some(l)) => format!("{uri}#{o}+{l}"),
         // A segment that owns its whole object records no slice bounds.
         _ => format!("{uri}#full"),
-    }
+    };
+    // The decode schema is part of the identity, because the cached value is NOT
+    // the file's native decode: `read_segment` null-fills to the CALLER's schema
+    // before returning. Under uuid keying an entry belonged to one branch's row,
+    // so its decode schema was that branch's table schema and this was implicit.
+    // Slice keying merges entries across branches — precisely where schemas can
+    // diverge, since a fork can ALTER independently of the parent while still
+    // naming the parent's slice. Without this, `main` adding `c BIGINT` and a
+    // fork adding `c TEXT` would have whichever missed first cache an all-null
+    // `c` of its own type, and the other branch's `project_batch_to_schema` would
+    // fail on the type mismatch — a cache-state-dependent error on a branch whose
+    // own metadata is consistent.
+    let fields: Vec<String> = decode_schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+        .collect();
+    format!("{slice}|{}", fields.join(","))
 }
 
 /// Cache-aware read of a single snapshot segment. Returns the full decoded
@@ -321,7 +348,12 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let key = slice_cache_key(&segment.uri, Some(segment.offset), Some(segment.length));
+    let key = slice_cache_key(
+        &segment.uri,
+        Some(segment.offset),
+        Some(segment.length),
+        full_schema,
+    );
 
     if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
@@ -373,7 +405,7 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
     cache.insert(
-        slice_cache_key(&segment.uri, segment.offset, segment.length),
+        slice_cache_key(&segment.uri, segment.offset, segment.length, full_schema),
         Arc::clone(&batch),
         weight,
     );
@@ -475,7 +507,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let key = slice_cache_key(&segment.uri, segment.offset, segment.length);
+    let key = slice_cache_key(&segment.uri, segment.offset, segment.length, full_schema);
 
     if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
@@ -519,11 +551,19 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    if let Some(batch) = cache.get(&slice_cache_key(
+    // The sidecar's key schema is the indexed columns' native types; the
+    // identity/name sidecars are the all-Utf8 special case. Derived BEFORE the
+    // lookup because it is part of the cache key — the cached batch is decoded
+    // to this schema, so two callers wanting different key types must not share
+    // an entry.
+    let schema = penca_format::index::segment_index_schema(key_types);
+    let key = slice_cache_key(
         &sidecar.object_uri,
         Some(sidecar.offset),
         Some(sidecar.length),
-    )) {
+        &schema,
+    );
+    if let Some(batch) = cache.get(&key) {
         span.record("cache", "hit");
         return Ok((*batch).clone());
     }
@@ -532,9 +572,6 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
-    // The sidecar's key schema is the indexed columns' native types; the
-    // identity/name sidecars are the all-Utf8 special case.
-    let schema = penca_format::index::segment_index_schema(key_types);
     let batch = reader
         .read_segment(
             &sidecar.object_uri,
@@ -548,15 +585,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let batch = Arc::new(batch);
     // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
     // decoded-but-not-cached rather than evicting the whole budget.
-    cache.insert(
-        slice_cache_key(
-            &sidecar.object_uri,
-            Some(sidecar.offset),
-            Some(sidecar.length),
-        ),
-        Arc::clone(&batch),
-        sidecar.size_bytes.max(0) as u64,
-    );
+    cache.insert(key, Arc::clone(&batch), sidecar.size_bytes.max(0) as u64);
     Ok((*batch).clone())
 }
 
@@ -1040,7 +1069,12 @@ mod tests {
 
     /// The cache key `segment(uuid, _)` lands under.
     fn seg_key(uuid: &str) -> String {
-        slice_cache_key(&format!("s3://test/{uuid}.parquet"), Some(0), Some(0))
+        slice_cache_key(
+            &format!("s3://test/{uuid}.parquet"),
+            Some(0),
+            Some(0),
+            &test_schema(),
+        )
     }
 
     /// Driver whose single reader (Parquet) is a counting reader; returns the
@@ -1835,6 +1869,42 @@ mod tests {
             cache.get(&seg_key("big")).is_none(),
             "oversized segment not stored"
         );
+    }
+
+    #[test]
+    fn slice_cache_key_separates_diverging_decode_schemas() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Same slice, two branches whose tables diverged on column `c`'s type.
+        // Reachable since CHA-539: a fork's copied row names the parent's
+        // (uri, offset, length) while the fork can ALTER independently.
+        let bigint: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        let text: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+
+        let a = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &bigint);
+        let b = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &text);
+        assert_ne!(
+            a, b,
+            "two branches decoding one slice to different column types must not \
+             share a cache entry — the cached batch is null-filled to the \
+             CALLER's schema, so sharing it hands the other branch a column of \
+             the wrong type and fails its projection"
+        );
+
+        // The dedup the slice key exists for still holds: same slice, same
+        // schema, different rows naming it -> one entry.
+        let c = slice_cache_key("s3://b/x.lance", Some(0), Some(10), &bigint);
+        assert_eq!(a, c, "one slice decoded one way is one cache entry");
+
+        // And distinct slices of one packed file stay distinct.
+        let d = slice_cache_key("s3://b/x.lance", Some(10), Some(10), &bigint);
+        assert_ne!(a, d, "the packer packs many partitions into one file");
     }
 
     #[tokio::test]

@@ -1385,7 +1385,7 @@ impl PgDialect {
             .collect::<Vec<_>>()
             .join(", ");
         driver
-            .execute_no_result(&format!("LOCK TABLE {list} IN ACCESS EXCLUSIVE MODE"))
+            .execute_no_result(&format!("LOCK TABLE ONLY {list} IN ACCESS EXCLUSIVE MODE"))
             .await
             .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         Ok(())
