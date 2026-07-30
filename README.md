@@ -13,6 +13,11 @@
 
 ## Introduction
 
+> [!WARNING]
+> **Penca is very early, closer to a proof of concept than a product.** Expect bugs and
+> rough edges, and read [Current shortcomings](#current-shortcomings) before you plan
+> anything around it: much of the [roadmap](#roadmap) is still ahead of us.
+
 Penca is a database that serves transactional and analytical queries from one copy of your
 data, stored as open columnar files on object storage. Unlike a split OLTP/OLAP stack there
 is no second system and no CDC pipeline between them: the files an analytical query reads
@@ -150,16 +155,15 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
   `UPDATE`/`DELETE`. There is no setting to choose, per catalog or at all.
 - **OLTP is passable, not competitive.** A point read or write is dominated by the fixed
   per-statement pipeline rather than by the storage underneath it, and the SQL path pays
-  more of that than the gRPC one. Good enough to build on, not a swap for Postgres on
+  more of that than the gRPC one. Good enough to build on, not a swap for bare-metal Postgres on
   single-client transactional work. Measure it yourself with `examples/oltp_demo.py`.
 - **OLAP is under-optimized.** Effort went into derisking transactions on a data lake first;
-  at small scale Postgres still wins the analytical query, a crossover rather than a wall
-  ([docs/performance.md](docs/performance.md)).
+  at small scale Postgres still wins the analytical query, a crossover rather than a wall.
 - **No Iceberg export.** The cold tier is open Lance or Parquet and any engine can read the
   files, but nothing publishes them as an Iceberg table.
 - **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
-- **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
+- **No full-text search and no vector indexes.** Secondary indexes are currently equality seeks only.
 
 ## Roadmap
 
