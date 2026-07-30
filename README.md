@@ -141,8 +141,9 @@ crash-safety invariants in [docs/algorithms.md](docs/algorithms.md).
 - **Branching is narrower than git.** You can fork `main`, not a fork, and merging back is
   fast-forward only — if the target took a commit past your fork point the merge is refused
   rather than reconciled. No conflict resolution, no `diff`, no `revert`.
-- **Last-write-wins is the only isolation level.** Branch concurrency resolves per row by
-  latest writer; there is no snapshot-isolation setting to choose, per catalog or at all.
+- **No configurable isolation level.** Reads inside an open transaction do get a snapshot
+  taken at `BEGIN`, but concurrent writes resolve last-writer-wins per row — no conflict
+  detection, and no level to choose, per catalog or at all.
 - **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
   operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
   single-statement read-modify-write. TPC-B tracks the gap, not parity.
