@@ -13,6 +13,11 @@
 
 ## Introduction
 
+> [!WARNING]
+> **Penca is very early, closer to a proof of concept than a product.** Expect bugs and
+> rough edges, and read [Current shortcomings](#current-shortcomings) before you plan
+> anything around it: much of the [roadmap](#roadmap) is still ahead of us.
+
 Penca is a database that serves transactional and analytical queries from one copy of your
 data, stored as open columnar files on object storage. Unlike a split OLTP/OLAP stack there
 is no second system and no CDC pipeline between them: the files an analytical query reads
