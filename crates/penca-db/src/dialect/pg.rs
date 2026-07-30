@@ -1396,17 +1396,21 @@ impl PgDialect {
             .collect::<Vec<_>>()
             .join(", ");
         // Bounded wait, so a teardown that loses a lock race fails fast with
-        // 55P03 for the caller to retry rather than parking on the lock. Ordering
-        // alone cannot remove every deadlock class here (see the note above), so
-        // the caller pairs this with a retry.
+        // 55P03 rather than parking on the lock. Ordering alone cannot remove
+        // every deadlock class here (see the note above), so the caller reports
+        // what is left as `Aborted` for the client to reissue.
+        //
+        // Both errors propagate UNWRAPPED. Re-wrapping as `sqlx::Error::Protocol`
+        // would erase the `Error::Database` variant, and `as_database_error()`
+        // returns `Some` only for that variant — so the SQLSTATE match the caller
+        // keys on would fail for exactly the 55P03/40P01 this timeout exists to
+        // raise, and the caller would surface `Internal` instead.
         driver
             .execute_no_result("SET LOCAL lock_timeout = '5s'")
-            .await
-            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+            .await?;
         driver
             .execute_no_result(&format!("LOCK TABLE ONLY {list} IN ACCESS EXCLUSIVE MODE"))
-            .await
-            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+            .await?;
         Ok(())
     }
 
