@@ -76,8 +76,8 @@ just penca-up --db ~/.penca/data
 
 The defensible claim is the *conjunction*, on one copy. Each alternative holds part of it:
 
-- **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
-  branch: queries run on the row store, at row-store cost.
+- **Neon.** Branchable Postgres on object storage. Branch plus OLTP, but data is persisted
+  as Postgres data pages. Does not provide OLAP capabilities out of the box.
 - **Dolt.** Branching, merge and audit, open source, but on a bespoke row-oriented
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie.** Branching over open columnar files, but no interactive
