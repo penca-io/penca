@@ -7,34 +7,36 @@
 [![Rust](https://img.shields.io/badge/rust-1.94+-orange)](rust-toolchain.toml)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](pyproject.toml)
 
-# Branchable OLTP + OLAP on one open columnar copy of your data
+# Branchable and versioned OLTP + OLAP on one open columnar copy of your data
 
-**Open-source and self-hostable on object storage — no second system, no ETL.**
+**Open-source and self-hostable on object storage — no second system, no CDC, no ETL.**
 
 ## Introduction
 
-Penca is a database you can fork like a git branch. A fork is a full read-write copy of
-your data that copies no rows, and you can run transactions *and* analytical queries
-against it. Fork production, let something loose on it, compare what it did, discard it.
+Penca is a database you can fork like a git branch. A fork is a full read-write copy of your
+data that copies no rows, and you can run transactions *and* analytical queries against it.
+Fork production, let something loose on it, compare what it did, discard it.
 
 Writes land in an internal Postgres hot tier under a real ACID transaction; a background
-pipeline persists, snapshots and purges them out to columnar files on object storage
-(Lance by default, Parquet supported). Reads merge both tiers on the fly, so a query
-sees committed writes immediately whichever tier they sit in. That merge is what makes
-the fork → transact → read-it-back loop *interactive* rather than a batch job. The
-Postgres tier ships inside the stack and Penca bootstraps it for you; object storage is
-the substrate you point it at.
+pipeline persists, snapshots and purges them out to columnar files on object storage (Lance
+by default, Parquet supported). Reads merge both tiers on the fly, so a query sees committed
+writes immediately whichever tier they sit in — that merge is what makes the fork →
+transact → read-it-back loop *interactive* rather than a batch job.
 
-The honest trade: Penca is not competitive with Postgres on transaction latency, and its
-analytical side is young. What you get is one copy of your data instead of two systems and
-a pipeline between them — [shortcomings](#current-shortcomings) has the edges.
+Object storage is pluggable, and the **only permanent home** for your data: the hot tier
+is a write buffer that purge reclaims once rows are cold. What you keep is one set of open
+columnar files, readable by anything that reads Lance or Parquet.
+
+The honest trade: Penca is not competitive with bare-metal Postgres on transaction latency,
+and its analytical side is young. What you get is one copy of your data instead of two
+systems and a pipeline between them — [shortcomings](#current-shortcomings) has the edges.
 
 ## See it work
 
 Three agents, three strategies, one live dataset. `examples/sandbox_demo.py` forks a
-branch per agent off `main`, drives one shared deterministic visitor feed through all
-three, lets each read back its own committed writes to steer its next move, then ranks
-them, deletes every fork and shows `main` untouched. Its scoreboard:
+branch per agent off `main`, drives one shared deterministic visitor feed through all three,
+lets each read back its own committed writes to steer its next move, then ranks them,
+deletes every fork and shows `main` untouched. Its scoreboard:
 
 | branch    | impressions | conversions | rate   |
 |:----------|------------:|------------:|:-------|
@@ -43,10 +45,10 @@ them, deletes every fork and shows `main` untouched. Its scoreboard:
 | `even`    |        3000 |         307 | 10.23% |
 
 `greedy` and `epsilon` beat `even` because they steer on what they just wrote; `even`
-splits on the visitor index and never reads — that read-your-writes loop on a branch is
-the pitch. The policies are toy; the mechanic is the point. Figures come from one seeded
-run on 2026-07-27: reproducible, but not pinned. The forks copy no rows, which the demo
-asserts rather than prints — see
+splits on the visitor index and never reads — that read-your-writes loop on a branch is the
+pitch. The policies are toy; the mechanic is the point. Figures come from one seeded run on
+2026-07-27: reproducible, but not pinned. The forks copy no rows, which the demo asserts
+rather than prints — see
 [`integration_sandbox_demo_test.py`](tests/integration/integration_sandbox_demo_test.py).
 
 ## Quick start
@@ -138,17 +140,16 @@ A limitation you find yourself after a rosy README costs more than one you read 
   service, and the Flight SQL handshake is unimplemented. Anything that reaches the ports
   has full access — hence the loopback bind. Do not expose Penca to a network you do not
   control.
-- **Branches share compute.** Only storage is isolated; every branch runs on the same
-  stack's CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
+- **Branches share compute.** Only storage is isolated; every branch runs on the same stack's
+  CPU, so concurrent multi-branch load contends. Know it before you benchmark it.
 - **Single-level branching.** You can fork `main`, not a fork — the attempt is rejected
   rather than silently returning incomplete data.
-- **Retention is configured but never prunes.** Reads below the floor are refused so
-  nothing serves partial history, but nothing reclaims it, and the window is immutable
-  once set.
+- **Retention is configured but never prunes.** Reads below the floor are refused so nothing
+  serves partial history, but nothing reclaims it, and the window is immutable once set.
 - **The lifecycle scheduler is v0** — single replica, no leader election.
-- **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates
-  point operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms
-  for a single-statement read-modify-write. TPC-B tracks the gap, not parity.
+- **OLTP is passable, not competitive.** The fixed per-statement pipeline dominates point
+  operations: ~15 ms of SQL-layer overhead over the equivalent gRPC seek, ~40 ms for a
+  single-statement read-modify-write. TPC-B tracks the gap, not parity.
 - **OLAP is under-optimized.** Effort so far went into derisking transactions on a data
   lake; at small scale Postgres still wins the analytical query — a crossover, not a wall.
   See [docs/performance.md](docs/performance.md).
@@ -172,8 +173,7 @@ story the shortcomings section is missing.
 - [docs/usage.md](docs/usage.md) — connecting, a first table over SQL and gRPC, the demos, DataGrip
 - [docs/architecture.md](docs/architecture.md) — services, storage tiers, concepts · [docs/development.md](docs/development.md) — build, run, test
 - [docs/algorithms.md](docs/algorithms.md) — write path, read path, branch merge · [docs/performance.md](docs/performance.md) — benchmarks
-- [docs/schema-reference.md](docs/schema-reference.md) — system table schemas
-- [docs/decisions/](docs/decisions/) — ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
+- [docs/schema-reference.md](docs/schema-reference.md) — system tables · [docs/decisions/](docs/decisions/) — ADRs · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## License
 
