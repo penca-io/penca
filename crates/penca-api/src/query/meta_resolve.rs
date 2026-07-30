@@ -61,9 +61,14 @@ use super::cold_read::stream_cold_read;
 /// acceptable because final consistency is enforced at `CommitTx`
 /// (`commit_open_tx` takes `FOR UPDATE OF begin_tx_log` and re-checks abort),
 /// so no committed data ever references a non-open tx — the orphaned
-/// upsert/delete rows are filtered by the `commit_tx_log` JOIN on read. A
-/// `for_update=true` lock here would only serialize concurrent appends to the
-/// same tx without buying any correctness — `CommitTx` is the authoritative gate.
+/// upsert/delete rows are filtered by the `commit_tx_log` JOIN on read. The
+/// fully-atomic tightening is to fold this predicate into the upsert/delete
+/// INSERT as a CTE (see the note on `crate::write::WriteManager::apply_change`).
+/// A `for_update=true` lock here is not taken: every append-path caller already
+/// runs inside a Pg transaction (via `crate::tx::with_pg_tx`), but locking
+/// `begin_tx_log` on this advisory fast-fail would only serialize concurrent
+/// appends to the same tx without buying any correctness — `CommitTx` is the
+/// authoritative gate.
 pub(crate) async fn resolve_tx(
     driver: &impl DbDriver<Row = PgRow>,
     catalog_uuid: &Uuid,
