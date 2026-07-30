@@ -632,30 +632,42 @@ impl LifecycleManager {
         // `snapshotted_at_micros <= LEAST(as_of, COALESCE(persist_wm, -1))` bound
         // collapses to -1 and the inherited snapshot is never picked. Zero rows,
         // silently — the same failure the inclusive baseline header above exists
-        // to prevent, which is why it is worth a check rather than a comment.
+        // to prevent, which is why it is worth failing the fork over.
         //
-        // Believed unreachable, and the reason is a property of persist rather
-        // than of this copy: a persist run's window is bounded below by the PURGE
-        // watermark, not by the previous run, so a run above the fork re-packs
-        // the pre-fork rows too and carries `min_commit_seq_num <= fork_seq`.
-        // Measured on a real fork — two runs over one table came out as
-        // `[min_seq 4, max_seq 4]` and `[min_seq 4, max_seq 6]` across a fork at
-        // seq 5, so the later run qualified on the earlier run's rows. Reaching
-        // the empty case needs the parent purged past the fork point, which is
-        // exactly what cross-branch retention preservation prevents.
+        // REACHABLE, on a legitimate request. At a HEAD fork it is not: nothing is
+        // committed above the head, so every non-empty parent run trivially
+        // carries `min_commit_seq_num <= fork_seq` and qualifies. Measured there —
+        // two runs over one table came out `[min_seq 4, max_seq 4]` and
+        // `[min_seq 4, max_seq 6]` across a fork at seq 5, the later run
+        // qualifying on the earlier run's rows, because a persist window is
+        // bounded below by the PURGE watermark rather than by the previous run.
         //
-        // So this is an invariant check, not a fallback path: failing the fork
-        // loudly beats writing a child that reads as empty, and a speculative
-        // repair branch here could never be tested.
+        // A HISTORICAL fork inverts that. `resolve_fork_watermark` accepts an
+        // arbitrary `ForkPoint`, resolved through `resolve_committed_tx`, which
+        // reaches the cold `tx_log` precisely for positions PurgeTxLog has already
+        // collected — so such a fork sits below the parent's purge watermark, every
+        // run above the baseline carries `min_commit_seq_num > fork_seq`, and none
+        // qualifies. Combine that with a baseline landing on no header's
+        // `persisted_at_micros` (an as_of-pinned parent snapshot) and the header set
+        // comes out empty.
+        //
+        // Do NOT attribute the guard to cross-branch retention preservation: CHA-72
+        // is unimplemented, and even implemented it preserves data for forks that
+        // already exist, while a historical fork is created after the parent purged
+        // past its position. There is nothing to preserve for a branch that does
+        // not exist yet.
+        //
+        // So: a precondition on the request, not an internal fault. The caller
+        // fixes it by forking closer to head — same family as the plan-time
+        // retention floor, and it surfaces with the same code.
         if !wrote_any_header && baseline_watermark.is_some() {
-            return Err(crate::MetadataError::Db(sqlx::Error::Protocol(format!(
-                "fork copy for table {table} adopted a baseline snapshot at \
-                 watermark {watermark:?} but copied no persist header; the child \
-                 would read zero rows. Every parent persist run at or above the \
-                 baseline carried only post-fork data, which implies the parent \
-                 was purged past fork seq {fork_commit_seq_num}",
+            return Err(crate::MetadataError::FailedPrecondition(format!(
+                "cannot fork table {table} at commit_seq_num {fork_commit_seq_num}: \
+                 the source has no persist run at or below that position covering \
+                 its adopted baseline (watermark {watermark:?}), so the fork would \
+                 read no rows. Fork at a more recent position",
                 watermark = baseline_watermark,
-            ))));
+            )));
         }
 
         Ok(())
