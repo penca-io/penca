@@ -1,29 +1,32 @@
-"""CHA-540 red-tests — open-tx snapshot resolution is resolved once, and a dead
-``open_tx_uuid`` is an error rather than a silent downgrade.
+"""CHA-540 — open-tx snapshot resolution happens once, and a dead ``open_tx_uuid``
+is an error rather than a silent downgrade.
 
 An autocommit read over Flight SQL resolves its snapshot to an integer once
 (``pin_as_of_seq`` stamps the seq frontier on the ticket) and every downstream
-resolution is then a pure arm. With a tx open, ``open_tx_uuid`` rides instead and
-``read_data`` resolves the tx **twice** against Postgres: once in ``resolve_base``
--> ``resolve_read_snapshot`` -> ``get_open_tx_began_at_seq_num`` (no validation),
-and again in ``read_data`` -> ``resolve_query_snapshot`` -> ``get_tx_status``.
+resolution is then a pure arm. With a tx open, ``open_tx_uuid`` rides instead, and
+``read_data`` used to resolve the tx **twice** against Postgres: once in
+``resolve_base`` -> ``resolve_read_snapshot`` (a bare unvalidated
+``begin_tx_log`` SELECT) and again for the data read via a second, validating
+resolver. Both the bare SELECT and that second resolver are now gone —
+``resolve_read_snapshot`` validates once via ``resolve_tx`` and ``read_data``
+reuses the result.
 
 This module pins:
 
 - ``test_open_tx_read_issues_one_begin_tx_log_lookup`` — an open-tx read issues
-  exactly ONE statement referencing the branch's ``begin_tx_log`` partition.
-  Fail-first: today it issues 2. This is the only red test here.
+  exactly ONE statement referencing the branch's ``begin_tx_log`` partition. This
+  was the red test: before the fix it issued 2.
 - the ``TestDeleteSchemaWithDeadTx`` and ``TestDeadTxCharacterization`` cases — a
-  dead ``open_tx_uuid`` keeps returning the status code it returns today. These are
+  dead ``open_tx_uuid`` returns the same status codes it always has. These were
   GREEN before and after; acceptance criterion 2 is "same status codes it does
   today", so they are regression guards, not red tests.
 
-The fallthrough in ``resolve_read_snapshot``'s open-tx arm has no user-visible
-consequence today, which is why nothing here goes red for it: reads are covered by
-``resolve_query_snapshot`` and every append path is covered by ``resolve_tx``.
-Removing it matters because CHA-540 deletes ``resolve_query_snapshot``, after which
-``resolve_read_snapshot`` is the read path's only dead-tx validation — so these
-guards are what would go red if the fallthrough survived that deletion.
+The fallthrough these guards protect against had no user-visible consequence
+before the change, which is why none of them went red for it: reads were covered
+by the second validating resolver and every append path by ``resolve_tx``. It
+mattered because deleting that second resolver leaves ``resolve_read_snapshot`` as
+the read path's only dead-tx validation — so these guards are what would go red if
+the fallthrough had survived the deletion.
 
 Counting is via ``pg_stat_statements``, the same seam the CHA-367 / CHA-441
 resolution-count tests use: ``count_stmts_referencing`` sums ``calls`` over
@@ -121,9 +124,9 @@ class TestDeleteSchemaWithDeadTx:
     """Characterization guard — GREEN before and after CHA-540.
 
     `delete_schema_cascade` passes `request_tx_uuid` straight into
-    `resolve_read_snapshot`, which is the one caller that does not subsequently
-    reach the validating `resolve_query_snapshot`. That looks like it should expose
-    the fallthrough, and it does not: every append path first calls `resolve_tx`
+    `resolve_read_snapshot` and, unlike `read_data`, never had a second validating
+    resolver behind it. That looks like it should expose the fallthrough, and it
+    does not: every append path first calls `resolve_tx`
     (`crates/penca-api/src/write/mod.rs`), which runs the same
     `begin_tx_log ⟕ abort_tx_log ⟕ commit_tx_log` join and rejects a dead tx with
     exactly these codes before the fallthrough can matter.

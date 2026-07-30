@@ -12,7 +12,8 @@
 //! arbitrate here: `GetFlightInfo` mints a fresh ticket (no client-supplied
 //! snapshot reaches it), and the `as_of` ⊕ `open_tx_uuid` mutual exclusion is
 //! enforced fail-fast at the read boundary (`penca-api`
-//! `resolve_query_snapshot`), never silently collapsed in this helper.
+//! `QueryManager::resolve_read_snapshot`), never silently collapsed in this
+//! helper.
 
 /// Decide the auto-commit read-snapshot pin. `None` when a
 /// tx is open — the open tx carries the snapshot via `open_tx_uuid` and the pin
