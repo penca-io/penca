@@ -261,8 +261,9 @@ message GetIndexRequest {
   optional string index_uuid = 9;
   optional string index_name = 10;
 
-  // CHA-164: RYOW. Mutually exclusive with `as_of_micros` / `as_of_seq`;
-  // INVALID_ARGUMENT if set alongside either. (Pin pair at
+  // CHA-164: RYOW. Mutually exclusive with `as_of_micros`; INVALID_ARGUMENT if
+  // both set. This message has no `as_of_seq` — its `RequestIdents` impl uses
+  // the no-seq variant, so that axis is always unset here. (Pin pair at
   // 11/12 — fields 9/10 are the index identifier, fixing the draft's
   // field-number collision.)
   optional string open_tx_uuid = 11;
