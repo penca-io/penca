@@ -671,17 +671,32 @@ penca-up profile="dev" db="" build="": vm-gc
     if [ -s "$HOME/.aws/credentials" ]; then export PENCA_AWS_CREDENTIALS="$HOME/.aws/credentials"; fi
     if [ -s "$HOME/.aws/config" ]; then export PENCA_AWS_CONFIG="$HOME/.aws/config"; fi
 
-    # Build once, explicitly, rather than via `up --build`. All six servicers
-    # share ONE image ref, but compose does not dedupe their identical build
-    # configs — `up --build` runs six concurrent targets that all race to
-    # export the same tag, and on the FIRST build of a tag that does not exist
-    # yet the losers die with `image "...": already exists`. Latent before
-    # CHA-187 only because `penca-rust-server:latest` already existed on every
-    # machine that had ever run this; a fresh tag or a fresh clone hits it
-    # every time. Building one service produces the image all six then find
-    # locally via `pull_policy: missing`.
+    # Materialize the shared image with exactly ONE target before `up`, so
+    # `up` never has to produce it. All six servicers name the same image ref
+    # but compose does not dedupe their identical build configs, so any path
+    # that leaves `up` to produce a missing image fans out six concurrent
+    # targets racing to export one tag — and the losers die with
+    # `image "...": already exists`. That bites hardest precisely where the
+    # tag provably does not exist yet: a `--build=1` run against a fresh
+    # profile tag, and the `pull_policy: missing` degradation where the pull
+    # fails and compose falls back to building (fresh clone before the first
+    # publish lands, offline, or a package that is not public yet). Latent
+    # before CHA-187 only because `penca-rust-server:latest` already existed
+    # on any machine that had ever run this.
+    #
+    # `query` is an arbitrary member of the six — they share one build config,
+    # so building any one of them produces the image the rest then find
+    # locally.
+    image_ref=$(docker compose $compose_files $env_file $profiles config --format json \
+        | jq -r '.services.query.image')
     if [ -n "$build_flag" ]; then
         docker compose $compose_files $env_file $profiles build query
+    elif ! docker image inspect "$image_ref" >/dev/null 2>&1; then
+        # Not already local, so `up` would otherwise resolve it six times over.
+        # Pull it once; on failure fall back to a single build target rather
+        # than letting compose degrade into the six-way race.
+        docker compose $compose_files $env_file $profiles pull query \
+            || docker compose $compose_files $env_file $profiles build query
     fi
     docker compose $compose_files $env_file $profiles up -d
 

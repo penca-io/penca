@@ -419,6 +419,44 @@ def test_penca_up_does_not_build_by_default():
     )
 
 
+def test_penca_up_never_leaves_the_image_to_up():
+    """`up` must never be the thing that produces a missing image.
+
+    The six servicers name one image ref but compose does not dedupe their
+    identical build configs, so any path that lets `up` resolve a missing
+    image fans out six concurrent targets racing to export one tag — the
+    losers die with ``image "...": already exists``. No config-shape assertion
+    reaches that race, but the *shape of the fix* is an ordinary Justfile line,
+    and re-appending ``$build_flag`` to the ``up`` call would reinstate a
+    first-build failure for every contributor while the rest of this suite
+    stayed green.
+    """
+    body = _recipe_body(_read("Justfile"), "penca-up")
+    # Match real invocations only: the prose explaining this invariant, and
+    # the --db refusal message ("build context (compose.yml ...)"), both
+    # mention compose and build without invoking either.
+    code = [line for line in body.splitlines() if not line.strip().startswith("#")]
+
+    up_calls = [line for line in code if "docker compose" in line and "up -d" in line]
+    assert up_calls, "penca-up no longer brings the stack up"
+    for line in up_calls:
+        assert "--build" not in line and "build_flag" not in line, (
+            f"`up` must not build; materialize the image beforehand: {line.strip()!r}"
+        )
+
+    # Both producing paths — explicit --build=1, and the pull-failure
+    # degradation — must go through a single-service build.
+    builds = [line for line in code if "docker compose" in line and " build " in line]
+    assert len(builds) >= 2, (
+        "expected a single-service build for both the --build=1 path and the "
+        f"pull-failure fallback, found {len(builds)}"
+    )
+    for line in builds:
+        assert re.search(r"build \S+\s*(\\|\||$)", line.strip()), (
+            f"build must name exactly one service, not fan out: {line.strip()!r}"
+        )
+
+
 def test_local_code_recipes_force_a_build():
     """Assertion 14: these loops test the working tree, not the published tag.
 
