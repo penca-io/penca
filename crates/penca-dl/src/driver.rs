@@ -974,11 +974,15 @@ mod tests {
         .unwrap()
     }
 
+    /// `content_hash` is derived from the name so distinct fixtures stay
+    /// distinct under content-hash cache keying; tests asserting dedup
+    /// overwrite it with a deliberately shared value.
     fn segment(uuid: &str, size_bytes: i64) -> SnapshotSegment {
         SnapshotSegment {
             table_snapshot_segment_uuid: uuid.to_string(),
             format: Format::Parquet,
             size_bytes,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
@@ -1088,7 +1092,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&[&format!(
+                    "idx-{name}"
+                )]),
             }),
             ..Default::default()
         }
@@ -1252,7 +1258,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&[&format!(
+                    "idx-{name}"
+                )]),
             }),
             ..Default::default()
         }
@@ -1523,7 +1531,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity-never-read".to_string(),
             size_bytes: 256,
-            content_hash: Uuid::nil(),
+            content_hash: penca_core::naming::deterministic_uuid_from(&["idx-identity-never-read"]),
         });
         let dl = routing_driver(cache, by_uri);
 
@@ -1553,7 +1561,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity".to_string(),
             size_bytes: 256,
-            content_hash: Uuid::nil(),
+            content_hash: penca_core::naming::deterministic_uuid_from(&["idx-identity"]),
         });
         let name_index = Uuid::new_v4();
         let res = dl
@@ -1595,7 +1603,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-other".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["idx-other"]),
             },
         )];
         let requested = Uuid::new_v4(); // != the keyed index present
@@ -1640,7 +1648,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-keyed-never-read".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&[
+                    "idx-keyed-never-read",
+                ]),
             },
         )];
         let dl = routing_driver(cache, by_uri);

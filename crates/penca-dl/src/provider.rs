@@ -674,7 +674,6 @@ mod tests {
     use datafusion::datasource::MemTable;
     use penca_core::{Format, PersistPlan};
     use penca_format::reader::{AnyFormatReader, FormatError};
-    use uuid::Uuid;
 
     fn user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -816,7 +815,7 @@ mod tests {
             offset: None,
             length: None,
             max_commit_seq_num: None,
-            content_hash: Uuid::nil(),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
         }
     }
 
@@ -1030,6 +1029,7 @@ mod tests {
             table_snapshot_segment_uuid: uuid.to_string(),
             format: Format::Parquet,
             size_bytes,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
@@ -1325,7 +1325,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar1"]),
             }),
             ..Default::default()
         };
@@ -1399,7 +1399,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar1"]),
             }),
             ..Default::default()
         };
@@ -1487,7 +1487,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "sc".to_string(),
             size_bytes: 64,
-            content_hash: Uuid::nil(),
+            content_hash: penca_core::naming::deterministic_uuid_from(&["sc"]),
         });
         let provider = SnapshotTableProvider::new(
             vec![seg],
@@ -1556,7 +1556,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-identity"]),
             }),
             index_sidecars: vec![(
                 user_index_uuid.to_string(),
@@ -1567,7 +1567,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-user".to_string(),
                     size_bytes: 256,
-                    content_hash: Uuid::nil(),
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-user"]),
                 },
             )],
             ..Default::default()
@@ -1649,7 +1649,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-identity"]),
             }),
             // No keyed sidecars: the user entry below cannot resolve.
             ..Default::default()
@@ -1701,7 +1701,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "id-sc".to_string(),
                 size_bytes: 1,
-                content_hash: Uuid::nil(),
+                content_hash: penca_core::naming::deterministic_uuid_from(&["id-sc"]),
             }),
             index_sidecars: vec![(
                 user.to_string(),
@@ -1712,7 +1712,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "user-sc".to_string(),
                     size_bytes: 1,
-                    content_hash: Uuid::nil(),
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["user-sc"]),
                 },
             )],
             ..Default::default()
@@ -1787,7 +1787,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-value".to_string(),
                     size_bytes: 256,
-                    content_hash: Uuid::nil(),
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-value"]),
                 },
             )],
             ..Default::default()
@@ -1899,7 +1899,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-x".to_string(),
                     size_bytes: 128,
-                    content_hash: Uuid::nil(),
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-x"]),
                 },
             )],
             ..Default::default()
@@ -1977,6 +1977,7 @@ mod by_plan_order_tests {
             uri: uri.to_string(),
             format: Format::Parquet,
             size_bytes: 64,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
