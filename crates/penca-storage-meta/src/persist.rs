@@ -44,7 +44,8 @@ impl LifecycleManager {
         commit_seq_num: Option<i64>,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "INSERT INTO {table} \
              (table_persist_uuid, branch_uuid, table_uuid, \
@@ -82,7 +83,8 @@ impl LifecycleManager {
         table_persist_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_persist_uuid = $2",
@@ -111,7 +113,8 @@ impl LifecycleManager {
         table_persist_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_persist_uuid = $2 \
@@ -146,7 +149,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(persisted_at_micros) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \
@@ -194,7 +198,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(commit_seq_num) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \
@@ -265,8 +270,9 @@ impl LifecycleManager {
         // `latest_committed_table_persist_watermark` — lifecycle ops call that
         // without a floor, so overloading it would ripple.
         let catalog = parse_uuid(catalog_uuid);
-        let persist_name = naming::table_persist_metadata_table(&catalog);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let persist_name = naming::table_persist_metadata_partition(&catalog, &branch);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let window_start = crate::retention_window_start_expr("$3");
         let floor_select =
             crate::retention_floor_select(&qi(&snap_name), "$1", "$2", &window_start);
@@ -334,7 +340,8 @@ impl LifecycleManager {
         statistics: &[u8],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         // min/max_commit_seq_num are stamped alongside the committed_at bounds
         // and, like them, are NOT refreshed by the DO UPDATE: compact re-points
         // storage location only and preserves the original commit-order bounds.
@@ -415,7 +422,8 @@ impl LifecycleManager {
         seal_now: bool,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let seal_clause = if seal_now { ", is_sealed = TRUE" } else { "" };
         let sql = format!(
             "UPDATE {table} SET \
@@ -458,7 +466,8 @@ impl LifecycleManager {
         size_bytes: i64,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET size_bytes = $1 \
              WHERE branch_uuid = $2 AND table_persist_segment_uuid = $3",
@@ -487,7 +496,8 @@ impl LifecycleManager {
         table_persist_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_persist_segment_uuid = $2",
@@ -516,7 +526,8 @@ impl LifecycleManager {
         table_persist_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_persist_segment_uuid = $2 \
@@ -556,8 +567,9 @@ impl LifecycleManager {
         max_persisted_at_micros: Option<i64>,
     ) -> Result<Vec<(Uuid, LogKind)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT DISTINCT seg.table_uuid, tfm.log_kind \
              FROM {seg} seg \
@@ -619,8 +631,9 @@ impl LifecycleManager {
         max_persisted_at_micros: Option<i64>,
     ) -> Result<Vec<LogKind>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT DISTINCT tfm.log_kind \
              FROM {seg} seg \
@@ -689,8 +702,9 @@ impl LifecycleManager {
         for_update: bool,
     ) -> Result<Vec<PgRow>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT seg.table_persist_segment_uuid, seg.table_persist_uuid, seg.object_uri, \
                     seg.\"offset\", seg.length, seg.format, seg.row_count, seg.size_bytes, \
@@ -783,7 +797,8 @@ impl LifecycleManager {
         table_uuids: &[&str],
     ) -> Result<Vec<(String, String)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         if table_uuids.is_empty() {
             return Ok(Vec::new());
         }
@@ -821,7 +836,8 @@ impl LifecycleManager {
         table_persist_segment_uuids: &[String],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let segment_uuid_refs: Vec<&str> = table_persist_segment_uuids
             .iter()
             .map(String::as_str)
