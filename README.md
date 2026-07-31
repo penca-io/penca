@@ -29,11 +29,10 @@ columnar files (Lance by default, Parquet supported). Reads merge both tiers, so
 sees committed writes immediately whichever tier they sit in.
 
 Object storage is pluggable and the only permanent home for anything Penca stores. Table
-data lives there today. Catalog and branch metadata is served from Postgres for latency,
-and the [roadmap](#roadmap) checkpoints it to the object store and reconstitutes those
-Postgres tables from the checkpointed records at startup. The end state is that nothing on
-local disk is durable: a Postgres page is always rebuildable from the object store, never a
-system of record.
+data lives there today. Catalog and branch metadata is served from Postgres for latency;
+checkpointing it to the object store and reconstituting those Postgres tables at startup is
+on the [roadmap](#roadmap). The end state is that nothing on local disk is durable: a
+Postgres page is always rebuildable from the object store, never a system of record.
 
 A branch is a full read-write copy that copies no rows, so forking production is cheap
 enough to do per experiment. Every mutation appends to an immutable log carrying an author
