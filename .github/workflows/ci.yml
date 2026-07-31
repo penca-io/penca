@@ -278,12 +278,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Cache mode differs per arch on purpose. The Actions cache is a
+          # single 10 GB per-repository budget with LRU eviction, and a
+          # mode=max scope over this cargo-chef cook layer is multiple GB —
+          # three of them (integration's, plus one per arch) would evict each
+          # other and push every build back toward cold, including the
+          # merge-gating integration job.
+          #
+          # amd64 is the same platform and Dockerfile the integration job
+          # already stores at mode=max, so it reads that scope and stores only
+          # its own final stage. arm64 has no such sibling, so its scope is
+          # the only cook-layer cache it will ever get and stays mode=max.
+          # Risk therefore lands on the publish job (an occasional cold
+          # rebuild) rather than on the merge gate.
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
+            cache_from: |
+              type=gha,scope=publish-amd64
+              type=gha
+            cache_mode: min
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+            cache_from: type=gha,scope=publish-arm64
+            cache_mode: max
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -304,12 +323,11 @@ jobs:
           # human-readable name, which is the manifest-list-less state this
           # job exists to avoid.
           outputs: type=image,name=ghcr.io/penca-io/penca-rust-server,push-by-digest=true,name-canonical=true,push=true
-          # Per-arch scopes: the two architectures share no layers, so a
-          # single scope just thrashes. Deliberately NOT the `integration`
-          # job's scope either — both run on the same push event, so sharing
-          # would be a concurrent cache write race for no gain.
-          cache-from: type=gha,scope=publish-${{ matrix.arch }}
-          cache-to: type=gha,scope=publish-${{ matrix.arch }},mode=max
+          # Per-arch scopes: the two architectures share no layers, so one
+          # shared scope would just thrash. See the matrix above for why the
+          # store mode differs per arch.
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: type=gha,scope=publish-${{ matrix.arch }},mode=${{ matrix.cache_mode }}
           # Same sccache→S3 wiring as the integration pre-build (CHA-440).
           # Inert on arm64: the Dockerfile gates its sccache download on
           # x86_64, so that leg leans on the layer cache alone.

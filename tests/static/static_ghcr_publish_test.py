@@ -165,14 +165,58 @@ def test_publish_image_pushes_by_digest_without_tags():
 
 
 def test_publish_image_cache_scopes_are_per_arch():
-    """Assertion 5: the two arches share no layers, so a shared scope thrashes."""
+    """Assertion 5: the two arches share no layers, so a shared scope thrashes.
+
+    Asserted on the resolved per-leg values rather than on the templated
+    string, since the legs no longer configure their sources identically.
+    """
     job = _job(_yaml(".github/workflows/ci.yml"), "publish-image")
     with_ = _step_using(job, "docker/build-push-action@v6")["with"]
 
-    for key in ("cache-from", "cache-to"):
-        assert "matrix.arch" in with_[key], (
-            f"{key} must be scoped per arch, got {with_[key]!r}"
+    assert "matrix.arch" in with_["cache-to"], (
+        f"cache-to must be scoped per arch, got {with_['cache-to']!r}"
+    )
+
+    for leg in job["strategy"]["matrix"]["include"]:
+        arch, sources = leg["arch"], leg["cache_from"]
+        other = "arm64" if arch == "amd64" else "amd64"
+
+        assert f"scope=publish-{arch}" in sources, f"{arch} must read its own scope"
+        assert f"scope=publish-{other}" not in sources, (
+            f"{arch} reads the {other} scope; the two share no layers"
         )
+
+
+def test_publish_is_scoped_to_main_merges():
+    """Dropping the `if:` would publish unreviewed branches straight to :main.
+
+    Every other publish-image assertion still passes without it, so this is
+    the one thing standing between a same-repo PR branch and the tag the
+    quickstart pulls.
+    """
+    condition = _job(_yaml(".github/workflows/ci.yml"), "publish-image").get("if", "")
+
+    assert "github.event_name == 'push'" in condition, (
+        f"publish-image must be push-scoped, got if: {condition!r}"
+    )
+
+
+def test_merge_job_cannot_publish_a_single_arch_manifest():
+    """`always()` here would ship a one-arch :main whenever a leg failed.
+
+    With fail-fast: false the surviving leg still uploads its digest, so an
+    always() merge job would run `imagetools create` over that one digest and
+    publish a manifest list covering a single architecture — silently breaking
+    everyone on the other one. A plain `needs:` skips instead, because a matrix
+    job's aggregate result is `failure` if any leg failed.
+    """
+    condition = str(
+        _job(_yaml(".github/workflows/ci.yml"), "publish-image-merge").get("if", "")
+    )
+
+    assert "always" not in condition, (
+        f"publish-image-merge must skip when a leg fails, got if: {condition!r}"
+    )
 
 
 def test_workflow_never_reaches_for_qemu():
