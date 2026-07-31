@@ -679,6 +679,14 @@ def test_penca_up_never_leaves_the_image_to_up():
                         f"it never runs on that path: {arm[0].strip()!r}"
                     )
 
+                # The other non-dominating shape: the export sits inside a
+                # nested block that CLOSES before the build, so depth goes
+                # negative and the export never runs on this path either.
+                assert depth >= 0, (
+                    "the redirect is inside a block that closes before the "
+                    f"build, so it does not dominate it: {arm[0].strip()!r}"
+                )
+
     assert checked >= 2, (
         "expected a build in both the --build=1 arm and the pull-failure "
         f"fallback, found {checked}"

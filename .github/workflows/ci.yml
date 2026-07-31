@@ -486,10 +486,20 @@ jobs:
             # tag; the immutable short-sha is always safe to publish.
             git -C "$GITHUB_WORKSPACE" fetch --quiet origin main
             tip=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
-            if [ "$tip" = "$GITHUB_SHA" ]; then
+            # "Am I the tip" is not the question — it is "will a newer image
+            # ever be published". publish-image is path-filtered, so a docs
+            # merge landing behind a Rust merge publishes nothing at all, and
+            # a bare tip check would leave :main stuck on the PREVIOUS image
+            # until some future Rust merge. So decline only when the newer
+            # commits actually touch the image.
+            if [ "$tip" = "$GITHUB_SHA" ] || git -C "$GITHUB_WORKSPACE" diff --quiet \
+                 "$GITHUB_SHA" "$tip" -- crates protos docker Cargo.toml Cargo.lock; then
               tags+=(-t "$image:main")
             else
-              echo "::notice::$GITHUB_SHA is behind main ($tip); publishing the short-sha only"
+              echo "::notice::$GITHUB_SHA is behind main ($tip), which rebuilds the image; publishing the short-sha only"
+              # Point the post-publish inspect at a tag THIS run wrote, not at
+              # some other run's :main — which may not exist at all yet.
+              release_tag="${GITHUB_SHA::7}"
             fi
           fi
 
