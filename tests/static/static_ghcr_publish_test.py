@@ -210,17 +210,33 @@ def test_merge_job_assembles_one_manifest_list_under_both_tags():
 
 
 def test_ci_success_gates_on_the_publish_jobs():
-    """Assertion 8.
+    """Assertion 8: a failed publish has to turn main red.
 
-    Both are ``skipped`` on pull_request and merge_group, which ci-success
-    already tolerates, so the merge gate is unaffected. What this buys is the
-    post-merge signal: a failed publish turns main red instead of leaving every
-    new user pulling a stale :main.
+    ``needs`` alone does not achieve that. ci-success runs ``if: always()``, so
+    a failed dependency does not fail it — the verdict comes entirely from the
+    ``success|skipped`` loop in its run body. Listing a job in ``needs`` and
+    forgetting the loop loses the signal silently, so both are asserted.
+
+    (Both are ``skipped`` on pull_request and merge_group, which that same loop
+    tolerates, so the merge gate is unaffected.)
     """
-    needs = _job(_yaml(".github/workflows/ci.yml"), "ci-success")["needs"]
+    job = _job(_yaml(".github/workflows/ci.yml"), "ci-success")
+    needs = job["needs"]
+    runs = "\n".join(step.get("run", "") for step in job["steps"])
 
-    for job in ("publish-image", "publish-image-merge"):
-        assert job in needs, f"ci-success must need {job!r}, got {needs}"
+    # Scope to the `for result in ... ; do` list, not the whole run body: the
+    # neighbouring `echo` lines name every result too, so a body-wide check
+    # stays green when a job is dropped from the list that actually decides.
+    loop = re.search(r"for result in(.*?); do", runs, re.DOTALL)
+    assert loop, "ci-success no longer has a for-result loop to check"
+    checked = loop.group(1)
+
+    for name in ("publish-image", "publish-image-merge"):
+        assert name in needs, f"ci-success must need {name!r}, got {needs}"
+        assert f"needs.{name}.result" in checked, (
+            f"ci-success needs {name!r} but never checks its result — "
+            "if: always() means this loop, not needs, is what decides the gate"
+        )
 
 
 def test_integration_job_runs_the_image_it_just_built():
@@ -233,12 +249,22 @@ def test_integration_job_runs_the_image_it_just_built():
     job = _job(_yaml(".github/workflows/ci.yml"), "integration")
     prebuilt = _step_using(job, "docker/build-push-action@v6")["with"]["tags"]
 
-    env = {}
-    for step in job["steps"]:
-        env.update(step.get("env", {}))
+    # Resolve the effective env for the step that actually runs the suite, not
+    # a union over every step: a union would both accept PENCA_IMAGE set on an
+    # unrelated step (which the suite never sees) and reject the equally valid
+    # job-level placement.
+    suite = [
+        step for step in job["steps"] if "just integration-test" in step.get("run", "")
+    ]
+    assert len(suite) == 1, (
+        f"expected exactly one integration-test step, found {len(suite)}"
+    )
+
+    env = {**job.get("env", {}), **suite[0].get("env", {})}
 
     assert env.get("PENCA_IMAGE") == prebuilt, (
-        f"integration must run its pre-built tag {prebuilt!r}, got PENCA_IMAGE={env.get('PENCA_IMAGE')!r}"
+        f"the integration-test step must run the pre-built tag {prebuilt!r}, "
+        f"got PENCA_IMAGE={env.get('PENCA_IMAGE')!r}"
     )
 
 
@@ -324,8 +350,14 @@ def test_local_code_recipes_force_a_build():
 
 
 def test_docs_no_longer_promise_a_from_source_first_run():
-    """Assertion 15."""
-    readme = _read("README.md")
+    """Assertion 15.
+
+    Matched against whitespace-collapsed text because this prose is
+    hard-wrapped: the original README split the claim as "compiles the
+    server\\nimage from source", so a raw substring check passed vacuously and
+    would have kept passing with the stale promise fully intact.
+    """
+    readme = " ".join(_read("README.md").split())
 
     for stale in (
         "compiles the server image from source",
@@ -333,9 +365,16 @@ def test_docs_no_longer_promise_a_from_source_first_run():
     ):
         assert stale not in readme, f"README still says {stale!r}"
 
-    development = _read("docs/development.md")
-    assert not re.search(r"arrives with[^\n]*CHA-187", development), (
+    development = " ".join(_read("docs/development.md").split())
+
+    assert not re.search(r"arrives with[^.]*CHA-187", development), (
         "docs/development.md still forward-references CHA-187 for the published image"
+    )
+    # The prereq table used to claim every first run compiles regardless. Left
+    # standing, a contributor runs the published :main believing their own
+    # edits are under test.
+    assert "builds the servicer image from source" not in development, (
+        "docs/development.md still claims penca-up builds from source"
     )
 
 
