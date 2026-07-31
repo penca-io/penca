@@ -516,7 +516,20 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         span.record("cache", "hit");
         return shape_native(&batch, &schema);
     }
-    span.record("cache", "miss");
+    let weight = sidecar.size_bytes.max(0) as u64;
+    // Telemetry only — unlike a base segment there is no narrower read to fall
+    // back to, so a non-admissible sidecar is still decoded whole (`insert`
+    // self-gates). Reporting the base paths' three-valued vocabulary is what
+    // makes a sidecar that can *never* cache — re-decoded from S3 on every read
+    // — distinguishable from an ordinary first touch.
+    span.record(
+        "cache",
+        if cache.admits(weight) {
+            "miss-cached"
+        } else {
+            "miss-uncached"
+        },
+    );
     let code = sidecar.format.as_wire_code();
     let reader = readers
         .get(&code)
@@ -528,7 +541,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         Some(sidecar.offset),
         Some(sidecar.length),
         sidecar.content_hash,
-        sidecar.size_bytes.max(0) as u64,
+        weight,
     )
     .await?;
     shape_native(&batch, &schema)
