@@ -180,3 +180,57 @@ reads footers, `register_listing_table` hits object storage,
 Tracked upstream: a real `clone_ctx()` in `datafusion-python` would let
 Python match Rust's mechanics exactly; until then the factory is the correct
 shape.
+
+---
+
+## Cold segments are cached by content hash, not by row uuid
+
+Every cold-artifact metadata row — persist segments, snapshot segments, and
+segment index sidecars — carries a `content_hash`: an `xxh3_128` digest of the
+**typed in-memory Arrow batch**, computed once at write time
+(`penca_core::digest::segment_content_hash`). `SegmentCache` is keyed by it.
+
+**The problem.** Reference copies mint a new row uuid over an unchanged
+`(object_uri, offset, length)`: `insert_carried_snapshot_segments` and
+`insert_carried_segment_indexes` carry a snapshot forward (CHA-531), and
+`fork_copy` materializes a fork's cold references at fork time (CHA-539).
+Nobody rewrites the bytes. A uuid-keyed cache therefore stored N identical
+decodes of one byte range — N× the memory under a fixed byte budget, and N cold
+reads to fill it. A fork's cold footprint is *mostly* its parent's files, so N
+grows with the branch count, which is the thing Penca expects to be cheap.
+
+**Why hash the decoded batch, not the encoded file bytes.** Two rows may
+reference the same byte slice under different schemas — that is exactly what a
+fork that `ALTER`s a column produces. Hashing the file bytes would collide them
+and hand one caller the other's types. Hashing the typed batch keeps the key a
+name for one decoded value.
+
+The same argument forced the cached *value* to be the file-native decode, with
+caller-shaping (projection + null-fill of columns added by a later
+`ALTER TABLE ADD COLUMN`) moved *after* the lookup —
+`FormatReader::read_segment_native` plus `reader::shape_to_schema`. A
+caller-shaped entry carries
+the schema of whichever branch decoded first, so the second branch's read fails
+on a type mismatch its own metadata never justified.
+
+**Why the scope is uniform across artifact classes.** Base segments and index
+sidecars both come out of object storage through the same `SegmentCache` and are
+both reference-copied by carry-forward and fork copy, so they duplicate for the
+same reason and dedup the same way. Sidecars were briefly scoped out on the
+argument that `segment_index_schema(key_types)` makes the cached value
+caller-dependent — but that argument is wrong for the same reason it is wrong
+for base segments, and the native-decode split answers it.
+
+`content_hash` is `NOT NULL` with no default on all three tables
+(`penca-db/src/dialect/pg.rs`). Every writer computes it and a catalog predating
+the column is recreated rather than migrated, so there is no legacy row to
+default and no uuid-fallback key space to keep alive.
+
+**Non-goal.** `tx_log_persist_segment_metadata` has no `content_hash`: it is
+never cache-read and never reference-copied.
+
+**Open question.** CHA-545 names checksum reuse as a possible second use of this
+digest. It is not available yet: the digest is taken on the in-memory batch
+before the format writer encodes it, and Parquet may widen a type or
+re-dictionary-encode on round-trip, so using it as a stored-file checksum needs
+round-trip stability established first.
