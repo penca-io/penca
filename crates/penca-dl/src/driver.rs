@@ -226,6 +226,7 @@ async fn decode_and_cache_native<R: FormatReader>(
     offset: Option<i64>,
     length: Option<i64>,
     content_hash: Uuid,
+    format_code: i32,
     weight: u64,
 ) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
@@ -233,7 +234,7 @@ async fn decode_and_cache_native<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(content_hash, Arc::clone(&batch), weight);
+    cache.insert(content_hash, format_code, Arc::clone(&batch), weight);
     tracing::debug!(rows = batch.num_rows(), "segment decoded and cached");
     Ok(batch)
 }
@@ -313,14 +314,14 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<CachedSegment, DlError> {
     let span = tracing::Span::current();
+    let code = segment.format.as_wire_code();
 
-    if let Some(full) = cache.get(&segment.content_hash) {
+    if let Some(full) = cache.get(&segment.content_hash, code) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok(CachedSegment::Native(full));
     }
 
-    let code = segment.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
@@ -338,6 +339,7 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
                 Some(segment.offset),
                 Some(segment.length),
                 segment.content_hash,
+                code,
                 weight,
             )
             .await?,
@@ -448,14 +450,14 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
+    let code = segment.format.as_wire_code();
 
-    if let Some(full) = cache.get(&segment.content_hash) {
+    if let Some(full) = cache.get(&segment.content_hash, code) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return shape_native(&full, full_schema);
     }
 
-    let code = segment.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
@@ -473,6 +475,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
             segment.offset,
             segment.length,
             segment.content_hash,
+            code,
             weight,
         )
         .await?;
@@ -509,10 +512,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
+    let code = sidecar.format.as_wire_code();
     // The sidecar's key schema is the indexed columns' native types; the
     // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
-    if let Some(batch) = cache.get(&sidecar.content_hash) {
+    if let Some(batch) = cache.get(&sidecar.content_hash, code) {
         span.record("cache", "hit");
         return shape_native(&batch, &schema);
     }
@@ -530,7 +534,6 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
             "miss-uncached"
         },
     );
-    let code = sidecar.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
@@ -541,6 +544,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         Some(sidecar.offset),
         Some(sidecar.length),
         sidecar.content_hash,
+        code,
         weight,
     )
     .await?;
@@ -2035,7 +2039,7 @@ mod tests {
             "oversized segment is never cached — both accesses re-read storage"
         );
         assert!(
-            cache.get(&seg.content_hash).is_none(),
+            cache.get(&seg.content_hash, seg.format.as_wire_code()).is_none(),
             "oversized segment not stored"
         );
     }
@@ -2057,7 +2061,11 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache.get(&segment("a", 150).content_hash).is_none() {
+        let a = segment("a", 150);
+        let evicted = if cache
+            .get(&a.content_hash, a.format.as_wire_code())
+            .is_none()
+        {
             "a"
         } else {
             "b"

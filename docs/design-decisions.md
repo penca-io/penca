@@ -188,7 +188,8 @@ shape.
 Every cold-artifact metadata row — persist segments, snapshot segments, and
 segment index sidecars — carries a `content_hash`: an `xxh3_128` digest of the
 **typed in-memory Arrow batch**, computed once at write time
-(`penca_core::digest::segment_content_hash`). `SegmentCache` is keyed by it.
+(`penca_core::digest::segment_content_hash`). `SegmentCache` is keyed by
+`(content_hash, format)`.
 
 **The problem.** Reference copies mint a new row uuid over an unchanged
 `(object_uri, offset, length)`: `insert_carried_snapshot_segments` and
@@ -207,6 +208,15 @@ encodes. Hashing the stored object would mean reading back what was just written
 It also makes dedup insensitive to encoding choices, so two independently written
 segments holding the same rows share an entry even if the writer picked different
 row-group boundaries or dictionary encodings.
+
+**Why `format` is the other half of the key.** Digesting the batch pre-encode is
+exactly what lets one hash name files in two formats, once
+`OBJECT_STORAGE_FORMAT` has been flipped between two writes of the same content.
+The cached *value*, meanwhile, is the file-native decode — a per-format artifact,
+since a round-trip may widen a type or re-dictionary-encode. So the format joins
+the cache key rather than the digest: the pair names one native decode, and
+`content_hash` stays a pure function of the batch, which is what lets a reference
+copy inherit it verbatim.
 
 **What the key deliberately does *not* do is separate a reference copy from its
 source.** Carry-forward and fork copy select `old.content_hash` verbatim

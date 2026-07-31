@@ -378,7 +378,7 @@ the `log_kind` classification (CHA-218: only `upsert_log` and
 | `length` | int64 (set at compact time) |
 | `row_count` | int64 |
 | `format` | text (parquet, lance) |
-| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key with `format`) |
 | `size_bytes` | int64 |
 | `metadata` | JSONB |
 | `statistics` | JSONB |
@@ -482,7 +482,7 @@ completes).
 | `length` | int64 NOT NULL (row count of the range) |
 | `size_bytes` | int64 |
 | `format` | text (lance, parquet) |
-| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key — see table 14) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key with `format` — see table 14) |
 | `metadata` | JSON (format-specific, e.g., row group size) |
 | `statistics` | JSON (column stats: min/max for filterable columns) |
 | `row_count` | int64 |
@@ -539,7 +539,7 @@ forward by reference with its base segment and participates in the ref-counted G
 | `offset` | int64 |
 | `length` | int64 |
 | `format` | text (lance, parquet) |
-| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key — see table 14) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key with `format` — see table 14) |
 | `size_bytes` | int64 |
 | `statistics` | bytes (indexed-key min/max bounds; binary, decoded in-planner by the CHA-454 seek in the `SnapshotTableProvider`) |
 | `written_at_micros` | int64 (micros, auto-generated) |
