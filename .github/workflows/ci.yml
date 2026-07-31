@@ -500,8 +500,15 @@ jobs:
             # a bare tip check would leave :main stuck on the PREVIOUS image
             # until some future Rust merge. So decline only when the newer
             # commits actually touch the image.
+            # This pathspec MUST mirror the `rust:` paths-filter above, which
+            # is what actually decides whether a newer run publishes. Narrower
+            # and we publish while a newer run also will (the race back);
+            # wider and we decline when nothing newer publishes (stale :main).
+            # The ghcr_publish static test asserts the two stay identical.
             if [ "$tip" = "$GITHUB_SHA" ] || git -C "$GITHUB_WORKSPACE" diff --quiet \
-                 "$GITHUB_SHA" "$tip" -- crates protos docker Cargo.toml Cargo.lock; then
+                 "$GITHUB_SHA" "$tip" -- crates protos docker Cargo.toml Cargo.lock \
+                 packages pyproject.toml uv.lock .github/workflows/ci.yml Justfile \
+                 tests/integration; then
               tags+=(-t "$image:main")
             else
               echo "::notice::$GITHUB_SHA is behind main ($tip), which rebuilds the image; publishing the short-sha only"

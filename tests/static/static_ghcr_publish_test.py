@@ -268,6 +268,33 @@ def test_release_can_be_cut_from_the_actions_tab():
         )
 
 
+def test_main_gate_pathspec_mirrors_the_paths_filter():
+    """The :main gate must ask exactly what the paths-filter decides.
+
+    The filter is what determines whether a newer run publishes at all.
+    Narrower here and we move :main while a newer run also will — the
+    out-of-order race. Wider and we decline when nothing newer publishes,
+    leaving :main stale. Only equality is correct.
+    """
+    workflow = _yaml(CI_WORKFLOW)
+    filters = yaml.safe_load(
+        _step_using(_job(workflow, "changes"), "dorny/paths-filter")["with"]["filters"]
+    )
+    expected = {p.replace("/**", "") for p in filters["rust"]}
+
+    runs = "\n".join(
+        step.get("run", "") for step in _job(workflow, "publish-image-merge")["steps"]
+    )
+    pathspec = re.search(r'"\$tip" --(.*?);\s*then', runs, re.DOTALL)
+    assert pathspec, "the :main gate no longer diffs a pathspec"
+
+    actual = set(pathspec.group(1).replace("\\", " ").split())
+    assert actual == expected, (
+        f"gate pathspec drifted from the rust: filter\n  only in gate: "
+        f"{sorted(actual - expected)}\n  only in filter: {sorted(expected - actual)}"
+    )
+
+
 def test_publish_is_scoped_to_main_merges():
     """Without this, `merge_group` builds would publish straight to :main.
 
