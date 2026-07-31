@@ -227,18 +227,22 @@ impl LifecycleManager {
     /// EXCLUSIVE` on the parent to rewrite its partition descriptor, and
     /// teardown enqueues here in the same transaction.
     ///
-    /// The compact merge (`lifecycle::compact`) and snapshot retirement
-    /// (`lifecycle::retire`) still take a parent lock — just a harmless
-    /// one. Naming a leaf removes the parent lock outright for `SELECT`,
-    /// `SELECT ... FOR UPDATE` and `DELETE`, but an `INSERT` or `UPDATE`
-    /// evaluates the leaf's partition constraint, which opens the parent
-    /// for its partition key and leaves `AccessShare` held to commit
-    /// (measured; see the table in
+    /// The other two callers clear the invariant for different reasons,
+    /// and the difference is worth keeping straight. Naming a leaf
+    /// removes the parent lock outright for `SELECT`, `SELECT ... FOR
+    /// UPDATE` and `DELETE`, but an `INSERT` or `UPDATE` evaluates the
+    /// leaf's partition constraint, which opens the parent for its
+    /// partition key and leaves `AccessShare` held to commit (measured;
+    /// see the table in
     /// `tests/integration/integration_cha546_partition_lock_footprint_test.py`).
-    /// `AccessShare` cannot conflict with the `AccessShare` the sweep's
-    /// gate takes, so ordering still costs those two paths nothing — but
-    /// "they touch no parent" would be false, and a future reader who
-    /// believed it might drop the rule.
+    /// So the compact merge (`lifecycle::compact`) does hold a parent
+    /// `AccessShare` — a harmless one, since it cannot conflict with the
+    /// `AccessShare` the sweep's gate takes. Snapshot retirement
+    /// (`lifecycle::retire`) issues only leaf `SELECT`s and `DELETE`s
+    /// before arriving here, so it holds no parent lock at all. Don't
+    /// collapse the two into "they touch no parent": that is true of
+    /// retire and false of compact, and a future reader who believed it
+    /// of both might drop the rule.
     ///
     /// The direction is forced, not chosen. CHA-531's refcount gate
     /// ([`Self::eligible_segment_delete_set_rows`],
