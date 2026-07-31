@@ -2039,7 +2039,9 @@ mod tests {
             "oversized segment is never cached — both accesses re-read storage"
         );
         assert!(
-            cache.get(&seg.content_hash, seg.format.as_wire_code()).is_none(),
+            cache
+                .get(&seg.content_hash, seg.format.as_wire_code())
+                .is_none(),
             "oversized segment not stored"
         );
     }
