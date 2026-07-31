@@ -1380,17 +1380,25 @@ impl PgDialect {
             .join(", ");
         // `SET LOCAL` is TRANSACTION-scoped, not statement-scoped, so this bound
         // governs every later statement too — including the 14 `DROP TABLE`s,
-        // which is where it actually bites. Two conflicts can reach them. On this
-        // branch, its own lifecycle work holds `ROW SHARE` / `ROW EXCLUSIVE` on
-        // the very leaves locked here — deleting a branch while writing it is the
-        // caller's own race. Catalog-wide, the only reader left on the
-        // segment-metadata parents is CHA-531's refcount gate, and it probes them
-        // in a single statement, so the `ACCESS EXCLUSIVE` a drop needs on the
-        // parent waits on that statement rather than on a whole lifecycle wave.
+        // which is where it actually bites, since `ACCESS EXCLUSIVE` on a parent
+        // conflicts with every mode while the `EXCLUSIVE` taken here does not
+        // conflict with `AccessShare`.
+        //
+        // On this branch, its own lifecycle work holds `ROW SHARE` /
+        // `ROW EXCLUSIVE` on the very leaves locked here — deleting a branch
+        // while writing it is the caller's own race, and the `EXCLUSIVE` below
+        // is what catches it. Catalog-wide, two holders can still delay the
+        // drops: CHA-531's refcount gate, which probes the segment-metadata
+        // parents in a single statement, and any in-flight writer on any branch,
+        // because an `INSERT`/`UPDATE` naming a LEAF still takes `AccessShare`
+        // on its parent to evaluate the partition constraint (measured — reads
+        // and `DELETE`s take nothing). Both are bounded by a statement or a
+        // transaction rather than by a whole lifecycle wave, which is the
+        // difference CHA-546 made.
         //
         // Failing is the right end of the trade — waiting instead would queue
         // every subsequent lock request on that parent behind us, turning one
-        // slow probe into a catalog-wide stall. The caller reports it as
+        // slow writer into a catalog-wide stall. The caller reports it as
         // `Aborted` and reissues.
         //
         // Both errors propagate UNWRAPPED. Re-wrapping as `sqlx::Error::Protocol`

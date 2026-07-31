@@ -222,13 +222,23 @@ impl LifecycleManager {
     /// **Lock-ordering invariant — call this LAST, after every
     /// segment-metadata parent the transaction touches.** Since CHA-546
     /// made every branch-scoped statement name its partition, branch
-    /// teardown (`write::delete_branch`) is the only writer left that
-    /// touches a parent: `DROP TABLE` on a leaf needs `ACCESS EXCLUSIVE`
-    /// on the parent to rewrite its partition descriptor, and teardown
-    /// enqueues here in the same transaction. The compact merge
-    /// (`lifecycle::compact`) and snapshot retirement
-    /// (`lifecycle::retire`) touch no parent at all now, so the rule
-    /// costs them nothing.
+    /// teardown (`write::delete_branch`) is the only writer left that can
+    /// CONFLICT on a parent: `DROP TABLE` on a leaf needs `ACCESS
+    /// EXCLUSIVE` on the parent to rewrite its partition descriptor, and
+    /// teardown enqueues here in the same transaction.
+    ///
+    /// The compact merge (`lifecycle::compact`) and snapshot retirement
+    /// (`lifecycle::retire`) still take a parent lock — just a harmless
+    /// one. Naming a leaf removes the parent lock outright for `SELECT`,
+    /// `SELECT ... FOR UPDATE` and `DELETE`, but an `INSERT` or `UPDATE`
+    /// evaluates the leaf's partition constraint, which opens the parent
+    /// for its partition key and leaves `AccessShare` held to commit
+    /// (measured; see the table in
+    /// `tests/integration/integration_cha546_partition_lock_footprint_test.py`).
+    /// `AccessShare` cannot conflict with the `AccessShare` the sweep's
+    /// gate takes, so ordering still costs those two paths nothing — but
+    /// "they touch no parent" would be false, and a future reader who
+    /// believed it might drop the rule.
     ///
     /// The direction is forced, not chosen. CHA-531's refcount gate
     /// ([`Self::eligible_segment_delete_set_rows`],

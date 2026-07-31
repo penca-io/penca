@@ -1087,12 +1087,20 @@ impl WriteManager {
         // which is why this maps to `Aborted` rather than the default `Internal`.
         //
         // One conflict ordering cannot remove: the drops below need ACCESS
-        // EXCLUSIVE on the catalog-wide parents, and CHA-531's refcount gate
-        // still reads those parents catalog-wide by design. That is a wait,
-        // not a cycle — the gate takes no lock this transaction holds — so it
-        // surfaces as a `lock_timeout` rather than a deadlock kill, and is
-        // clean either way (full rollback, reported as `Aborted`, succeeds on
-        // reissue).
+        // EXCLUSIVE on the catalog-wide parents, which conflicts with EVERY
+        // mode, so any concurrent holder of any mode on a parent delays them.
+        // Two such holders survive CHA-546 by design. CHA-531's refcount gate
+        // reads those parents catalog-wide, and — measured, not assumed — an
+        // INSERT or UPDATE naming a LEAF still takes `AccessShare` on its
+        // parent to evaluate the partition constraint, held to commit. So any
+        // in-flight writer on any branch in the catalog delays these drops.
+        //
+        // Both are waits, not cycles — neither holder takes a lock this
+        // transaction holds — so they surface as a `lock_timeout` rather than a
+        // deadlock kill, and are clean either way (full rollback, reported as
+        // `Aborted`, succeeds on reissue). What CHA-546 bought here is the
+        // EXCLUSIVE step above rather than these drops: `AccessShare` clears
+        // it, the pre-CHA-546 `RowExclusive` did not.
         //
         // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
         // resolved BEFORE the teardown transaction and used only for their drops.

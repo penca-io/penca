@@ -358,8 +358,9 @@ where
 
     // Delete-set LAST, per the ordering invariant on
     // `insert_segment_delete_set_rows`. Since CHA-546 every statement above
-    // names this branch's partitions, so the tx holds no segment-metadata parent
-    // lock and the invariant costs this path nothing.
+    // names this branch's partitions, so the only parent lock this tx holds is
+    // the `AccessShare` its leaf INSERTs imply — compatible with the sweep's,
+    // so the invariant costs this path nothing.
     //
     // Still inside `tx`, which is what ADR 0019 §"Four-part mechanism" item 3
     // requires: the row must commit atomically with the URI swap.

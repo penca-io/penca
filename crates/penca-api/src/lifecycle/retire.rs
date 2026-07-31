@@ -180,9 +180,10 @@ impl LifecycleManager {
 
         // Delete-set LAST, per the ordering invariant on
         // `insert_segment_delete_set_rows`. Since CHA-546 every statement above
-        // names this branch's partitions, so the tx holds no segment-metadata
-        // parent lock and the invariant costs this path nothing. Position within
-        // the tx is free for ADR 0019 item 3 — it requires the rows to commit
+        // names this branch's partitions, so the only parent lock this tx holds
+        // is the `AccessShare` its leaf INSERTs imply — compatible with the
+        // sweep's, so the invariant costs this path nothing. Position within the
+        // tx is free for ADR 0019 item 3 — it requires the rows to commit
         // atomically with the retirement, not to precede it.
         penca_storage_meta::LifecycleManager::insert_segment_delete_set_rows(
             &tx,
