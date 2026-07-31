@@ -1,18 +1,26 @@
-# Two profiles, layered so deployments can mix and match:
+# Three profiles, layered so deployments can mix and match:
 #
-#   infra           — Postgres + SeaweedFS + the SeaweedFS bucket-init job.
-#                     Self-contained for local dev; skipped when the operator
-#                     points the servicers at an existing Postgres / S3.
-#   penca-backend  — the 3 servicer binaries + the Flight SQL gateway.
+#   infra           — Postgres. Self-contained for local dev; skipped when the
+#                     operator points the servicers at an existing Postgres.
+#   seaweedfs       — the in-stack S3 gateway + its bucket-init job. Skipped
+#                     when the cold tier is a real bucket (see `s3.env`).
+#   penca-backend   — the 3 servicer binaries + the Flight SQL gateway.
 #
-# Bring up the full stack:
-#   docker compose -f docker/compose.yml --profile infra --profile penca-backend up -d
+# Postgres and the object store are separate profiles because they are
+# separately external: pointing the cold tier at real S3 while keeping
+# Postgres local is a normal configuration, and was not expressible while
+# both lived in `infra`.
 #
-# Bring up only the servicers, against external Postgres + S3: this file
-# inlines `DATABASE_URL` / `OBJECT_STORAGE_*` for the local stack, so an
-# external deployment needs a `docker-compose.override.yml` that
-# replaces those keys (compose merges on `services.<svc>.environment`)
-# and `--profile penca-backend` only.
+# Bring up the full local stack:
+#   docker compose -f docker/compose.yml --env-file docker/dev.env \
+#     --profile infra --profile seaweedfs --profile penca-backend up -d
+#
+# `just penca-up [--profile dev|test|s3]` wraps that and picks the profile set
+# to match. `DATABASE_URL` is still inlined per service, so a deployment
+# against an existing Postgres overrides it in a `docker-compose.override.yml`
+# (compose merges on `services.<svc>.environment`) and runs `--profile
+# penca-backend` alone. Object storage no longer needs an override file — it
+# is interpolated from the env file; see the `x-object-storage` anchor below.
 
 # Shared build definition for every penca-rust-server service (CHA-420).
 # All servicers build the same image from one Dockerfile, so this anchor is
@@ -29,6 +37,31 @@ x-rust-build: &rust-build
   # the top-level `secrets:` block). BuildKit excludes secret values from
   # layer-cache keys, so toggling creds never invalidates cached layers.
   secrets: [aws_credentials, aws_config]
+
+# Cold-tier object store, shared by the three servicers that touch it (query,
+# write, lifecycle). They MUST agree on every value — a servicer reading a
+# different bucket than the one written to fails as an empty table, not an
+# error — so this is one anchor merged into each, not three hand-synced copies.
+#
+# Defaults describe the in-stack SeaweedFS gateway, so `dev.env` / `test.env`
+# need say nothing about storage. `s3.env` overrides them for a real bucket.
+#
+# ENDPOINT / ACCESS_KEY / SECRET_KEY use the no-colon `${VAR-default}` form on
+# purpose: a real-S3 deployment has to *blank* all three — an empty endpoint is
+# what makes `ObjectStorageConfig` skip `with_endpoint` so the AWS endpoint is
+# derived from the region, and empty keys are what make it fall through to the
+# standard AWS credential chain (IAM role, SSO, `~/.aws`). The `${VAR:-default}`
+# form substitutes on empty as well as unset, so it could never express that;
+# the no-colon form substitutes only when unset. Verified, not assumed.
+x-object-storage: &object-storage
+  OBJECT_STORAGE_PROVIDER: "${OBJECT_STORAGE_PROVIDER:-s3}"
+  OBJECT_STORAGE_BUCKET: "${OBJECT_STORAGE_BUCKET:-penca}"
+  OBJECT_STORAGE_FORMAT: "${OBJECT_STORAGE_FORMAT:-lance}"
+  OBJECT_STORAGE_REGION: "${OBJECT_STORAGE_REGION:-us-east-1}"
+  OBJECT_STORAGE_SCHEME: "${OBJECT_STORAGE_SCHEME:-http}"
+  OBJECT_STORAGE_ENDPOINT: "${OBJECT_STORAGE_ENDPOINT-http://seaweedfs:8333}"
+  OBJECT_STORAGE_ACCESS_KEY: "${OBJECT_STORAGE_ACCESS_KEY-pencaadmin}"
+  OBJECT_STORAGE_SECRET_KEY: "${OBJECT_STORAGE_SECRET_KEY-pencaadmin}"
 
 services:
   postgres:
@@ -57,7 +90,7 @@ services:
 
   seaweedfs:
     image: chrislusf/seaweedfs:4.33
-    profiles: [infra]
+    profiles: [seaweedfs]
     command: server -s3 -s3.config=/etc/seaweedfs/s3.json -s3.ip.bind=0.0.0.0 -dir=/data
     ports:
       - "${SEAWEEDFS_HOST_PORT}:8333"
@@ -96,7 +129,7 @@ services:
   # boundary and would accept a stray `penca-foo` as proof of `penca`. CHA-542.
   seaweedfs-init:
     image: chrislusf/seaweedfs:4.33
-    profiles: [infra]
+    profiles: [seaweedfs]
     depends_on:
       seaweedfs:
         condition: service_healthy
@@ -147,6 +180,11 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
+        # `required: false` so the servicers still start when the `seaweedfs`
+        # profile is off (the `s3` profile points them at a real bucket, where
+        # the in-stack gateway has nothing to serve). When the profile IS on,
+        # this is still a hard wait on the bucket-create job.
+        required: false
       bootstrap-init:
         condition: service_completed_successfully
     environment:
@@ -177,14 +215,7 @@ services:
       # snapshot files it names (the GC grace bound).
       QUERY_SNAPSHOT_LIST_CACHE_TTL_SECONDS: "${QUERY_SNAPSHOT_LIST_CACHE_TTL_SECONDS:-30}"
       QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES: "${QUERY_SNAPSHOT_LIST_CACHE_MAX_ENTRIES:-10000}"
-      OBJECT_STORAGE_PROVIDER: s3
-      OBJECT_STORAGE_BUCKET: penca
-      OBJECT_STORAGE_FORMAT: lance
-      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
-      OBJECT_STORAGE_SECRET_KEY: pencaadmin
-      OBJECT_STORAGE_REGION: us-east-1
-      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
-      OBJECT_STORAGE_SCHEME: http
+      <<: *object-storage
       RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
       PENCA_SPAN_TIMING: "${PENCA_SPAN_TIMING:-}"  # CHA-353: opt-in span busy/idle timing
     command: penca-query
@@ -200,6 +231,11 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
+        # `required: false` so the servicers still start when the `seaweedfs`
+        # profile is off (the `s3` profile points them at a real bucket, where
+        # the in-stack gateway has nothing to serve). When the profile IS on,
+        # this is still a hard wait on the bucket-create job.
+        required: false
       bootstrap-init:
         condition: service_completed_successfully
       # CHA-273 rework: the write path connects to the lifecycle service at
@@ -224,14 +260,7 @@ services:
       # service to flush the source branch hot→cold at CreateBranch. The persist
       # loop (and its segment-size knob) lives in the lifecycle pod now.
       LIFECYCLE_SERVICE_ADDR: http://lifecycle:50054
-      OBJECT_STORAGE_PROVIDER: s3
-      OBJECT_STORAGE_BUCKET: penca
-      OBJECT_STORAGE_FORMAT: lance
-      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
-      OBJECT_STORAGE_SECRET_KEY: pencaadmin
-      OBJECT_STORAGE_REGION: us-east-1
-      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
-      OBJECT_STORAGE_SCHEME: http
+      <<: *object-storage
       RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
       PENCA_SPAN_TIMING: "${PENCA_SPAN_TIMING:-}"  # CHA-353: opt-in span busy/idle timing
     command: penca-write
@@ -247,6 +276,11 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
+        # `required: false` so the servicers still start when the `seaweedfs`
+        # profile is off (the `s3` profile points them at a real bucket, where
+        # the in-stack gateway has nothing to serve). When the profile IS on,
+        # this is still a hard wait on the bucket-create job.
+        required: false
       bootstrap-init:
         condition: service_completed_successfully
     environment:
@@ -265,14 +299,7 @@ services:
       HOT_PURGE_GRACE_SECONDS: "${HOT_PURGE_GRACE_SECONDS:-60}"
       SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS: "${SCHEDULER_PERSIST_TICK_INTERVAL_SECONDS:-1}"
       SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS: "${SCHEDULER_SNAPSHOT_TICK_INTERVAL_SECONDS:-5}"
-      OBJECT_STORAGE_PROVIDER: s3
-      OBJECT_STORAGE_BUCKET: penca
-      OBJECT_STORAGE_FORMAT: lance
-      OBJECT_STORAGE_ACCESS_KEY: pencaadmin
-      OBJECT_STORAGE_SECRET_KEY: pencaadmin
-      OBJECT_STORAGE_REGION: us-east-1
-      OBJECT_STORAGE_ENDPOINT: http://seaweedfs:8333
-      OBJECT_STORAGE_SCHEME: http
+      <<: *object-storage
       RUST_LOG: "${RUST_LOG:-info,penca=debug}"  # CHA-329
     command: penca-lifecycle
     ports:

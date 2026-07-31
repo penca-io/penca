@@ -76,6 +76,7 @@ Requires Docker.
 |---|---|
 | `dev` (default) | Fixed ports 50052–50054 + 50060, lifecycle scheduler running |
 | `test` | Random host ports: parallel-worktree-safe; scheduler idle so it can't race a suite's manual lifecycle calls |
+| `s3` | Cold tier is a real S3 bucket instead of the in-stack SeaweedFS; Postgres still local. See [Backing the cold tier with a real S3 bucket](#backing-the-cold-tier-with-a-real-s3-bucket) |
 
 To keep your data across restarts, give it a directory; both Postgres and the object
 store write there, and it survives `just penca-down`:
@@ -83,6 +84,57 @@ store write there, and it survives `just penca-down`:
 ```bash
 just penca-up --db ~/.penca/data
 ```
+
+The directory must live **outside** the repo, which `penca-up` enforces rather than
+warns about. The repo is the Docker build context (`context: ..`), and Postgres
+creates its datadir mode 0700 owned by a container uid — so an in-repo datadir makes
+the next `--build` fail outright reading the context, not merely run slowly.
+
+### Backing the cold tier with a real S3 bucket
+
+The `s3` profile points the three storage-touching servicers (query, write,
+lifecycle) at a bucket you own. Postgres stays local, so this is the "real cold
+tier, disposable hot tier" configuration — useful for seeing what the lifecycle
+scheduler actually writes, and for sizing what a deployment costs to store.
+
+The bucket must already exist; nothing in the stack creates it.
+
+```bash
+export PENCA_S3_BUCKET=my-penca-bucket
+export PENCA_S3_REGION=us-west-1
+
+# Only needed where there is no instance role — see below.
+export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+
+just penca-up --profile s3 --db ~/.penca/data
+```
+
+`PENCA_S3_BUCKET` has no default on purpose. A silent fall-through to the dev
+bucket name would point a real deployment at the wrong store, and reads against
+the wrong bucket surface as an empty table rather than an error — so
+[`docker/s3.env`](../docker/s3.env) fails the run instead.
+
+Credentials are read from the **shell** environment, not `~/.aws/credentials`: a
+`aws configure` profile on disk is not visible inside a container. Leaving them
+unset is a valid configuration rather than a broken one — empty keys make
+`object_store` fall through to the standard AWS credential chain, which is what
+you want under an EC2/EKS instance role.
+
+For an S3-compatible store that is not AWS (MinIO, R2, Ceph), set
+`OBJECT_STORAGE_ENDPOINT` to its URL, and `OBJECT_STORAGE_SCHEME=http` if that
+endpoint is plaintext. Empty is what selects AWS proper: it makes
+`ObjectStorageConfig` skip `with_endpoint` so the endpoint is derived from the
+region.
+
+Two things behave differently under this profile:
+
+- **No SeaweedFS container.** The `seaweedfs` compose profile is off, so nothing
+  starts an S3 gateway with nothing to serve. `penca-up` prints the bucket in
+  place of the gateway port.
+- **`penca-down` does not touch the bucket.** It removes containers and Docker
+  volumes; your objects and their storage cost outlive the stack. Clean up with
+  `aws s3 rm --recursive` when you are done with a scratch bucket.
 
 Standalone deployments (your own Postgres + object store) bootstrap
 the database by running the same image the cluster runs; no version

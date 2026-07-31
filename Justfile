@@ -620,11 +620,18 @@ penca-up profile="dev" db="": vm-gc
         export PENCA_S3_VOLUME="$db_dir/s3"
         echo "Persistent storage: $db_dir (pg/ and s3/)"
     fi
-    # Every service in both compose files is tagged with a profile (`infra`
-    # or `penca-backend`), so a plain `docker compose up` would start
-    # nothing. Activate both profiles for every invocation that acts on
-    # containers (up / wait / down / port).
-    profiles="--profile infra --profile penca-backend"
+    # Every service in the compose file is tagged with a profile (`infra`,
+    # `seaweedfs` or `penca-backend`), so a plain `docker compose up` would
+    # start nothing. Activate the ones this stack profile needs.
+    #
+    # `seaweedfs` (the in-stack S3 gateway + its bucket-init job) is dropped
+    # for stack profiles whose cold tier is a real bucket — it would idle with
+    # nothing to serve, and its bucket-init job would assert a bucket the
+    # deployment never reads. Add future real-bucket profiles to this case.
+    case "{{profile}}" in
+        s3) profiles="--profile infra --profile penca-backend" ;;
+        *)  profiles="--profile infra --profile seaweedfs --profile penca-backend" ;;
+    esac
 
     # `up -d` respects `depends_on: service_completed_successfully` on
     # seaweedfs-init + bootstrap-init and `service_healthy` on
@@ -650,7 +657,13 @@ penca-up profile="dev" db="": vm-gc
 
     # Query the ports Docker actually bound.
     pg_port=$(docker compose $compose_files $env_file $profiles port postgres 5432 | cut -d: -f2)
-    s3_port=$(docker compose $compose_files $env_file $profiles port seaweedfs 8333 | cut -d: -f2)
+    # Only when the gateway is part of this profile. `docker compose port` on a
+    # service with no container exits non-zero, which under `set -e` would
+    # abort a bring-up that in fact succeeded.
+    s3_port=""
+    if [[ "$profiles" == *"--profile seaweedfs"* ]]; then
+        s3_port=$(docker compose $compose_files $env_file $profiles port seaweedfs 8333 | cut -d: -f2)
+    fi
     query_port=$(docker compose $compose_files $env_file $profiles port query 50052 | cut -d: -f2)
     write_port=$(docker compose $compose_files $env_file $profiles port write 50053 | cut -d: -f2)
     lifecycle_port=$(docker compose $compose_files $env_file $profiles port lifecycle 50054 | cut -d: -f2)
@@ -673,7 +686,13 @@ penca-up profile="dev" db="": vm-gc
     else
         echo "Storage: docker volumes (wiped by penca-down)"
     fi
-    echo "Postgres on :$pg_port, SeaweedFS on :$s3_port"
+    if [ -n "$s3_port" ]; then
+        echo "Postgres on :$pg_port, SeaweedFS on :$s3_port"
+    else
+        # Name the bucket, not a port: with no gateway in the stack, the bucket
+        # is the only way to tell which cold tier this stack is writing to.
+        echo "Postgres on :$pg_port, cold tier s3://${PENCA_S3_BUCKET:-?} (${PENCA_S3_REGION:-us-east-1})"
+    fi
     echo "Servicers — query:$query_port write:$write_port lifecycle:$lifecycle_port"
     echo "Flight SQL — penca-sql-server:$penca_sql_port"
     echo "Generated docker/.client.env and docker/.baseline.env"
@@ -688,6 +707,13 @@ penca-up profile="dev" db="": vm-gc
 penca-down profile="dev":
     #!/usr/bin/env bash
     set -euo pipefail
+    # `docker/s3.env` hard-fails interpolation when PENCA_S3_BUCKET is unset, so
+    # without this placeholder you could bring a stack up in one shell and then
+    # be unable to tear it down from another. Teardown never reads the bucket —
+    # the value only lands in the env of containers being removed — so any
+    # non-empty string is correct here, and refusing to stop a running stack
+    # over a missing variable is not.
+    export PENCA_S3_BUCKET="${PENCA_S3_BUCKET:-unset}"
     log_dir="/tmp/penca-logs-$(basename "$PWD")"
     rm -rf "$log_dir" && mkdir -p "$log_dir"
     printf '\n┌─ Service logs (saved before teardown) ──────────────────────────────\n'
@@ -704,7 +730,7 @@ penca-down profile="dev":
         fi
     done
     printf '└─────────────────────────────────────────────────────────────────────\n\n'
-    docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend down -v
+    docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile seaweedfs --profile penca-backend down -v
 
     # `compose down` returns once the containers are gone, but the daemon can
     # hold the published host ports for seconds afterwards (~11s measured), so
@@ -726,7 +752,7 @@ penca-down profile="dev":
     # iteration one and read as a satisfied wait rather than a skipped one.
     # Drop it here instead, so the empty branch below announces the skip and
     # every path out of this block says what it did.
-    ports_json=$(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json)
+    ports_json=$(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile seaweedfs --profile penca-backend config --format json)
     published_str=$(jq -r '[.services[].ports[]? | select(.published and .published != "0") | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]' <<< "$ports_json")
     if [[ -z "$published_str" ]]; then
         printf 'penca-down: compose config lists no fixed published host ports; skipping wait\n' >&2
@@ -764,9 +790,14 @@ penca-down profile="dev":
 # (e.g. `just penca-logs query write`) to filter. Service names:
 # postgres, seaweedfs, query, write, lifecycle,
 # penca-sql-server.
+#
+# The PENCA_S3_BUCKET placeholder is there for the same reason as penca-down's:
+# reading logs must not require the variable the `s3` profile demands at
+# bring-up. It stays on the command line rather than in the recipe body because
+# just echoes every body line, comments included.
 [arg("profile", long)]
 penca-logs profile="dev" *services:
-    docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend logs -f {{services}}
+    PENCA_S3_BUCKET="${PENCA_S3_BUCKET:-unset}" docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile seaweedfs --profile penca-backend logs -f {{services}}
 
 # Sync labels and projects to Linear. Requires LINEAR_API_KEY.
 # Usage: just sync-linear, just sync-linear --labels, just sync-linear --projects, just sync-linear --retag
