@@ -281,6 +281,14 @@ jobs:
   publish-image:
     name: Publish image (${{ matrix.arch }})
     needs: changes
+    # Deliberately NOT `needs: integration`. On a main push the publish runs
+    # alongside the post-merge suite, so an admin-bypass merge that breaks the
+    # servicers can reach `:main` before that net reports. Accepted, because
+    # the merge queue already ran the full suite on the merged result, and the
+    # tag readers actually consume — `:latest` — moves only on a deliberate
+    # `v*` release cut from a known-good main. Exposure is limited to people
+    # tracking `:main`. Gating on it would add ~40 min to every publish.
+    #
     # A `v*` tag publishes unconditionally: a release must never be silently
     # skipped because a paths-filter hiccuped, and `changes` is scoped to
     # main-merge diffs anyway. `always()` is what keeps a failed or skipped
@@ -448,8 +456,9 @@ jobs:
             fi
           fi
           echo "PUBLISHED_TAG=$release_tag" >> "$GITHUB_ENV"
-          docker buildx imagetools create "${tags[@]}" \
-            $(printf "$image@sha256:%s " *)
+          refs=()
+          for digest in *; do refs+=("$image@sha256:$digest"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
       - name: Inspect manifest list
         run: |
           docker buildx imagetools inspect \

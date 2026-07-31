@@ -226,11 +226,14 @@ def test_pushes_are_never_cancelled_mid_publish():
 
 
 def test_publish_is_scoped_to_main_merges():
-    """Dropping the `if:` would publish unreviewed branches straight to :main.
+    """Without this, `merge_group` builds would publish straight to :main.
 
-    Every other publish-image assertion still passes without it, so this is
-    the one thing standing between a same-repo PR branch and the tag the
-    quickstart pulls.
+    Not feature branches — `push:` is scoped to main and `v*` tags, so a
+    branch push never triggers this workflow, and `pull_request` skips anyway
+    because `changes` is skipped there. The real regression is the queue:
+    `changes` DOES run on `merge_group` and can report rust=true, so dropping
+    the event check would publish queue builds for PRs that may never merge.
+    Every other publish-image assertion still passes without it.
     """
     condition = _publish_job().get("if", "")
 

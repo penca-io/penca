@@ -100,7 +100,8 @@ docker run --rm \
 `main` merge, as a manifest list covering `linux/amd64` and `linux/arm64`,
 each built on a native runner — so `docker run` and Compose resolve your
 architecture without being told. Pin a specific release with `:vX.Y.Z`, or
-track unreleased `main` with `:main` (also tagged `:<short-sha>` per merge).
+track unreleased `main` with `:main`. Merges that change the image also
+get a `:<short-sha>` tag to pin; docs-only merges publish nothing.
 
 ## Repository structure
 
