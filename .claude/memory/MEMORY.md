@@ -33,6 +33,7 @@
 
 ## Workflow / tool habits
 - [feedback_absence_is_not_evidence.md](feedback_absence_is_not_evidence.md) — A check whose output you didn't READ proves nothing: `src/**/*.rs` misses `src/file.rs` without globstar, `2>/dev/null && echo ok` hides exit 2, `grep -c 'queued|running'` never reaches 0.
+- [feedback_measure_boundaries_dont_reason.md](feedback_measure_boundaries_dont_reason.md) — Boundary fixes (which join side, which axis, which tier, inclusive vs exclusive, lock order vs scope) are where my reasoning fails and the compiler can't see it; dump real state and red-verify.
 - [feedback_slow_commands_capture_and_wait.md](feedback_slow_commands_capture_and_wait.md) — Capture slow runs to a logfile on the FIRST run and grep it; no `until grep` poll loops; verify bg output directly.
 - [feedback_integration_suite_full_fresh_before_pr.md](feedback_integration_suite_full_fresh_before_pr.md) — Pre-PR gate = FULL suite on a FRESH stack (branch CI skips integration entirely); subsets are inner-loop only.
 - [feedback_just_check_gate_trust.md](feedback_just_check_gate_trust.md) — Trust `just check` only when it truly passed; mid-pipeline "All checks passed!" lies.

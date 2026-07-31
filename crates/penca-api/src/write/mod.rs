@@ -23,7 +23,6 @@ use penca_db::driver::pg::{PgDriver, PgTransactionDriver};
 use penca_db::driver::{DbDriver, SqlValue};
 use penca_dl::driver::DlDriver;
 use penca_format::reader::FormatReader;
-use penca_format::writer::FormatWriter;
 use penca_proto::external::v1::create_branch_request::ForkPoint;
 use penca_proto::external::v1::{
     AbortTxRequest, AbortTxResponse, BeginTxRequest, BeginTxResponse, Branch, Change,
@@ -197,6 +196,23 @@ fn validate_create_table_primary_keys(
         }
     }
     Ok(())
+}
+
+/// Whether an error is PG telling us we lost a lock race, rather than anything
+/// about the work itself.
+///
+/// `40P01` deadlock_detected and `55P03` lock_not_available (what a
+/// `lock_timeout` raises). Both mean "try again"; neither says the transaction
+/// was wrong. Matched on SQLSTATE rather than message text so a PG wording
+/// change cannot silently turn a retry into a surfaced error.
+fn is_lock_contention(err: &ApiError) -> bool {
+    let ApiError::Metadata(penca_storage_meta::MetadataError::Db(sqlx_err)) = err else {
+        return false;
+    };
+    sqlx_err
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()))
+        .is_some_and(|code| code == "40P01" || code == "55P03")
 }
 
 /// Map a sqlx error originating from a PG `UNIQUE` constraint
@@ -869,6 +885,7 @@ impl WriteManager {
                     &branch_str,
                     &request.branch_name,
                     fork.commit_seq_num,
+                    fork.commit_micros,
                     // The parent lineage the read planner's parent-cold source
                     // keys on.
                     Some(source_branch_str.as_str()),
@@ -914,6 +931,44 @@ impl WriteManager {
                 &request.comment,
             )
             .await?;
+
+            // CHA-539: make the fork's claim on the parent's cold files an
+            // EXPLICIT row in the child's own partition. Reaching across the fork
+            // edge at plan time left the claim invisible to the sweep's refcount
+            // gate, which is a `NOT EXISTS` probe over metadata tables — no row,
+            // no probe can find it. Metadata only: every copied row carries the
+            // parent's `object_uri`, so this is O(cold segments) in rows and O(1)
+            // in bytes.
+            //
+            // Same table list `materialize_metadata_from_source` walked, and in
+            // the same transaction, so `commit_micros` is stamped directly and a
+            // rollback takes the whole copy with it.
+            let inherited_tables = self
+                .query_manager
+                .list_table_uuids_for_branch(tx, dl_driver, &catalog_str, None, &source_branch_str)
+                .await?;
+            // Two distinct axes, so two distinct values. `fork.commit_micros` is
+            // the fork POSITION; the copied rows' `commit_micros` is a phase-2
+            // commit stamp answering "when did this row become visible", which is
+            // now — stamping the fork position there would date the stamp before
+            // the transaction that wrote the row. Inert while every consumer
+            // treats the column as an IS NOT NULL visibility flag, but the column
+            // has to keep meaning what it says for the next comparative reader.
+            // Atomicity comes from this transaction, not from the value.
+            let copy_commit_micros = LifecycleManager::now_micros(tx).await?;
+            for inherited_table in &inherited_tables {
+                LifecycleManager::materialize_fork_cold_references(
+                    tx,
+                    &catalog_str,
+                    &branch_str,
+                    &source_branch_str,
+                    inherited_table,
+                    fork.commit_seq_num,
+                    fork.commit_micros,
+                    copy_commit_micros,
+                )
+                .await?;
+            }
             Ok(())
         })
         .await?;
@@ -928,15 +983,21 @@ impl WriteManager {
         })
     }
 
-    /// Delete a branch with 3-phase cleanup.
+    /// Delete a branch: enumerate its cold URIs, then drop its metadata and
+    /// enqueue those URIs for the refcount gate, atomically.
     ///
-    /// Phase 1: collect cold storage URIs.
-    /// Phase 2: delete cold files via FormatWriter.
-    /// Phase 3: transactional metadata cleanup.
+    /// A pure metadata operation — it unlinks nothing itself. Dropping the
+    /// branch's segment rows is what makes a file unreferenced; the next
+    /// `sweep_segments` decides, past the universal grace window, whether any
+    /// other branch still names it. That indirection is the whole point: since
+    /// CHA-531 a carried row lives in one branch's partition while its
+    /// `object_uri` names the file another branch wrote, so a teardown that
+    /// unlinked what its own enumeration reached would destroy a sibling's data
+    /// in either direction across a fork edge (CHA-539).
     ///
-    /// Catalog-scoped: phases 1–3 walk every schema's tables on the branch,
-    /// so cold segments + log/snapshot metadata for `s1.t1`, `s2.t2`, ... are
-    /// all cleaned up.
+    /// Catalog-scoped: the walk covers every schema's tables on the branch, so
+    /// cold segments + log/snapshot metadata for `s1.t1`, `s2.t2`, ... are all
+    /// cleaned up.
     #[tracing::instrument(
         skip_all,
         level = "debug",
@@ -949,7 +1010,6 @@ impl WriteManager {
         &self,
         pool: &PgDriver,
         dl_driver: &L,
-        writer: &impl FormatWriter,
         request: &DeleteBranchRequest,
     ) -> Result<DeleteBranchResponse, ApiError> {
         let catalog = resolve_catalog(
@@ -968,6 +1028,27 @@ impl WriteManager {
         .await?;
         let branch_uuid = parse_resolved_uuid(&branch.branch_uuid, "branch_uuid")?;
 
+        // `main` is the catalog's root, not a branch you can tear down. Deleting
+        // it leaves the catalog unusable for reasons unrelated to cold data —
+        // every read resolves the main branch, so subsequent requests fail with
+        // "main branch missing for catalog" — and `DeleteCatalog` is the
+        // operation for removing a catalog.
+        //
+        // Not a substitute for the refcount gate, which is what actually makes
+        // cross-fork teardown safe. This only removes a case that was never
+        // coherent: while forks are main-only (CHA-515), "delete the branch a
+        // fork inherits from" always means deleting `main`, so there is no
+        // legitimate caller. TODO(CHA-509): once a fork can be a non-main
+        // branch, deleting an intermediate parent becomes legitimate and the
+        // gate is the only thing standing behind it.
+        let main_branch_uuid = resolve_main_branch_uuid(pool, &catalog_uuid).await?;
+        if branch_uuid == main_branch_uuid {
+            return Err(ApiError::InvalidRequest(format!(
+                "cannot delete the catalog's main branch ({branch_uuid}); \
+                 use DeleteCatalog to remove the catalog"
+            )));
+        }
+
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
         span.record("branch_uuid", tracing::field::display(&branch_uuid));
@@ -975,76 +1056,177 @@ impl WriteManager {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
 
-        // Phase 1: collect all cold storage file URIs. `schema_uuid = None`
-        // makes this the catalog-wide table list.
+        // Enumerate the files AND drop the metadata in one transaction. One
+        // transaction because removing the references and queueing the files must
+        // be a single fact: a crash between them leaves either an unreferenced
+        // file nothing will ever collect, or a queued file still referenced with
+        // no clock to reconcile. The enqueue's ON CONFLICT refresh gives a URI
+        // already queued by another branch's retirement the later grace clock.
+        //
+        // Every SEGMENT enumeration is inside the transaction and behind the
+        // lock, and none is scoped by a table list — they read the branch's own
+        // partitions directly. That is what closes the leak: a lifecycle wave
+        // committing new segment rows after a table-list read used to leave a
+        // file both unreferenced and absent from `segment_delete_set`, which
+        // enqueue-only teardown makes permanent since it retired the orphan-scan
+        // fallback. Removing the dependency is what fixes it; the reads being
+        // inside the transaction was never sufficient on its own, because plain
+        // `SELECT`s take only ACCESS SHARE and a wave's ROW EXCLUSIVE is
+        // compatible with it.
+        //
+        // The lock is EXCLUSIVE on this branch's 14 partitions — never the
+        // catalog-wide parents, which would stall every other branch for the
+        // length of teardown. See `lock_branch_teardown_partitions`.
+        //
+        // A lock loss is reported, not retried. Retrying here would be the wrong
+        // layer: the caller knows whether a second attempt is wanted, and a
+        // server-side loop with no backoff turns a loud conflict into a quiet
+        // livelock while charging the request up to lock_timeout x attempts of
+        // latency. The whole transaction rolls back, so reissuing DeleteBranch is
+        // safe — what the caller needs is to TELL a lock loss from a real failure,
+        // which is why this maps to `Aborted` rather than the default `Internal`.
+        //
+        // One conflict ordering cannot remove, TODO(CHA-546): a lifecycle write
+        // names the catalog-wide PARENT, so it holds ROW EXCLUSIVE there while
+        // waiting on this branch's leaf, and the drops below need ACCESS
+        // EXCLUSIVE on that same parent — a cycle, measured, which Postgres
+        // resolves by killing teardown. Rare (it needs a metadata write on this
+        // branch inside teardown's window) and clean (full rollback, reported as
+        // `Aborted`, succeeds on reissue). CHA-546 converts those writes to name
+        // the partition, as the tx-log family already does, which removes it.
+        //
+        // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
+        // resolved BEFORE the teardown transaction and used only for their drops.
+        //
+        // It cannot move inside. `list_table_uuids_for_branch` plans through
+        // `QueryManager::plan`, which reads the catalog-wide metadata parents BY
+        // NAME — so running it in the transaction takes `ACCESS SHARE` on every
+        // one of them, which is precisely what
+        // `lock_branch_teardown_partitions` is built to avoid: it stalls plans on
+        // every branch in the catalog while this cold-capable read waits on
+        // object storage, and it sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
+        // upgrade at the drops that deadlocks two concurrent teardowns of
+        // DIFFERENT branches. Partition-scoping the enumerations bought exactly
+        // that property; planning inside the lock gives it back.
+        //
+        // The cost is a real leak, stated plainly rather than filed under
+        // "best effort": a `CreateTable` committing between this read and the
+        // lock is missed, and since teardown removes the `branch_store` row,
+        // nothing ever returns to drop its `upsert_log` / `delete_log` /
+        // `write_sequence` relations. They are hot-only — no cold file, so no
+        // delete-set consequence — but they are permanent.
+        //
+        // Pre-existing, not introduced here: `main` resolves this list the same
+        // way. Closing it needs a branch-scoped table enumeration that does not
+        // plan through the parents, which does not exist today — the hot data
+        // relations are named `hash(table_uuid, branch_uuid)`, so they cannot be
+        // recovered from `pg_class` by branch either. Needs its own ticket.
         let table_uuid_strs = self
             .query_manager
             .list_table_uuids_for_branch(pool, dl_driver, &catalog_str, None, &branch_str)
             .await?;
 
-        // Cold holds no commit_tx_log, so the touched set is just the data
-        // tables; snapshot segments key directly on `(branch, table)`.
-        let segment_table_uuids: Vec<&str> = table_uuid_strs.iter().map(String::as_str).collect();
+        self.delete_branch_tx(pool, &catalog_uuid, &branch_uuid, &table_uuid_strs)
+            .await
+            .map_err(|e| {
+                if is_lock_contention(&e) {
+                    ApiError::Aborted(format!(
+                        "branch teardown lost a lock race with a concurrent \
+                     catalog operation and made no changes; retry the request \
+                     ({e})"
+                    ))
+                } else {
+                    e
+                }
+            })?;
 
-        let persist_segments = LifecycleManager::get_table_persist_segments_for_tables(
-            pool,
-            &catalog_str,
-            &branch_str,
-            &segment_table_uuids,
-        )
-        .await?;
+        Ok(DeleteBranchResponse {})
+    }
 
-        let mut snap_segments: Vec<(String, String)> = Vec::new();
-        for table_uuid_str in &table_uuid_strs {
-            let segs = LifecycleManager::get_snapshot_segments_for_table(
-                pool,
-                &catalog_str,
-                &branch_str,
-                table_uuid_str,
+    /// The teardown transaction. Split out from `delete_branch` so that
+    /// everything inside it runs behind `lock_branch_teardown_partitions` by
+    /// construction — the resolution, `main` guard and table-list read that
+    /// precede it are ordinary reads that must not run under the lock. There is
+    /// no retry: see the note at its call site.
+    async fn delete_branch_tx(
+        &self,
+        pool: &PgDriver,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+        table_uuid_strs: &[String],
+    ) -> Result<(), ApiError> {
+        // `PgDialect` helpers take `&Uuid`, `LifecycleManager` helpers take
+        // `&str`. Converting once here beats threading each identifier twice.
+        let catalog_str = &catalog_uuid.to_string();
+        let branch_str = &branch_uuid.to_string();
+        with_pg_tx(pool, async |tx| {
+            PgDialect::lock_branch_teardown_partitions(tx, catalog_uuid, branch_uuid).await?;
+
+            // Every enumeration below reads the branch's own PARTITION by name,
+            // never the catalog-wide parent. Reading through the parent would take
+            // `ACCESS SHARE` on it, which both contends with every other branch in
+            // the catalog and sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
+            // upgrade at the drops that deadlocks two concurrent teardowns.
+            // Partition-scoped reads keep teardown's footprint to this branch
+            // until `drop_branch_partitions` takes the parent locks at the end.
+            let persist_segments = LifecycleManager::get_table_persist_segments_for_branch(
+                tx,
+                catalog_str,
+                branch_str,
             )
             .await?;
-            snap_segments.extend(segs);
-        }
 
-        // Also enumerate in-flight compact merged files tracked in
-        // `compact_segment_metadata`. Two cases:
-        //   - committed rows: the merged file is still referenced by
-        //     `table_*_segment_metadata` rows on the branch and is
-        //     covered by the persist/snap enumerations above. The
-        //     overlap is harmless — `writer.delete` is idempotent.
-        //   - NULL rows (crashed-mid-compact orphans): no segment
-        //     metadata points at the merged file, so without this
-        //     enumeration the file would leak past the partition
-        //     CASCADE in Phase 3.
-        let compact_uris =
-            LifecycleManager::get_compact_segment_uris_for_branch(pool, &catalog_str, &branch_str)
-                .await?;
-
-        // Phase 2: Delete cold storage files. Best-effort: the metadata
-        // rows pointing at them go away in Phase 3 via DROP PARTITION
-        // CASCADE regardless of which file deletes succeed, so a
-        // residual orphan-file scan would be the only follow-up needed.
-        for (_, uri) in &persist_segments {
-            let _ = writer.delete(uri, true).await;
-        }
-        for (_, uri) in &snap_segments {
-            let _ = writer.delete(uri, true).await;
-        }
-        for uri in &compact_uris {
-            let _ = writer.delete(uri, true).await;
-        }
-
-        // Phase 3: Transactional metadata cleanup.
-        with_pg_tx(pool, async |tx| {
-            let deleted = LifecycleManager::delete_branch(tx, &catalog_str, &branch_str).await?;
-            if deleted {
-                for table_uuid_str in &table_uuid_strs {
-                    LifecycleManager::drop_data_tables(
-                        tx,
-                        table_uuid_str,
-                        &branch_uuid.to_string(),
-                    )
+            let snap_segments =
+                LifecycleManager::get_snapshot_segments_for_branch(tx, catalog_str, branch_str)
                     .await?;
+
+            // Cold-index sidecars are their own files and their own delete-set
+            // participants (ADR 0026 §5), but they are not reachable from the base
+            // segment enumeration above — they hang off an index header. Without
+            // this they would leak past the partition CASCADE below, and an
+            // enqueue-only teardown would make that leak permanent rather than
+            // merely untidy.
+            //
+            // `list_all_segment_index_uris`, not the committed-only planning read:
+            // the CASCADE drops uncommitted sidecar rows too, so a sidecar whose
+            // phase-2 stamp had not landed would lose its row without its URI ever
+            // being queued. Matches the two sibling enumerations above, neither of
+            // which filters on `commit_micros`.
+            let sidecar_uris: Vec<String> =
+                LifecycleManager::list_all_segment_index_uris(tx, catalog_str, branch_str).await?;
+
+            // Also enumerate in-flight compact merged files tracked in
+            // `compact_segment_metadata`. Two cases:
+            //   - committed rows: the merged file is still referenced by
+            //     `table_*_segment_metadata` rows on the branch and is
+            //     covered by the persist/snap enumerations above. The
+            //     overlap is harmless — the delete set holds one row per file.
+            //   - NULL rows (crashed-mid-compact orphans): no segment
+            //     metadata points at the merged file, so without this
+            //     enumeration the file would leak past the partition
+            //     CASCADE below.
+            let compact_uris =
+                LifecycleManager::get_compact_segment_uris_for_branch(tx, catalog_str, branch_str)
+                    .await?;
+
+            // Every URI the branch referenced, queued as one set. Deduped because
+            // one physical file legitimately backs several rows (the packer packs
+            // many partitions into one file) and `segment_delete_set` holds one row
+            // per file.
+            let queued_uris: Vec<String> = persist_segments
+                .into_iter()
+                .map(|(_, uri)| uri)
+                .chain(snap_segments.into_iter().map(|(_, uri)| uri))
+                .chain(compact_uris)
+                .chain(sidecar_uris)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            let deleted = LifecycleManager::delete_branch(tx, catalog_str, branch_str).await?;
+            if deleted {
+                for table_uuid_str in table_uuid_strs {
+                    LifecycleManager::drop_data_tables(tx, table_uuid_str, branch_str).await?;
                 }
 
                 // drop_branch_partitions removes the per-branch
@@ -1052,16 +1234,26 @@ impl WriteManager {
                 // table_persist_segment_metadata, table_snapshot_metadata,
                 // and table_snapshot_segment_metadata via DROP TABLE
                 // CASCADE — so explicit per-row DELETEs against those
-                // parents would be redundant. Only the cold-storage file
-                // deletes (Phase 2 above) and the data-table drops above
-                // are tier-specific and stay here.
-                LifecycleManager::drop_branch_partitions(tx, &catalog_str, &branch_str).await?;
+                // parents would be redundant. Dropping those rows is exactly
+                // what makes the enqueued files unreferenced, which is what
+                // lets the sweep's refcount gate collect them. Only the
+                // data-table drops above are tier-specific and stay here.
+                LifecycleManager::drop_branch_partitions(tx, catalog_str, branch_str).await?;
+
+                // Delete-set LAST, after the partition drops, per the ordering
+                // invariant on `insert_segment_delete_set_rows`. Dropping a
+                // partition takes ACCESS EXCLUSIVE on the catalog-wide parent; a
+                // concurrent compact holds ROW SHARE on that same parent from its
+                // opening `SELECT ... FOR UPDATE` and cannot release it, so
+                // teardown must not be holding a delete-set row while it waits
+                // for the parent. Still one transaction, so removing the
+                // references and queueing the files remain one atomic fact.
+                LifecycleManager::insert_segment_delete_set_rows(tx, catalog_str, &queued_uris)
+                    .await?;
             }
             Ok(())
         })
-        .await?;
-
-        Ok(DeleteBranchResponse {})
+        .await
     }
 
     /// Rename a branch. Branches are catalog-scoped; the

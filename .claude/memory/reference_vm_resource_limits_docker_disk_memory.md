@@ -18,19 +18,51 @@ interact, so they live together.
   usually finishes. Isolate the build: run `just penca-up` **alone**, never
   `just integration-test` (which does up + test + down in one killable task).
 - **Run tests against the kept-up stack** rather than `just integration-test`
-  per file. After `penca-up`:
-  `export COMPOSE_PROJECT_NAME="penca-$(basename "$PWD")"`, then
-  `set -a && source docker/test.env docker/.client.env docker/.baseline.env && set +a`,
-  then `uv run pytest tests/integration/integration_<name>_test.py -q`
+  per file. Bring it up with **`just penca-up --profile=test`**, then:
+
+  ```bash
+  export COMPOSE_PROJECT_NAME="penca-$(basename "$PWD")"
+  set -a
+  source docker/test.env      # one `source` PER FILE — see below
+  source docker/.client.env
+  source docker/.baseline.env
+  set +a
+  uv run pytest tests/integration/integration_<name>_test.py -q
+  ```
+
   (~1 min/file). Safe for **subsets only** — see
   [[feedback_integration_suite_full_fresh_before_pr]] for why the full suite
   needs a fresh stack.
+
+  Two ways this recipe silently produces a **false red**, both cost a full run:
+
+  - **`source a b c` sources only `a`.** bash `source` takes ONE file; `b` and
+    `c` become `$1`/`$2` to it. Collapsing the three onto one line leaves every
+    `PENCA_DB_*` unset (they live in `.baseline.env`) and every white-box test
+    dies at fixture setup with `5 validation errors for DbSettings`. Reads like
+    a real regression until you count them — 22 failures, 22 identical
+    signatures. Same attribute-before-debugging rule as `COMPOSE_PROJECT_NAME`
+    below.
+  - **`--profile=test` is not the default.** `just penca-up` alone brings up the
+    **dev** profile, where the lifecycle scheduler's tick loop is ACTIVE and
+    races the manual Persist/Snapshot/Purge/Sweep calls these suites make. The
+    GC and delete-set files (`branch_fork_gc_refcount`, `branch_delete_refcount`,
+    `snapshot_gc`) then fail on timing while everything else passes — 6 failures
+    clustered in exactly the timing-sensitive files. `just integration-test`
+    passes `--profile=test` for this reason; the kept-up recipe must too.
 - **Chunk the files DISJOINTLY — each file exactly once per stack.** Never
   re-run the same test file against a persistent stack: fixed-name tests (e.g.
   `branch_inheritance_read`) fail on the 2nd run with
   `AlreadyExistsError: catalog name already in use`. That is a **false** failure
   from state pollution, not a bug you introduced. `just penca-down` +
   `penca-up` resets to a clean stack when you need to re-run one.
+- **`just integration-test` does NOT wipe a stack that is already up.** It opens
+  with `just penca-up --profile=test`, which no-ops against a running
+  test-profile stack rather than recreating it — so the volumes, and every
+  catalog your earlier subset runs created, survive into the "fresh" suite. The
+  fixed-name collision above then fires mid-suite and reads as a regression from
+  whatever you last committed. **`just penca-down --profile=test` FIRST**, every
+  time, before a full-suite gate run.
 - **`COMPOSE_PROJECT_NAME` is NOT in `docker/*.env`.** The Justfile *exports*
   it, so sourcing the env files alone leaves it unset and every test that reads
   it to fetch container logs dies with `KeyError: 'COMPOSE_PROJECT_NAME'`. Cost

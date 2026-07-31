@@ -138,6 +138,27 @@ impl<'a> PersistScope<'a> {
             statistics: Vec::new(),
             offset,
             length,
+            // Populated to build a well-formed `PersistSegment`, and then
+            // deliberately unused. Nothing is threaded through the merge: a
+            // compaction input's recorded ceiling survives because
+            // `repoint_table_persist_segment` never writes the column, not
+            // because this value flows anywhere. Said plainly so nobody "fixes"
+            // the repoint to preserve something it never dropped.
+            //
+            // The compaction READ deliberately does not apply it —
+            // `read_persist_segments`, not the `_bounded` sibling. The slice
+            // arithmetic below walks `cumulative += row_count` to assign each
+            // input its `(offset, length)` in the merged file, so a clamped short
+            // read would misalign every downstream slice.
+            //
+            // That is safe only because a fork's inherited persist rows are
+            // written `is_sealed = TRUE` (CHA-539) and this scope's input query
+            // filters `is_sealed = FALSE`, so a clamped row is never a compaction
+            // input in the first place. The two decisions hold each other up: if
+            // inherited rows ever become compactable, this read has to start
+            // honoring the ceiling AND the slice arithmetic has to be reworked
+            // for short reads.
+            max_commit_seq_num: Some(row.get("max_commit_seq_num")),
         })
     }
 }
@@ -284,7 +305,15 @@ where
     // `is_sealed`.
     let total_rows: i64 = input_meta.iter().map(|m| m.row_count).sum();
     let mut cumulative: i64 = 0;
-    let mut uris_to_defer_delete: HashSet<String> = HashSet::new();
+    // Reachable only for rows in `input_meta`, so a seal-mode wave's prior
+    // active — whose rows stay sealed and keep pointing at their file — is never
+    // enqueued.
+    let uris_to_defer_delete: HashSet<String> = input_meta
+        .iter()
+        .filter(|meta| meta.old_uri != merged_uri)
+        .map(|meta| meta.old_uri.clone())
+        .collect();
+
     for meta in &input_meta {
         let proportional_size = if total_rows > 0 {
             merged_size_bytes * meta.row_count / total_rows
@@ -306,12 +335,6 @@ where
         )
         .await?;
         cumulative += meta.row_count;
-        if meta.old_uri != merged_uri {
-            // This row no longer references its old file. Reachable only for
-            // rows in `input_meta`, so a seal-mode prior active — whose rows
-            // stay sealed-and-pointing at their file — is never enqueued.
-            uris_to_defer_delete.insert(meta.old_uri.clone());
-        }
     }
     if !plan.seal_indices.is_empty() {
         let seal_uuid_strs: Vec<String> = plan
@@ -333,8 +356,16 @@ where
     }
     LifecycleManager::commit_compact_segment(&tx, &catalog_str, &branch_str, &merged_uri).await?;
 
-    // Must happen inside the merge tx (ADR 0019 §"Four-part mechanism" item
-    // 3) so the deferred-delete row commits atomically with the URI swap.
+    // Delete-set LAST, per the ordering invariant on
+    // `insert_segment_delete_set_rows`. This tx already holds a lock on the
+    // segment-metadata parent — its very first statement is
+    // `enumerate_unsealed_segments`, a `SELECT ... FOR UPDATE OF seg` against the
+    // catalog-wide parent — and the defer set is derived from that read, so
+    // compact cannot take a delete-set row lock before a parent lock even in
+    // principle. That is what fixes the global order for every other writer.
+    //
+    // Still inside `tx`, which is what ADR 0019 §"Four-part mechanism" item 3
+    // requires: the row must commit atomically with the URI swap.
     // `sweep_segments` removes the file only once past the grace window, by
     // which time any concurrent plan holding the old URI has finished within
     // `query_timeout` and still found the file.

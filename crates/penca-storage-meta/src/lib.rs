@@ -14,6 +14,7 @@ mod compact;
 // `parse_uuid`/`qi`/`epoch`/`resolve_branch` call-site aliases.
 pub mod convert;
 mod ddl;
+mod fork_copy;
 pub mod helpers;
 mod index;
 mod lifecycle;
@@ -46,6 +47,13 @@ pub enum MetadataError {
 
     #[error(transparent)]
     Uuid(#[from] uuid::Error),
+
+    /// The request is answerable in principle but not against this state — the
+    /// caller has to change the request, not retry it. Distinct from `Db` so it
+    /// can surface as `FAILED_PRECONDITION` rather than falling through to
+    /// `INTERNAL` and reading like a server bug.
+    #[error("{0}")]
+    FailedPrecondition(String),
 }
 
 pub type Result<T> = std::result::Result<T, MetadataError>;

@@ -431,6 +431,55 @@ impl LifecycleManager {
             .collect())
     }
 
+    /// Every sidecar `object_uri` on a branch — committed AND uncommitted, and
+    /// for every segment — for branch teardown's delete-set enqueue.
+    ///
+    /// Unfiltered on both axes, unlike [`Self::list_segment_index_metadata`],
+    /// and for the same underlying reason in each case: teardown's
+    /// `DROP TABLE … CASCADE` removes the branch's sidecar rows whatever their
+    /// commit state and whatever their segment row looks like, and under
+    /// enqueue-only teardown a URI that never reached `segment_delete_set` is
+    /// never collected by anything. The sibling enumerations teardown pairs this
+    /// with ([`Self::get_table_persist_segments_for_branch`],
+    /// [`Self::get_snapshot_segments_for_branch`]) are unfiltered for the same
+    /// reason.
+    ///
+    /// This is the read-side counterpart of the asymmetry `retire` already
+    /// handles on the write side, where a committed-only list is paired with an
+    /// unconditional `delete_segment_index_metadata_for_segments`.
+    ///
+    /// 1 SQL query.
+    pub async fn list_all_segment_index_uris(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+    ) -> Result<Vec<String>> {
+        let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
+        // The branch's own partition, like teardown's three sibling
+        // enumerations: naming the parent would take `ACCESS SHARE` on a
+        // catalog-wide relation that `drop_branch_partitions` later needs
+        // `ACCESS EXCLUSIVE` on, which is the upgrade two concurrent teardowns
+        // deadlock over.
+        let table = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
+        // No `segment_uuid` filter. Keying off the snapshot segments teardown
+        // enumerated leaves behind any sidecar whose segment row is already gone
+        // — reachable through the snapshot failure path, which deletes carried
+        // segment rows before their sidecars on separate best-effort statements.
+        // Such a sidecar's URI would never reach `segment_delete_set`, which
+        // enqueue-only teardown makes permanent. The partition holds exactly this
+        // branch's sidecars, so dropping the filter is both complete and cheaper
+        // than inlining an O(cold segments) uuid array into the statement text.
+        let sql = format!(
+            "SELECT object_uri FROM {table} WHERE branch_uuid = $1",
+            table = qi(&table),
+        );
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .await?;
+        Ok(rows.iter().map(|r| r.get("object_uri")).collect())
+    }
+
     /// Carry forward the internal `row_uuid` sidecar of each carried base
     /// segment (CHA-406): for each `(new_seg ← prior_seg)` pair, copy the prior
     /// segment's committed sidecar to a new row under the new segment, NULL-

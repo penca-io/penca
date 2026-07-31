@@ -35,6 +35,12 @@ pub enum ApiError {
     #[error(transparent)]
     Uuid(#[from] uuid::Error),
 
+    /// A concurrency conflict the caller can resolve by reissuing: the
+    /// operation made no changes and a retry is safe. Distinct from
+    /// `FailedPrecondition`, which means the request itself was wrong.
+    #[error("aborted: {0}")]
+    Aborted(String),
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 

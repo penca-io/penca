@@ -37,6 +37,7 @@ use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use futures::{StreamExt, TryStreamExt};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
 use penca_format::reader::FormatReader;
+use penca_storage_cold::apply_segment_seq_ceiling;
 
 use crate::cache::SegmentCache;
 use crate::driver::SegmentOrder;
@@ -238,7 +239,13 @@ impl<R: FormatReader + 'static> PartitionStream for PersistPartitionStream<R> {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let projected = project_batch_to_schema(&batch, &output_schema)
+                // Apply the segment's own ceiling BEFORE projecting: the
+                // projection may drop `commit_seq_num` (see `scan`'s
+                // output_ordering), and filtering after it would silently skip
+                // the ceiling on exactly the queries that project it away.
+                let bounded = apply_segment_seq_ceiling(&batch, segment)
+                    .map_err(DataFusionError::from)?;
+                let projected = project_batch_to_schema(&bounded, &output_schema)
                     .map_err(DataFusionError::from)?;
                 if projected.num_rows() > 0 {
                     yield projected;
@@ -807,6 +814,7 @@ mod tests {
             statistics: stats,
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 

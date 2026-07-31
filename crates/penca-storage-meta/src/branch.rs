@@ -25,6 +25,7 @@ impl LifecycleManager {
         branch_uuid: &str,
         branch_name: &str,
         fork_commit_seq_num: i64,
+        fork_commit_micros: i64,
         parent_branch_uuid: Option<&str>,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
@@ -32,8 +33,9 @@ impl LifecycleManager {
 
         let sql = format!(
             "INSERT INTO {table} \
-             (branch_uuid, branch_name, fork_commit_seq_num, parent_branch_uuid) \
-             VALUES ($1, $2, $3, $4)",
+             (branch_uuid, branch_name, fork_commit_seq_num, fork_commit_micros, \
+              parent_branch_uuid) \
+             VALUES ($1, $2, $3, $4, $5)",
             table = qi(&table),
         );
         let parent = match parent_branch_uuid {
@@ -47,6 +49,7 @@ impl LifecycleManager {
                     SqlValue::uuid_str(branch_uuid)?,
                     SqlValue::Text(branch_name.to_string()),
                     SqlValue::Int64(fork_commit_seq_num),
+                    SqlValue::Int64(fork_commit_micros),
                     parent,
                 ],
             )

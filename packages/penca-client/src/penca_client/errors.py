@@ -41,6 +41,19 @@ class AlreadyExistsError(ApiError):
     """
 
 
+class AbortedError(ApiError):
+    """A concurrency conflict; the operation made no changes and a retry is safe.
+
+    Distinct from ``FailedPreconditionError``, which means the request itself was
+    wrong and reissuing it unchanged will fail again. Raised when a server-side
+    operation loses a lock race with a concurrent catalog operation — currently
+    ``DeleteBranch``, which locks only the branch's own partitions but must still
+    take a catalog-wide lock to drop them, and rolls back wholly on contention.
+    Retrying is the caller's call: the server deliberately does not loop, since a
+    retry with no backoff turns a loud conflict into a quiet livelock.
+    """
+
+
 class QueryTimeoutError(ApiError):
     """``read_data`` / ``audit_data`` ran past ``query_timeout_seconds``.
 

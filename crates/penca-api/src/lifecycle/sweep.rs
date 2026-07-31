@@ -56,6 +56,25 @@ impl LifecycleManager {
         let catalog_str = catalog_uuid.to_string();
 
         let now_micros = penca_storage_meta::LifecycleManager::now_micros(pool).await?;
+
+        // Reap first: drop past-grace rows whose URI still has a COMMITTED
+        // reference, so the eligibility scan below walks a set that does not
+        // accumulate. Nothing else ever removes such a row — the unlink path only
+        // deletes after a successful delete — so before this they sat in the
+        // expired range forever, and enqueue-only branch teardown made that growth
+        // monotonic in "forks ever deleted". Whoever later drops the URI's last
+        // committed reference re-enqueues it, so reaping loses nothing. Rows
+        // pinned only by an in-flight snapshot's UNCOMMITTED carried refs are
+        // deliberately left alone; that path's cleanup does not enqueue.
+        let reaped_count =
+            penca_storage_meta::LifecycleManager::reap_referenced_segment_delete_set_rows(
+                pool,
+                &catalog_str,
+                now_micros,
+                self.query_timeout_micros,
+            )
+            .await?;
+
         let eligible = penca_storage_meta::LifecycleManager::eligible_segment_delete_set_rows(
             pool,
             &catalog_str,
@@ -81,13 +100,18 @@ impl LifecycleManager {
             }
         }
 
-        // Triage guide for these two fields: `eligible` already excludes
+        // Triage guide for these three fields: `eligible` already excludes
         // refcount-pinned rows, so a persistent 0 while the delete set grows
         // reads as "everything still referenced". `deleted` lagging `eligible`
         // means cold-file deletes are failing and the rows await a retry.
+        // `reaped` is the still-referenced rows dropped from the set this pass —
+        // it is what distinguishes a healthy idle sweep from the old failure mode
+        // where `eligible` and `deleted` both read 0 forever while the set grew
+        // without bound.
         tracing::debug!(
             eligible = eligible_count,
             deleted = deleted_count,
+            reaped = reaped_count,
             "sweep_segments complete"
         );
 

@@ -113,15 +113,21 @@ pub struct AuditPlan {
     /// When set, `audit_data` reattaches per-tx `author`/`comment` by joining
     /// the cold `tx_log`; when unset those columns are omitted.
     include_tx_metadata: bool,
-    /// The branch's committed cold `tx_log` segments (the commit map), read
-    /// once here and joined by the cold audit builders on `commit_seq_num`
-    /// when `include_tx_metadata` is set. Empty when the flag is off.
+    /// The commit map the branch's OWN cold arm joins on `commit_seq_num` when
+    /// `include_tx_metadata` is set. Empty when the flag is off.
+    ///
+    /// For a fork this is the branch's own committed cold `tx_log` segments
+    /// UNION the parent's, bounded at the fork: since the fork copy, the own arm
+    /// serves the inherited range, whose commits are recorded in the parent's map
+    /// and not the child's. The union is unambiguous because the parent's half
+    /// stops at the fork and the child's own commits start above it.
     tx_log_segments: Vec<PersistSegment>,
     /// The parent branch's persist segments, for a forked branch's
     /// audit — so `audit_data` surfaces the inherited history. Empty for a
     /// non-forked branch. Streamed after the branch's own cold segments,
     /// capped per-row at `base_seq_to` so the child never audits the parent's
-    /// post-fork rows.
+    /// post-fork rows, and at `base_cold_to` so it never re-reports the rows
+    /// the child's own copied arm already carries.
     base_cold_upsert_segments: Vec<PersistSegment>,
     base_cold_delete_segments: Vec<PersistSegment>,
     /// The parent branch's committed cold `tx_log` segments, joined onto the
@@ -133,6 +139,20 @@ pub struct AuditPlan {
     /// Exclusive per-row `commit_seq_num` upper bound for the base (parent)
     /// segments = `min(seq_to, fork_seed + 1)`. `None` for a non-forked branch.
     base_seq_to: Option<i64>,
+    /// Exclusive per-row `committed_at_micros` upper bound for the base
+    /// (parent) segments = `min(cold_to, inherited_own_arm_floor)`. `None` for
+    /// a non-forked branch, or for a fork that copied no persist segments.
+    ///
+    /// Load-bearing on the *row* axis, not just segment selection: the two arms
+    /// are only disjoint because the base arm stops exactly where the child's
+    /// own copied arm begins. Segment selection alone cannot enforce that — a
+    /// parent segment whose micros range straddles the floor is still selected
+    /// (it overlaps the window), and then contributes *all* of its rows unless
+    /// this bound clips them. Passing the uncapped `cold_to` here is what made
+    /// a fork with a real adopted baseline emit every inherited change row
+    /// twice; deriving the floor from the adopted snapshot's watermark rather
+    /// than from the copied segments left it emitting one of them three times.
+    base_cold_to: Option<i64>,
     /// ids point-lookup restriction, decoded once here so both
     /// stream halves (upserts + deletes) share one derivation.
     row_uuids: Option<Vec<uuid::Uuid>>,
@@ -1309,12 +1329,22 @@ impl QueryManager {
         )
         .await?;
         // The parent branch's inherited upsert history, capped per-row at the
-        // fork seq (`base_seq_to`).
+        // fork seq (`base_seq_to`) and at the inherited watermark on the micros
+        // axis (`base_cold_to`) — the latter is what keeps this arm disjoint
+        // from the child's own copied arm.
         let base_cold_batches = if plan.base_cold_upsert_segments.is_empty() {
             Vec::new()
         } else {
+            // Its OWN session, not `cold_session`. `cold_audit_batches`
+            // registers its MemTable under the fixed name `d`, so two non-empty
+            // arms on one context collide with "The table d already exists" — a
+            // hard error, not wrong rows. Unreachable while a fork's own cold arm
+            // is always empty; CHA-539's fork copy makes both arms non-empty on
+            // every fork. Gating the base arm off for at-or-above-fork reads does
+            // NOT cover this: a below-fork as-of read keeps both arms by design.
+            let base_cold_session = penca_dl::derive_cold_session(&self.session_template);
             cold_upsert_audit_batches(
-                &cold_session,
+                &base_cold_session,
                 readers.as_ref(),
                 &plan.base_cold_upsert_segments,
                 &plan.base_tx_log_segments,
@@ -1322,7 +1352,7 @@ impl QueryManager {
                 &audit_schema,
                 plan.include_tx_metadata,
                 plan.cold_from,
-                plan.cold_to,
+                plan.base_cold_to,
                 seq_from,
                 plan.base_seq_to,
                 plan.row_uuids.as_deref(),
@@ -1439,12 +1469,15 @@ impl QueryManager {
         )
         .await?;
         // The parent branch's inherited delete history, capped per-row at the
-        // fork seq (`base_seq_to`).
+        // fork seq (`base_seq_to`) and at the inherited watermark on the micros
+        // axis (`base_cold_to`) — see the upsert side.
         let base_cold_batches = if plan.base_cold_delete_segments.is_empty() {
             Vec::new()
         } else {
+            // Its own session — same fixed-name collision as the upsert side.
+            let base_cold_session = penca_dl::derive_cold_session(&self.session_template);
             cold_delete_audit_batches(
-                &cold_session,
+                &base_cold_session,
                 readers.as_ref(),
                 &plan.base_cold_delete_segments,
                 &plan.base_tx_log_segments,
@@ -1452,7 +1485,7 @@ impl QueryManager {
                 &plan.primary_keys,
                 plan.include_tx_metadata,
                 plan.cold_from,
-                plan.cold_to,
+                plan.base_cold_to,
                 seq_from,
                 plan.base_seq_to,
                 plan.row_uuids.as_deref(),
@@ -1730,7 +1763,7 @@ impl QueryManager {
         // The cold audit builders reattach author/comment via a
         // commit_seq_num join against these.
         let include_tx_metadata = request.include_tx_metadata;
-        let tx_log_segments = if include_tx_metadata && hot_min != 0 {
+        let mut tx_log_segments = if include_tx_metadata && hot_min != 0 {
             tx_log_persist_segments(
                 pool,
                 &catalog_uuid_str,
@@ -1747,8 +1780,9 @@ impl QueryManager {
 
         // For a forked branch, enumerate the parent's persist segments so
         // `audit_data` surfaces the inherited history. Capped at the fork seq
-        // at the segment level here and per-row via `base_seq_to` below, so the
-        // child never audits the parent's post-fork rows. Fetched
+        // at the segment level here and per-row via `base_seq_to` /
+        // `base_cold_to` below, so the child never audits the parent's
+        // post-fork rows and never re-reports what its own arm carries. Fetched
         // unconditionally, independent of the child's `hot_min == 0` skip — the
         // parent's history lives entirely in its cold tier. Its tx_log is read
         // too so the inherited rows reattach author/comment from the parent's
@@ -1758,11 +1792,36 @@ impl QueryManager {
             base_cold_delete_segments,
             base_tx_log_segments,
             base_seq_to,
+            base_cold_to,
         ) = match self
             .read_branch_lineage(pool, &catalog_uuid_str, &branch_uuid_str)
             .await?
         {
-            Some((parent_branch_uuid, fork_commit_seq_num)) => {
+            // CHA-539: the child's OWN persist rows now carry the parent's CDC
+            // from the fork back to wherever its copied segments start, so the
+            // base arm must stop exactly there or the overlap is double-reported
+            // — `audit_data` concatenates the two arms and does not dedup.
+            Some((parent_branch_uuid, fork_commit_seq_num, _fork_commit_micros)) => {
+                let own_arm_floor = self
+                    .inherited_own_arm_floor(
+                        pool,
+                        &catalog_uuid_str,
+                        &branch_uuid_str,
+                        &table_uuid_str,
+                        fork_commit_seq_num,
+                    )
+                    .await?;
+                let base_cold_to = match own_arm_floor {
+                    // Exclusive, with no `+ 1`: the child's own copied segments
+                    // start AT the floor, so the parent must stop strictly below
+                    // it. A genesis-inherit child copied everything, so its floor
+                    // is the earliest row overall and this window comes out empty
+                    // — the same outcome as skipping the arm, reached uniformly.
+                    Some(floor) => Some(cold_to.map_or(floor, |to| to.min(floor))),
+                    // The child copied no persist segments, so there is no own-arm
+                    // coverage to avoid overlapping: keep the caller's window.
+                    None => cold_to,
+                };
                 let (base_upserts, base_deletes) = self
                     .read_persist_segments_for_window(
                         pool,
@@ -1770,19 +1829,22 @@ impl QueryManager {
                         &parent_branch_uuid,
                         &table_uuid_str,
                         cold_from,
-                        cold_to,
+                        base_cold_to,
                         Some(fork_commit_seq_num),
                     )
                     .await?;
                 // Exclusive per-row cap: parent rows must be <= fork_seed,
                 // tightened by any audit seq-window upper.
                 let base_seq_to = Some(base_audit_seq_cap(seq_to, fork_commit_seq_num));
-                // Only fetch the parent tx_log when it will actually be joined:
-                // the audit builders short-circuit on empty base segments, so a
-                // parent with no persisted history in the window needs no read.
-                let base_tx_log = if include_tx_metadata
-                    && !(base_upserts.is_empty() && base_deletes.is_empty())
-                {
+                // Fetched whenever metadata is requested on a fork, NOT only when
+                // the base arm is non-empty. Since the fork copy, the child's OWN
+                // arm serves the inherited range, and that arm joins the child's
+                // tx_log — which holds no row for any inherited commit_seq_num,
+                // because `seed_commit_seq_num_from_fork` puts the child's own
+                // commits strictly above the fork. `build_cold_audit_sql` uses a
+                // LEFT JOIN, so a miss nulls author/comment silently rather than
+                // erroring. Both arms therefore need the parent's map.
+                let base_tx_log = if include_tx_metadata {
                     tx_log_persist_segments(
                         pool,
                         &catalog_uuid_str,
@@ -1796,10 +1858,36 @@ impl QueryManager {
                 } else {
                     Vec::new()
                 };
-                (base_upserts, base_deletes, base_tx_log, base_seq_to)
+                (
+                    base_upserts,
+                    base_deletes,
+                    base_tx_log,
+                    base_seq_to,
+                    base_cold_to,
+                )
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), None),
+            None => (Vec::new(), Vec::new(), Vec::new(), None, None),
         };
+
+        // The own arm joins this, and since the fork copy it serves the inherited
+        // range — whose commits live in the PARENT's map, so the parent's segments
+        // are unioned in.
+        //
+        // Each carries a per-row `max_commit_seq_num` ceiling rather than relying
+        // on the segment-level prune. `base_seq_to` bounds segment SELECTION and
+        // the data side of the join; the tx_log side has no predicate at all, so a
+        // parent segment straddling the fork (`min <= fork_seq < max`) is admitted
+        // whole. Its post-fork `commit_seq_num`s are exactly the values the child's
+        // own commits use — both counters continue from `fork_seq` — so one own-arm
+        // row would match two `t` rows and come out twice, one copy carrying the
+        // parent's author. Reachable whenever the fork-time flush does not re-cut
+        // the segment at the fork: an exact-seq ForkPoint below head no-ops the
+        // flush, and the same-micros leak does it even at head.
+        let base_tx_log_ceiling = base_seq_to.map(|to| to.saturating_sub(1));
+        tx_log_segments.extend(base_tx_log_segments.iter().map(|seg| PersistSegment {
+            max_commit_seq_num: base_tx_log_ceiling,
+            ..seg.clone()
+        }));
 
         Ok(AuditPlan {
             catalog_uuid,
@@ -1821,6 +1909,7 @@ impl QueryManager {
             base_cold_delete_segments,
             base_tx_log_segments,
             base_seq_to,
+            base_cold_to,
             row_uuids,
             deadline,
         })
@@ -2342,11 +2431,15 @@ async fn cold_upsert_audit_batches<R: FormatReader + 'static>(
         return Ok(Vec::new());
     }
     let cold_upsert_schema = penca_merge::cold_upsert_schema(user_schema);
-    let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, segments, &cold_upsert_schema, None)
-            .try_collect()
-            .await
-            .map_err(ApiError::ColdStorage)?;
+    let data_batches: Vec<RecordBatch> = ColdStorageClient::read_persist_segments_bounded(
+        readers,
+        segments,
+        &cold_upsert_schema,
+        None,
+    )
+    .try_collect()
+    .await
+    .map_err(ApiError::ColdStorage)?;
     let (tx_log_batches, tx_log_schema) =
         read_tx_log_batches(readers, tx_log_segments, include_tx_metadata).await?;
     penca_merge::cold_audit_batches(
@@ -2378,8 +2471,18 @@ async fn read_tx_log_batches<R: FormatReader + 'static>(
     if !include_tx_metadata || tx_log_segments.is_empty() {
         return Ok((Vec::new(), schema));
     }
+    // `_bounded`, so a segment carrying `max_commit_seq_num` has its rows clipped
+    // to that ceiling. Load-bearing for a fork: the parent's tx_log is unioned
+    // into the child's own arm to recover inherited authors, and
+    // `build_cold_audit_sql` puts NO predicate on the tx_log side of the join —
+    // so a parent segment straddling the fork would contribute its post-fork rows
+    // to `t`. Those collide by construction: the child's own commits and the
+    // parent's post-fork commits both continue from `fork_seq`, so one own-arm
+    // data row would match two `t` rows and be emitted twice, one copy carrying
+    // the parent's author. The child's own segments carry no ceiling and pass
+    // through untouched.
     let batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, tx_log_segments, &schema, None)
+        ColdStorageClient::read_persist_segments_bounded(readers, tx_log_segments, &schema, None)
             .try_collect()
             .await
             .map_err(ApiError::ColdStorage)?;
@@ -2472,11 +2575,15 @@ async fn cold_delete_audit_batches<R: FormatReader + 'static>(
     }
     let audit_schema = audit_delete_schema(user_schema, primary_keys, include_tx_metadata)?;
     let cold_delete_schema = penca_merge::cold_delete_schema(user_schema, primary_keys)?;
-    let data_batches: Vec<RecordBatch> =
-        ColdStorageClient::read_persist_segments(readers, segments, &cold_delete_schema, None)
-            .try_collect()
-            .await
-            .map_err(ApiError::ColdStorage)?;
+    let data_batches: Vec<RecordBatch> = ColdStorageClient::read_persist_segments_bounded(
+        readers,
+        segments,
+        &cold_delete_schema,
+        None,
+    )
+    .try_collect()
+    .await
+    .map_err(ApiError::ColdStorage)?;
     let (tx_log_batches, tx_log_schema) =
         read_tx_log_batches(readers, tx_log_segments, include_tx_metadata).await?;
     penca_merge::cold_audit_batches(

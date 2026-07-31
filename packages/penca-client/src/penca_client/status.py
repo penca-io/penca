@@ -12,6 +12,7 @@ from __future__ import annotations
 from grpc import RpcError, StatusCode
 
 from penca_client.errors import (
+    AbortedError,
     AlreadyExistsError,
     ApiError,
     FailedPreconditionError,
@@ -49,6 +50,12 @@ def rpc_error_to_api_error(err: RpcError) -> Exception:
 
     if code == StatusCode.UNIMPLEMENTED:
         return NotImplementedError(detail)
+
+    # ABORTED is the concurrency-conflict code: the operation made no changes,
+    # so reissuing is safe. Mapped to its own class so a caller can retry it
+    # without also swallowing genuine failures.
+    if code == StatusCode.ABORTED:
+        return AbortedError(detail)
 
     # ADR 0019 / CHA-233: `read_data` / `audit_data` past
     # ``query_timeout_seconds`` surfaces as ``RESOURCE_EXHAUSTED``;

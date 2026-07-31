@@ -1319,13 +1319,14 @@ schedule.
 
 **Branch deletion picks up in-flight orphans.**
 `WriteManager::delete_branch`
-(`crates/penca-api/src/write.rs:324`) calls
+(`crates/penca-api/src/write/mod.rs`) calls
 `LifecycleManager::get_compact_segment_uris_for_branch` *in addition
 to* the persist/snapshot segment enumerations, so the merged files
-behind both committed AND `NULL` rows get deleted from cold
-storage before the partition `DROP … CASCADE` removes the
-`compact_segment_metadata` rows themselves. Without this branch a
-crashed-mid-compact merged file would leak past branch delete.
+behind both committed AND `NULL` rows are queued onto
+`segment_delete_set` in the same transaction that drops the
+`compact_segment_metadata` rows. Without this branch a
+crashed-mid-compact merged file would leak past branch delete: nothing
+else names it, so no later enumeration would ever find it.
 
 **Visibility is preserved end-to-end.** No row's
 `commit_micros` is ever nulled. Before the merge `tx.commit`,
@@ -1344,42 +1345,54 @@ sealed away, it is dead code.
 
 ## Branch deletion
 
-**Implementation:** `WriteManager.delete_branch`
-(`lib/api/write.py`)
+**Implementation:** `WriteManager::delete_branch`
+(`crates/penca-api/src/write/mod.rs`)
 
-Branch deletion follows the [no-orphans design principle](#design-principles):
-cold storage files are deleted before their metadata rows, so a crash never
-leaves untracked files in object storage.
+Branch deletion is a **pure metadata operation**: it unlinks nothing itself.
+Dropping the branch's segment rows is what makes a file unreferenced, and the
+`segment_delete_set` refcount gate decides — past the universal grace window —
+whether any other branch still names it.
 
-**Phase 1: Collect segments.** Query `table_persist_segment_metadata` and
-`table_snapshot_segment_metadata` for all `(pk_uuid, object_uri)` pairs
-associated with the branch's data tables and commit_tx_log partition.
+That indirection is load-bearing (CHA-539). Since CHA-531 a carried row lives in
+one branch's partition while its `object_uri` names the file another branch
+wrote, so a teardown that unlinked whatever its own enumeration reached would
+destroy a sibling's data across a fork edge: deleting the child unlinks files its
+carried rows name — the parent's. Handing the URIs to the gate instead of
+deleting them is what makes that safe, and it replaces the previous best-effort
+delete: a queued row that fails to collect is simply retried by the next sweep.
 
-**Phase 2: Delete files.** Delete each cold storage file via the format
-writer. Successfully deleted segments are tracked by their PK UUID
-(`table_persist_segment_uuid` for persist, `table_snapshot_segment_uuid` for snapshot). Segments
-whose files fail to delete are skipped — their metadata rows are
-preserved.
+**`main` cannot be deleted.** The opposite direction — deleting the branch a fork
+inherits *from* — is rejected outright with `INVALID_ARGUMENT` rather than made
+safe. While forks are main-only (CHA-515) that always means deleting `main`,
+which leaves the catalog unusable for reasons unrelated to cold data: every read
+resolves the main branch. `DeleteCatalog` is the removal path. So the gate covers
+the child direction today; the parent direction becomes reachable, and the gate
+becomes the only thing behind it, once [CHA-509](https://linear.app/chapala/issue/CHA-509)
+allows a fork off a non-main branch.
 
-**Phase 3: Transactional metadata cleanup.** Inside a single Postgres
-transaction:
+**Phase 1: Collect URIs.** Catalog-wide over the branch's tables:
+`table_persist_segment_metadata`, `table_snapshot_segment_metadata`, the
+cold-index sidecars (`table_snapshot_segment_index_metadata` — their own files,
+reachable only through an index header, so they need their own enumeration or
+they leak past the partition CASCADE), and `compact_segment_metadata`. The last
+covers crashed-mid-compact merged files, whose `NULL` rows no segment metadata
+points at. Deduped: one physical file legitimately backs several rows, and the
+delete set holds one row per file.
+
+**Phase 2: Drop metadata and queue the files, in one transaction.**
 
 1. DELETE the branch row from `branch_store`.
-2. For each `data_log_prefix_uuid` on the branch:
-   a. DROP the hot data tables (`{physical}_upsert_log`,
-      `{physical}_delete_log`).
-3. DELETE from `table_snapshot_segment_metadata WHERE
-   table_snapshot_segment_uuid = ANY(deleted_snap_uuids)`.
-4. DELETE from `table_snapshot_metadata` for snapshots with no remaining
-   segments.
-5. DELETE from `table_persist_segment_metadata WHERE
-   table_persist_segment_uuid = ANY(deleted_persist_uuids)`.
-6. DROP the branch's `commit_tx_log` family partitions and its `table_metadata_*`
-   sub-partitions under each schema in the catalog.
+2. DROP the hot data tables per table on the branch.
+3. `drop_branch_partitions` — DROP TABLE CASCADE on the per-branch leaves of the
+   persist/snapshot metadata families, which removes the branch's segment rows
+   and with them its references.
+4. `insert_segment_delete_set_rows` for the Phase-1 set.
 
-All metadata deletes use PK-based lookups. If any file deletions failed,
-the corresponding metadata rows are preserved — they point to real files
-and are detectable for retry by a future cleanup process.
+Steps 3 and 4 share the transaction deliberately: dropping the references and
+queueing the files must be one atomic fact. A crash between them would leave
+either an unreferenced file nothing will ever collect, or a queued file still
+referenced with no clock to reconcile. The enqueue's `ON CONFLICT` refresh gives
+a URI already queued by another branch's retirement the later grace clock.
 
 ## Snapshot (cold storage optimization)
 

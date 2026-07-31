@@ -29,8 +29,10 @@ use penca_storage_meta::{MetadataError, Result, RetentionFloor, SnapshotResult};
 use super::QueryManager;
 use super::meta_resolve::parse_meta_uuid;
 
-/// A branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num)`.
-type BranchLineage = (String, i64);
+/// A branch's fork lineage — `(parent_branch_uuid, fork_commit_seq_num,
+/// fork_commit_micros)`. The position is carried on both axes because reads
+/// arrive on both; seq stays the authority for any ceiling.
+type BranchLineage = (String, i64, i64);
 
 /// Result of [`Self::read_and_classify_persist_segments`].
 struct ClassifiedPersistSegments {
@@ -131,15 +133,6 @@ impl QueryManager {
                 retention_duration_seconds,
             )
             .await?;
-
-        // The seq of the child snapshot this read will resolve on
-        // (`SNAPSHOT_SEQ_GENESIS` when none is picked — a fresh fork or a
-        // time-travel read below any child snapshot). The base-source gate
-        // keys on this: any real child snapshot has `w_snap > fork_seed`, so a
-        // picked snapshot always covers the fork and subsumes the parent.
-        let child_snapshot_seq = cache_pick
-            .as_ref()
-            .map_or(watermarks::SNAPSHOT_SEQ_GENESIS, |pick| pick.w_snap);
 
         // Pre-Persist (`hot_min == 0`): hot owns every row, so skip the
         // cold fetch AND the phase-1 capture — `assemble_plan` ignores the
@@ -263,9 +256,31 @@ impl QueryManager {
         // parent's `object_uri`s forward by reference rather than by rewriting
         // them — so enumerating the base source again would double-count.
         // Steady-state forked reads return to the non-forked plan shape.
+        // CHA-539: the child now HOLDS the parent's cold as-of the fork as its own
+        // rows, so the base arm is exactly redundant for any read at or above the
+        // fork — and still required below it, where the child inherited one
+        // baseline rather than the parent's whole history.
+        //
+        // The old gate (`child_snapshot_seq < fork_commit_seq_num`) asked the
+        // wrong question: the inherited snapshot carries the PARENT's `W_snap`,
+        // which is at or below the fork, so it stayed open on every fork forever
+        // and every forked read re-enumerated data the child already owned.
+        //
+        // Deliberately CONSERVATIVE. It closes the arm only for reads provably at
+        // or above the fork; a read below it keeps today's path verbatim. So an
+        // `as_of` between the inherited watermark and the fork still enumerates
+        // the parent even though the copied rows could answer alone — the two
+        // resolve to the same files and the fold dedups them, and preserving the
+        // existing path for every below-fork read is worth more than saving an
+        // enumeration on a rare time-travel query. Do not narrow this to the
+        // inherited watermark.
+        let read_is_below_fork = |fork_seq: i64, fork_micros: i64| {
+            as_of_micros < fork_micros
+                || commit_seq_upper.is_some_and(|as_of_seq| as_of_seq < fork_seq)
+        };
         let base_cold_storage = match lineage {
-            Some((parent_branch_uuid, fork_commit_seq_num))
-                if child_snapshot_seq < fork_commit_seq_num =>
+            Some((parent_branch_uuid, fork_commit_seq_num, fork_commit_micros))
+                if read_is_below_fork(fork_commit_seq_num, fork_commit_micros) =>
             {
                 // Parent ceiling = min(fork_seed, as_of_seq): the fork is a hard
                 // cap `as_of` can only push down.
@@ -471,7 +486,8 @@ impl QueryManager {
                  WHERE branch_uuid = $2 AND table_uuid = $1 AND commit_micros IS NOT NULL \
              ) \
              SELECT h.persist_wm, p.commit_seq_num AS w_snap, p.table_snapshot_uuid, \
-                    bs.parent_branch_uuid, bs.fork_commit_seq_num{floor_cols} \
+                    bs.parent_branch_uuid, bs.fork_commit_seq_num, \
+                    bs.fork_commit_micros{floor_cols} \
              FROM hot h \
              LEFT JOIN LATERAL ( \
                  SELECT s.commit_seq_num, s.table_snapshot_uuid \
@@ -530,7 +546,9 @@ impl QueryManager {
                 let fork_commit_seq_num: i64 = r
                     .try_get("fork_commit_seq_num")
                     .map_err(MetadataError::Db)?;
-                parent.map(|parent| (parent.to_string(), fork_commit_seq_num))
+                let fork_commit_micros: i64 =
+                    r.try_get("fork_commit_micros").map_err(MetadataError::Db)?;
+                parent.map(|parent| (parent.to_string(), fork_commit_seq_num, fork_commit_micros))
             }
             None => None,
         };
@@ -973,21 +991,87 @@ impl QueryManager {
         Ok((upsert_segments, delete_segments))
     }
 
-    /// Read a branch's fork lineage from `branch_store` — the parent
-    /// branch and the fork commit's seq. `None` for `main` and any branch with
-    /// NULL lineage (non-forked). The read planner consults this to decide
-    /// whether to enumerate a parent cold source for a forked-branch read.
+    /// The `commit_micros` at which a fork's OWN inherited coverage begins —
+    /// `MIN(min_tx_commit_micros)` over the persist segments `CreateBranch`
+    /// copied into the child. The audit base arm stops here (exclusively), so
+    /// the two arms meet exactly: the parent covers `[genesis, floor)` and the
+    /// child's copies cover `[floor, fork]`.
+    ///
+    /// Derived from the copied segments themselves rather than from the adopted
+    /// snapshot's `snapshotted_at_micros`, because those two do not have to
+    /// align. The copy is per-persist-*header*: a header whose
+    /// `persisted_at_micros` sits above the baseline is copied with all of its
+    /// segments, and such a segment carries every row of that persist run —
+    /// including rows committed at or below the baseline. `snapshotted_at_micros`
+    /// is caller-supplied on the public `Snapshot` RPC and
+    /// `compute_snapshot_window` takes `min(as_of, persisted_at)`, so a baseline
+    /// landing mid-run is directly reachable. Capping at `baseline + 1` then
+    /// leaves the parent re-emitting every row the straddling copied segment
+    /// already carries — observed as one inherited change row appearing three
+    /// times, once per overlapping parent segment plus the child's own copy.
+    ///
+    /// Bounded at the fork on the seq axis: the child's own post-fork segments
+    /// all sit above `fork_commit_seq_num`, so without the bound this `MIN`
+    /// would keep dropping as the child persists its own writes and the base
+    /// arm would widen back over ground the child already covers.
+    ///
+    /// `None` when the child copied no persist segments at all — there is then
+    /// no own-arm coverage to be disjoint from, so the base arm keeps the
+    /// caller's full window.
+    pub async fn inherited_own_arm_floor(
+        &self,
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+        table_uuid: &str,
+        fork_commit_seq_num: i64,
+    ) -> Result<Option<i64>> {
+        let catalog = parse_uuid(catalog_uuid);
+        let seg = naming::table_persist_segment_metadata_table(&catalog);
+        let rows = driver
+            .execute_params(
+                &format!(
+                    "SELECT MIN(min_tx_commit_micros) AS floor FROM {seg} \
+                     WHERE branch_uuid = $1 AND table_uuid = $2 \
+                       AND commit_micros IS NOT NULL \
+                       AND min_commit_seq_num <= $3",
+                    seg = qi(&seg),
+                ),
+                &[
+                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::uuid_str(table_uuid)?,
+                    SqlValue::Int64(fork_commit_seq_num),
+                ],
+            )
+            .await?;
+
+        Ok(rows
+            .first()
+            .and_then(|row| row.try_get::<Option<i64>, _>("floor").ok().flatten()))
+    }
+
+    /// Read a branch's fork lineage from `branch_store` — the parent branch and
+    /// the fork commit's position on both axes, `(parent, seq, micros)`. `None`
+    /// for `main` and any branch with NULL lineage (non-forked). The read planner
+    /// consults this to decide whether to enumerate a parent cold source for a
+    /// forked-branch read.
+    ///
+    /// Both axes come back because reads arrive on both: a seq-axis read carries
+    /// `commit_seq_upper`, a current-time or `AsOfMicros` read carries only
+    /// `as_of_micros`. Seq remains the authority for any ceiling — see the
+    /// non-strict-monotonic `commit_micros` note on the `branch_store` DDL.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn read_branch_lineage(
         &self,
         driver: &impl DbDriver<Row = PgRow>,
         catalog_uuid: &str,
         branch_uuid: &str,
-    ) -> Result<Option<(String, i64)>> {
+    ) -> Result<Option<(String, i64, i64)>> {
         let catalog = parse_uuid(catalog_uuid);
         let branch_store = naming::branch_store_table(&catalog);
         let sql = format!(
-            "SELECT parent_branch_uuid, fork_commit_seq_num FROM {store} WHERE branch_uuid = $1",
+            "SELECT parent_branch_uuid, fork_commit_seq_num, fork_commit_micros \
+             FROM {store} WHERE branch_uuid = $1",
             store = qi(&branch_store),
         );
         let rows = driver
@@ -1007,7 +1091,16 @@ impl QueryManager {
         let fork_commit_seq_num: i64 = row
             .try_get("fork_commit_seq_num")
             .map_err(MetadataError::Db)?;
-        Ok(parent.map(|parent_branch_uuid| (parent_branch_uuid.to_string(), fork_commit_seq_num)))
+        let fork_commit_micros: i64 = row
+            .try_get("fork_commit_micros")
+            .map_err(MetadataError::Db)?;
+        Ok(parent.map(|parent_branch_uuid| {
+            (
+                parent_branch_uuid.to_string(),
+                fork_commit_seq_num,
+                fork_commit_micros,
+            )
+        }))
     }
 
     /// Enumerate the parent branch's cold tier as a second cold
@@ -1164,6 +1257,7 @@ impl QueryManager {
                     seg.row_count, seg.format, \
                     seg.min_tx_commit_micros, \
                     seg.max_tx_commit_micros, \
+                    seg.max_commit_seq_num, \
                     seg.size_bytes, seg.metadata, seg.statistics \
              FROM {seg} seg \
              INNER JOIN {tfm} tfm \
@@ -1232,6 +1326,10 @@ impl QueryManager {
                 statistics: statistics.unwrap_or_default(),
                 offset,
                 length,
+                // Always set, even where it is inert: for an ordinarily-written
+                // segment this equals the file's true maximum, so the ceiling
+                // costs a no-op filter and needs no per-row special case.
+                max_commit_seq_num: Some(row.get("max_commit_seq_num")),
             };
 
             match log_kind {
@@ -1676,6 +1774,7 @@ mod assemble_tests {
             statistics: vec![],
             offset: None,
             length: None,
+            max_commit_seq_num: None,
         }
     }
 

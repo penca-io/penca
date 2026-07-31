@@ -33,6 +33,7 @@ from uuid import uuid4
 import pyarrow as pa
 from penca_client.naming import (
     SEGMENT_DELETE_SET,
+    TABLE_PERSIST_SEGMENT_METADATA,
     TABLE_SNAPSHOT_INDEX_METADATA,
     TABLE_SNAPSHOT_METADATA,
     TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
@@ -199,6 +200,27 @@ def _enqueue_delete_set_row(catalog_uuid, uri, written_at):
     )
 
 
+def _drop_all_branch_references(catalog_uuid, branch_uuid):
+    """Drop EVERY cold reference row a branch holds, in both tiers plus sidecars.
+
+    The positive controls need zero remaining references to the file. Since
+    CHA-539 a fork also carries its own inherited reference rows from
+    `create_branch`, so dropping only the rows a test synthesized leaves the file
+    still referenced and the control silently stops controlling.
+    """
+    for table_name in (
+        TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA,
+        TABLE_SNAPSHOT_SEGMENT_METADATA,
+        TABLE_PERSIST_SEGMENT_METADATA,
+    ):
+        get_pg_driver().execute_no_result(
+            SQL("DELETE FROM {tbl} WHERE branch_uuid = %s").format(
+                tbl=Identifier(f"{catalog_uuid}_{table_name}")
+            ),
+            (branch_uuid,),
+        )
+
+
 def _drop_snapshot_rows(catalog_uuid, branch_uuid, snapshot_uuid):
     """Drop every row a snapshot owns, as retirement would.
 
@@ -326,7 +348,7 @@ def test_parent_retire_does_not_delete_child_referenced_segment():
     # sweeping again isolates the child reference as the one thing
     # pinning the file: if the row drains now, the sweep was live and
     # willing to delete this URI all along.
-    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+    _drop_all_branch_references(catalog_uuid, child_branch)
     assert _segment_uris(catalog_uuid, child_branch, child_snap) == [], (
         "the control's setup did not take: the child's synthesized segment"
         " rows are still present, so a surviving delete-set row below would"
@@ -444,7 +466,7 @@ def test_parent_sweep_spares_a_sidecar_another_branch_references():
 
     # Positive control: drop the child's copied sidecar and the file has
     # zero references left, so the same sweep drains it.
-    _drop_snapshot_rows(catalog_uuid, child_branch, child_snap)
+    _drop_all_branch_references(catalog_uuid, child_branch)
 
     client.sweep_segments(catalog_uuid=catalog_uuid)
 
@@ -530,4 +552,136 @@ def test_later_retirement_refreshes_a_shared_files_grace_window():
         "with the delete-set row for this file past grace and zero live"
         f" references, the sweep must drain {shared_uri}; it did not, so the"
         " assertion above proves nothing about the grace clock."
+    )
+
+
+def _persist_segment_rows(catalog_uuid, branch_uuid, table_uuid):
+    """``[(table_persist_segment_uuid, object_uri), ...]`` for a (branch, table).
+
+    Persist segments survive a snapshot (it is additive), so a write_cycle
+    leaves both tiers' rows in place with disjoint URI prefixes
+    (``/persist/`` vs ``/snapshot/``).
+    """
+    seg = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT table_persist_segment_uuid::text, object_uri FROM {tbl}"
+            " WHERE branch_uuid = %s AND table_uuid = %s AND commit_micros IS NOT NULL"
+            " ORDER BY min_commit_seq_num"
+        ).format(tbl=Identifier(seg)),
+        (branch_uuid, table_uuid),
+    )
+
+    return [(r[0], r[1]) for r in rows]
+
+
+def _drop_persist_segment_rows(catalog_uuid, branch_uuid, uri):
+    """Drop one branch's persist references to ``uri`` (a compaction re-point or
+    a branch teardown does this)."""
+    seg = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
+    get_pg_driver().execute_no_result(
+        SQL("DELETE FROM {tbl} WHERE branch_uuid = %s AND object_uri = %s").format(
+            tbl=Identifier(seg)
+        ),
+        (branch_uuid, uri),
+    )
+
+
+def test_sweep_spares_a_uri_another_branch_persist_row_references():
+    """CHA-539: the refcount gate must see PERSIST references too.
+
+    The gate has two ``NOT EXISTS`` arms — snapshot segments and index
+    sidecars. Neither covers ``table_persist_segment_metadata``, so a persist
+    URI is unguarded. That is load-bearing for CHA-539: once ``delete_branch``
+    becomes enqueue-only it will queue the persist URIs a fork references, and
+    a fork's materialized reference rows are persist rows.
+
+    Not defence-in-depth over an existing mechanism. The only other cross-branch
+    protection persist segments would have is CHA-72's
+    ``earliest_fork_point_into`` retention clamp, which is **unimplemented**
+    (zero matches in the tree), so this arm is the first one.
+
+    Synthesized with direct SQL for the same reason the sibling tests are —
+    it pins the GC gate independent of the fork-copy writer landing.
+    """
+    client, catalog_uuid, schema_uuid, table_uuid, main_branch = (
+        setup_partitioned_table("fgcp")
+    )
+
+    write_cycle(
+        client,
+        catalog_uuid=catalog_uuid,
+        schema_uuid=schema_uuid,
+        table_uuid=table_uuid,
+        branch_uuid=main_branch,
+        upserts=pa.table(
+            {"name": ["alice", "bob", "carol"], "value": [1, 2, 3]},
+            schema=USER_SCHEMA,
+        ),
+    )
+    parent_rows = _persist_segment_rows(catalog_uuid, main_branch, table_uuid)
+    assert parent_rows, "the parent must hold at least one committed persist segment"
+    shared_seg_uuid, shared_uri = parent_rows[0]
+
+    child_branch = client.create_branch(
+        f"fgcp_child_{uuid4().hex[:6]}",
+        catalog_uuid=catalog_uuid,
+        author="test",
+        comment="cha-539",
+    ).branch_uuid
+
+    # The child's materialized persist reference: same object_uri, new segment
+    # identity, under the child's branch_uuid — the row shape CHA-539's fork
+    # copy produces.
+    seg_table = f"{catalog_uuid}_{TABLE_PERSIST_SEGMENT_METADATA}"
+    _copy_row_to_branch(
+        seg_table,
+        where="branch_uuid = %s AND table_persist_segment_uuid = %s",
+        params=(main_branch, shared_seg_uuid),
+        overrides={
+            "branch_uuid": child_branch,
+            "table_persist_segment_uuid": str(uuid4()),
+        },
+    )
+    child_uris = [
+        uri
+        for _uuid, uri in _persist_segment_rows(catalog_uuid, child_branch, table_uuid)
+    ]
+    assert shared_uri in child_uris, (
+        "setup failed: the child must hold a persist reference to the parent's file"
+    )
+
+    # The owning branch drops its own reference and enqueues the file past its
+    # grace window — what enqueue-only branch teardown will do.
+    _enqueue_delete_set_row(catalog_uuid, shared_uri, _now_micros() - 10_000_000)
+    _drop_persist_segment_rows(catalog_uuid, main_branch, shared_uri)
+
+    client.sweep_segments(catalog_uuid=catalog_uuid)
+
+    remaining = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
+    assert len(remaining) == 1, (
+        "sweep deleted a cold file another branch's PERSIST row still"
+        " references. eligible_segment_delete_set_rows has no NOT EXISTS arm"
+        " over table_persist_segment_metadata, so the reference held by branch"
+        f" {child_branch} on {shared_uri} is invisible to the gate."
+    )
+
+    # Positive control — surviving above is also what a sweep that never
+    # considered the URI eligible looks like. Drop the child's reference and
+    # sweep again: if the row drains now, the sweep was live and willing to
+    # delete this URI all along, and the child's row was the one thing pinning it.
+    _drop_persist_segment_rows(catalog_uuid, child_branch, shared_uri)
+    assert shared_uri not in [
+        uri
+        for _uuid, uri in _persist_segment_rows(catalog_uuid, child_branch, table_uuid)
+    ], "the control's setup did not take: the child still references the file"
+
+    client.sweep_segments(catalog_uuid=catalog_uuid)
+
+    drained = _delete_set_rows_for_uris(catalog_uuid, [shared_uri])
+    assert drained == [], (
+        "the delete-set row survived a sweep with zero remaining references, so"
+        " the survival above proves nothing about the gate. Either the sweep"
+        f" never treated {shared_uri} as eligible, or the cold-file delete"
+        " failed and the row was left for retry."
     )

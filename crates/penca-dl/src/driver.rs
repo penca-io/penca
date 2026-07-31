@@ -13,14 +13,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::{SessionContext, SessionState};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
-use penca_format::reader::FormatReader;
-use penca_storage_cold::ColdStorageError;
+use penca_format::reader::{FormatError, FormatReader};
+use penca_storage_cold::{COMMIT_SEQ_NUM_COLUMN, ColdStorageError};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
@@ -355,12 +355,37 @@ async fn read_and_cache_full_persist<R: FormatReader>(
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
 /// An oversized persist segment is read narrow rather than widened only to be
 /// discarded.
+///
+/// Exception: a segment carrying a `max_commit_seq_num` ceiling is widened by
+/// `commit_seq_num` when the projection drops it, because the caller has to
+/// filter on that column and cannot recover it afterwards. Narrowing here is an
+/// optimization; the ceiling is a correctness bound, so the bound wins. Without
+/// this the ceiling would hold on the cached path and silently vanish on the
+/// uncached one — wrong rows, no signal, and cache-state dependent.
 async fn read_projected_uncached_persist<R: FormatReader>(
     reader: &R,
     segment: &PersistSegment,
     out_schema: &SchemaRef,
+    full_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
-    let out_cols: Vec<&str> = out_schema
+    let read_schema = match segment.max_commit_seq_num {
+        Some(_) if out_schema.index_of(COMMIT_SEQ_NUM_COLUMN).is_err() => {
+            let mut fields: Vec<_> = out_schema.fields().iter().cloned().collect();
+            fields.push(
+                full_schema
+                    .field(
+                        full_schema
+                            .index_of(COMMIT_SEQ_NUM_COLUMN)
+                            .map_err(|e| ColdStorageError::from(FormatError::Arrow(e)))?,
+                    )
+                    .clone()
+                    .into(),
+            );
+            Arc::new(Schema::new(fields))
+        }
+        _ => out_schema.clone(),
+    };
+    let out_cols: Vec<&str> = read_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())
@@ -370,7 +395,7 @@ async fn read_projected_uncached_persist<R: FormatReader>(
             &segment.uri,
             segment.offset,
             segment.length,
-            out_schema,
+            &read_schema,
             Some(&out_cols),
         )
         .await
@@ -431,7 +456,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
         read_and_cache_full_persist(reader, cache, segment, full_schema, weight).await
     } else {
         span.record("cache", "miss-uncached");
-        read_projected_uncached_persist(reader, segment, out_schema).await
+        read_projected_uncached_persist(reader, segment, out_schema, full_schema).await
     }
 }
 
@@ -893,16 +918,41 @@ mod tests {
     }
 
     impl FormatReader for CountingFormatReader {
+        /// Honors `projection` when it can satisfy it, and returns the full
+        /// batch when it cannot.
+        ///
+        /// Honoring it at all is necessary: returning the batch verbatim
+        /// regardless makes any test about *which* columns were requested
+        /// vacuous — it would pass whether or not the caller widened its
+        /// projection, which is exactly what
+        /// `uncached_oversized_segment_honors_its_seq_ceiling` must distinguish
+        /// (verified by defeating the widening and watching that test fail).
+        ///
+        /// Falling back is equally necessary: `scan_snapshot_schema_tolerance`
+        /// deliberately projects a column this batch does NOT have, so the
+        /// CALLER's null-filling tolerance is what's under test there. Erroring
+        /// would move the failure into the double and hide the behavior.
         async fn read_segment(
             &self,
             _uri: &str,
             _offset: Option<i64>,
             _length: Option<i64>,
             _schema: &SchemaRef,
-            _projection: Option<&[&str]>,
+            projection: Option<&[&str]>,
         ) -> Result<RecordBatch, FormatError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(self.batch.clone())
+            let Some(cols) = projection else {
+                return Ok(self.batch.clone());
+            };
+            let Ok(indices) = cols
+                .iter()
+                .map(|name| self.batch.schema().index_of(name))
+                .collect::<Result<Vec<usize>, _>>()
+            else {
+                return Ok(self.batch.clone());
+            };
+
+            Ok(self.batch.project(&indices)?)
         }
     }
 
@@ -1837,6 +1887,69 @@ mod tests {
         assert_eq!(
             first, second,
             "cached persist read returns identical content, not just the same row count"
+        );
+    }
+
+    /// The ceiling must survive the UNCACHED read path. `read_cached_persist_segment`
+    /// returns a batch already projected to the output schema when
+    /// `cache.admits` is false, so a scan projecting `commit_seq_num` away would
+    /// leave the bound unenforceable unless the read widens for it.
+    ///
+    /// Distinguishing: with the widening, the read asks for
+    /// `(row_uuid, commit_seq_num)` and the ceiling drops the over-bound row;
+    /// without it, the read asks for `row_uuid` alone and
+    /// `apply_segment_seq_ceiling` errors rather than silently passing rows
+    /// through. Either way the assertion below fails if the widening is removed.
+    #[tokio::test]
+    async fn uncached_oversized_segment_honors_its_seq_ceiling() {
+        use penca_core::{PersistPlan, PersistSegment};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("commit_seq_num", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r0", "r1", "r2"])),
+                Arc::new(arrow::array::Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .unwrap();
+        // Budget below size_bytes so `admits` is false and the read takes the
+        // uncached, already-projected path.
+        let cache = Arc::new(SegmentCache::new(64));
+        let (dl, _reads) = driver_with(cache, batch);
+
+        let seg = PersistSegment {
+            segment_uuid: "big-with-ceiling".into(),
+            format: Format::Parquet,
+            size_bytes: 4096,
+            max_commit_seq_num: Some(20),
+            ..Default::default()
+        };
+        let plan = ColdStoragePlan {
+            snapshot: None,
+            persist: Some(PersistPlan {
+                upsert_segments: vec![seg],
+                ..Default::default()
+            }),
+        };
+        let log_schemas = LogSchemas {
+            upsert: schema.clone(),
+            delete: schema.clone(),
+        };
+
+        // Projection deliberately drops `commit_seq_num`.
+        let out = dl
+            .execute_sql(&plan, "SELECT row_uuid FROM upsert_log", &log_schemas)
+            .await
+            .expect("the ceiling must be enforceable on the uncached path");
+        let rows = out.num_rows();
+        assert_eq!(
+            rows, 2,
+            "ceiling 20 must drop the seq-30 row even though the projection omits \
+             commit_seq_num; saw {rows} rows"
         );
     }
 

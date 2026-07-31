@@ -186,10 +186,21 @@ impl PgDialect {
                 // planner can enumerate the parent's cold tier as a second
                 // source, capped at `fork_commit_seq_num`. NULL for `main` and
                 // any non-forked branch.
+                //
+                // The fork position is recorded on BOTH axes because reads arrive
+                // on both: a seq-axis read carries `commit_seq_upper`, while a
+                // current-time or `AsOfMicros` read carries only `as_of_micros`.
+                // The planner has to answer "is this read at or above the fork?"
+                // for either, and CreateBranch resolves the position to a full
+                // `Watermark` anyway, so both halves are free at write time.
+                // Seq stays the authority for any *ceiling* — `commit_micros` is
+                // only non-strictly monotonic (CHA-178), so a same-micros
+                // higher-seq commit would leak past a micros bound.
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
                     branch_uuid          UUID PRIMARY KEY,
                     branch_name          TEXT NOT NULL UNIQUE,
                     fork_commit_seq_num  BIGINT NOT NULL,
+                    fork_commit_micros   BIGINT NOT NULL,
                     parent_branch_uuid   UUID
                 )"#,
                 qi = Self::quote_identifier(&branch_store),
@@ -907,6 +918,25 @@ impl PgDialect {
         // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
         // at CreateCatalog, so older catalogs lack the index — the gate stays
         // correct there, the probe just seq-scans the branch leaf.
+        // CHA-539 added a third refcount arm over the PERSIST segment table, so
+        // that probe needs the same `object_uri` access path its snapshot
+        // siblings have. Without it the arm seq-scans every branch leaf per
+        // candidate row. The pre-existing `idx_..._tfsm_seal` is a partial index
+        // on `branch_uuid` and cannot serve a catalog-wide `object_uri` probe.
+        //
+        // Stale-catalog note (pre-release, in-place DDL): this CREATE only runs
+        // at CreateCatalog, so older catalogs lack the index — the gate stays
+        // correct there, the probe just seq-scans.
+        let idx_tfsm_uri = format!("idx_{cat_u}_tfsm_uri");
+        driver
+            .execute_no_result(&format!(
+                r#"CREATE INDEX IF NOT EXISTS {qi_idx}
+                ON {qi_tbl} (object_uri)"#,
+                qi_idx = Self::quote_identifier(&idx_tfsm_uri),
+                qi_tbl = Self::quote_identifier(&table_persist_segment_metadata),
+            ))
+            .await?;
+
         let idx_tssm_uri = format!("idx_{cat_u}_tssm_uri");
         driver
             .execute_no_result(&format!(
@@ -1013,8 +1043,9 @@ impl PgDialect {
         // position.
         driver
             .execute_no_result(&format!(
-                r#"INSERT INTO {qi} (branch_uuid, branch_name, fork_commit_seq_num)
-                VALUES ('{main_branch_uuid}', '{main_branch_name}', 0)"#,
+                r#"INSERT INTO {qi}
+                    (branch_uuid, branch_name, fork_commit_seq_num, fork_commit_micros)
+                VALUES ('{main_branch_uuid}', '{main_branch_name}', 0, 0)"#,
                 qi = Self::quote_identifier(&branch_store),
                 main_branch_name = naming::MAIN_BRANCH_NAME,
             ))
@@ -1280,6 +1311,105 @@ impl PgDialect {
         Ok(())
     }
 
+    /// Take `EXCLUSIVE` on the 14 partitions branch teardown will enumerate and
+    /// then drop. Must be the FIRST statement of the teardown transaction, before
+    /// any enumerating `SELECT`.
+    ///
+    /// # Why before the reads
+    ///
+    /// Enumerating first does not close the race it looks like it closes. The
+    /// enumerating reads are plain `SELECT`s taking only `ACCESS SHARE`, which is
+    /// compatible with a lifecycle wave's `ROW EXCLUSIVE` — so under READ
+    /// COMMITTED a wave can insert segment rows and write a cold file after those
+    /// reads, commit before the drops, and have its rows removed by the CASCADE.
+    /// That is the unreferenced-and-unqueued file enqueue-only teardown must never
+    /// produce, and with the best-effort unlink retired there is no orphan scan
+    /// left to find it.
+    ///
+    /// # Why the PARTITIONS, not the parents
+    ///
+    /// The parents are catalog-wide. Locking them exclusively stalls commits and
+    /// lifecycle waves on EVERY branch in the catalog for as long as teardown
+    /// runs — branches must not operationally impact each other beyond CPU
+    /// contention, so that is not an acceptable cost for deleting one of them.
+    ///
+    /// All 14 are LIST-partitioned on `branch_uuid`, so the isolation is already
+    /// structural in the schema: a lifecycle write routed through the parent name
+    /// takes its lock on the TARGET branch's leaf, and a write for branch C never
+    /// touches B's. Locking B's leaves blocks exactly the writers that could add a
+    /// row to B, and nothing else.
+    ///
+    /// The set is exactly what [`Self::drop_branch_partitions`] drops, and both
+    /// derive from [`Self::branch_partition_pairs`] rather than restating it. Two
+    /// roles, and dropping either half reopens the race:
+    ///
+    /// - the **6 tx-log** partitions stop new commits — and uncommitted writes,
+    ///   which is what keeps the hot tier from leaking rows past the drop;
+    /// - the **8 metadata** partitions stop persist / snapshot / compact / purge
+    ///   from inserting segment rows after the enumeration. Blocking commits does
+    ///   NOT cover these: lifecycle waves write segment metadata without going
+    ///   through the tx log.
+    ///
+    /// Per-(table, branch) advisory locks cannot serve this role. `persist:`,
+    /// `purge:` and `snapshot:` are keyed by table, so taking them requires a
+    /// table list first — and a table created concurrently has no entry in it and
+    /// therefore no lock to take, which is the same leak by another route. A
+    /// partition is the one thing a not-yet-known table's rows still land in.
+    ///
+    /// # Why `EXCLUSIVE` rather than `ACCESS EXCLUSIVE`
+    ///
+    /// `EXCLUSIVE` conflicts with `ROW EXCLUSIVE`, so it blocks every writer,
+    /// while still admitting `ACCESS SHARE` — plain `SELECT`s on the branch keep
+    /// working until the drops. Blocking writers is the entire requirement; taking
+    /// the stronger mode would block readers of B for no correctness gain. The
+    /// drops upgrade to `ACCESS EXCLUSIVE` on their own, which is unavoidable
+    /// (removing a partition rewrites the parent's descriptor) and brief.
+    pub async fn lock_branch_teardown_partitions(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let partitions: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .map(|(partition, _)| partition)
+            .collect();
+        let list = partitions
+            .iter()
+            .map(|t| Self::quote_identifier(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `SET LOCAL` is TRANSACTION-scoped, not statement-scoped, so this bound
+        // governs every later statement too — including the 14 `DROP TABLE`s,
+        // which is where it actually bites. That is deliberate but worth stating,
+        // because the dominant conflict is not another teardown: `compact` opens
+        // with `SELECT ... FOR UPDATE OF seg` naming the catalog-wide
+        // `table_persist_segment_metadata` PARENT, so it holds `ROW SHARE` there
+        // across its whole cold read and merged write. A drop needs `ACCESS
+        // EXCLUSIVE` on that parent, so a compact running anywhere in the catalog
+        // for longer than this bound fails the teardown.
+        //
+        // Failing is the right end of the trade — waiting instead would queue
+        // every subsequent lock request on that parent behind us, turning one
+        // slow compact into a catalog-wide stall. The caller reports it as
+        // `Aborted` and reissues. TODO(CHA-546): the root cause is compact naming
+        // the parent rather than the branch's partition; once reads and writes
+        // both target partitions, teardown's drops contend with nothing outside
+        // the branch and this stops being reachable in steady state.
+        //
+        // Both errors propagate UNWRAPPED. Re-wrapping as `sqlx::Error::Protocol`
+        // would erase the `Error::Database` variant, and `as_database_error()`
+        // returns `Some` only for that variant — so the SQLSTATE match the caller
+        // keys on would fail for exactly the 55P03/40P01 this timeout exists to
+        // raise, and the caller would surface `Internal` instead.
+        driver
+            .execute_no_result("SET LOCAL lock_timeout = '5s'")
+            .await?;
+        driver
+            .execute_no_result(&format!("LOCK TABLE {list} IN EXCLUSIVE MODE"))
+            .await?;
+        Ok(())
+    }
+
     /// Drop per-catalog log partitions + system-table data tables for a branch.
     #[tracing::instrument(
         level = "info",
@@ -1291,25 +1421,19 @@ impl PgDialect {
         catalog_uuid: &Uuid,
         branch_uuid: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        let tx_partitions = [
-            naming::tx_table_log_partition(catalog_uuid, branch_uuid),
-            naming::abort_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::commit_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::begin_tx_log_partition(catalog_uuid, branch_uuid),
-            naming::commit_tx_log_seq_num_partition(catalog_uuid, branch_uuid),
-            naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
-            // The persist + snapshot metadata partitions hang under the same
-            // per-catalog parents, so they drop in this same CASCADE loop and
-            // DeleteBranch leaves no residue.
-            naming::table_snapshot_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_purge_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_persist_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
-            naming::compact_segment_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_index_metadata_partition(catalog_uuid, branch_uuid),
-            naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
-        ];
+        // Same pair list `ensure_branch_partitions` creates and
+        // `lock_branch_teardown_partitions` locks, so "every partition this branch
+        // has" needs no second enumeration to stay in step with the first.
+        //
+        // Each DROP upgrades its partition's `EXCLUSIVE` to `ACCESS EXCLUSIVE` and
+        // takes `ACCESS EXCLUSIVE` on the parent to rewrite its descriptor. That
+        // parent lock is catalog-wide and unavoidable, which is why it is taken
+        // HERE and not around the enumeration: the stall is the drops only, not
+        // the whole teardown.
+        let tx_partitions: Vec<String> = Self::branch_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .map(|(partition, _)| partition)
+            .collect();
         // `segment_delete_set` is deliberately absent: it is catalog-wide and
         // unpartitioned (CHA-531). Dropping the two snapshot-segment partitions
         // above removes this branch's references to any queued file, so the
@@ -1324,16 +1448,25 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the tx-log-family branch partitions for a branch.
+    /// Every `(partition, parent)` pair a branch owns, in the order
+    /// [`Self::ensure_branch_partitions`] creates them: the tx-log family first,
+    /// then the metadata parents.
     ///
-    /// Covers begin_tx_log / abort_tx_log / commit_tx_log / tx_table_log —
-    /// single-axis LIST partitions on `branch_uuid`. Idempotent.
-    async fn ensure_tx_log_branch_partitions(
-        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
-        catalog_uuid: &Uuid,
-        branch_uuid: &Uuid,
-    ) -> Result<(), sqlx::Error> {
-        let partitions: [(String, String); 6] = [
+    /// The single source for the three sites that must agree on this set —
+    /// creation, [`Self::lock_branch_teardown_partitions`], and
+    /// [`Self::drop_branch_partitions`]. They were three hand-maintained lists,
+    /// which is precisely how the lock list came to be missing a parent and
+    /// ordered against creation. Derivation makes both properties structural, so
+    /// adding a partitioned table here reaches all three at once.
+    fn branch_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> Vec<(String, String)> {
+        Self::tx_log_partition_pairs(catalog_uuid, branch_uuid)
+            .into_iter()
+            .chain(Self::metadata_partition_pairs(catalog_uuid, branch_uuid))
+            .collect()
+    }
+
+    fn tx_log_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> [(String, String); 6] {
+        [
             (
                 naming::begin_tx_log_partition(catalog_uuid, branch_uuid),
                 naming::begin_tx_log_table(catalog_uuid),
@@ -1358,7 +1491,19 @@ impl PgDialect {
                 naming::abort_seq_num_partition(catalog_uuid, branch_uuid),
                 naming::abort_seq_num_table(catalog_uuid),
             ),
-        ];
+        ]
+    }
+
+    /// Create the tx-log-family branch partitions for a branch.
+    ///
+    /// Covers begin_tx_log / abort_tx_log / commit_tx_log / tx_table_log —
+    /// single-axis LIST partitions on `branch_uuid`. Idempotent.
+    async fn ensure_tx_log_branch_partitions(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let partitions = Self::tx_log_partition_pairs(catalog_uuid, branch_uuid);
 
         Self::ensure_list_partitions(driver, branch_uuid, &partitions).await?;
 
@@ -1382,19 +1527,8 @@ impl PgDialect {
         Ok(())
     }
 
-    /// Create the persist + snapshot metadata branch partitions for a branch.
-    ///
-    /// Covers table_persist_metadata / table_persist_segment_metadata /
-    /// table_purge_metadata / table_snapshot_metadata /
-    /// table_snapshot_segment_metadata / compact_segment_metadata — all
-    /// single-axis LIST partitions on `branch_uuid`, same shape as
-    /// [`Self::ensure_tx_log_branch_partitions`]. Idempotent.
-    async fn ensure_metadata_branch_partitions(
-        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
-        catalog_uuid: &Uuid,
-        branch_uuid: &Uuid,
-    ) -> Result<(), sqlx::Error> {
-        let partitions: [(String, String); 8] = [
+    fn metadata_partition_pairs(catalog_uuid: &Uuid, branch_uuid: &Uuid) -> [(String, String); 8] {
+        [
             (
                 naming::table_persist_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_persist_metadata_table(catalog_uuid),
@@ -1427,7 +1561,22 @@ impl PgDialect {
                 naming::table_snapshot_segment_index_metadata_partition(catalog_uuid, branch_uuid),
                 naming::table_snapshot_segment_index_metadata_table(catalog_uuid),
             ),
-        ];
+        ]
+    }
+
+    /// Create the persist + snapshot metadata branch partitions for a branch.
+    ///
+    /// Covers table_persist_metadata / table_persist_segment_metadata /
+    /// table_purge_metadata / table_snapshot_metadata /
+    /// table_snapshot_segment_metadata / compact_segment_metadata — all
+    /// single-axis LIST partitions on `branch_uuid`, same shape as
+    /// [`Self::ensure_tx_log_branch_partitions`]. Idempotent.
+    async fn ensure_metadata_branch_partitions(
+        driver: &impl DbDriver<Row = sqlx::postgres::PgRow>,
+        catalog_uuid: &Uuid,
+        branch_uuid: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let partitions = Self::metadata_partition_pairs(catalog_uuid, branch_uuid);
 
         Self::ensure_list_partitions(driver, branch_uuid, &partitions).await
     }

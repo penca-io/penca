@@ -13,6 +13,22 @@ use sqlx::postgres::PgRow;
 use crate::helpers::{epoch, parse_uuid, qi};
 use crate::{LifecycleManager, Result};
 
+/// How much older than the reader-safety grace window a refcount-pinned
+/// `segment_delete_set` row must be before the sweep reaps it.
+///
+/// Deliberately not 1×. The gate's threshold answers "is it safe to delete this
+/// file now"; this answers "has this pin proven durable", and collapsing the two
+/// costs the delete-set row its value as evidence: with one threshold, a row's
+/// absence after a sweep conflates "reaped because still referenced" with
+/// "collected because unreferenced". For an index sidecar there is no second
+/// observable — no read reaches the file — so a refcount-gate regression would
+/// become indistinguishable from correct behaviour.
+///
+/// The value only has to be comfortably clear of the grace window; the growth it
+/// bounds accrues per deleted fork, not per second, so reaping an hour late
+/// costs nothing.
+const REAP_GRACE_MULTIPLE: i64 = 10;
+
 impl LifecycleManager {
     // Concurrency safety for compaction itself comes from `SELECT FOR
     // UPDATE` on the input `table_persist_segment_metadata` rows, not
@@ -145,7 +161,8 @@ impl LifecycleManager {
         branch_uuid: &str,
     ) -> Result<Vec<String>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::compact_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::compact_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT object_uri FROM {table} WHERE branch_uuid = $1",
             table = qi(&table),
@@ -199,6 +216,35 @@ impl LifecycleManager {
     /// `table_snapshot_segment_metadata` (the retirement tx does the
     /// same with its segment-row deletes).
     ///
+    /// **Lock-ordering invariant — call this LAST, after every
+    /// segment-metadata parent the transaction touches.** Three writers
+    /// mutate both this table and those parents: the compact merge
+    /// (`lifecycle::compact`), snapshot retirement (`lifecycle::retire`),
+    /// and branch teardown (`write::delete_branch`). A writer holding a
+    /// delete-set row while it waits for a parent lock deadlocks against
+    /// one holding that parent while it waits for the row, and PG breaks
+    /// the cycle by aborting a side — a nondeterministic user-visible
+    /// failure or a killed lifecycle wave. A URI shared across a fork
+    /// edge makes it reachable with no misuse, since carry-forward and
+    /// the CHA-539 fork copy both leave one file referenced from several
+    /// branches.
+    ///
+    /// The direction is forced, not chosen. `compact_one_scope`'s FIRST
+    /// statement is `enumerate_unsealed_segments` — a
+    /// `SELECT ... FOR UPDATE OF seg` against the catalog-wide
+    /// `table_persist_segment_metadata` parent, taking `ROW SHARE` held
+    /// to commit — and the URIs it defers are derived from that read. So
+    /// compact cannot reach a delete-set row before a parent lock even in
+    /// principle, and `ROW SHARE` conflicts with the `ACCESS EXCLUSIVE`
+    /// that teardown's `DROP PARTITION` needs on the same parent.
+    /// Parent-locks-first is therefore the only order all three can
+    /// honor; the other two conform to compact.
+    ///
+    /// Position within the transaction is free as far as ADR 0019
+    /// §"Four-part mechanism" item 3 is concerned: it requires these rows
+    /// to commit *atomically with* the metadata change, not to precede
+    /// it.
+    ///
     /// 1 SQL query.
     pub async fn insert_segment_delete_set_rows(
         driver: &impl DbDriver<Row = PgRow>,
@@ -250,21 +296,20 @@ impl LifecycleManager {
     /// it references and nothing else. A still-referenced row stays
     /// queued; the retirement that drops the last reference
     /// re-enqueues the URI and refreshes its grace clock (see
-    /// [`Self::insert_segment_delete_set_rows`]). Persist-compaction
-    /// URIs never appear in the snapshot segment table, so the gate is
-    /// a structural no-op for them.
+    /// [`Self::insert_segment_delete_set_rows`]).
     ///
-    /// Both the candidate scan and the two refcount probes are
+    /// Both the candidate scan and the three refcount probes are
     /// **catalog-wide**: carry-forward crosses fork edges, so a child
     /// branch's snapshot can reference a file the parent wrote, and a
     /// branch-scoped probe would not see it. `idx_..._sds_age` serves
     /// the eligibility scan; the per-leaf `object_uri` indexes serve
     /// the refcount probes (base segments via `idx_..._tssm_uri`,
-    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455).
+    /// cold-index sidecars via `idx_..._tssim_uri`, CHA-455, persist
+    /// segments via `idx_..._tfsm_uri`).
     ///
     /// Cost note: a catalog-wide correlated `NOT EXISTS` plans as one
     /// index probe per branch leaf, so each candidate row costs
-    /// O(branches) probes rather than one. Combined with the note
+    /// O(3 x branches) probes rather than one. Combined with the note
     /// above — refcount-pinned rows sit in the expired range and are
     /// re-scanned by every sweep — a standing blocked set costs
     /// O(blocked_rows x branches) per sweep. The triage signal is
@@ -290,6 +335,16 @@ impl LifecycleManager {
         // make a file eligible while a younger carried sidecar still
         // points at it. One NOT EXISTS arm per referencing table.
         let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        // CHA-539: the persist tier joins the refcount domain. A fork
+        // materializes its inherited cold references as persist rows
+        // naming the parent's files, and enqueue-only branch teardown
+        // queues those same URIs — so without this arm the sweep would
+        // collect a file a sibling branch still reads. This is the FIRST
+        // cross-branch protection persist segments have, not a second
+        // one: CHA-72's `earliest_fork_point_into` retention clamp, which
+        // the tier's protection was previously attributed to, is
+        // unimplemented.
+        let persist_seg_table = naming::table_persist_segment_metadata_table(&catalog);
         // CHA-531: neither arm filters on `branch_uuid`. Carry-forward
         // crosses fork edges, so a child's snapshot rows reference a
         // file the parent wrote while living in the CHILD's partition;
@@ -309,17 +364,14 @@ impl LifecycleManager {
         let sql = format!(
             "SELECT object_uri FROM {table} sds \
              WHERE sds.written_at_micros < $1 \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {seg_table} seg \
-                 WHERE seg.object_uri = sds.object_uri\
-               ) \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {seg_index_table} six \
-                 WHERE six.object_uri = sds.object_uri\
-               )",
+               AND NOT ({referenced})",
             table = qi(&table),
-            seg_table = qi(&seg_table),
-            seg_index_table = qi(&seg_index_table),
+            referenced = Self::segment_delete_set_referenced_predicate(
+                &seg_table,
+                &seg_index_table,
+                &persist_seg_table,
+                false,
+            ),
         );
         let rows = driver
             .execute_params(&sql, &[SqlValue::Int64(now_micros - query_timeout_micros)])
@@ -328,6 +380,148 @@ impl LifecycleManager {
             .iter()
             .map(|r| r.get::<String, _>("object_uri"))
             .collect())
+    }
+
+    /// The "some row still references this URI" disjunction, over one set of
+    /// referencing tables, shared by the eligibility gate (negated) and the
+    /// reaper (asserted).
+    ///
+    /// One source for WHICH tables, because that half must never drift: if a
+    /// fourth referencing table were added to the gate but not to the reaper, the
+    /// reaper would drop delete-set rows for URIs that table still references.
+    ///
+    /// `committed_only` is where the two callers deliberately differ, and the
+    /// asymmetry is load-bearing in both directions:
+    ///
+    /// - The **gate** counts uncommitted rows too (`false`). An in-flight
+    ///   snapshot's carried refs can outlive its source snapshot's retirement, so
+    ///   a file pinned only by them must not be collected.
+    /// - The **reaper** counts only committed rows (`true`). A delete-set row
+    ///   pinned *solely* by uncommitted refs is the safety net the snapshot
+    ///   FAILURE path depends on: that path deletes its uncommitted carried rows
+    ///   without enqueuing anything, because historically the row was already
+    ///   sitting in the set and the next sweep collected the file once those rows
+    ///   were gone. Reaping it would strand the file with no row and no
+    ///   reference — permanently invisible to every future sweep.
+    ///
+    /// So the two are exact complements over past-grace rows carrying a COMMITTED
+    /// reference. A row pinned only by uncommitted refs is in neither set and
+    /// stays put, exactly as before, until the in-flight op resolves — it commits
+    /// (a committed ref, reapable later) or its cleanup removes the rows (no refs,
+    /// eligible). Bounded either way by in-flight ops, so it does not reintroduce
+    /// the unbounded term; the fork-teardown growth this reaper exists for is
+    /// committed rows and still drains.
+    ///
+    /// Note for CHA-435's anticipated orphan reaper: it must enqueue what it
+    /// dereferences, since it cannot rely on a pre-existing row either.
+    fn segment_delete_set_referenced_predicate(
+        seg_table: &str,
+        seg_index_table: &str,
+        persist_seg_table: &str,
+        committed_only: bool,
+    ) -> String {
+        let committed = if committed_only {
+            " AND {alias}.commit_micros IS NOT NULL"
+        } else {
+            ""
+        };
+        let arm = |table: &str, alias: &str| {
+            format!(
+                "EXISTS (SELECT 1 FROM {t} {alias} WHERE {alias}.object_uri = sds.object_uri{c})",
+                t = qi(table),
+                alias = alias,
+                c = committed.replace("{alias}", alias),
+            )
+        };
+        format!(
+            "{} OR {} OR {}",
+            arm(seg_table, "seg"),
+            arm(seg_index_table, "six"),
+            arm(persist_seg_table, "pseg"),
+        )
+    }
+
+    /// Drop delete-set rows whose URI is past the grace window but STILL
+    /// referenced, returning how many were reaped. Together with
+    /// [`Self::eligible_segment_delete_set_rows`] every row is eventually claimed
+    /// by one of the two, so the set does not grow without bound. Not a partition
+    /// of the past-grace set at any single instant — the two run on different
+    /// horizons, so a still-referenced row spends the gap in neither, which is
+    /// deliberate; see the horizon note below.
+    ///
+    /// Without this the set only ever shrinks by a successful unlink, so a
+    /// refcount-pinned row sits in the expired range forever and is re-scanned by
+    /// every sweep. Enqueue-only branch teardown is what makes that unbounded
+    /// rather than merely untidy: a fork's cold footprint is mostly the PARENT's
+    /// files and `main` keeps its rows for the life of the catalog, so every fork
+    /// teardown permanently added ~O(parent cold segments) rows no sweep could
+    /// drain. For an agentic-branch workload that is the dominant term, and the
+    /// growth is irreversible once the rows exist.
+    ///
+    /// Safe to drop a row that is still referenced by a COMMITTED row, because
+    /// every path that drops a committed reference enqueues the URI in the same
+    /// transaction: `retire` on retirement, `compact` on superseding an input,
+    /// branch teardown on dropping the branch's rows. So a reaped row is
+    /// re-created by whoever later drops the LAST such reference, with a fresh
+    /// grace clock from the `ON CONFLICT` refresh.
+    ///
+    /// That enumeration is exhaustive only over COMMITTED references, which is
+    /// exactly why this counts only those (`committed_only = true` — see
+    /// [`Self::segment_delete_set_referenced_predicate`]). The snapshot FAILURE
+    /// path deletes its uncommitted carried rows without enqueuing anything, so a
+    /// row pinned solely by an in-flight snapshot's carried refs must survive; it
+    /// is the mechanism that path has always relied on.
+    ///
+    /// Reaps on a horizon of [`REAP_GRACE_MULTIPLE`] × the query timeout, strictly
+    /// LONGER than the gate's grace window, because the two answer different
+    /// questions: the gate's asks "is it safe to delete this file now", the reap
+    /// horizon asks "has this pin proven durable". Same-threshold reaping also
+    /// makes the delete-set row useless as evidence — a row's absence would
+    /// conflate reaped with collected, and for a sidecar there is no other
+    /// observable (no read reaches an index file), so a gate regression would be
+    /// indistinguishable from correct behaviour.
+    ///
+    /// No table lock is needed despite the reap and the gate not being atomic
+    /// with each other: a reaped-then-dereferenced URI is re-enqueued per the
+    /// invariant above, and the opposite direction cannot happen — a new
+    /// reference to an unreferenced URI would have to be copied from an existing
+    /// row, and by definition there is none.
+    ///
+    /// 1 SQL query.
+    pub async fn reap_referenced_segment_delete_set_rows(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        now_micros: i64,
+        query_timeout_micros: i64,
+    ) -> Result<u64> {
+        let catalog = parse_uuid(catalog_uuid);
+        let table = naming::segment_delete_set_table(&catalog);
+        let seg_table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let seg_index_table = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let persist_seg_table = naming::table_persist_segment_metadata_table(&catalog);
+        let sql = format!(
+            // RETURNING so the count is real: `execute_params` surfaces returned
+            // rows, not an affected-row tally, and a silent 0 here would read as
+            // "nothing to reap" — the exact signal the sweep needs to be honest
+            // about.
+            "DELETE FROM {table} sds \
+             WHERE sds.written_at_micros < $1 \
+               AND ({referenced}) \
+             RETURNING sds.object_uri",
+            table = qi(&table),
+            referenced = Self::segment_delete_set_referenced_predicate(
+                &seg_table,
+                &seg_index_table,
+                &persist_seg_table,
+                true,
+            ),
+        );
+        let horizon = now_micros - query_timeout_micros.saturating_mul(REAP_GRACE_MULTIPLE);
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::Int64(horizon)])
+            .await?;
+
+        Ok(rows.len() as u64)
     }
 
     /// Delete one `segment_delete_set` row by its `object_uri` PK.

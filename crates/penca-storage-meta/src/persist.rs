@@ -695,7 +695,7 @@ impl LifecycleManager {
             "SELECT seg.table_persist_segment_uuid, seg.table_persist_uuid, seg.object_uri, \
                     seg.\"offset\", seg.length, seg.format, seg.row_count, seg.size_bytes, \
                     seg.table_uuid, seg.min_tx_commit_micros, seg.max_tx_commit_micros, \
-                    seg.is_sealed, tfm.log_kind \
+                    seg.max_commit_seq_num, seg.is_sealed, tfm.log_kind \
              FROM {seg} seg \
              INNER JOIN {tfm} tfm \
                ON seg.table_persist_uuid = tfm.table_persist_uuid \
@@ -736,12 +736,44 @@ impl LifecycleManager {
         Ok(rows)
     }
 
+    /// Every persist segment on a branch, across all tables.
+    ///
+    /// Branch teardown's enumeration — see
+    /// [`Self::get_snapshot_segments_for_branch`] for why teardown scopes by
+    /// branch rather than by a resolved table list.
+    pub async fn get_table_persist_segments_for_branch(
+        driver: &impl DbDriver<Row = PgRow>,
+        catalog_uuid: &str,
+        branch_uuid: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let sql = format!(
+            "SELECT table_persist_segment_uuid, object_uri \
+             FROM {table} WHERE branch_uuid = $1",
+            table = qi(&table),
+        );
+        let rows = driver
+            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let uuid: Uuid = r.get("table_persist_segment_uuid");
+                let uri: String = r.get("object_uri");
+                (uuid.to_string(), uri)
+            })
+            .collect())
+    }
+
     /// Return `(table_persist_segment_uuid, object_uri)` for every segment
     /// belonging to any of the given tables on a branch.
     ///
     /// Keyed on `(branch_uuid, table_uuid IN (...))` on the segment table
-    /// directly. Used by DeleteBranch to enumerate every cold file the branch
-    /// owns.
+    /// directly. No caller since branch teardown moved to
+    /// [`Self::get_table_persist_segments_for_branch`], which needs no table
+    /// list; retained as the table-scoped shape a future caller would want.
     ///
     /// 1 SQL query.
     pub async fn get_table_persist_segments_for_tables(
