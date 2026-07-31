@@ -12,7 +12,7 @@
 mod cold_read;
 mod index_select;
 mod meta_plan;
-mod meta_resolve;
+pub(crate) mod meta_resolve;
 
 use crate::scope::ResolvedScope;
 
@@ -327,132 +327,6 @@ fn apply_projection(
                 full_schema.project(&indices).map_err(ApiError::Arrow)?,
             ))
         }
-    }
-}
-
-/// Derive the read's visibility snapshot from `open_tx_uuid` (RYOW) /
-/// `as_of_micros` (explicit point-in-time) / `as_of_seq` (explicit seq travel)
-/// / neither (pinned to the per-branch seq frontier). The request axes are
-/// mutually exclusive — see `ReadDataRequest` proto comments. When
-/// `open_tx_uuid` is supplied, validates the format, looks up the tx on the
-/// request's branch leaf partitions (so a tx on a different branch surfaces as
-/// `NotFound`), and rejects expired / aborted / committed states with
-/// `FailedPrecondition`.
-// The snapshot derivation inputs are irreducible.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_query_snapshot<D>(
-    driver: &D,
-    deadline: tokio::time::Instant,
-    catalog_uuid: &uuid::Uuid,
-    branch_uuid: &uuid::Uuid,
-    request_open_tx_uuid: Option<&str>,
-    request_commit_micros: Option<i64>,
-    request_commit_seq_num: Option<i64>,
-    default_frontier: Option<i64>,
-) -> Result<ReadSnapshot, ApiError>
-where
-    D: DbDriver<Row = PgRow>,
-{
-    // The two `as_of` arms are mutually exclusive by the proto oneof;
-    // either is mutually exclusive with open_tx (RYOW only at the tx's own
-    // begin frontier).
-    if (request_commit_micros.is_some() || request_commit_seq_num.is_some())
-        && request_open_tx_uuid.is_some()
-    {
-        return Err(ApiError::InvalidRequest(
-            "exactly one of as_of / open_tx_uuid may be set".to_string(),
-        ));
-    }
-    if let Some(open_tx_uuid) = request_open_tx_uuid {
-        // Validate format up front (also prevents SQL injection when
-        // the tx_uuid is interpolated into the synthetic UNION row
-        // literal in the merge SQL builder). Once parsed we keep the
-        // typed `uuid::Uuid` and pass it through; downstream code never
-        // re-parses or re-stringifies.
-        let tx_uuid = uuid::Uuid::parse_str(open_tx_uuid).map_err(|_| {
-            ApiError::InvalidRequest(format!("malformed open_tx_uuid: {open_tx_uuid}"))
-        })?;
-
-        // Target the leaf partitions for the request's branch.
-        // get_tx_status's begin_tx_log lookup against the leaf
-        // therefore returns `None` for any tx that lives on a
-        // different branch — no separate branch-mismatch check needed.
-        let begin_partition = naming::begin_tx_log_partition(catalog_uuid, branch_uuid);
-        let abort_partition = naming::abort_tx_log_partition(catalog_uuid, branch_uuid);
-        let tx_partition = naming::commit_tx_log_partition(catalog_uuid, branch_uuid);
-        let hot = HotStorageClient;
-        let status = await_within_query_timeout(
-            deadline,
-            hot.get_tx_status(
-                driver,
-                &begin_partition,
-                &abort_partition,
-                &tx_partition,
-                &tx_uuid,
-                /*for_update=*/ false,
-            ),
-        )
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "open_tx_uuid not found in begin_tx_log on branch {branch_uuid} \
-                 (tx may be on a different branch or was never begun): \
-                 {open_tx_uuid}"
-            ))
-        })?;
-
-        match status {
-            penca_storage_hot::TxStatus::Open {
-                began_at_seq_num, ..
-            } => Ok(ReadSnapshot::OpenTx {
-                began_at_seq_num,
-                tx_uuid,
-            }),
-            penca_storage_hot::TxStatus::Expired { expired_at_micros } => {
-                Err(ApiError::FailedPrecondition(format!(
-                    "open_tx_uuid expired at {expired_at_micros} (lifecycle sweep will \
-                     move it to abort_tx_log): {open_tx_uuid}"
-                )))
-            }
-            penca_storage_hot::TxStatus::Aborted {
-                aborted_at_micros, ..
-            } => Err(ApiError::FailedPrecondition(format!(
-                "open_tx_uuid was aborted at {aborted_at_micros}: {open_tx_uuid}"
-            ))),
-            penca_storage_hot::TxStatus::Committed { commit_micros } => {
-                Err(ApiError::FailedPrecondition(format!(
-                    "open_tx_uuid was already committed at {commit_micros}; \
-                 re-issue the read without open_tx_uuid (or pass as_of_micros to \
-                 view post-commit state): {open_tx_uuid}"
-                )))
-            }
-        }
-    } else if let Some(seq) = request_commit_seq_num {
-        // Explicit seq-axis pin — exact, no resolution.
-        Ok(ReadSnapshot::AsOfSeq(seq))
-    } else if let Some(ts) = request_commit_micros {
-        Ok(ReadSnapshot::AsOfMicros(ts))
-    } else {
-        // A read with neither an open tx nor an explicit as_of pins a bounded
-        // snapshot at the per-branch seq frontier (counter - 1) rather than
-        // pg_now, so "read latest" composes with the seq tier-fence and
-        // resolves names on the same axis as data. `read_data` threads the
-        // frontier it captured for identifier resolution as
-        // `default_frontier` so the whole RPC shares ONE pin; a single-shot
-        // caller passes None and self-captures here. Still never an unbounded
-        // read — the frontier is a bounded upper.
-        let frontier = match default_frontier {
-            Some(seq) => seq,
-            None => {
-                QueryManager::branch_seq_frontier(
-                    driver,
-                    &catalog_uuid.to_string(),
-                    &branch_uuid.to_string(),
-                )
-                .await?
-            }
-        };
-        Ok(ReadSnapshot::LatestSeq(frontier))
     }
 }
 
@@ -942,33 +816,22 @@ impl QueryManager {
         // commit_seq_num axis. The merge probes run as independent statements
         // and must share ONE bounded pin, captured once below — the seq
         // frontier for a default read, the request's explicit axis otherwise.
-        let (request_commit_micros, request_commit_seq_num) =
-            crate::scope::read_data_as_of_axes(&request.as_of);
         // Resolve the identifier-stage snapshot from the request's as_of /
-        // open_tx so a renamed table/schema is findable at its historical name
-        // on the SAME axis as the data. On the default path resolve_table
-        // self-captures the per-branch seq frontier — hence the `None` — and
-        // that same frontier is reused for the data read below so the whole
-        // RPC shares one pin. The micros/seq/open_tx arms ignore it.
-        let scope = ResolvedScope::resolve_table(self, driver, &dl, request, None).await?;
+        // open_tx so a renamed table/schema is findable at its historical name on
+        // the SAME axis as the data, then reuse that ONE resolution for the data
+        // read below (`scope.snapshot`) so the whole RPC shares a single pin. On
+        // the default path resolve_table self-captures the per-branch seq frontier
+        // — hence the `None`.
+        //
+        // Wrapped in the deadline because ADR 0019 wants it to bind the metadata
+        // round-trips, not just the stream phase.
+        let scope = await_within_query_timeout(
+            deadline,
+            ResolvedScope::resolve_table(self, driver, &dl, request, None),
+        )
+        .await?;
         let catalog_uuid = scope.catalog_uuid;
         let branch_uuid = scope.branch_uuid;
-        // The seq frontier resolve_table pinned for a default read — threaded
-        // into the data-read snapshot so identifiers + data share it. `None`
-        // on any explicit-as_of / open_tx read (those arms self-derive).
-        let default_frontier = if request_commit_micros.is_none()
-            && request_commit_seq_num.is_none()
-            && request.open_tx_uuid.is_none()
-        {
-            match &scope.snapshot {
-                ReadSnapshot::AsOfSeq(frontier) | ReadSnapshot::LatestSeq(frontier) => {
-                    Some(*frontier)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
         let span = tracing::Span::current();
         span.record("catalog_uuid", tracing::field::display(&catalog_uuid));
         span.record("branch_uuid", tracing::field::display(&branch_uuid));
@@ -1041,17 +904,7 @@ impl QueryManager {
         // once and serves every projection from it.
         let schema_ref = apply_projection(full_schema.clone(), request.projection.as_ref())?;
 
-        let snapshot = resolve_query_snapshot(
-            driver,
-            deadline,
-            &catalog_uuid,
-            &branch_uuid,
-            request.open_tx_uuid.as_deref(),
-            request_commit_micros,
-            request_commit_seq_num,
-            default_frontier,
-        )
-        .await?;
+        let snapshot = scope.snapshot;
 
         // Inclusive `as_of_micros` upper bound the planner uses for
         // cold-segment selection. `ReadSnapshot::plan_as_of_micros`
@@ -2710,7 +2563,6 @@ mod tests {
         // Head takes the greatest seq.
         assert_eq!(seek(None), Some((7, 700)));
     }
-    use penca_db::driver::SqlValue;
 
     #[test]
     fn base_audit_seq_cap_bounds_parent_at_fork() {
@@ -2739,127 +2591,6 @@ mod tests {
             combine_filters(Some("a = 1".into()), Some("b = 2")),
             Some("(a = 1) AND (b = 2)".into())
         );
-    }
-
-    // No-op driver: the no-tx / no-as_of and explicit-as_of resolution
-    // paths never touch the database, so every method can return empty.
-    struct NoopDriver;
-
-    impl DbDriver for NoopDriver {
-        type Row = PgRow;
-
-        async fn execute(&self, _query: &str) -> Result<Vec<PgRow>, sqlx::Error> {
-            Ok(vec![])
-        }
-        async fn execute_no_result(&self, _query: &str) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn execute_many(&self, _queries: &[String]) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn execute_params(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<Vec<PgRow>, sqlx::Error> {
-            Ok(vec![])
-        }
-        async fn execute_no_result_params(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<(), sqlx::Error> {
-            Ok(())
-        }
-        async fn fetch_optional(
-            &self,
-            _query: &str,
-            _params: &[SqlValue],
-        ) -> Result<Option<PgRow>, sqlx::Error> {
-            Ok(None)
-        }
-        async fn close(&self) {}
-        fn fetch_stream<'a>(
-            &'a self,
-            _query: &'a str,
-            _params: &'a [SqlValue],
-        ) -> Pin<Box<dyn Stream<Item = Result<PgRow, sqlx::Error>> + Send + 'a>> {
-            Box::pin(futures_util::stream::empty())
-        }
-    }
-
-    fn test_deadline() -> tokio::time::Instant {
-        tokio::time::Instant::now() + Duration::from_secs(60)
-    }
-
-    // A read with neither `open_tx_uuid` nor an explicit `as_of` pins the
-    // "read latest" snapshot on the SEQ axis, not committed_at micros, so it
-    // composes with the seq tier-fence and resolves names on the same axis as
-    // data.
-    #[tokio::test]
-    async fn resolve_query_snapshot_no_tx_no_as_of_pins_snapshot() {
-        let catalog = uuid::Uuid::nil();
-        let branch = uuid::Uuid::nil();
-        let snapshot = resolve_query_snapshot(
-            &NoopDriver,
-            test_deadline(),
-            &catalog,
-            &branch,
-            /*open_tx_uuid=*/ None,
-            /*commit_micros=*/ None,
-            /*commit_seq_num=*/ None,
-            /*default_frontier=*/ Some(2_468_135),
-        )
-        .await
-        .expect("resolution must not error on the no-tx / no-as_of path");
-
-        // The default "read latest" path pins the SEQ frontier as `LatestSeq`
-        // — the cache-eligible marker, not committed_at micros — and a threaded
-        // default_frontier pins exactly that value.
-        assert_eq!(snapshot, ReadSnapshot::LatestSeq(2_468_135));
-    }
-
-    // An explicit `as_of_micros` maps to `AsOfMicros(ts)` verbatim.
-    #[tokio::test]
-    async fn resolve_query_snapshot_explicit_as_of_unchanged() {
-        let catalog = uuid::Uuid::nil();
-        let branch = uuid::Uuid::nil();
-        let snapshot = resolve_query_snapshot(
-            &NoopDriver,
-            test_deadline(),
-            &catalog,
-            &branch,
-            /*open_tx_uuid=*/ None,
-            /*commit_micros=*/ Some(1_234_567),
-            /*commit_seq_num=*/ None,
-            /*default_frontier=*/ None,
-        )
-        .await
-        .expect("explicit as_of must resolve");
-
-        assert_eq!(snapshot, ReadSnapshot::AsOfMicros(1_234_567));
-    }
-
-    // An explicit `commit_seq_num` maps to `AsOfSeq(n)` verbatim —
-    // exact, no resolution, no DB round-trip.
-    #[tokio::test]
-    async fn resolve_query_snapshot_explicit_commit_seq_num_maps_to_as_of_seq() {
-        let catalog = uuid::Uuid::nil();
-        let branch = uuid::Uuid::nil();
-        let snapshot = resolve_query_snapshot(
-            &NoopDriver,
-            test_deadline(),
-            &catalog,
-            &branch,
-            /*open_tx_uuid=*/ None,
-            /*commit_micros=*/ None,
-            /*commit_seq_num=*/ Some(42),
-            /*default_frontier=*/ None,
-        )
-        .await
-        .expect("explicit commit_seq_num must resolve");
-
-        assert_eq!(snapshot, ReadSnapshot::AsOfSeq(42));
     }
 
     /// Pins the three-way dispatch contract over the four plan shapes,

@@ -5,6 +5,8 @@
 //! return proto messages directly.
 
 use crate::query::QueryManager;
+use crate::query::meta_resolve::resolve_tx;
+use penca_merge::ReadSnapshot;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,8 +15,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use penca_core::naming::{
-    self, abort_tx_log_partition, begin_tx_log_partition, commit_tx_log_partition,
-    delete_log_table, system_indexes_table_uuid, system_schema_uuid, system_schemas_table_uuid,
+    self, abort_tx_log_partition, commit_tx_log_partition, delete_log_table,
+    system_indexes_table_uuid, system_schema_uuid, system_schemas_table_uuid,
     system_tables_table_uuid, tx_table_log_partition, upsert_log_table,
 };
 use penca_db::dialect::Dialect;
@@ -401,72 +403,6 @@ async fn resolve_or_auto_commit_tx(
                 auto_commit_tx(driver, catalog_uuid, branch_uuid, author, comment).await?;
             Ok((tx_uuid, Some(committed)))
         }
-    }
-}
-
-/// Resolve an append-path `tx_uuid` to its open state.
-///
-/// Reads the single-shot `begin_tx_log ⟕ abort_tx_log ⟕ commit_tx_log` join via
-/// `HotStorageClient::get_tx_status` against the request branch's leaf
-/// partitions, and rejects:
-/// - a tx with no `begin_tx_log` row (never begun, or begun on another
-///   branch) → `NotFound`;
-/// - a tx that is aborted / expired / already committed →
-///   `FailedPrecondition`.
-///
-/// Snapshot read (`for_update=false`): a best-effort fast-fail, not a lock.
-/// Under READ COMMITTED a concurrent `abort_tx` / expiry sweep can land an
-/// `abort_tx_log` row after this SELECT but before the append commits, so a
-/// racing append can still reference a tx that just went non-open. That's
-/// acceptable here because final consistency is enforced at `CommitTx`
-/// (`commit_open_tx` takes `FOR UPDATE OF begin_tx_log` and re-checks abort),
-/// so no committed data ever references a non-open tx — the orphaned
-/// upsert/delete rows are filtered by the `commit_tx_log` JOIN on read. The
-/// fully-atomic tightening is to fold this predicate into the upsert/delete
-/// INSERT as a CTE (see the note on `apply_change`). A `for_update=true`
-/// lock here is not taken: every caller already runs inside a Pg transaction
-/// (via `with_pg_tx`), but locking `begin_tx_log` on this advisory fast-fail
-/// would only serialize concurrent appends to the same tx without buying any
-/// correctness — `CommitTx` is the authoritative gate.
-async fn resolve_tx(
-    driver: &impl DbDriver<Row = PgRow>,
-    catalog_uuid: &Uuid,
-    branch_uuid: &Uuid,
-    tx_uuid: &str,
-) -> Result<(), ApiError> {
-    let parsed = Uuid::parse_str(tx_uuid)
-        .map_err(|e| ApiError::InvalidRequest(format!("invalid tx_uuid '{tx_uuid}': {e}")))?;
-    let begin_partition = begin_tx_log_partition(catalog_uuid, branch_uuid);
-    let abort_partition = abort_tx_log_partition(catalog_uuid, branch_uuid);
-    let tx_partition = commit_tx_log_partition(catalog_uuid, branch_uuid);
-    let hot = HotStorageClient;
-    let status = hot
-        .get_tx_status(
-            driver,
-            &begin_partition,
-            &abort_partition,
-            &tx_partition,
-            &parsed,
-            false,
-        )
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "transaction not found on this branch \
-                 (never begun, or begun on a different branch): {tx_uuid}"
-            ))
-        })?;
-    match status {
-        penca_storage_hot::TxStatus::Open { .. } => Ok(()),
-        penca_storage_hot::TxStatus::Aborted { .. } => Err(ApiError::FailedPrecondition(format!(
-            "transaction {tx_uuid} has been aborted"
-        ))),
-        penca_storage_hot::TxStatus::Expired { .. } => Err(ApiError::FailedPrecondition(format!(
-            "transaction {tx_uuid} has expired"
-        ))),
-        penca_storage_hot::TxStatus::Committed { .. } => Err(ApiError::FailedPrecondition(
-            format!("transaction {tx_uuid} has already been committed"),
-        )),
     }
 }
 
@@ -1671,6 +1607,19 @@ impl WriteManager {
         // managed by `create_catalog_tables`, and the whole catalog physicals
         // get CASCADE-dropped below anyway.
         let system_schema_str = system_schema_uuid(&catalog_uuid).to_string();
+        // Resolved once for the whole cascade rather than per schema: this is a
+        // catalog teardown with no open tx, so every iteration would otherwise
+        // re-derive the identical committed frontier.
+        let cascade_snapshot = QueryManager::resolve_read_snapshot(
+            driver,
+            &catalog_str,
+            &main_branch_str,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
         for schema_uuid in &schema_uuids {
             if schema_uuid == &system_schema_str {
                 continue;
@@ -1684,6 +1633,7 @@ impl WriteManager {
                 None,
                 Some("DeleteCatalog cascade"),
                 Some("system"),
+                &cascade_snapshot,
             )
             .await?;
         }
@@ -1917,16 +1867,31 @@ impl WriteManager {
             )
             .await?;
 
-            let ryow_snapshot = QueryManager::resolve_read_snapshot(
-                tx,
-                &catalog_str,
-                &branch_str,
-                Some(&tx_uuid),
-                None,
-                None, // as_of_seq — inert on the OpenTx (RYOW) arm
-                None,
-            )
-            .await?;
+            // On the explicit-tx path `write_snapshot` is ALREADY
+            // `OpenTx { began_at_seq_num, tx_uuid }` for this same tx — it was
+            // resolved from `request.tx_uuid` at the top of this method — so
+            // re-resolving would repeat the `get_tx_status` join for an answer we
+            // hold. Clone it.
+            //
+            // The auto-commit branch must genuinely re-read: it needs the
+            // `commit_tx_log_seq_num` counter that `auto_commit_tx` bumped inside
+            // this Pg tx, which `write_snapshot` predates. `None` is the correct
+            // input there — the minted tx is already committed and has no
+            // `begin_tx_log` row, so resolving it as open would be NotFound.
+            let ryow_snapshot = if request.tx_uuid.is_some() {
+                write_snapshot.clone()
+            } else {
+                QueryManager::resolve_read_snapshot(
+                    tx,
+                    &catalog_str,
+                    &branch_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+            };
             let schema = self
                 .query_manager
                 .meta_get_schema(
@@ -1990,6 +1955,7 @@ impl WriteManager {
                 request.tx_uuid.as_deref(),
                 request.author.as_deref(),
                 request.comment.as_deref(),
+                &scope.snapshot,
             )
             .await?;
             Ok(())
@@ -2012,19 +1978,22 @@ impl WriteManager {
         request_tx_uuid: Option<&str>,
         request_author: Option<&str>,
         request_comment: Option<&str>,
+        // The caller already resolved this from the same request, and this read
+        // happens BEFORE any write here, so re-resolving would repeat the
+        // `get_tx_status` join for an answer it holds.
+        //
+        // Asymmetry worth knowing: on the explicit-tx arm this is exactly
+        // equivalent, because `OpenTx` carries the tx's immutable BEGIN frontier
+        // and resolve timing cannot change it. On the auto-commit arm the
+        // `LatestSeq` frontier is now captured a couple of round trips earlier
+        // than the in-cascade resolve captured it, which marginally widens the
+        // pre-existing window in which a concurrent commit lands above the pin. (Contrast the post-write
+        // RYOW re-reads in `update_schema` / `update_table`, where the
+        // auto-commit arm genuinely needs a frontier captured after the write.)
+        read_snapshot: &ReadSnapshot,
     ) -> Result<(), ApiError> {
         let catalog_str = catalog_uuid.to_string();
         let branch_str = branch_uuid.to_string();
-        let read_snapshot = QueryManager::resolve_read_snapshot(
-            driver,
-            &catalog_str,
-            &branch_str,
-            request_tx_uuid,
-            None,
-            None, // as_of_seq
-            None,
-        )
-        .await?;
         let tables = self
             .query_manager
             .meta_list_tables(
@@ -2033,7 +2002,7 @@ impl WriteManager {
                 &catalog_str,
                 schema_uuid,
                 Some(&branch_str),
-                &read_snapshot,
+                read_snapshot,
             )
             .await?;
 
@@ -2694,16 +2663,22 @@ impl WriteManager {
             )
             .await?;
 
-            let ryow_snapshot = QueryManager::resolve_read_snapshot(
-                tx,
-                &catalog_uuid_str,
-                &branch_uuid_str,
-                Some(&tx_uuid_str),
-                None,
-                None, // as_of_seq — inert on the OpenTx (RYOW) arm
-                None,
-            )
-            .await?;
+            // Reuse the already-resolved snapshot on the explicit-tx path; re-read
+            // only for auto-commit. See the matching comment in `update_schema`.
+            let ryow_snapshot = if request.tx_uuid.is_some() {
+                write_snapshot.clone()
+            } else {
+                QueryManager::resolve_read_snapshot(
+                    tx,
+                    &catalog_uuid_str,
+                    &branch_uuid_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+            };
             let table = self
                 .query_manager
                 .meta_get_table(

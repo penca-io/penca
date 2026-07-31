@@ -101,7 +101,8 @@ message GetSchemaRequest {
   // CHA-164: when set, the resolve includes uncommitted rows from this
   // open tx so callers see their own in-flight DDL (read-your-own-writes).
   // Mirrors the data-path RYOW plumbing from CHA-165.
-  // Mutually exclusive with `as_of_micros`.
+  // Mutually exclusive with `as_of_micros` / `as_of_seq`; INVALID_ARGUMENT
+  // if set alongside either.
   optional string open_tx_uuid = 5;
 
   // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
@@ -118,8 +119,8 @@ message GetSchemaRequest {
   // serial) axis — resolves names as of `commit_seq_num <= as_of_seq`. The seq
   // sibling of `as_of_micros`, so the SQL session pin can resolve identifiers
   // on the same seq axis as its data read. Mutually exclusive with
-  // `as_of_micros` / `open_tx_uuid` (resolver precedence: open_tx, then
-  // micros, then seq).
+  // `open_tx_uuid`; INVALID_ARGUMENT if both set. Setting both `as_of_micros`
+  // and `as_of_seq` resolves to `as_of_micros`.
   optional int64 as_of_seq = 9;
 }
 
@@ -138,7 +139,8 @@ message ListSchemasRequest {
   PaginationRequest pagination = 3;
 
   // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
-  // Mutually exclusive with `as_of_micros`.
+  // Mutually exclusive with `as_of_micros` / `as_of_seq`; INVALID_ARGUMENT
+  // if set alongside either.
   optional string open_tx_uuid = 4;
 
   // CHA-177: schemas are branch-scoped. Defaults to "main" when both omitted.
@@ -185,7 +187,8 @@ message GetTableRequest {
   optional string table_name = 8;
 
   // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
-  // Mutually exclusive with `as_of_micros`.
+  // Mutually exclusive with `as_of_micros` / `as_of_seq`; INVALID_ARGUMENT
+  // if set alongside either.
   optional string open_tx_uuid = 9;
 
   // CHA-236: point-in-time name resolution. See
@@ -219,7 +222,8 @@ message ListTablesRequest {
   PaginationRequest pagination = 7;
 
   // CHA-164: RYOW. See GetSchemaRequest.open_tx_uuid.
-  // Mutually exclusive with `as_of_micros`.
+  // Mutually exclusive with `as_of_micros` / `as_of_seq`; INVALID_ARGUMENT
+  // if set alongside either.
   optional string open_tx_uuid = 8;
 
   // CHA-236: point-in-time name resolution. See
@@ -257,7 +261,9 @@ message GetIndexRequest {
   optional string index_uuid = 9;
   optional string index_name = 10;
 
-  // CHA-164: RYOW. Mutually exclusive with `as_of_micros`. (Pin pair at
+  // CHA-164: RYOW. Mutually exclusive with `as_of_micros`; INVALID_ARGUMENT if
+  // both set. This message has no `as_of_seq`, so that axis cannot conflict
+  // here. (Pin pair at
   // 11/12 — fields 9/10 are the index identifier, fixing the draft's
   // field-number collision.)
   optional string open_tx_uuid = 11;

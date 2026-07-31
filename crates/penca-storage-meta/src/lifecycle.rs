@@ -40,35 +40,6 @@ impl LifecycleManager {
         Ok(ReadSnapshot::AsOfMicros(Self::now_micros(driver).await?))
     }
 
-    /// Return `began_at_seq_num` for an open tx (present in
-    /// `begin_tx_log_partition`, not yet committed or aborted).
-    /// Returns `None` if the tx is unknown or already settled.
-    ///
-    /// Used by RYOW reads to construct [`ReadSnapshot::OpenTx`]: the snapshot
-    /// bound is the tx's `began_at_seq_num` (OpenTx visibility rides the
-    /// commit-order axis, `commit_seq_num < began_at_seq_num`), and the
-    /// OR-clause picks up the open tx's own uncommitted writes.
-    pub async fn get_open_tx_began_at_seq_num(
-        driver: &impl DbDriver<Row = PgRow>,
-        catalog_uuid: &Uuid,
-        branch_uuid: &Uuid,
-        tx_uuid: &Uuid,
-    ) -> Result<Option<i64>> {
-        let begin_part = naming::begin_tx_log_partition(catalog_uuid, branch_uuid);
-        // OpenTx visibility pins on the commit-order axis, so name resolution
-        // for an open tx reads the seq frontier captured at BEGIN, not micros.
-        let sql = format!(
-            "SELECT began_at_seq_num FROM {begin} \
-             WHERE tx_uuid = $1 \
-             LIMIT 1",
-            begin = qi(&begin_part),
-        );
-        let rows = driver
-            .execute_params(&sql, &[SqlValue::Uuid(*tx_uuid)])
-            .await?;
-        Ok(rows.first().map(|r| r.get::<i64, _>("began_at_seq_num")))
-    }
-
     /// Return distinct `table_uuid`s touched by committed txs on
     /// `(catalog, branch)` with `commit_micros <= effective_target`.
     ///
