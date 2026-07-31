@@ -707,10 +707,10 @@ impl QueryManager {
         pinned_snapshot_uuid: Option<Uuid>,
     ) -> Result<SnapshotResult> {
         let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
         // Parse fallibly (unlike the panicking `parse_uuid` above): a malformed
         // `table_uuid` surfaces as the same typed protocol error the
         // `meta_resolve` getters produce.
-        let branch = parse_uuid(branch_uuid);
         let table = parse_meta_uuid(table_uuid, "table_uuid")?;
         let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let seg_name = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
