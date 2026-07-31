@@ -199,19 +199,30 @@ decodes of one byte range — N× the memory under a fixed byte budget, and N co
 reads to fill it. A fork's cold footprint is *mostly* its parent's files, so N
 grows with the branch count, which is the thing Penca expects to be cheap.
 
-**Why hash the decoded batch, not the encoded file bytes.** Two rows may
-reference the same byte slice under different schemas — that is exactly what a
-fork that `ALTER`s a column produces. Hashing the file bytes would collide them
-and hand one caller the other's types. Hashing the typed batch keeps the key a
-name for one decoded value.
+**Why hash the decoded batch, not the encoded file bytes.** The key has to name
+one decoded batch — equal hash must mean equal decode, or two unrelated segments
+would share an entry. Hashing the typed batch gives that directly, and it is what
+is available where the digest is taken: write time, *before* the format writer
+encodes. Hashing the stored object would mean reading back what was just written.
+It also makes dedup insensitive to encoding choices, so two independently written
+segments holding the same rows share an entry even if the writer picked different
+row-group boundaries or dictionary encodings.
 
-The same argument forced the cached *value* to be the file-native decode, with
+**What the key deliberately does *not* do is separate a reference copy from its
+source.** Carry-forward and fork copy select `old.content_hash` verbatim
+(`fork_copy.rs`, `snapshot.rs`, `segment_index.rs`) and it is never recomputed —
+that inheritance *is* the dedup. So when a fork `ALTER`s a column, its rows still
+read the parent's bytes under the parent's hash: parent and fork share one cache
+entry while disagreeing about that column's type, and no hashing scheme could
+separate them, because neither row's digest was ever taken under its own read
+schema.
+
+That is what forces the cached *value* to be the file-native decode, with
 caller-shaping (projection + null-fill of columns added by a later
 `ALTER TABLE ADD COLUMN`) moved *after* the lookup —
 `FormatReader::read_segment_native` plus `reader::shape_to_schema`. A
-caller-shaped entry carries
-the schema of whichever branch decoded first, so the second branch's read fails
-on a type mismatch its own metadata never justified.
+caller-shaped entry carries the schema of whichever branch decoded first, so the
+second branch's read fails on a type mismatch its own metadata never justified.
 
 **Why the scope is uniform across artifact classes.** Base segments and index
 sidecars both come out of object storage through the same `SegmentCache` and are

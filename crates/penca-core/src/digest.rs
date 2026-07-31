@@ -13,11 +13,20 @@ const IPC_ALIGNMENT: usize = 8;
 
 /// `xxh3_128` of a segment's **typed in-memory Arrow batch**, as a [`Uuid`].
 ///
-/// The input is the decoded batch, never the encoded file bytes. That is what
-/// makes the digest schema-sensitive: two segments referencing the same
-/// `(object_uri, offset, length)` slice under different schemas must hash
-/// differently, because they are two different decoded objects and a cache
-/// keyed by this value would otherwise hand one caller the other's types.
+/// The input is the decoded batch, never the encoded file bytes, so everything
+/// that distinguishes two decoded batches is in the digest: values, types, column
+/// names, nullability, column order, row count. That is the soundness property a
+/// cache keyed by this value needs — equal hash must mean equal decode, or two
+/// unrelated segments would share one entry.
+///
+/// It is **not** a defence against a reader whose schema differs from the
+/// writer's. A reference copy inherits this value verbatim (`fork_copy`, snapshot
+/// carry-forward) and it is never recomputed, so a fork that `ALTER`s a column
+/// still reads the parent's bytes under the parent's hash — no digest could
+/// separate the two, because neither row's was ever taken under its own read
+/// schema. Serving both from one entry safely is the cached *value's* job: it
+/// holds the file-native decode and callers shape after the lookup. See
+/// `penca_dl::cache::SegmentCache`.
 ///
 /// **Write-time only.** A digest taken before the format writer encodes a batch
 /// is *not* guaranteed to equal the digest of a later decode of that file:

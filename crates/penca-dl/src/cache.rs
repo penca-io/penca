@@ -4,8 +4,8 @@
 //! as an `Arc::clone` of the already-decoded Arrow batches, skipping the S3 GET +
 //! Parquet/Lance decode. It holds snapshot segments, persist data segments and
 //! index sidecars under one byte budget, all keyed by `content_hash`. The
-//! mapping is stable and needs no invalidation: a hash names one decoded value
-//! by construction, and cold artifacts are immutable — although a *resolved
+//! mapping is stable and needs no invalidation: a hash names one file-native
+//! decode by construction, and cold artifacts are immutable — although a *resolved
 //! persist tier* is mutable under retention compaction, an individual persist
 //! *file* is not. There is no TTL — immutability makes W-TinyLFU eviction the
 //! whole reclaim mechanism for every tier.
