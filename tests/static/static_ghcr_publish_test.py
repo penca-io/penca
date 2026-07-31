@@ -260,8 +260,48 @@ def test_merge_job_assembles_one_manifest_list_under_both_tags():
     runs = "\n".join(step.get("run", "") for step in job["steps"])
 
     assert "docker buildx imagetools create" in runs
-    assert PUBLISHED_TAG in runs, f"merge job must tag {PUBLISHED_TAG}"
+    assert IMAGE in runs, f"merge job must name {IMAGE}"
+    # The main-merge arm, as distinct from the release arm below: a moving
+    # :main plus an immutable short-sha to pin against.
+    assert re.search(r'\$image:main"?\s', runs), (
+        "merge job must tag :main on a main push"
+    )
     assert "GITHUB_SHA::7" in runs, "merge job must also apply the short-sha tag"
+
+
+def test_release_tags_publish_a_pinned_version_and_latest():
+    """A `v*` tag must publish :<version> + :latest, not :main.
+
+    :main moves under a reader, so a quickstart cannot be pinned to it. The
+    version comes from the tag name — there is no hand-typed version field,
+    which is what keeps a release anchored to a real commit.
+    """
+    workflow = _yaml(CI_WORKFLOW)
+
+    # PyYAML parses the `on:` key as the boolean True (YAML 1.1), so reach for
+    # whichever key survived rather than assuming the string.
+    triggers = workflow.get("on", workflow.get(True))
+    assert "v*" in triggers["push"]["tags"], (
+        f"push trigger must fire on v* tags, got {triggers['push']}"
+    )
+
+    # The release must not be gated on the paths-filter: a docs-only tag is
+    # still a release, and a `changes` hiccup must not swallow it.
+    condition = _publish_job()["if"]
+    assert "refs/tags/v" in condition, (
+        f"publish-image must fire for v* tags, got if: {condition!r}"
+    )
+    assert "always()" in condition, (
+        "publish-image needs always() or a skipped `changes` swallows the release"
+    )
+
+    runs = "\n".join(
+        step.get("run", "") for step in _job(workflow, "publish-image-merge")["steps"]
+    )
+    assert "refs/tags/v" in runs, "merge job must branch on the tag ref"
+    assert f"{IMAGE}:latest" in runs or "$image:latest" in runs, (
+        "a release must move :latest onto the pinned version"
+    )
 
 
 def test_ci_success_gates_on_the_publish_jobs():
@@ -508,10 +548,17 @@ def test_docs_no_longer_promise_a_from_source_first_run():
 
 
 def test_standalone_snippet_uses_the_tag_we_actually_publish():
-    """Assertion 16: :latest is never published, so pointing at it 404s."""
+    """Assertion 16: docs must point at a tag that resolves today.
+
+    :latest is published, but only by a `v*` release tag — and no release
+    exists yet, so a doc pointing at it would 404 for every reader. Once one
+    is cut, :latest and :vX.Y.Z both become fair game here.
+    """
     development = _read("docs/development.md")
 
     assert PUBLISHED_TAG in development, (
         f"standalone docker run snippet must use {PUBLISHED_TAG}"
     )
-    assert f"{IMAGE}:latest" not in development, "nothing publishes :latest"
+    assert f"{IMAGE}:latest" not in development, (
+        "no release has been cut, so :latest does not resolve yet"
+    )
