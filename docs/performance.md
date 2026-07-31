@@ -34,13 +34,16 @@ truth, and each run renders its own report:
   run against history (sourced from SQLite, falling back to the run's JSONL).
 
 **Comparisons against another engine belong in the report, not in prose.**
-Every suite records its Postgres baseline alongside Penca's own measurement,
-on the same host in the same run — that pairing is the only place a ratio
-means anything. A "faster than Postgres" claim written into this doc silently
-carries the host, disk, client library, and baseline configuration it was
-measured on; move any of those and it can invert. Prose here describes
-mechanism, ordering between Penca's own tiers and paths, and the open levers.
-Read the ratio off the run.
+Where a suite has a Postgres baseline — query, write, the gRPC and SQL OLTP
+suites, gRPC OLAP, pgbench — it records that baseline alongside Penca's own
+measurement, on the same host in the same run, and that pairing is the only
+place a ratio means anything. (The lifecycle and metadata suites and the
+criterion floors have no cross-engine baseline at all; for those, the run
+report carries Penca-side figures only.) A "faster than Postgres" claim
+written into this doc silently carries the host, disk, client library, and
+baseline configuration it was measured on; move any of those and it can
+invert. Prose here describes mechanism, ordering between Penca's own tiers
+and paths, and the open levers. Read the ratio off the run.
 
 **Lifecycle note:** In the happy path, persist and snapshot are always
 called atomically — data moves from hot storage directly to a
@@ -166,8 +169,9 @@ Four operations across every system state:
 - `query_filter_non_pk[match_N]` — `SELECT … WHERE …` via Flight SQL (ADBC),
   parametrized over result-set size. `match_1` filters on `name = ?` for a
   single row; `match_1000` filters on `value < 1100.0` which matches 1,000
-  rows out of 100k. Same scan, different return sizes — see the analysis
-  for why the ratio tightens dramatically as the result set grows.
+  rows out of 100k. Same scan, different return sizes — see
+  [Mechanism and cost attribution](#mechanism-and-cost-attribution) for how
+  that separates the fixed per-query cost from the per-row cost.
 - `query_aggregate` — `SELECT COUNT(*), SUM(value), AVG(value)` via Flight SQL.
 
 ## Write Performance
