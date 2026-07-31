@@ -403,6 +403,18 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
+          # Assert the arch set BEFORE tagging anything. "a failed leg makes
+          # the matrix aggregate `failure`, so this job is skipped" is a
+          # convention, not an invariant: `retention-days: 1` plus a
+          # next-day "Re-run failed jobs" leaves one surviving digest, the
+          # aggregate flips to success, and `imagetools create` would happily
+          # publish a single-arch manifest under :main or :latest — every
+          # pull on the other architecture then fails, with green CI.
+          if [ "$(ls -1 | wc -l)" -ne 2 ]; then
+            echo "::error::expected 2 arch digests, got: $(ls -1 | tr '\n' ' ')"
+            exit 1
+          fi
+
           image=ghcr.io/penca-io/penca-rust-server
           # A `v*` tag is a release: pin the version. A main push gets the
           # moving :main plus an immutable short-sha to pin against. :latest

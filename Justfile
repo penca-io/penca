@@ -577,7 +577,8 @@ docker-ensure:
 [arg("profile", long)]
 [arg("db", long)]
 [arg("build", long)]
-penca-up profile="dev" db="" build="": vm-gc
+[arg("pull", long)]
+penca-up profile="dev" db="" build="" pull="": vm-gc
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -687,28 +688,41 @@ penca-up profile="dev" db="" build="": vm-gc
     # `query` is an arbitrary member of the six — they share one build config,
     # so building any one of them produces the image the rest then find
     # locally.
-    image_ref=$(docker compose $compose_files $env_file $profiles config --format json \
-        | jq -r '.services.query.image')
+    # Materialize the shared image with exactly ONE target before `up`, so
+    # `up` never has to produce it. All six servicers name the same image ref
+    # but compose does not dedupe their identical build configs, so any path
+    # that leaves `up` to produce a missing image fans out six concurrent
+    # targets racing to export one tag — and the losers die with
+    # `image "...": already exists`.
+    #
+    # `pull --policy missing` is what makes this one target instead of six,
+    # and it is deliberately not a `config` + `docker image inspect` dance:
+    # that needed `jq` to read the ref back, which would make `jq` a hard
+    # requirement of the quickstart's very first command and it is not a
+    # documented prerequisite (macOS ships without it).
+    pull_policy=missing
+    if [ -n "{{pull}}" ]; then
+        # `pull_policy: missing` never re-pulls, so a reader who ran the
+        # quickstart once is frozen on that image while `git pull` keeps
+        # moving examples/ and the client forward. This is the refresh.
+        pull_policy=always
+    fi
+
     if [ -n "$build_flag" ]; then
         docker compose $compose_files $env_file $profiles build query
-    elif ! docker image inspect "$image_ref" >/dev/null 2>&1; then
-        # Not already local, so `up` would otherwise resolve it six times over.
-        # Pull it once; on failure fall back to a single build target rather
-        # than letting compose degrade into the six-way race.
-        if ! docker compose $compose_files $env_file $profiles pull query; then
-            # Redirect BEFORE building, for the same reason the --build=1 path
-            # does: compose tags a build's output under whatever `image:`
-            # resolves to, so building here would stamp a local build onto the
-            # PUBLISHED ref and `pull_policy: missing` would then serve it
-            # forever — surviving `git pull`, and outliving the registry
-            # actually becoming reachable. This is the default path whenever
-            # the published image is unreachable (before the first release, no
-            # network, package still private), so it is the one a first-time
-            # reader is most likely to hit.
-            export PENCA_IMAGE="penca-rust-server:${CARGO_PROFILE:-release}"
-            docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1 \
-                || docker compose $compose_files $env_file $profiles build query
-        fi
+    elif ! docker compose $compose_files $env_file $profiles pull --policy "$pull_policy" query; then
+        # Redirect BEFORE building, for the same reason the --build=1 path
+        # does: compose tags a build's output under whatever `image:`
+        # resolves to, so building here would stamp a local build onto the
+        # PUBLISHED ref and `pull_policy: missing` would then serve it
+        # forever — surviving `git pull`, and outliving the registry
+        # actually becoming reachable. This is the default path whenever
+        # the published image is unreachable (before the first release, no
+        # network, package still private), so it is the one a first-time
+        # reader is most likely to hit.
+        export PENCA_IMAGE="penca-rust-server:${CARGO_PROFILE:-release}"
+        docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1 \
+            || docker compose $compose_files $env_file $profiles build query
     fi
     docker compose $compose_files $env_file $profiles up -d
 

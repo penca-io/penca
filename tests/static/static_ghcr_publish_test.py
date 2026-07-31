@@ -248,10 +248,24 @@ def test_merge_job_cannot_publish_a_single_arch_manifest():
     everyone on the other one. A plain `needs:` skips instead, because a matrix
     job's aggregate result is `failure` if any leg failed.
     """
-    condition = str(_job(_yaml(CI_WORKFLOW), "publish-image-merge").get("if", ""))
+    job = _job(_yaml(CI_WORKFLOW), "publish-image-merge")
+    condition = str(job.get("if", ""))
 
-    assert "always" not in condition, (
-        f"publish-image-merge must skip when a leg fails, got if: {condition!r}"
+    # Any status-check function re-enables the job on a failed leg, not just
+    # always(): `if: ${{ !cancelled() }}` is the idiomatic alternative and was
+    # red-verified during review to pass a bare "always" check.
+    for fn in ("always", "cancelled", "failure", "success"):
+        assert fn not in condition, (
+            f"publish-image-merge must skip when a leg fails; {fn}() re-enables "
+            f"it, got if: {condition!r}"
+        )
+
+    # And the convention is backed by an actual check, because a next-day
+    # re-run can expire one leg's artifact and leave the aggregate green with
+    # a single digest present.
+    runs = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "wc -l" in runs and "-ne 2" in runs, (
+        "the merge job must assert it received both arch digests before tagging"
     )
 
 
@@ -562,6 +576,23 @@ def test_penca_up_never_leaves_the_image_to_up():
     for line in builds:
         assert re.search(r"build \S+\s*(\\|\||$)", line.strip()), (
             f"build must name exactly one service, not fan out: {line.strip()!r}"
+        )
+
+
+def test_penca_up_needs_no_undocumented_tools():
+    """The quickstart's first command must run with only the documented prereqs.
+
+    Those are Docker, `uv` and `just`. `jq` is in neither prereq list, is not
+    installed by `just bootstrap`, and macOS ships without it — so reaching for
+    it here means a reader's very first Penca command dies at `command not
+    found` before anything starts.
+    """
+    body = _recipe_body(_read("Justfile"), "penca-up")
+    code = [line for line in body.splitlines() if not line.strip().startswith("#")]
+
+    for line in code:
+        assert not re.search(r"\bjq\b", line), (
+            f"penca-up must not require jq — not a documented prereq: {line.strip()!r}"
         )
 
 
