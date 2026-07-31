@@ -253,8 +253,11 @@ def _within_deadline(label: str, mode: str, fn, *args, **kwargs):
 def seeded_branch():
     """Catalog + partitioned table + a branch with persist and snapshot state.
 
-    Module-scoped: the setup is DDL-heavy and identical for both tests, and
-    neither test mutates state the other reads.
+    Module-scoped: the setup is DDL-heavy and identical for both tests. The
+    write test does mutate what the read test reads — it persists, snapshots
+    and compacts this table — but the read test only asserts ``num_rows > 0``,
+    which those additions cannot falsify. Keep any new assertion here monotone
+    in the same way, or make the fixture function-scoped.
     """
     client, catalog_uuid, schema_uuid, table_uuid, main_branch_uuid = (
         setup_partitioned_table("cha546_lockfoot")
