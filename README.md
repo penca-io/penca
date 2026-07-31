@@ -28,9 +28,12 @@ real ACID transaction. A background pipeline persists, snapshots and purges them
 columnar files (Lance by default, Parquet supported). Reads merge both tiers, so a query
 sees committed writes immediately whichever tier they sit in.
 
-Object storage is pluggable and the only permanent home for your table data. Catalog and
-branch metadata is served from Postgres and stays that way, with object-storage checkpoints
-for recovery on the [roadmap](#roadmap).
+Object storage is pluggable and the only permanent home for anything Penca stores. Table
+data lives there today. Catalog and branch metadata is served from Postgres for latency,
+and the [roadmap](#roadmap) checkpoints it to the object store and reconstitutes those
+Postgres tables from the checkpointed records at startup. The end state is that nothing on
+local disk is durable: a Postgres page is always rebuildable from the object store, never a
+system of record.
 
 A branch is a full read-write copy that copies no rows, so forking production is cheap
 enough to do per experiment. Every mutation appends to an immutable log carrying an author
@@ -188,8 +191,9 @@ the hot tier, so you can ingest existing data-lake files at full speed, and adop
 Iceberg table in place with no migration. Retention gains the pruning half it is missing. A
 structured predicate on the read wire kills the SQL-string double parse, with aggregate /
 limit / TopN pushed into the scan. Catalog metadata gets checkpointed to object storage and
-reloaded into Postgres at startup, still served from Postgres in steady state but recoverable
-from the object store alone.
+reconstituted into Postgres tables at startup — still served from Postgres in steady state,
+but rebuildable from the object store alone. That is the step that makes every local disk in
+the system ephemeral, so a lost Postgres volume costs a restart rather than data.
 
 ## Documentation
 
