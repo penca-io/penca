@@ -674,6 +674,7 @@ mod tests {
     use datafusion::datasource::MemTable;
     use penca_core::{Format, PersistPlan};
     use penca_format::reader::{AnyFormatReader, FormatError};
+    use uuid::Uuid;
 
     fn user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -815,6 +816,7 @@ mod tests {
             offset: None,
             length: None,
             max_commit_seq_num: None,
+            content_hash: Uuid::nil(),
         }
     }
 
@@ -1323,6 +1325,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             ..Default::default()
         };
@@ -1396,6 +1399,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             ..Default::default()
         };
@@ -1483,6 +1487,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "sc".to_string(),
             size_bytes: 64,
+            content_hash: Uuid::nil(),
         });
         let provider = SnapshotTableProvider::new(
             vec![seg],
@@ -1551,6 +1556,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             index_sidecars: vec![(
                 user_index_uuid.to_string(),
@@ -1561,6 +1567,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-user".to_string(),
                     size_bytes: 256,
+                    content_hash: Uuid::nil(),
                 },
             )],
             ..Default::default()
@@ -1642,6 +1649,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             // No keyed sidecars: the user entry below cannot resolve.
             ..Default::default()
@@ -1693,6 +1701,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "id-sc".to_string(),
                 size_bytes: 1,
+                content_hash: Uuid::nil(),
             }),
             index_sidecars: vec![(
                 user.to_string(),
@@ -1703,6 +1712,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "user-sc".to_string(),
                     size_bytes: 1,
+                    content_hash: Uuid::nil(),
                 },
             )],
             ..Default::default()
@@ -1777,6 +1787,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-value".to_string(),
                     size_bytes: 256,
+                    content_hash: Uuid::nil(),
                 },
             )],
             ..Default::default()
@@ -1888,6 +1899,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-x".to_string(),
                     size_bytes: 128,
+                    content_hash: Uuid::nil(),
                 },
             )],
             ..Default::default()

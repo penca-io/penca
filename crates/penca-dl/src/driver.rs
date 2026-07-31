@@ -1088,6 +1088,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             ..Default::default()
         }
@@ -1251,6 +1252,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             }),
             ..Default::default()
         }
@@ -1521,6 +1523,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity-never-read".to_string(),
             size_bytes: 256,
+            content_hash: Uuid::nil(),
         });
         let dl = routing_driver(cache, by_uri);
 
@@ -1550,6 +1553,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity".to_string(),
             size_bytes: 256,
+            content_hash: Uuid::nil(),
         });
         let name_index = Uuid::new_v4();
         let res = dl
@@ -1591,6 +1595,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-other".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             },
         )];
         let requested = Uuid::new_v4(); // != the keyed index present
@@ -1635,6 +1640,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-keyed-never-read".to_string(),
                 size_bytes: 256,
+                content_hash: Uuid::nil(),
             },
         )];
         let dl = routing_driver(cache, by_uri);
@@ -1754,6 +1760,128 @@ mod tests {
             second.column(0).to_data().buffers()[0].as_ptr(),
             "cache hit is an Arc::clone — same backing buffer, no copy"
         );
+    }
+
+    /// Two metadata rows over one byte range — exactly what snapshot
+    /// carry-forward (CHA-531) and a fork's reference copy (CHA-539) produce: a
+    /// NEW row uuid over an unchanged `(uri, offset, length)`. Keyed by uuid the
+    /// cache stores both decodes of identical bytes; keyed by `content_hash` it
+    /// stores one (CHA-545).
+    ///
+    /// One test per artifact class because the scope rule is precisely that all
+    /// three behave identically — a fix that dedups segments but leaves sidecars
+    /// uuid-keyed would pass a single-class test.
+    #[tokio::test]
+    async fn snapshot_segments_sharing_content_hash_decode_once() {
+        let schema = test_schema();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&schema));
+
+        let shared = Uuid::from_u128(0xc0ffee);
+        let mut parent = segment("parent-seg", 128);
+        parent.uri = "s3://t/shared.parquet".into();
+        parent.content_hash = shared;
+        let mut fork = segment("fork-seg", 128);
+        fork.uri = parent.uri.clone();
+        fork.content_hash = shared;
+
+        let first = read_seg(&dl, &parent, &schema, &schema).await.unwrap();
+        let second = read_seg(&dl, &fork, &schema, &schema).await.unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct segment uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
+    }
+
+    #[tokio::test]
+    async fn persist_segments_sharing_content_hash_decode_once() {
+        let schema = test_schema();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&schema));
+
+        let shared = Uuid::from_u128(0xc0ffee);
+        let seg = |uuid: &str| PersistSegment {
+            segment_uuid: uuid.to_string(),
+            uri: "s3://t/shared.parquet".into(),
+            format: Format::Parquet,
+            size_bytes: 256,
+            content_hash: shared,
+            ..Default::default()
+        };
+
+        let first = read_cached_persist_segment(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &seg("parent-p"),
+            &schema,
+            &schema,
+        )
+        .await
+        .unwrap();
+        let second = read_cached_persist_segment(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &seg("fork-p"),
+            &schema,
+            &schema,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct persist segment uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
+    }
+
+    /// `CountingFormatReader::read_segment` ignores its `schema` argument and
+    /// returns a fixed batch, so no sidecar-shaped fixture is needed — the
+    /// `key_types` slice only has to reach the reader.
+    #[tokio::test]
+    async fn index_sidecars_sharing_content_hash_decode_once() {
+        let schema = test_schema();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&schema));
+
+        let shared = Uuid::from_u128(0xbeef);
+        let sidecar = |uuid: &str| IndexSidecar {
+            object_uri: "s3://t/shared.idx".into(),
+            offset: 0,
+            length: 3,
+            format: Format::Parquet,
+            segment_index_uuid: uuid.to_string(),
+            size_bytes: 256,
+            content_hash: shared,
+        };
+
+        let first = read_cached_index_sidecar(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &sidecar("parent-idx"),
+            &[DataType::Utf8],
+        )
+        .await
+        .unwrap();
+        let second = read_cached_index_sidecar(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &sidecar("fork-idx"),
+            &[DataType::Utf8],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct sidecar uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
     }
 
     #[tokio::test]
