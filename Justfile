@@ -627,9 +627,15 @@ penca-up profile="dev" db="": vm-gc
     # `seaweedfs` (the in-stack S3 gateway + its bucket-init job) is dropped
     # for stack profiles whose cold tier is a real bucket — it would idle with
     # nothing to serve, and its bucket-init job would assert a bucket the
-    # deployment never reads. Add future real-bucket profiles to this case.
+    # deployment never reads. Those profiles also need compose.s3.yml, which
+    # relaxes the servicers' dependency on the now-absent seaweedfs-init; see
+    # that file for why the relaxation is opt-in rather than the default.
+    # Add future real-bucket profiles to this case.
     case "{{profile}}" in
-        s3) profiles="--profile infra --profile penca-backend" ;;
+        s3)
+            compose_files="$compose_files -f docker/compose.s3.yml"
+            profiles="--profile infra --profile penca-backend"
+            ;;
         *)  profiles="--profile infra --profile seaweedfs --profile penca-backend" ;;
     esac
 
