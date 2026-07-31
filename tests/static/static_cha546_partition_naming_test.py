@@ -8,8 +8,12 @@ leaf-to-parent, the writer parent-to-leaf) and compact's ``SELECT ... FOR
 UPDATE OF seg`` holds ``ROW SHARE`` on the parent across its whole cold
 read and merged write — long enough that ``DeleteBranch`` trips
 ``lock_branch_teardown_partitions``' 5s ``lock_timeout`` in ordinary
-operation. Naming a partition takes no parent lock at all, which is what
-makes this a fix rather than a tidy-up.
+operation. Naming a partition takes no parent lock at all for ``SELECT``,
+``SELECT ... FOR UPDATE`` and ``DELETE``, and downgrades an ``INSERT`` or
+``UPDATE`` from ``RowExclusive`` to a commit-held ``AccessShare`` — which
+still clears teardown's ``EXCLUSIVE`` step. That is what makes this a fix
+rather than a tidy-up; the measured table is in
+``tests/integration/integration_cha546_partition_lock_footprint_test.py``.
 
 Two exceptions are enumerated, not incidental:
 
