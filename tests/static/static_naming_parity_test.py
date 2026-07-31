@@ -34,6 +34,7 @@ from penca_client.naming import (
     table_persist_segment_uuid,
     table_persist_uuid,
     table_purge_uuid,
+    table_snapshot_segment_metadata_partition,
     table_snapshot_segment_uuid,
     table_snapshot_uuid,
     tx_table_log_partition,
@@ -121,6 +122,16 @@ class TestNamingParity:
         assert (
             commit_tx_log_seq_num_partition(CAT, BR)
             == "4bb9308a-f277-9b8b-0631-bd6d5aa5c2f9_commit_tx_log_seq_num_partition"
+        )
+
+    def test_table_snapshot_segment_metadata_partition(self):
+        # CHA-546: the metadata family resolves by leaf name too, and this
+        # is the first such leaf Python has to compute. Golden mirrors the
+        # Rust unit test in crates/penca-core/src/naming/tables.rs.
+        assert (
+            table_snapshot_segment_metadata_partition(CAT, BR)
+            == "1a93a047-8229-c30f-2de8-08a4482c2051"
+            "_table_snapshot_segment_metadata_partition"
         )
 
     def test_write_sequence(self):

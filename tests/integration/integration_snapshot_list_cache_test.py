@@ -11,8 +11,9 @@ skip the per-read PG round-trip. This module pins:
 
 Counting is via ``pg_stat_statements`` (the CHA-367 resolution-count seam):
 ``count_stmts_referencing`` sums ``calls`` over normalized statements whose text
-contains the per-catalog ``…_table_snapshot_segment_metadata`` identifier, so
-background activity on other catalogs can't pollute the count.
+contains this branch's ``…_table_snapshot_segment_metadata_partition`` leaf name
+(CHA-546 — the read path names the leaf, never the catalog-wide parent), so
+background activity on other branches or catalogs can't pollute the count.
 
 Run: ``just integration-test --test-arg integration_snapshot_list_cache_test``.
 """
@@ -23,7 +24,7 @@ import pyarrow as pa
 import pytest
 from penca_client import Mutation
 from penca_client._time import micros_to_datetime
-from penca_client.naming import TABLE_SNAPSHOT_SEGMENT_METADATA
+from penca_client.naming import table_snapshot_segment_metadata_partition
 
 from .integration_helpers import (
     USER_SCHEMA,
@@ -77,9 +78,11 @@ class TestSnapshotListCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        # Per-catalog needle: pg_stat_statements preserves identifiers, so this
-        # matches only this catalog's snapshot-segment-metadata reads.
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        # Per-BRANCH needle: pg_stat_statements preserves identifiers, and since
+        # CHA-546 the read path names the branch's partition, not the catalog-wide
+        # parent. A parent-name needle here would match nothing, silently turning
+        # every `== 0` assertion below into a tautology.
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         # First current-time read — cache miss, populates the entry.
         reset_pg_stat(pg)
@@ -147,7 +150,7 @@ class TestSnapshotListCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         # Warm the cache, then confirm a current-time read is a hit AND sees carol.
         client.read_data(
@@ -220,7 +223,7 @@ class TestSnapshotListCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         # Warm the cache on the LATEST snapshot (S2 → its own W_snap key).
         current = client.read_data(
@@ -460,7 +463,7 @@ class TestSystemTableResolveCache:
     itself COLD via ``_persist_purge_system_tables_past_grace`` so the resolve
     must consult a snapshot segment list — the read the W_snap-keyed
     snapshot-list cache (CHA-472/492) serves from cache on both the query and
-    write paths. Same per-catalog ``…_table_snapshot_segment_metadata`` needle.
+    write paths. Same per-branch partition-leaf needle.
     """
 
     def test_system_table_resolve_cache_hit_cuts_pg_read(self):
@@ -486,7 +489,7 @@ class TestSystemTableResolveCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         # 1st read — warms the system-table snapshot-list cache entry.
         reset_pg_stat(pg)
@@ -536,7 +539,7 @@ class TestSystemTableResolveCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         def _autocommit_write(name, value):
             client.write_data(
@@ -596,7 +599,7 @@ class TestSystemTableResolveCache:
 
         pg = get_pg_driver()
         ensure_pg_stat_statements(pg)
-        seg_table = f"{cat}_{TABLE_SNAPSHOT_SEGMENT_METADATA}"
+        seg_table = table_snapshot_segment_metadata_partition(cat, br)
 
         # Warm the system-table cache via a current-time read.
         client.read_data(
