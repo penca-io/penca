@@ -671,7 +671,19 @@ penca-up profile="dev" db="" build="": vm-gc
     if [ -s "$HOME/.aws/credentials" ]; then export PENCA_AWS_CREDENTIALS="$HOME/.aws/credentials"; fi
     if [ -s "$HOME/.aws/config" ]; then export PENCA_AWS_CONFIG="$HOME/.aws/config"; fi
 
-    docker compose $compose_files $env_file $profiles up -d $build_flag
+    # Build once, explicitly, rather than via `up --build`. All six servicers
+    # share ONE image ref, but compose does not dedupe their identical build
+    # configs — `up --build` runs six concurrent targets that all race to
+    # export the same tag, and on the FIRST build of a tag that does not exist
+    # yet the losers die with `image "...": already exists`. Latent before
+    # CHA-187 only because `penca-rust-server:latest` already existed on every
+    # machine that had ever run this; a fresh tag or a fresh clone hits it
+    # every time. Building one service produces the image all six then find
+    # locally via `pull_policy: missing`.
+    if [ -n "$build_flag" ]; then
+        docker compose $compose_files $env_file $profiles build query
+    fi
+    docker compose $compose_files $env_file $profiles up -d
 
     # Query the ports Docker actually bound.
     pg_port=$(docker compose $compose_files $env_file $profiles port postgres 5432 | cut -d: -f2)
