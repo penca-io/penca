@@ -82,7 +82,7 @@ fn empty_merge_placeholder_step(
     base_uri: &str,
     storage_format_text: &str,
     user_schema: &SchemaRef,
-) -> SnapshotFileStep {
+) -> Result<SnapshotFileStep, ApiError> {
     let placeholder_batch = RecordBatch::new_empty(penca_merge::snapshot_read_schema(user_schema));
     let seg_uuid = table_snapshot_segment_uuid(snap_uuid, 0);
     let uri = snapshot_segment_uri(
@@ -94,7 +94,11 @@ fn empty_merge_placeholder_step(
         storage_format_text,
     );
     let statistics = penca_dl::stats::compute_segment_statistics(&placeholder_batch);
-    SnapshotFileStep {
+    // Every empty placeholder over one schema is the same zero-row content, so
+    // they legitimately collapse onto one cache entry.
+    let content_hash =
+        penca_core::digest::segment_content_hash(&placeholder_batch).map_err(ApiError::Arrow)?;
+    Ok(SnapshotFileStep {
         snap_uuid_str: snap_str.to_string(),
         uri,
         file_batch: placeholder_batch,
@@ -106,8 +110,9 @@ fn empty_merge_placeholder_step(
             length: 0,
             size_bytes: 0,
             statistics,
+            content_hash,
         }],
-    }
+    })
 }
 
 impl LifecycleManager {
@@ -1539,7 +1544,7 @@ impl LifecycleManager {
                     &self.base_uri,
                     ctx.storage_format_text,
                     ctx.user_schema,
-                );
+                )?;
                 seg_writer
                     .write_segment_group(pool, writer, &placeholder)
                     .await?;
@@ -1912,6 +1917,10 @@ async fn build_one_segment_sidecar<W: FormatWriter>(
         // sorted the keys, so the bounds are the first/last entry). Deferred so
         // the seek owns the exact bound encoding rather than guessing it here.
         &[],
+        // The sidecar's own content, not the base segment's: two segments with
+        // different rows can build byte-identical indexes, and it is the index
+        // batch that this row's cache entry holds.
+        &penca_core::digest::segment_content_hash(&sidecar).map_err(ApiError::Arrow)?,
     )
     .await?;
     built_uris.push(uri);

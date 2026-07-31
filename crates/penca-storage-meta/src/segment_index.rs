@@ -255,6 +255,7 @@ impl LifecycleManager {
         format_text: &str,
         size_bytes: i64,
         statistics: &[u8],
+        content_hash: &Uuid,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let branch = parse_uuid(branch_uuid);
@@ -262,8 +263,9 @@ impl LifecycleManager {
         let sql = format!(
             "INSERT INTO {table} \
              (segment_index_uuid, branch_uuid, segment_uuid, table_snapshot_index_uuid, \
-              object_uri, \"offset\", length, format, size_bytes, statistics) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+              object_uri, \"offset\", length, format, size_bytes, statistics, \
+              content_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (branch_uuid, segment_index_uuid) DO UPDATE \
                 SET segment_uuid = EXCLUDED.segment_uuid, \
                     table_snapshot_index_uuid = EXCLUDED.table_snapshot_index_uuid, \
@@ -272,7 +274,8 @@ impl LifecycleManager {
                     length = EXCLUDED.length, \
                     format = EXCLUDED.format, \
                     size_bytes = EXCLUDED.size_bytes, \
-                    statistics = EXCLUDED.statistics",
+                    statistics = EXCLUDED.statistics, \
+                    content_hash = EXCLUDED.content_hash",
             table = qi(&table),
         );
         driver
@@ -289,6 +292,7 @@ impl LifecycleManager {
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Int64(size_bytes),
                     SqlValue::Bytes(statistics.to_vec()),
+                    SqlValue::Uuid(*content_hash),
                 ],
             )
             .await?;

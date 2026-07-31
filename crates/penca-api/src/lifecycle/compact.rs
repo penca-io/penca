@@ -321,6 +321,15 @@ where
         } else {
             0
         };
+        // Recomputed per slice rather than carried over from the input row.
+        // The rows are preserved 1:1, but `concat_batches` normalizes every
+        // input to one `segment_schema`, so a slice of the merged batch can
+        // decode to a wider type than its input file did. Carrying the old hash
+        // would leave two different decodes under one cache key.
+        let slice_hash = penca_core::digest::segment_content_hash(
+            &merged.slice(cumulative as usize, meta.row_count as usize),
+        )
+        .map_err(ApiError::Arrow)?;
         LifecycleManager::repoint_table_persist_segment(
             &tx,
             &catalog_str,
@@ -332,6 +341,7 @@ where
             proportional_size,
             storage_format_text,
             &merged_stats,
+            &slice_hash,
             false,
         )
         .await?;
