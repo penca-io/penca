@@ -16,7 +16,8 @@ use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::{
-    FormatError, FormatReader, empty_batch, present_columns, project_schema, shape_to_schema,
+    FormatError, FormatReader, empty_batch, present_columns, project_schema, requested_columns,
+    shape_to_schema,
 };
 use crate::uri::uri_to_object_path;
 
@@ -192,10 +193,7 @@ impl FormatReader for LanceFormatReader {
         schema: &SchemaRef,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch, FormatError> {
-        let column_names: Vec<&str> = match projection {
-            Some(cols) => cols.to_vec(),
-            None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
-        };
+        let column_names = requested_columns(schema, projection);
         let present = self
             .read_in_file_schema(uri, offset, length, Some(&column_names))
             .await?;

@@ -215,6 +215,20 @@ pub(crate) fn null_fill_to_schema(
     Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
+/// The columns a segment read should request from the file: the projection when
+/// given, otherwise every column in `schema`. The `None` case is what makes a
+/// projection-less [`FormatReader::read_segment`] return the caller's whole
+/// schema, null-filling any column the file predates.
+pub(crate) fn requested_columns<'a>(
+    schema: &'a SchemaRef,
+    projection: Option<&[&'a str]>,
+) -> Vec<&'a str> {
+    match projection {
+        Some(cols) => cols.to_vec(),
+        None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
+    }
+}
+
 /// The subset of `names` that actually exist as columns in `file_schema`,
 /// preserving the requested order. Used by readers to project only the columns
 /// physically present in a segment before null-filling the rest.
@@ -261,6 +275,21 @@ mod tests {
         let schema = test_schema();
         let err = project_schema(&schema, Some(&["a", "zzz"])).unwrap_err();
         assert!(matches!(err, FormatError::UnknownProjectionColumn(name) if name == "zzz"));
+    }
+
+    #[test]
+    fn requested_columns_passes_projection_through_and_expands_none() {
+        let schema = test_schema();
+        assert_eq!(
+            requested_columns(&schema, Some(&["c", "a"])),
+            vec!["c", "a"],
+            "a projection is returned verbatim, in the requested order"
+        );
+        assert_eq!(
+            requested_columns(&schema, None),
+            vec!["a", "b", "c"],
+            "no projection means every column in the caller's schema"
+        );
     }
 
     #[test]
