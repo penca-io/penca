@@ -27,18 +27,25 @@ const IPC_ALIGNMENT: usize = 8;
 /// reuse as a possible future use of this digest; that use requires
 /// establishing round-trip stability first, and this function does not.
 ///
-/// **Slice-invariant for every column type Penca supports.** A batch from
-/// `slice()` stays a view onto its parent's buffers, which physically hold
-/// bytes outside the slice, but the IPC writer encodes only the logical range —
-/// measured on arrow-rs 57.3 for Int32/Int64/Utf8/List, which with LargeList
-/// and FixedSizeList are the whole supported set (everything else is
-/// `UnsupportedType`, see [`crate::types`]). The one measured exception is
-/// dictionary-encoded columns, where `DictionaryHandling::Resend` emits the
-/// full dictionary regardless of which rows the slice covers; Penca rejects
-/// `DataType::Dictionary` at the type boundary, so no such column reaches here.
-/// Were one to, the cost is a *missed dedup* — two cache entries for one
-/// logical content — never a wrong result, because the digest is computed once
-/// and inherited, never recomputed and compared.
+/// **Slice-invariant except for view-encoded columns.** A batch from `slice()`
+/// stays a view onto its parent's buffers, which physically hold bytes outside
+/// the slice, but the IPC writer encodes only the logical range. Measured on
+/// arrow-rs 57.3 across the supported set (see [`crate::types`]): primitives,
+/// decimals, dates/times/timestamps, `Boolean` at a non-byte-aligned offset,
+/// `Utf8`/`LargeUtf8`/`Binary`, and `List`/`LargeList`/`FixedSizeList` all hold.
+///
+/// `Utf8View`/`BinaryView` do not, top-level or as a list child: the writer
+/// truncates the *views* buffer but emits each variadic data buffer whole, so a
+/// slice carries bytes belonging to rows it does not cover. Only above the
+/// 12-byte inline threshold — shorter values live in the view itself and are
+/// invariant. `Dictionary` fails the same way under `DictionaryHandling::Resend`
+/// but is rejected at the type boundary and cannot reach here.
+///
+/// Neither costs correctness, and neither costs the dedup this digest exists
+/// for: a reference copy *inherits* the stored hash rather than recomputing it,
+/// so fork and copy sharing is unaffected. What is lost is dedup between two
+/// segments written independently whose identical rows happened to be sliced out
+/// of differently-shaped parent batches.
 ///
 /// Changing the IPC options or the hash changes every future digest. That is
 /// safe — stored digests are opaque identity, never recomputed and compared
@@ -63,7 +70,7 @@ pub fn segment_content_hash(batch: &RecordBatch) -> Result<Uuid, ArrowError> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, ListArray, StringArray};
+    use arrow::array::{Int64Array, ListArray, StringArray, StringViewArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 
     use super::*;
@@ -269,6 +276,40 @@ mod tests {
             hash(&sliced),
             hash(&lists(vec![vec![2, 2], vec![3, 3, 3]])),
             "a sliced list column hashes as its own logical rows"
+        );
+    }
+
+    /// The one exception in the contract above, pinned so the contract cannot go
+    /// stale: arrow-rs 57.3 truncates a view array's *views* buffer on slice but
+    /// emits each variadic data buffer whole.
+    ///
+    /// A failure here means arrow started compacting those buffers — delete this
+    /// test and the exception paragraph it guards.
+    #[test]
+    fn sliced_view_column_is_the_documented_non_invariant_case() {
+        let view = |v: Vec<&str>| {
+            batch(
+                vec![Field::new("s", DataType::Utf8View, true)],
+                vec![Arc::new(StringViewArray::from(v))],
+            )
+        };
+        // Above the 12-byte inline threshold, so the values live in a data
+        // buffer rather than in the view word itself.
+        let long = [
+            "aaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccc",
+        ];
+
+        assert_ne!(
+            hash(&view(long.to_vec()).slice(1, 2)),
+            hash(&view(vec![long[1], long[2]])),
+            "arrow now truncates variadic data buffers — update the contract above"
+        );
+        assert_eq!(
+            hash(&view(vec!["aa", "bb", "cc"]).slice(1, 2)),
+            hash(&view(vec!["bb", "cc"])),
+            "inline-length views carry no data buffer, so they stay invariant"
         );
     }
 }
