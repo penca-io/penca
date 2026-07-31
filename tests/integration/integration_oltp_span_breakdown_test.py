@@ -1,6 +1,6 @@
 """CHA-417 acceptance: the stream/IPC-encode bucket emits timing spans.
 
-docs/performance.md attributes ~60-70 ms of the OLTP point read to a
+docs/performance.md attributes part of the OLTP point-read wall time to a
 "streaming + IPC encode" bucket that is invisible to the span table —
 the encode tails (`penca-server-grpc::ipc` for gRPC `read_data`,
 `record_batch_response` for every Flight SQL DoGet arm) carry no spans.
