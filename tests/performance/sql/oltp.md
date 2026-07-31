@@ -133,4 +133,4 @@ plan/metadata work — both [CHA-355](https://linear.app/chapala/issue/CHA-355)
 dedup) have landed — so the sole genuinely-open lever is
 [CHA-120](https://linear.app/chapala/issue/CHA-120) (metadata + plan caching). See
 the run's HTML report and the
-[main performance notes](../../../docs/performance.md#analysis).
+[main performance notes](../../../docs/performance.md#mechanism-and-cost-attribution).

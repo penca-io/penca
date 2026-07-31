@@ -18,27 +18,25 @@
 > rough edges, and read [Current shortcomings](#current-shortcomings) before you plan
 > anything around it: much of the [roadmap](#roadmap) is still ahead of us.
 
-Penca is a database that serves transactional and analytical queries from one copy of your
-data, stored as open columnar files on object storage. Unlike a split OLTP/OLAP stack there
-is no second system and no CDC pipeline between them: the files an analytical query reads
-are the files production wrote. The trade-off is that a single-row transaction costs more
-than it would on a local-disk row store.
+Penca serves transactional and analytical queries from one copy of your data, stored as open
+columnar files on object storage: the files an analytical query reads are the files
+production wrote, so there is no second system and no CDC pipeline between them. The
+trade-off is that a single-row transaction costs more than on a local-disk row store.
 
 To keep transactional latency workable, writes land in an internal Postgres hot tier under a
 real ACID transaction. A background pipeline persists, snapshots and purges them out to
 columnar files (Lance by default, Parquet supported). Reads merge both tiers, so a query
 sees committed writes immediately whichever tier they sit in.
 
-Object storage is pluggable and the only permanent home for your table data. Catalog and
-branch metadata is served from Postgres and stays that way, with object-storage checkpoints
-for recovery on the [roadmap](#roadmap).
+Object storage is pluggable and the only permanent home for anything Penca stores. Table
+data lives there today. Catalog and branch metadata is served from Postgres for latency;
+checkpointing it to the object store and reconstituting those Postgres tables at startup is
+on the [roadmap](#roadmap). The end state is that nothing on local disk is durable: a
+Postgres page is always rebuildable from the object store, never a system of record.
 
 A branch is a full read-write copy that copies no rows, so forking production is cheap
 enough to do per experiment. Every mutation appends to an immutable log carrying an author
 and a timestamp, so any state is auditable and readable as of an earlier commit.
-
-See [docs/architecture.md](docs/architecture.md) for the full design, and
-[Current shortcomings](#current-shortcomings) for where the edges are.
 
 ## See it work
 
@@ -63,9 +61,29 @@ which the demo asserts rather than prints: see
 
 ```bash
 just penca-up                            # Postgres + object store + servicers + Flight SQL gateway
-set -a && source docker/.client.env      # PENCA_*_URL for the client
-uv run python examples/sandbox_demo.py
+
+uv run python - <<'EOF'                  # write a table and read it back
+from adbc_driver_flightsql.dbapi import connect
+
+with connect("grpc://localhost:50060", autocommit=True) as conn, conn.cursor() as cur:
+    cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
+    cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
+    cur.execute("SELECT * FROM greetings ORDER BY id")
+    print(cur.fetch_arrow_table())
+EOF
+
+set -a && source docker/.client.env      # PENCA_*_URL, for the demo below
+uv run python examples/sandbox_demo.py   # the branching demo above
 ```
+
+That is a stock Arrow Flight SQL driver talking to port 50060: no Penca client, no custom
+protocol, and `greetings` lands in the default catalog and schema, so there is nothing to
+create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way. `autocommit=True` is
+load-bearing: DB-API defaults it to `False`, so nothing commits and the writes are discarded
+on close.
+
+The shipped Python client wraps that surface plus the gRPC one, which is what the
+branching, audit and time-travel calls use; see [docs/usage.md](docs/usage.md).
 
 You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
 and [`just`](https://github.com/casey/just). `just penca-up` pulls a prebuilt server image
@@ -82,23 +100,23 @@ just penca-up --db ~/.penca/data
 
 The defensible claim is the *conjunction*, on one copy. Each alternative holds part of it:
 
-- **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
-  branch: queries run on the row store, at row-store cost.
+- **Neon.** Branchable Postgres on object storage. Branch plus OLTP, but data is persisted
+  as Postgres data pages. Does not provide OLAP capabilities out of the box.
 - **Dolt.** Branching, merge and audit, open source, but on a bespoke row-oriented
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie.** Branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks LTAP.** The closest peer by far.
-  [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage), built
-  on Lakebase and announced in June 2026, argues the same thing we do: the way out of the
-  split is storing the data once in open formats instead of syncing a second copy to read
-  it. We could not have asked for better validation. Where the two diverge is data
-  versioning. LTAP keeps intermediate row versions to preserve Postgres MVCC and
-  point-in-time recovery, but they stay invisible to Iceberg and Delta readers and are
-  garbage-collected in time. Branching there is metadata-only, as it is here. Penca is
-  Apache-2.0 and self-hostable rather than a managed service, and it makes that version
-  history a first-class queryable surface: a row-level audit trail and `as_of` reads today,
-  revert to come.
+- **Databricks Lakebase.** Managed Postgres next to a lakehouse, branchable. Branch plus OLTP
+  plus OLAP, but not on one copy: the analytical side is a synced table — what their own docs
+  call a managed copy, kept current by CDC — and a branch forks the Postgres storage layer and
+  only that, so its analytical half needs a sync pipeline of its own.
+
+Databricks' [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage),
+announced in June 2026 and rolling out since, argues the same thing we do: store the data once
+in open formats instead of syncing a second copy to read it. We could not have asked for
+better validation. Where we expect to differ is that Penca is Apache-2.0 and self-hostable,
+and makes version history a queryable surface — row-level audit and `as_of` reads today,
+revert to come — rather than MVCC bookkeeping that lakehouse readers never see.
 
 ## Architecture
 
@@ -164,18 +182,18 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
   files, but nothing registers them yet with an Iceberg REST catalog.
 - **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
-- **No full-text search and no vector indexes.** Secondary indexes are currently equality seeks only.
+- **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
 
 ## Roadmap
 
-Everything above is the roadmap, in roughly that order. The shortcomings section is a plan
-stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot
-tier, so you can ingest existing data-lake files at full speed, and adopting an Iceberg
-table in place with no migration. Retention gains the pruning half it is missing and the
-scheduler gains leader election. A structured predicate on the read wire kills the
-SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog
-metadata gets checkpointed to object storage and reloaded into Postgres at startup, still
-served from Postgres in steady state but recoverable from the object store alone.
+Everything above is the roadmap, in roughly that order. Beyond it: bulk load that bypasses
+the hot tier, so you can ingest existing data-lake files at full speed, and adopting an
+Iceberg table in place with no migration. Retention gains the pruning half it is missing. A
+structured predicate on the read wire kills the SQL-string double parse, with aggregate /
+limit / TopN pushed into the scan. Catalog metadata gets checkpointed to object storage and
+reconstituted into Postgres tables at startup — still served from Postgres in steady state,
+but rebuildable from the object store alone. That is the step that makes every local disk in
+the system ephemeral, so a lost Postgres volume costs a restart rather than data.
 
 ## Documentation
 

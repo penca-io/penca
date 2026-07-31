@@ -2,12 +2,16 @@
 
 The demo's claim is that a primary-key seek is still a seek once the rows live in
 open columnar files — it drives the table cold with persist + snapshot + purge,
-then times the lookup over both the gRPC client and Flight SQL. That is two
-numbers a reader is invited to trust, so what needs coverage is that both are
-really measured, that the seek returned exactly the row it sought, and that the
-tier transition the word "cold" depends on actually ran. Purge is the load-bearing
-step there: persist alone leaves the rows queryable from hot, so without it a
-"cold" read still carries a hot arm.
+then times the lookup over both the gRPC client and Flight SQL. That is a
+latency table a reader is invited to trust, so what needs coverage is that both
+arms are really measured, that the seek returned exactly the row it sought, and
+that the tier transition the word "cold" depends on actually ran. Purge is the
+load-bearing step there: persist alone leaves the rows queryable from hot, so
+without it a "cold" read still carries a hot arm.
+
+What is deliberately not covered is the timings themselves. They are the output
+of a measurement, not of a code path, and any threshold this asserted would be a
+statement about the machine CI happens to run on.
 
 Deliberately a subprocess smoke test rather than an import-and-assert: the demo
 is a flat ``main()`` that prints, with no seam to call into, and adding one
@@ -48,6 +52,11 @@ _DEMO_PATH = _REPO_ROOT / "examples" / "oltp_demo.py"
 # none of the assertions below depend on the scale.
 _ROWS = 2_000
 _REPS = 5
+# The warm-up buys a steady-state number, which nothing here asserts on — this
+# test reads the table's shape, not its values. So it is bought back as suite
+# time. Not zero: zero would leave the demo's default warm-up path unexercised,
+# and this is the only test that runs the demo at all.
+_WARMUP_SECONDS = 0.2
 
 # The demo seeds owner_<id zero-padded to 6>, and looks up the row at the middle
 # of the key range. Derived here rather than pinned so the two move together if
@@ -55,7 +64,9 @@ _REPS = 5
 _TARGET_ID = _ROWS // 2
 _TARGET_OWNER = f"owner_{_TARGET_ID:06d}"
 _ROW_SECTION = "--- The row we looked up ---"
-_LATENCY_SECTION = "--- Point lookup latency on cold columnar (mean per lookup) ---"
+_LATENCY_SECTION = (
+    f"--- Point lookup latency on cold columnar ({_REPS} reps per arm) ---"
+)
 
 # A pandas/tabulate cell holding a millisecond figure: "| 1.23 |", "|  0.4 |".
 # Lookahead on the closing pipe so adjacent cells share their delimiter —
@@ -88,6 +99,8 @@ def test_oltp_demo_seeks_one_row_on_both_paths_against_cold_columnar():
                 str(_ROWS),
                 "--reps",
                 str(_REPS),
+                "--warmup-seconds",
+                str(_WARMUP_SECONDS),
             ],
             cwd=_REPO_ROOT,
             capture_output=True,
@@ -237,9 +250,13 @@ def _assert_both_arms_measured(stdout: str) -> None:
         f"in:\n{latency_section[:2000]}"
     )
 
-    # And each row carries a real number rather than a placeholder.
-    measured = _MS_CELL.findall(latency_section)
-    assert len(measured) >= 2, (
-        f"expected a measurement for each arm, saw {len(measured)} numeric "
-        f"cells in:\n{latency_section[:2000]}"
+    # And each row carries a real number rather than a placeholder. Per row, not
+    # a count over the whole table: the table is one row per arm and several
+    # percentile columns wide, so a total would let one fully measured arm cover
+    # for an unmeasured one. Counting per row is also independent of how many
+    # percentiles the demo chooses to print.
+    unmeasured = [row for row in rows if not _MS_CELL.findall(row)]
+    assert not unmeasured, (
+        f"every arm must carry a measurement; {len(unmeasured)} row(s) had no "
+        f"numeric cell in:\n{latency_section[:2000]}"
     )
