@@ -1183,9 +1183,16 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
     )
 
     # The precondition the scenario rests on: the fork's cold row and the
-    # parent's must name the SAME slice, or the two branches decode
+    # parent's must land on the SAME cache entry, or the two branches decode
     # independently, every assertion below still passes, and this test covers
     # nothing. Metadata-only, so it does not warm the cache it is about to probe.
+    #
+    # `content_hash` is the join that matters — it is the cache key (CHA-545).
+    # Matching `object_uri`/`offset`/`length` too pins WHY they collide: the
+    # fork's row is a reference copy of the parent's slice that inherited its
+    # hash, not two writes that happened to produce the same bytes. Joining on
+    # addressing alone would pass even if the copy minted a fresh hash, which
+    # is the failure mode that would silently retire this test.
     #
     # BOTH tiers, because which one carries the shared slice depends on the
     # fixture: here the snapshot covers the whole persist, so `copy_inherited_
@@ -1197,7 +1204,9 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
         rows = get_pg_driver().execute(
             SQL(
                 "SELECT count(*) FROM {tbl} p JOIN {tbl} c"
-                ' ON p.object_uri = c.object_uri AND p."offset" IS NOT DISTINCT FROM c."offset"'
+                " ON p.content_hash = c.content_hash AND p.object_uri = c.object_uri"
+                ' AND p."offset" IS NOT DISTINCT FROM c."offset"'
+                " AND p.length IS NOT DISTINCT FROM c.length"
                 " WHERE p.branch_uuid = %s AND c.branch_uuid = %s AND p.table_uuid = %s"
             ).format(tbl=Identifier(f"{catalog_uuid}_{base}")),
             (main_branch, child, table_uuid),
@@ -1206,9 +1215,10 @@ def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
 
     if shared == 0:
         raise RuntimeError(
-            "setup failed: the fork holds no cold row naming the parent's slice "
-            "in either tier, so both branches would decode independently and the "
-            "cross-branch cache sharing this test pins is unreachable"
+            "setup failed: the fork holds no cold row sharing a content_hash "
+            "with the parent's slice in either tier, so both branches would "
+            "decode independently and the cross-branch cache sharing this test "
+            "pins is unreachable"
         )
 
     # Child first, then parent: the child's decode populates the cache and the
