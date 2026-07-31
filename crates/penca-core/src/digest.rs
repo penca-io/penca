@@ -36,10 +36,13 @@ const IPC_ALIGNMENT: usize = 8;
 ///
 /// `Utf8View`/`BinaryView` do not, top-level or as a list child: the writer
 /// truncates the *views* buffer but emits each variadic data buffer whole, so a
-/// slice carries bytes belonging to rows it does not cover. Only above the
-/// 12-byte inline threshold — shorter values live in the view itself and are
-/// invariant. `Dictionary` fails the same way under `DictionaryHandling::Resend`
-/// but is rejected at the type boundary and cannot reach here.
+/// slice carries bytes belonging to rows it does not cover. The condition is a
+/// property of the parent array, not of the sliced rows — a single value above
+/// the 12-byte inline threshold anywhere in the parent gives the array data
+/// buffers, and every slice of it then carries them in full. Invariance holds
+/// only when *no* value in the parent is longer than that. `Dictionary` fails
+/// the same way under `DictionaryHandling::Resend` but is rejected at the type
+/// boundary and cannot reach here.
 ///
 /// Neither costs correctness, and neither costs the dedup this digest exists
 /// for: a reference copy *inherits* the stored hash rather than recomputing it,
@@ -309,7 +312,15 @@ mod tests {
         assert_eq!(
             hash(&view(vec!["aa", "bb", "cc"]).slice(1, 2)),
             hash(&view(vec!["bb", "cc"])),
-            "inline-length views carry no data buffer, so they stay invariant"
+            "an all-inline parent has no data buffer at all, so it stays invariant"
+        );
+        // The narrow reading of the line above — "short rows are invariant" —
+        // is false: one long value anywhere in the parent gives the array a
+        // data buffer, and a slice of only short rows still carries it.
+        assert_ne!(
+            hash(&view(vec!["aa", "bb", &long[0]]).slice(0, 2)),
+            hash(&view(vec!["aa", "bb"])),
+            "the exception is a property of the parent array, not of the sliced rows"
         );
     }
 }
