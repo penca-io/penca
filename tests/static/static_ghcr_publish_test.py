@@ -35,7 +35,11 @@ CI_WORKFLOW = ".github/workflows/ci.yml"
 COMPOSE = "docker/compose.yml"
 
 IMAGE = "ghcr.io/penca-io/penca-rust-server"
-PUBLISHED_TAG = f"{IMAGE}:main"
+# What compose and the docs point at: the newest `v*` release, so a quickstart
+# a reader follows today behaves the same next week. `:main` still exists and
+# still gets published; it is just not what a reader is aimed at.
+QUICKSTART_TAG = f"{IMAGE}:latest"
+MAIN_TAG = f"{IMAGE}:main"
 
 # Every service that runs a penca-rust-server binary. bootstrap-init is in the
 # list deliberately: it is a one-shot job, but it runs the same image, so
@@ -377,7 +381,7 @@ def test_every_rust_service_runs_the_published_image():
 
     for name in RUST_SERVICES:
         image = services[name]["image"]
-        assert image == f"${{PENCA_IMAGE:-{PUBLISHED_TAG}}}", f"{name} runs {image!r}"
+        assert image == f"${{PENCA_IMAGE:-{QUICKSTART_TAG}}}", f"{name} runs {image!r}"
 
 
 def test_every_rust_service_pulls_rather_than_builds():
@@ -548,17 +552,25 @@ def test_docs_no_longer_promise_a_from_source_first_run():
 
 
 def test_standalone_snippet_uses_the_tag_we_actually_publish():
-    """Assertion 16: docs must point at a tag that resolves today.
+    """Assertion 16: docs aim readers at releases, not at moving `main`.
 
-    :latest is published, but only by a `v*` release tag — and no release
-    exists yet, so a doc pointing at it would 404 for every reader. Once one
-    is cut, :latest and :vX.Y.Z both become fair game here.
+    Someone who follows the quickstart today should get the same thing next
+    week. `:main` moves on every qualifying merge, so it is the wrong thing to
+    put in front of a reader — it stays published for tracking unreleased
+    work, and the surrounding prose may explain it, but the runnable snippet
+    must not use it.
+
+    This depends on a `v*` release existing: until one is pushed, `:latest`
+    does not resolve and Compose falls back to building from source.
     """
     development = _read("docs/development.md")
 
-    assert PUBLISHED_TAG in development, (
-        f"standalone docker run snippet must use {PUBLISHED_TAG}"
+    assert QUICKSTART_TAG in development, (
+        f"standalone docker run snippet must use {QUICKSTART_TAG}"
     )
-    assert f"{IMAGE}:latest" not in development, (
-        "no release has been cut, so :latest does not resolve yet"
+
+    snippet = re.search(r"```bash\n(docker run.*?)```", development, re.DOTALL)
+    assert snippet, "standalone docker run snippet not found"
+    assert MAIN_TAG not in snippet.group(1), (
+        f"the runnable snippet must not aim readers at the moving {MAIN_TAG}"
     )

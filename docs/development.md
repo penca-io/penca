@@ -92,14 +92,15 @@ drift between operator's bootstrap and prod:
 docker run --rm \
   -e DATABASE_URL="postgres://penca:penca@PROD_PG_HOST:5432/penca" \
   -e SQL_SERVER_DEFAULT_CATALOG=public \
-  ghcr.io/penca-io/penca-rust-server:main \
+  ghcr.io/penca-io/penca-rust-server:latest \
   penca-bootstrap
 ```
 
-CI publishes that image on every `main` merge as a manifest list covering
-`linux/amd64` and `linux/arm64`, each built on a native runner, so `docker
-run` and Compose both resolve your architecture without being told. Merges
-are also tagged `:<short-sha>` if you need to pin one.
+`:latest` is the newest `v*` release. CI publishes each release, and every
+`main` merge, as a manifest list covering `linux/amd64` and `linux/arm64`,
+each built on a native runner — so `docker run` and Compose resolve your
+architecture without being told. Pin a specific release with `:vX.Y.Z`, or
+track unreleased `main` with `:main` (also tagged `:<short-sha>` per merge).
 
 ## Repository structure
 

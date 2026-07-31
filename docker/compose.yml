@@ -40,13 +40,18 @@ x-rust-build: &rust-build
 # present, so this key is what makes the behaviour independent of whichever
 # Compose the reader has.
 #
+# `:latest` is the newest `v*` release, not a moving `main` — a quickstart a
+# reader follows today should still behave the same next week. Pin a specific
+# release with PENCA_IMAGE=ghcr.io/penca-io/penca-rust-server:vX.Y.Z, or track
+# main with :main.
+#
 # PENCA_IMAGE lets CI run the tag its own pre-build step produced rather than
 # the published one. It is also how `just penca-up --build=1` keeps a local
 # build off this ref: Compose tags a build's output under whatever `image:`
 # resolves to, so a build left here would shadow the pulled image for every
 # later run — `pull_policy: missing` would never re-pull it.
 x-rust-image: &rust-image
-  image: ${PENCA_IMAGE:-ghcr.io/penca-io/penca-rust-server:main}
+  image: ${PENCA_IMAGE:-ghcr.io/penca-io/penca-rust-server:latest}
   pull_policy: missing
   build: *rust-build
 
