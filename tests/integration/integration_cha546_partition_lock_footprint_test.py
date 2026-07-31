@@ -17,11 +17,47 @@ difference costs twice:
   has been mid-merge for more than five seconds. That is ordinary
   operation, not a race — and it is a *read* that causes it.
 
-Both costs are the same fact, so one fixture covers both: hold
-``ACCESS EXCLUSIVE`` on ``ONLY`` the 8 parents from an out-of-band session
-— what a mid-``DROP TABLE`` teardown holds against every branch other than
-the one it is deleting — and require every branch-scoped operation to
-finish anyway.
+The fixture holds locks on ``ONLY`` the 8 parents from an out-of-band
+session — what teardown holds against every branch other than the one it
+is deleting — and requires branch-scoped operations to finish anyway.
+
+**Two lock modes, because the fix does not reach equally far.** Naming a
+partition removes the parent lock for reads outright, but not for writes.
+Measured directly against PG 17 (``pg_locks`` for the issuing backend,
+inside its transaction, statement issued against the LEAF):
+
+===============================  ===========================
+statement on a leaf              lock taken on its parent
+===============================  ===========================
+``SELECT``                       none
+``SELECT ... FOR UPDATE``        none
+``DELETE``                       none
+``INSERT``                       ``AccessShare``, held to commit
+``UPDATE``                       ``AccessShare``, held to commit
+===============================  ===========================
+
+The write rows are not avoidable and not a leftover parent-naming bug:
+evaluating the leaf's partition constraint opens the parent for its
+partition key, so any statement that produces a new row tuple takes
+``AccessShare`` there. ``DELETE`` and every read produce none, so they take
+nothing — which is why the read half of the fix is total and the write half
+is a downgrade from ``RowExclusive`` to ``AccessShare``.
+
+That downgrade is the whole point for teardown, because the two conflict
+differently. ``lock_branch_teardown_partitions`` takes ``EXCLUSIVE``, which
+conflicts with ``RowExclusive`` but **not** with ``AccessShare``. So:
+
+* ``EXCLUSIVE`` held on the parents — writes must proceed. Red before the
+  fix (the writer's parent ``RowExclusive`` conflicts), green after.
+* ``ACCESS EXCLUSIVE`` held on the parents — reads must proceed. Red before
+  the fix (the reader's parent ``AccessShare`` conflicts), green after,
+  since reads now take nothing on the parent at all.
+
+Asserting writes under ``ACCESS EXCLUSIVE`` would be asserting something
+Postgres cannot give, and is why that residual is documented on
+``write::delete_branch`` rather than tested away here: a ``DROP TABLE``
+still needs ``ACCESS EXCLUSIVE`` on the parent and still waits behind a
+concurrent writer's ``AccessShare``.
 
 Rejected alternatives, so a later reader does not "fix" this back into one:
 
@@ -29,6 +65,9 @@ Rejected alternatives, so a later reader does not "fix" this back into one:
   mid-merge for over five seconds to trip the timeout. Inherently flaky.
 * **Simulate compact's lock with a raw ``SELECT ... FOR UPDATE`` on the
   partition.** That passes before the fix, so it is not a red test.
+* **One fixture at ``ACCESS EXCLUSIVE`` for both halves.** What this file
+  did first. It fails on an idle stack for the write half, for the
+  Postgres reason above — a green that no correct implementation can earn.
 
 Setup runs to completion *before* the locks are taken: catalog, schema,
 table, and branch creation are DDL, and DDL names parents by design.
@@ -92,9 +131,20 @@ HOLDER_ACQUIRE_TIMEOUT_S = 30.0
 _SEED = pa.table({"name": ["alice", "bob"], "value": [1, 2]}, schema=USER_SCHEMA)
 _MORE = pa.table({"name": ["carol", "dave"], "value": [3, 4]}, schema=USER_SCHEMA)
 
+# Composed rather than interpolated: `SQL` accepts only literals, and a lookup
+# keeps the mode out of the statement text entirely.
+_LOCK_MODES = {
+    "EXCLUSIVE": SQL("EXCLUSIVE"),
+    "ACCESS EXCLUSIVE": SQL("ACCESS EXCLUSIVE"),
+}
+
 
 class _ParentLockHolder:
-    """Holds ``ACCESS EXCLUSIVE`` on every metadata parent in one transaction.
+    """Holds ``mode`` on every metadata parent in one transaction.
+
+    ``mode`` is ``EXCLUSIVE`` for the write half and ``ACCESS EXCLUSIVE`` for
+    the read half — see the module docstring for why the two halves cannot
+    share one mode.
 
     ``ONLY`` is what makes this a valid model of teardown and a test that can
     actually go green: without it Postgres locks the named table *and every
@@ -111,7 +161,8 @@ class _ParentLockHolder:
     pooled connection handed back mid-hold would carry them to another caller.
     """
 
-    def __init__(self, catalog_uuid: str) -> None:
+    def __init__(self, catalog_uuid: str, mode: str) -> None:
+        self._mode = mode
         self._parents = [f"{catalog_uuid}_{tag}" for tag in METADATA_PARENT_TAGS]
         self._driver = make_lock_driver()
         self._held = threading.Event()
@@ -129,11 +180,12 @@ class _ParentLockHolder:
                     f"SET LOCAL lock_timeout = '{int(HOLDER_ACQUIRE_TIMEOUT_S)}s'"
                 )
                 tx.execute_no_result(
-                    SQL("LOCK TABLE {tbls} IN ACCESS EXCLUSIVE MODE").format(
+                    SQL("LOCK TABLE {tbls} IN {mode} MODE").format(
                         tbls=SQL(", ").join(
                             SQL("ONLY {tbl}").format(tbl=Identifier(parent))
                             for parent in self._parents
-                        )
+                        ),
+                        mode=_LOCK_MODES[self._mode],
                     )
                 )
 
@@ -157,7 +209,7 @@ class _ParentLockHolder:
             # and report green — the worst outcome for a red test.
             self._release.set()
             raise AssertionError(
-                "could not take ACCESS EXCLUSIVE on the metadata parents "
+                f"could not take {self._mode} on the metadata parents "
                 f"({self._parents}). Something else is holding a lock on them — "
                 "which is itself the CHA-546 defect, one step earlier."
             ) from self._error
@@ -173,7 +225,7 @@ class _Rollback(Exception):
     """Unwinds the holder's transaction without committing."""
 
 
-def _within_deadline(label: str, fn, *args, **kwargs):
+def _within_deadline(label: str, mode: str, fn, *args, **kwargs):
     """Run ``fn`` on a worker thread and fail if it does not return in time.
 
     The client exposes no per-call deadline, so the timeout lives here. The
@@ -189,9 +241,9 @@ def _within_deadline(label: str, fn, *args, **kwargs):
         except FutureTimeout:
             pytest.fail(
                 f"{label} did not complete within {OP_DEADLINE_S}s while another "
-                "session held ACCESS EXCLUSIVE on the 8 metadata parents. A "
-                "branch-scoped statement is still naming a parent instead of the "
-                "branch's partition (CHA-546)."
+                f"session held {mode} on the 8 metadata parents. A branch-scoped "
+                "statement is still naming a parent instead of the branch's "
+                "partition (CHA-546)."
             )
     finally:
         executor.shutdown(wait=False)
@@ -228,13 +280,20 @@ def seeded_branch():
 
 
 class TestParentLockFootprint:
-    def test_branch_writes_proceed_under_parent_access_exclusive(self, seeded_branch):
-        """Cost 1: the write path must not contend with teardown."""
-        client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = seeded_branch
+    def test_branch_writes_proceed_under_parent_exclusive(self, seeded_branch):
+        """Cost 1: the write path must not contend with teardown.
 
-        with _ParentLockHolder(catalog_uuid):
+        ``EXCLUSIVE`` is exactly what ``lock_branch_teardown_partitions`` takes,
+        and is the strongest mode a writer can be asked to clear: its parent
+        ``AccessShare`` is compatible, its pre-fix ``RowExclusive`` was not.
+        """
+        client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = seeded_branch
+        mode = "EXCLUSIVE"
+
+        with _ParentLockHolder(catalog_uuid, mode):
             _within_deadline(
                 "write -> commit -> persist",
+                mode,
                 write_and_persist,
                 client,
                 catalog_uuid=catalog_uuid,
@@ -245,25 +304,20 @@ class TestParentLockFootprint:
             )
             _within_deadline(
                 "snapshot",
+                mode,
                 client.snapshot,
                 catalog_uuid=catalog_uuid,
                 schema_uuid=schema_uuid,
                 table_uuid=table_uuid,
                 branch_uuid=branch_uuid,
             )
-
-    def test_branch_reads_and_compaction_proceed_under_parent_access_exclusive(
-        self, seeded_branch
-    ):
-        """Cost 2: the read path — the larger of the two, and the ticket's point."""
-        client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = seeded_branch
-
-        with _ParentLockHolder(catalog_uuid):
             # enumerate_unsealed_persist_segments_for_scope's
             # `SELECT ... FOR UPDATE OF seg` — the site that makes DeleteBranch
-            # fail Aborted in steady state.
+            # fail Aborted in steady state. It reads under this mode, but its
+            # merged write is what needs the parent to be at most AccessShare.
             _within_deadline(
                 "compact_persist_segments",
+                mode,
                 client.compact_persist_segments,
                 catalog_uuid=catalog_uuid,
                 schema_uuid=schema_uuid,
@@ -272,16 +326,30 @@ class TestParentLockFootprint:
             )
             _within_deadline(
                 "purge",
+                mode,
                 client.purge,
                 catalog_uuid=catalog_uuid,
                 schema_uuid=schema_uuid,
                 table_uuid=table_uuid,
                 branch_uuid=branch_uuid,
             )
+
+    def test_branch_reads_proceed_under_parent_access_exclusive(self, seeded_branch):
+        """Cost 2: the read path — the larger of the two, and the ticket's point.
+
+        ``ACCESS EXCLUSIVE`` conflicts with every mode there is, so a read
+        completing under it is the strongest available statement: the read path
+        takes NO lock on a metadata parent, not merely a compatible one.
+        """
+        client, catalog_uuid, schema_uuid, table_uuid, branch_uuid = seeded_branch
+        mode = "ACCESS EXCLUSIVE"
+
+        with _ParentLockHolder(catalog_uuid, mode):
             # meta_plan.rs: phase_one_fence_and_existence,
             # read_and_classify_persist_segments, hot_min_and_snapshot_pick.
             result = _within_deadline(
                 "read_data",
+                mode,
                 client.read_data,
                 catalog_uuid=catalog_uuid,
                 schema_uuid=schema_uuid,
