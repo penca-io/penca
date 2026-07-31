@@ -182,12 +182,15 @@ mod tests {
     /// A sliced batch and an independently built batch of the same logical rows
     /// must hash equal — the digest is over content, not representation.
     ///
-    /// Uses Utf8 because that is where a slice demonstrably stays a *view* —
-    /// the guard below asserts the slice still shares its parent's values
-    /// buffer, so the buffer physically holds bytes outside the slice. Without
-    /// normalization the encoding could pick those up. (`RecordBatch::slice`
+    /// Uses Utf8 because that is where a slice demonstrably stays a *view* — the
+    /// guard below asserts it still shares its parent's values buffer, so that
+    /// buffer physically holds bytes outside the slice. (`RecordBatch::slice`
     /// reports `offset() == 0` even here, so asserting on the offset would
     /// silently pass on a fixture that proves nothing.)
+    ///
+    /// This currently passes with or without the `concat_batches` normalization
+    /// — arrow-rs's IPC writer compacts on its own. It is a guard on the
+    /// property, not proof that the normalization is reachable.
     #[test]
     fn slice_hashes_equal_to_an_independently_built_batch() {
         let parent = batch(
