@@ -33,6 +33,15 @@ truth, and each run renders its own report:
   `.perf/perf.db`. The dashboard takes an optional `--run_id` to overlay one
   run against history (sourced from SQLite, falling back to the run's JSONL).
 
+**Comparisons against another engine belong in the report, not in prose.**
+Every suite records its Postgres baseline alongside Penca's own measurement,
+on the same host in the same run — that pairing is the only place a ratio
+means anything. A "faster than Postgres" claim written into this doc silently
+carries the host, disk, client library, and baseline configuration it was
+measured on; move any of those and it can invert. Prose here describes
+mechanism, ordering between Penca's own tiers and paths, and the open levers.
+Read the ratio off the run.
+
 **Lifecycle note:** In the happy path, persist and snapshot are always
 called atomically — data moves from hot storage directly to a
 snapshotted state. Persist on its own (producing unsnapshotted cold data)
@@ -230,6 +239,12 @@ overhead is fixed while Postgres scales with rows, so at larger scale Penca
 pulls ahead. The columnar/vectorized analytical advantage shows once there is
 enough data to amortize the fixed cost.
 
+This is the one cross-engine claim in this doc, and it is kept because it is
+a statement about *shape* — fixed cost against linear cost — which holds
+whatever the hardware. Where the crossover falls does not: it moves with the
+host, so read the scale at which it flips off the run rather than quoting one.
+The OLAP suite measures both sides at 100k and 1M for exactly this reason.
+
 The query is written with explicit joins, not the natural correlated-subquery
 phrasing: Penca's Flight SQL rejects the single-level correlated `COUNT`
 ([CHA-402](https://linear.app/chapala/issue/CHA-402)) and the doubly-nested
@@ -243,7 +258,15 @@ widening, empty `filler`, single-client/sequential) are documented in the
 `tests/performance/performance_pgbench_test.py` module docstring. Run via
 `PENCA_BACKEND=rust just perf-test performance_pgbench_test.py`.
 
-## Analysis
+## Mechanism and cost attribution
+
+What follows is *how* each path resolves a query and *where* its cost lands —
+not how it scores against another engine. Comparative verdicts belong in the
+run report, which measures both sides on the same host in the same run; see
+[Recording & viewing results](#recording--viewing-results). Where a cost is
+quantified below it is a **delta between two Penca paths** measured in one run
+(pushed vs unpushed, SQL vs gRPC), which is the kind of figure that survives a
+change of hardware.
 
 **SQL-path single-statement OLTP: the cost is the fixed Flight SQL pipeline, not
 the scan.** The [SQL OLTP suite](../tests/performance/sql/oltp.md) drives one
@@ -267,17 +290,18 @@ but never profiled in isolation. Full attribution in the
 [suite doc](../tests/performance/sql/oltp.md).
 
 **Read performance scales with storage tier.** Cold snapshotted data reads
-fastest — well ahead of Postgres — because snapshots are pre-deduplicated
-Lance files with zero merge-on-read overhead. This is the expected
-production state, since persist and snapshot are called atomically in
-normal operation. Even mixed hot+cold reads stay strong once snapshots are
-present. States with unsnapshotted cold data represent a worst-case
-scenario — not normal operation.
+fastest, because snapshots are pre-deduplicated Lance files with zero
+merge-on-read overhead — the expected production state, since persist and
+snapshot are called atomically in normal operation. States with
+unsnapshotted cold data are the worst case: every segment read pays the
+merge-on-read fan-in without the pre-dedupe a snapshot provides. The
+durable shape is that ordering — snapshotted ahead of unsnapshotted, in
+both all-cold and mixed states — not the size of the gap.
 
-**Hot-only reads still outrun Postgres.** Merge-on-read runs in full (upsert
-log scan, transaction log join, delete tombstone filtering, dedupe by
-`row_uuid`), but the Rust path (DataFusion + Arrow, columnar all the way
-through) keeps it cheap relative to row-oriented Postgres.
+**Hot-only reads still run the full merge-on-read** (upsert log scan,
+transaction log join, delete tombstone filtering, dedupe by `row_uuid`),
+but the Rust path — DataFusion + Arrow, columnar all the way through —
+keeps it cheap.
 
 **Flight SQL `query_filter_non_pk` is pushed down end-to-end as of
 [CHA-142](https://linear.app/chapala/issue/CHA-142).** The
@@ -299,21 +323,17 @@ residual-filters each batch; its `COUNT(*)` push-down survives only for
 the no-filter case.
 
 The test is parametrized over result-set size (`match_1` vs
-`match_1000`) on the same 100k-row table to make the ratio shape
-visible. Penca's wall time is dominated by per-query fixed overhead
-(plan resolution, metadata RPCs, Flight SQL handshake) — roughly
-constant across the two cases, which is why `match_1000` throughput
-scales almost linearly with rows returned. The Postgres baseline
-moves the other way: psycopg's per-tuple Python object construction
-dominates on the 1,000-row return, dragging PG throughput *down* as
-the result set grows. The ratio therefore tightens sharply from
-`match_1` to `match_1000` in every state. In other words, the
-overhead gap you see on `match_1` is mostly a measurement of Penca's
-fixed per-query cost against PG's near-zero single-row read — it's an
-honest upper bound on the ratio, not a throughput ceiling.
+`match_1000`) on the same 100k-row table to separate fixed cost from
+per-row cost. Penca's wall time is dominated by per-query fixed
+overhead (plan resolution, metadata RPCs, Flight SQL handshake),
+which is roughly constant across the two cases — so `match_1000`
+returns a thousand times the rows for close to the same wall time,
+and its throughput scales almost linearly with rows returned.
+`match_1` is therefore a measurement of that fixed floor, not of scan
+speed.
 
 Cold-dominant states (`all_cold_snapshotted`,
-`cold_snapshotted_and_unsnapshotted`) pay a larger relative penalty
+`cold_snapshotted_and_unsnapshotted`) are slowest
 on `match_1` because the segment scan + per-segment filter
 evaluation is the bottleneck; snapshot-tier segment pruning
 ([CHA-82](https://linear.app/chapala/issue/CHA-82), landed) trims
@@ -340,8 +360,8 @@ Throughput ratios understate what matters for sub-50 ms-per-query web
 workloads. In absolute terms `match_1` lands well over the typical
 web-app point-lookup budget (<50 ms wall, often <20 ms) even in
 snapshotted states, and several times worse again with unsnapshotted
-cold data, against a Postgres baseline comfortably inside that budget.
-This is a real gap for latency-sensitive web reads today, but it is a
+cold data. This is a real gap for latency-sensitive web reads today,
+but it is a
 fixed-overhead / handshake gap, not an architectural one: Penca's
 per-row scan cost is low enough that the actual work for a 100k-row
 selective scan is a small fraction of the wall time, which is dominated
@@ -361,29 +381,30 @@ should be read as an upper bound on handshake cost, not a steady-state
 ceiling.
 
 **Flight SQL `query_aggregate` still pays the full merge-on-read cost
-per tier**, and trails Postgres by a wide margin in every state. Unlike
+per tier.** Unlike
 filters, aggregates are not pushed through `stream_merged` yet —
 aggregate pushdown over merge-on-read is tracked separately as
 [CHA-143](https://linear.app/chapala/issue/CHA-143). The partial +
 correction approach sketched there is the follow-up.
 
-**Bulk write throughput runs ahead of the equivalent Postgres baseline.**
-Wins come from Arrow IPC over the wire, vectorized `row_uuid` /
-`version_uuid` computation, and one-shot auto-commit `WriteData` (server
-opens + commits a tx in one round-trip when `tx_uuid` is unset). Per-tx
-fan-out hurts: splitting the same rows across more transactions drops
-throughput monotonically, and single-row OLTP inserts pay a full RPC
-round trip per commit — now tracked in the
+**The bulk write path is Arrow end-to-end.** Throughput comes from Arrow
+IPC over the wire, vectorized `row_uuid` / `version_uuid` computation, and
+one-shot auto-commit `WriteData` (server opens + commits a tx in one
+round-trip when `tx_uuid` is unset). Per-tx fan-out is what costs:
+`write_multi_tx` splits a fixed row count across 1 / 10 / 100 transactions
+to expose it, and the 100-transaction arm is materially slower than the
+single-transaction one. Single-row OLTP inserts pay a full RPC round trip
+per commit — tracked in the
 [OLTP (gRPC) suite](../tests/performance/grpc/oltp.md).
 
-**Snapshot outruns persist.** Persist moves data from Postgres (hot) to
-Lance files on S3 (cold); snapshot materializes pre-deduplicated
-point-in-time views and is the faster of the two. **Log segment
-compaction throughput is flat across group size**, since the cost is
-dominated by the cold-storage read+write rather than per-segment
-overhead. In the full **write → persist → snapshot pipeline** each stage
-is faster than the last — the snapshot stage is fastest because it
-operates on already-persisted, pre-deduplicated batches.
+**The lifecycle stages have different cost structures.** Persist moves data
+from Postgres (hot) to Lance files on S3 (cold); snapshot materializes
+pre-deduplicated point-in-time views, operating on already-persisted
+batches. Log segment compaction is dominated by the cold-storage read+write
+rather than per-segment overhead, so its cost tracks bytes moved rather than
+the number of segments in the group. Which stage is cheapest is a property
+of the host's disk and network, not of the design — read it off the run
+report rather than assuming an ordering.
 
 ## Future improvements
 
