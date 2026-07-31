@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use moka::sync::Cache;
+use uuid::Uuid;
 
 /// In-process W-TinyLFU cache of decoded cold segments, keyed by `content_hash`
 /// and bounded by a byte budget.
@@ -61,7 +62,7 @@ use moka::sync::Cache;
 pub struct SegmentCache {
     /// Value carries its own weight so the weigher can charge the
     /// caller-supplied `size_bytes` rather than the batch's runtime memory.
-    inner: Cache<String, (Arc<RecordBatch>, u32)>,
+    inner: Cache<Uuid, (Arc<RecordBatch>, u32)>,
     budget_bytes: u64,
 }
 
@@ -76,7 +77,7 @@ impl SegmentCache {
             .max_capacity(budget_bytes)
             // Weight in the same byte unit as `max_capacity` so the budget is a
             // real RAM bound; the stored `u32` is the entry's `size_bytes`.
-            .weigher(|_hash: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
+            .weigher(|_hash: &Uuid, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
             .build();
         Self {
             inner,
@@ -118,7 +119,7 @@ impl SegmentCache {
 
     /// Fetch a decoded segment by content hash, bumping its frequency estimate.
     /// A hit is an `Arc::clone` — no buffer copy.
-    pub fn get(&self, content_hash: &str) -> Option<Arc<RecordBatch>> {
+    pub fn get(&self, content_hash: &Uuid) -> Option<Arc<RecordBatch>> {
         self.inner.get(content_hash).map(|(batch, _weight)| batch)
     }
 
@@ -126,7 +127,7 @@ impl SegmentCache {
     /// against the budget. No-op when the segment is not
     /// [`admits`](Self::admits)-ible. moka enforces `max_capacity` via
     /// W-TinyLFU; there is no manual eviction loop here.
-    pub fn insert(&self, content_hash: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
+    pub fn insert(&self, content_hash: Uuid, batch: Arc<RecordBatch>, weight_bytes: u64) {
         if !self.admits(weight_bytes) {
             return;
         }
@@ -157,6 +158,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use uuid::Uuid;
 
     use super::SegmentCache;
 
@@ -185,10 +187,10 @@ mod tests {
     #[test]
     fn zero_weight_segment_is_not_cached() {
         let cache = SegmentCache::new(1 << 20);
-        cache.insert("zero".into(), batch(4), 0);
+        cache.insert(Uuid::from_u128(1), batch(4), 0);
         cache.run_pending();
         assert!(
-            cache.get("zero").is_none(),
+            cache.get(&Uuid::from_u128(1)).is_none(),
             "weight-0 segment must not be pinned in the cache"
         );
     }
@@ -208,22 +210,31 @@ mod tests {
         );
         assert!(cache.admits(u32::MAX as u64), "exactly u32::MAX is fine");
 
-        cache.insert("huge".into(), batch(8), over_u32);
+        cache.insert(Uuid::from_u128(2), batch(8), over_u32);
         cache.run_pending();
-        assert!(cache.get("huge").is_none(), "over-u32 weight never stored");
+        assert!(
+            cache.get(&Uuid::from_u128(2)).is_none(),
+            "over-u32 weight never stored"
+        );
     }
 
     #[test]
     fn over_budget_insert_is_noop() {
         let cache = SegmentCache::new(100);
-        cache.insert("too-big".into(), batch(8), 200);
+        cache.insert(Uuid::from_u128(3), batch(8), 200);
         cache.run_pending();
-        assert!(cache.get("too-big").is_none(), "over-budget never stored");
+        assert!(
+            cache.get(&Uuid::from_u128(3)).is_none(),
+            "over-budget never stored"
+        );
 
         let disabled = SegmentCache::disabled();
-        disabled.insert("x".into(), batch(8), 1);
+        disabled.insert(Uuid::from_u128(4), batch(8), 1);
         disabled.run_pending();
-        assert!(disabled.get("x").is_none(), "disabled never stores");
+        assert!(
+            disabled.get(&Uuid::from_u128(4)).is_none(),
+            "disabled never stores"
+        );
     }
 
     #[test]
@@ -234,7 +245,7 @@ mod tests {
         // moka's W-TinyLFU choice, not Penca's contract).
         let cache = SegmentCache::new(100);
         for i in 0..5 {
-            cache.insert(format!("seg-{i}"), batch(10), 40);
+            cache.insert(Uuid::from_u128(i), batch(10), 40);
         }
         cache.run_pending();
         assert!(
@@ -248,9 +259,9 @@ mod tests {
     fn hit_returns_arc_clone_same_buffers() {
         let cache = SegmentCache::new(1_000);
         let original = batch(16);
-        cache.insert("seg".into(), original.clone(), 40);
+        cache.insert(Uuid::from_u128(5), original.clone(), 40);
         cache.run_pending();
-        let hit = cache.get("seg").expect("cached");
+        let hit = cache.get(&Uuid::from_u128(5)).expect("cached");
         // Same backing column buffer — a hit is a refcount bump, no copy.
         assert_eq!(
             original.column(0).to_data().buffers()[0].as_ptr(),

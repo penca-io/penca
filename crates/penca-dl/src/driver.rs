@@ -219,7 +219,7 @@ async fn read_and_cache_full<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(segment.content_hash.to_string(), Arc::clone(&batch), weight);
+    cache.insert(segment.content_hash, Arc::clone(&batch), weight);
     tracing::debug!(
         rows = batch.num_rows(),
         "snapshot segment cached full decode"
@@ -294,7 +294,7 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
 ) -> Result<CachedSegment, DlError> {
     let span = tracing::Span::current();
 
-    if let Some(full) = cache.get(&segment.content_hash.to_string()) {
+    if let Some(full) = cache.get(&segment.content_hash) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok(CachedSegment::Native(full));
@@ -353,7 +353,7 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(segment.content_hash.to_string(), Arc::clone(&batch), weight);
+    cache.insert(segment.content_hash, Arc::clone(&batch), weight);
     tracing::debug!(
         rows = batch.num_rows(),
         "persist segment decoded and cached"
@@ -444,7 +444,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
 
-    if let Some(full) = cache.get(&segment.content_hash.to_string()) {
+    if let Some(full) = cache.get(&segment.content_hash) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
@@ -498,7 +498,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     // The sidecar's key schema is the indexed columns' native types; the
     // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
-    if let Some(batch) = cache.get(&sidecar.content_hash.to_string()) {
+    if let Some(batch) = cache.get(&sidecar.content_hash) {
         span.record("cache", "hit");
         return Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?);
     }
@@ -519,7 +519,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
     // decoded-but-not-cached rather than evicting the whole budget.
     cache.insert(
-        sidecar.content_hash.to_string(),
+        sidecar.content_hash,
         Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
     );
@@ -2014,7 +2014,7 @@ mod tests {
             "oversized segment is never cached — both accesses re-read storage"
         );
         assert!(
-            cache.get(&seg.content_hash.to_string()).is_none(),
+            cache.get(&seg.content_hash).is_none(),
             "oversized segment not stored"
         );
     }
@@ -2036,10 +2036,7 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache
-            .get(&segment("a", 150).content_hash.to_string())
-            .is_none()
-        {
+        let evicted = if cache.get(&segment("a", 150).content_hash).is_none() {
             "a"
         } else {
             "b"
