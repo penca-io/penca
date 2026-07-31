@@ -31,6 +31,9 @@ import yaml
 
 REPO = Path(__file__).parents[2]
 
+CI_WORKFLOW = ".github/workflows/ci.yml"
+COMPOSE = "docker/compose.yml"
+
 IMAGE = "ghcr.io/penca-io/penca-rust-server"
 PUBLISHED_TAG = f"{IMAGE}:main"
 
@@ -103,12 +106,16 @@ def _step_using(job: dict, action: str) -> dict:
     )
 
 
+def _publish_job() -> dict:
+    return _job(_yaml(CI_WORKFLOW), "publish-image")
+
+
 # --- .github/workflows/ci.yml ------------------------------------------------
 
 
 def test_publish_image_matrix_builds_each_arch_natively():
     """Assertion 1: one job per arch, arm64 on a native arm64 runner."""
-    job = _job(_yaml(".github/workflows/ci.yml"), "publish-image")
+    job = _publish_job()
     legs = {
         (leg["platform"], leg["runner"]) for leg in job["strategy"]["matrix"]["include"]
     }
@@ -126,7 +133,7 @@ def test_publish_image_declares_packages_write_and_contents_read():
     read`` has to be re-declared alongside it or actions/checkout loses the
     read it inherits today.
     """
-    perms = _job(_yaml(".github/workflows/ci.yml"), "publish-image")["permissions"]
+    perms = _publish_job()["permissions"]
 
     assert perms.get("packages") == "write", (
         f"publish-image needs packages: write, got {perms}"
@@ -138,7 +145,7 @@ def test_publish_image_declares_packages_write_and_contents_read():
 
 def test_publish_image_authenticates_against_ghcr():
     """Assertion 3."""
-    job = _job(_yaml(".github/workflows/ci.yml"), "publish-image")
+    job = _publish_job()
     login = _step_using(job, "docker/login-action@v3")
 
     assert login["with"]["registry"] == "ghcr.io"
@@ -150,7 +157,7 @@ def test_publish_image_pushes_by_digest_without_tags():
     A ``tags:`` here would publish a single-arch image under a human-readable
     tag, which is exactly the manifest-list-less state this ticket removes.
     """
-    job = _job(_yaml(".github/workflows/ci.yml"), "publish-image")
+    job = _publish_job()
     with_ = _step_using(job, "docker/build-push-action@v6")["with"]
     outputs = with_["outputs"]
 
@@ -170,7 +177,7 @@ def test_publish_image_cache_scopes_are_per_arch():
     Asserted on the resolved per-leg values rather than on the templated
     string, since the legs no longer configure their sources identically.
     """
-    job = _job(_yaml(".github/workflows/ci.yml"), "publish-image")
+    job = _publish_job()
     with_ = _step_using(job, "docker/build-push-action@v6")["with"]
 
     assert "matrix.arch" in with_["cache-to"], (
@@ -200,7 +207,7 @@ def test_publish_is_scoped_to_main_merges():
     the one thing standing between a same-repo PR branch and the tag the
     quickstart pulls.
     """
-    condition = _job(_yaml(".github/workflows/ci.yml"), "publish-image").get("if", "")
+    condition = _publish_job().get("if", "")
 
     assert "github.event_name == 'push'" in condition, (
         f"publish-image must be push-scoped, got if: {condition!r}"
@@ -216,9 +223,7 @@ def test_merge_job_cannot_publish_a_single_arch_manifest():
     everyone on the other one. A plain `needs:` skips instead, because a matrix
     job's aggregate result is `failure` if any leg failed.
     """
-    condition = str(
-        _job(_yaml(".github/workflows/ci.yml"), "publish-image-merge").get("if", "")
-    )
+    condition = str(_job(_yaml(CI_WORKFLOW), "publish-image-merge").get("if", ""))
 
     assert "always" not in condition, (
         f"publish-image-merge must skip when a leg fails, got if: {condition!r}"
@@ -233,7 +238,7 @@ def test_workflow_never_reaches_for_qemu():
     file mentions the action, so the comment explaining the prohibition does
     not trip the guard meant to enforce it.
     """
-    workflow = _yaml(".github/workflows/ci.yml")
+    workflow = _yaml(CI_WORKFLOW)
 
     for name, job in workflow["jobs"].items():
         for step in job.get("steps", []):
@@ -244,7 +249,7 @@ def test_workflow_never_reaches_for_qemu():
 
 def test_merge_job_assembles_one_manifest_list_under_both_tags():
     """Assertion 7."""
-    job = _job(_yaml(".github/workflows/ci.yml"), "publish-image-merge")
+    job = _job(_yaml(CI_WORKFLOW), "publish-image-merge")
     needs = job["needs"]
     needs = [needs] if isinstance(needs, str) else needs
 
@@ -270,7 +275,7 @@ def test_ci_success_gates_on_the_publish_jobs():
     (Both are ``skipped`` on pull_request and merge_group, which that same loop
     tolerates, so the merge gate is unaffected.)
     """
-    job = _job(_yaml(".github/workflows/ci.yml"), "ci-success")
+    job = _job(_yaml(CI_WORKFLOW), "ci-success")
     needs = job["needs"]
     runs = "\n".join(step.get("run", "") for step in job["steps"])
 
@@ -296,7 +301,7 @@ def test_integration_job_runs_the_image_it_just_built():
     test :main rather than the code under review. Deriving both sides from the
     file means renaming one without the other fails here.
     """
-    job = _job(_yaml(".github/workflows/ci.yml"), "integration")
+    job = _job(_yaml(CI_WORKFLOW), "integration")
     prebuilt = _step_using(job, "docker/build-push-action@v6")["with"]["tags"]
 
     # Resolve the effective env for the step that actually runs the suite, not
@@ -328,7 +333,7 @@ def test_every_rust_service_runs_the_published_image():
     configuration defaults live in one place) while letting CI point the same
     file at a locally built tag.
     """
-    services = _yaml("docker/compose.yml")["services"]
+    services = _yaml(COMPOSE)["services"]
 
     for name in RUST_SERVICES:
         image = services[name]["image"]
@@ -342,7 +347,7 @@ def test_every_rust_service_pulls_rather_than_builds():
     *spec* documents ``build`` as the default when a build section is present,
     so the key is what makes the behaviour version-independent.
     """
-    services = _yaml("docker/compose.yml")["services"]
+    services = _yaml(COMPOSE)["services"]
 
     for name in RUST_SERVICES:
         policy = services[name].get("pull_policy")
@@ -356,7 +361,7 @@ def test_every_rust_service_keeps_the_from_source_path():
     graceful degradation when the pull fails (offline, or before the first
     publish exists). Losing it turns those into hard failures.
     """
-    services = _yaml("docker/compose.yml")["services"]
+    services = _yaml(COMPOSE)["services"]
 
     for name in RUST_SERVICES:
         assert "build" in services[name], f"{name} lost its build: section"
