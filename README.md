@@ -68,8 +68,9 @@ uv run python examples/sandbox_demo.py
 ```
 
 You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
-and [`just`](https://github.com/casey/just). The first `just penca-up` compiles the server
-image from source, which takes a while; a prebuilt image is on the way. Ports are fixed
+and [`just`](https://github.com/casey/just). `just penca-up` pulls a prebuilt server image
+(`ghcr.io/penca-io/penca-rust-server:main`, native on x86-64 and Apple Silicon alike); if the
+pull fails it falls back to compiling from source, which takes a while. Ports are fixed
 (Postgres 5432, Flight SQL 50060) and bound to loopback. Data is ephemeral unless you ask
 for a directory, which survives `just penca-down`:
 

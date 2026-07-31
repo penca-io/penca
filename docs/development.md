@@ -24,7 +24,7 @@ Go 1.26.3+ is the one prereq `bootstrap` does not auto-install; platform varianc
 
 | Tool | Why |
 |---|---|
-| [Rust 1.94+](../rust-toolchain.toml) | Build the server. Note that `just penca-up` also builds the servicer image from source today: the `x-rust-build` anchor in `docker/compose.yml` applies to every service: so the first run compiles regardless. `rust-toolchain.toml` pins the version. |
+| [Rust 1.94+](../rust-toolchain.toml) | Build the server. `just penca-up` pulls the published image, so you only need this when you change Rust code and run `just penca-up --build=1` (which `just integration-test`, `just perf-test` and `just tdd` do for you). `rust-toolchain.toml` pins the version. |
 | [`rust-analyzer`](https://rust-analyzer.github.io/) | Powers the `LSP` tool and the `language-server` MCP server for Claude Code agents (`goToDefinition`, `findReferences`, `rename_symbol`). |
 | [`mcp-language-server`](https://github.com/isaacphi/mcp-language-server) | MCP server registered in [`.mcp.json`](../.mcp.json) that exposes rust-analyzer's `rename_symbol` and friends to agents. |
 | [`kata`](https://github.com/kenn-io/kata) | Per-ticket task queue used by `/do-issue` (plan → red → drain). |
@@ -92,14 +92,14 @@ drift between operator's bootstrap and prod:
 docker run --rm \
   -e DATABASE_URL="postgres://penca:penca@PROD_PG_HOST:5432/penca" \
   -e SQL_SERVER_DEFAULT_CATALOG=public \
-  ghcr.io/penca-io/penca-rust-server:latest \
+  ghcr.io/penca-io/penca-rust-server:main \
   penca-bootstrap
 ```
 
-> The published `ghcr.io/penca-io/penca-rust-server:latest` image
-> arrives with [CHA-187](https://linear.app/chapala/issue/CHA-187);
-> until then, contributors building from source can use the `cargo
-> run` path documented under [Development](#development).
+CI publishes that image on every `main` merge as a manifest list covering
+`linux/amd64` and `linux/arm64`, each built on a native runner, so `docker
+run` and Compose both resolve your architecture without being told. Merges
+are also tagged `:<short-sha>` if you need to pin one.
 
 ## Repository structure
 
@@ -168,7 +168,7 @@ Run `just` to list every recipe (Just installation is in
 | `just lint` | Run ruff linter |
 | `just format` / `just format-check` | Run / check ruff formatter + blank-line fixer |
 | `just check` | Run Python lint + format check + unit tests + static checks, plus Rust clippy / fmt-check / test. Mirrors CI. |
-| `just penca-up [--profile P] [--db DIR]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `--profile` = `dev` (default: fixed ports, lifecycle scheduler running) or `test` (random ports so parallel worktrees don't collide, scheduler idle so it can't race the suites' manual lifecycle calls). `--db DIR` persists Postgres and the object store under a host directory, so the stack survives `penca-down`. Requires Docker. |
+| `just penca-up [--profile P] [--db DIR] [--build=1]` | Start the full stack (the `bootstrap-init` compose service seeds global tables before servicers bind). `--profile` = `dev` (default: fixed ports, lifecycle scheduler running) or `test` (random ports so parallel worktrees don't collide, scheduler idle so it can't race the suites' manual lifecycle calls). `--db DIR` persists Postgres and the object store under a host directory, so the stack survives `penca-down`. `--build=1` compiles the image from your working tree instead of pulling the published one — the value is required, `just` has no valueless flags. Requires Docker. |
 | `just penca-down [profile]` | Stop servicers + infra and remove volumes. |
 | `just integration-test [services]` | Start infra, run integration tests against the Rust services, tear down. Pass service names to scope: `just integration-test lifecycle query`. Requires Docker. |
 | `just perf-test [paths]` | Start infra, run performance tests against the Rust services, tear down. `paths` scope the run to one or more dirs/files under `tests/performance/` (e.g. `grpc`, `grpc/oltp_test.py`); omit to run everything. Captures each run to `.perf/results.jsonl` and writes a static HTML report (`.perf/report-<run_id>.html`) comparing it to history; pass `--record` to also persist the run into the SQLite history. Sources `docker/.baseline.env` for the direct-Postgres baseline. Requires Docker. |
