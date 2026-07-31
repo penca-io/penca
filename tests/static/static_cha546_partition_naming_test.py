@@ -72,12 +72,27 @@ UNRESTRICTED = frozenset(
 # probes through ``segment_delete_set_referenced_predicate``, which takes
 # the table names as arguments rather than deriving them.
 GATE_FILE = "crates/penca-storage-meta/src/compact.rs"
+
+# The three parents each gate function must probe. Pinning the exact set
+# matters: asserting merely that *a* parent survives would let two of the
+# three be narrowed to partitions while the third keeps the assertion green,
+# and the forward guard exempts the whole function body — so CHA-531's bug
+# would come back silently for the narrowed probes.
+GATE_PARENTS = frozenset(
+    {
+        "table_snapshot_segment_metadata_table",
+        "table_snapshot_segment_index_metadata_table",
+        "table_persist_segment_metadata_table",
+    }
+)
 GATE_FUNCTIONS = frozenset(
     {
         "eligible_segment_delete_set_rows",
         "reap_referenced_segment_delete_set_rows",
     }
 )
+
+_PARTITION_RE = re.compile(r"\b\w+_metadata_partition\b")
 
 
 def _rust_sources() -> list[Path]:
@@ -132,12 +147,18 @@ class TestPartitionDirectNaming:
         for fn in sorted(GATE_FUNCTIONS):
             body = _function_body(text, fn)
             assert body is not None, f"{GATE_FILE} no longer defines `{fn}`"
-            assert _PARENT_RE.search(body), (
-                f"{GATE_FILE}::{fn} must keep naming the catalog-wide parents "
-                "— the segment_delete_set refcount gate spans fork edges "
-                "(CHA-531). A branch-scoped probe reintroduces the bug where "
-                "a parent's segment is deleted out from under a child's "
-                "carried-forward snapshot."
+            assert set(_PARENT_RE.findall(body)) == GATE_PARENTS, (
+                f"{GATE_FILE}::{fn} must probe exactly {sorted(GATE_PARENTS)} "
+                "catalog-wide — the segment_delete_set refcount gate spans fork "
+                "edges (CHA-531). Narrowing any one probe to a partition "
+                "reintroduces the bug where a parent's segment is deleted out "
+                "from under a child's carried-forward snapshot. Found: "
+                f"{sorted(set(_PARENT_RE.findall(body)))}"
+            )
+            assert not _PARTITION_RE.search(body), (
+                f"{GATE_FILE}::{fn} must not name any branch partition — the "
+                "refcount gate is deliberately catalog-wide (CHA-531). Found: "
+                f"{sorted(set(_PARTITION_RE.findall(body)))}"
             )
 
     def test_no_open_cha546_todos(self):
