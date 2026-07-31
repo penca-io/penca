@@ -174,7 +174,11 @@ def build_graph(list_payload: dict, show_payloads: list[dict]) -> list[Task]:
 
 def fetch_payloads(slug: str) -> tuple[dict, list[dict]]:
     """Shell to kata: the listing for `slug` plus one show payload per task."""
-    listing = run_kata(["list", "--label", slug])
+    # `--status all` because `kata list` defaults to `open`: on the resume path
+    # (re-running /do-issue after any task has closed) the default silently
+    # drops the closed tasks, and the diagram then misrepresents the plan as
+    # smaller than it is rather than failing loudly.
+    listing = run_kata(["list", "--label", slug, "--status", "all"])
     qids = sorted(i["qualified_id"] for i in listing.get("issues", []))
     if not qids:
         sys.exit(f"no kata tasks under label {slug}")

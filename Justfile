@@ -702,6 +702,59 @@ penca-down profile="dev":
     printf '└─────────────────────────────────────────────────────────────────────\n\n'
     docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend down -v
 
+    # `compose down` returns once the containers are gone, but the daemon can
+    # hold the published host ports for seconds afterwards (~11s measured), so
+    # a `penca-down && penca-up` chain dies with "address already in use"
+    # despite teardown reporting success. Block until they're free, so exiting
+    # 0 means "safe to bring up again". CHA-542.
+    #
+    # Both the compose render and the jq filter are captured to variables
+    # rather than read straight from a process substitution, whose exit status
+    # neither `set -e` nor `pipefail` observes: a failure on either side would
+    # yield an empty port list and skip the wait silently, restoring the race
+    # this guard exists to close.
+    #
+    # `published == "0"` is an ephemeral bind — `docker/test.env` publishes
+    # every port that way, which is the profile all three integration EXIT
+    # traps tear down with. The kernel never reuses a port that is still bound,
+    # so there is genuinely nothing to wait for; but a literal `:0` can never
+    # appear in `ss` either, so leaving it in the list would break the loop on
+    # iteration one and read as a satisfied wait rather than a skipped one.
+    # Drop it here instead, so the empty branch below announces the skip and
+    # every path out of this block says what it did.
+    ports_json=$(docker compose -f docker/compose.yml --env-file docker/{{profile}}.env --profile infra --profile penca-backend config --format json)
+    published_str=$(jq -r '[.services[].ports[]? | select(.published and .published != "0") | "\(.host_ip // "0.0.0.0"):\(.published)"] | unique | .[]' <<< "$ports_json")
+    if [[ -z "$published_str" ]]; then
+        printf 'penca-down: compose config lists no fixed published host ports; skipping wait\n' >&2
+    elif ! command -v ss > /dev/null; then
+        # Probed once, with a message. Left bare, a missing `ss` aborts the
+        # recipe at status 127 with no output — and three integration recipes
+        # call penca-down from an EXIT trap, so a green suite would end in an
+        # unexplained failure pointing nowhere.
+        printf 'penca-down: ss (iproute2) not found; skipping host-port release wait\n' >&2
+    else
+        # Split only here, where the string is known non-empty: `mapfile` on an
+        # empty heredoc yields a one-element array holding the empty string,
+        # which would sail past a `${#published[@]} == 0` check and then wait
+        # on a port named "".
+        mapfile -t published <<< "$published_str"
+        deadline=$(( SECONDS + 60 ))
+        while :; do
+            listening=$(ss -ltnH | awk '{print $4}')
+            busy=()
+            for hp in "${published[@]}"; do
+                grep -qxF "$hp" <<< "$listening" && busy+=("$hp")
+            done
+            (( ${#busy[@]} == 0 )) && break
+            if (( SECONDS >= deadline )); then
+                printf 'penca-down: host ports still bound after 60s: %s\n' "${busy[*]}" >&2
+                printf 'penca-down: something outside this compose project is holding them.\n' >&2
+                exit 1
+            fi
+            sleep 0.2
+        done
+    fi
+
 # Tail logs from services started by `penca-up` (follows by default).
 # With no service arg, follows every service; pass one or more service names
 # (e.g. `just penca-logs query write`) to filter. Service names:

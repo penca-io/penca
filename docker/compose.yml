@@ -56,7 +56,7 @@ services:
       retries: 10
 
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.33
     profiles: [infra]
     command: server -s3 -s3.config=/etc/seaweedfs/s3.json -s3.ip.bind=0.0.0.0 -dir=/data
     ports:
@@ -64,24 +64,49 @@ services:
     volumes:
       - ${PENCA_S3_VOLUME:-seaweedfsdata}:/data
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    # start_period is the cold-start grace window: failures inside it don't
+    # count against `retries`, and the container flips healthy on the first
+    # success regardless of how much of the window is left — so a generous
+    # value costs a fast boot nothing. Without one the budget was
+    # interval x retries ~= 20s, and measured cold boot to a 200 on /status
+    # varies with host contention (2.6s / 10.3s / 2.4s on an idle 2-core VM,
+    # ~30s reported under load) — under 2x margin, which is why `penca-up`
+    # failed intermittently and machine-specifically. 60s covers the loaded
+    # case; `retries` stays a post-boot liveness budget. CHA-542.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status"]
       interval: 2s
       timeout: 5s
       retries: 10
+      start_period: 60s
 
+  # Reuses the seaweedfs image rather than a third-party S3 CLI: one fewer
+  # pull on the cold-start path, one fewer tag that can drift, and no second
+  # copy of the credentials — `weed shell` reaches the master directly,
+  # bypassing the S3 gateway's SigV4 auth.
+  #
+  # The `s3.bucket.list` assertion is load-bearing, not belt-and-braces.
+  # `weed shell` is a REPL: it exits 0 even on `error: ...`, and on an
+  # unreachable master it hangs, still exiting 0 when killed. So the create
+  # alone can never fail this container — yet three services gate on
+  # `service_completed_successfully`, so a silent failure would start the
+  # backend against a nonexistent bucket and surface as opaque NoSuchBucket
+  # errors. Asserting the end state restores the fail-fast `mc mb` gave us.
+  # `awk` on an exact field rather than `grep -w`, which treats `-` as a word
+  # boundary and would accept a stray `penca-foo` as proof of `penca`. CHA-542.
   seaweedfs-init:
-    image: minio/mc:latest
+    image: chrislusf/seaweedfs:4.33
     profiles: [infra]
     depends_on:
       seaweedfs:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://seaweedfs:8333 pencaadmin pencaadmin &&
-      mc mb --ignore-existing local/penca &&
-      exit 0
-      "
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo 's3.bucket.create -name penca' | timeout 60 weed shell -master=seaweedfs:9333
+        echo 's3.bucket.list' | timeout 60 weed shell -master=seaweedfs:9333 \
+          | awk '$1 == "penca" { found = 1 } END { exit !found }'
 
   # One-shot init job: seeds global Penca tables + the default catalog
   # row that SQL_SERVER_DEFAULT_CATALOG resolves against. All runtime
