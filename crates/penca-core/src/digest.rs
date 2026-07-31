@@ -3,7 +3,7 @@
 use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 use arrow::ipc::MetadataVersion;
-use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow::ipc::writer::{DictionaryHandling, IpcWriteOptions, StreamWriter};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -27,25 +27,32 @@ const IPC_ALIGNMENT: usize = 8;
 /// reuse as a possible future use of this digest; that use requires
 /// establishing round-trip stability first, and this function does not.
 ///
-/// Changing the normalization, the IPC options, or the hash changes every
-/// future digest. That is safe — stored digests are opaque identity, never
-/// recomputed and compared against a stored value — but it must stay
-/// deliberate, which is why nothing here relies on a library default.
+/// **Slice-invariant for every column type Penca supports.** A batch from
+/// `slice()` stays a view onto its parent's buffers, which physically hold
+/// bytes outside the slice, but the IPC writer encodes only the logical range —
+/// measured on arrow-rs 57.3 for Int32/Int64/Utf8/List, which with LargeList
+/// and FixedSizeList are the whole supported set (everything else is
+/// `UnsupportedType`, see [`crate::types`]). The one measured exception is
+/// dictionary-encoded columns, where `DictionaryHandling::Resend` emits the
+/// full dictionary regardless of which rows the slice covers; Penca rejects
+/// `DataType::Dictionary` at the type boundary, so no such column reaches here.
+/// Were one to, the cost is a *missed dedup* — two cache entries for one
+/// logical content — never a wrong result, because the digest is computed once
+/// and inherited, never recomputed and compared.
+///
+/// Changing the IPC options or the hash changes every future digest. That is
+/// safe — stored digests are opaque identity, never recomputed and compared
+/// against a stored value — but it must stay deliberate, which is why nothing
+/// here relies on a library default.
 pub fn segment_content_hash(batch: &RecordBatch) -> Result<Uuid, ArrowError> {
-    // A batch from `slice()` stays a view onto its parent's buffers, so those
-    // buffers physically hold bytes outside the slice. Measured on arrow-rs
-    // 57.3: the IPC writer already encodes only the logical range, so for
-    // primitive and Utf8 columns this concat is redundant (removing it leaves
-    // `slice_hashes_equal_to_an_independently_built_batch` green). It stays
-    // because that redundancy is an arrow-rs implementation detail and this
-    // digest must be representation-independent for every column type,
-    // including the nested ones no test here covers.
-    let compacted = arrow::compute::concat_batches(&batch.schema(), std::slice::from_ref(batch))?;
-
-    let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5)?;
+    let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5)?
+        // Pinned for the same reason as the alignment: the default is `Resend`
+        // today, and a future flip to `Delta` would make a batch's digest
+        // depend on what the writer had already emitted.
+        .with_dictionary_handling(DictionaryHandling::Resend);
     let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new_with_options(&mut bytes, &compacted.schema(), options)?;
-    writer.write(&compacted)?;
+    let mut writer = StreamWriter::try_new_with_options(&mut bytes, &batch.schema(), options)?;
+    writer.write(batch)?;
     writer.finish()?;
     drop(writer);
 
@@ -56,8 +63,8 @@ pub fn segment_content_hash(batch: &RecordBatch) -> Result<Uuid, ArrowError> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Int64Array, ListArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 
     use super::*;
 
@@ -187,10 +194,6 @@ mod tests {
     /// buffer physically holds bytes outside the slice. (`RecordBatch::slice`
     /// reports `offset() == 0` even here, so asserting on the offset would
     /// silently pass on a fixture that proves nothing.)
-    ///
-    /// This currently passes with or without the `concat_batches` normalization
-    /// — arrow-rs's IPC writer compacts on its own. It is a guard on the
-    /// property, not proof that the normalization is reachable.
     #[test]
     fn slice_hashes_equal_to_an_independently_built_batch() {
         let parent = batch(
@@ -225,6 +228,47 @@ mod tests {
             hash(&parent.slice(1, 2)),
             hash(&one_i64("a", vec![None, Some(3)])),
             "sliced primitive rows hash as their own content"
+        );
+    }
+
+    /// The nested twin, and the reason `segment_content_hash` needs no
+    /// compaction step. Slicing a `List` rebases the offsets buffer but leaves
+    /// the *child* array whole — the guard below pins that it still holds all
+    /// four rows' values, shared with the parent — and the IPC writer still
+    /// encodes only the logical range.
+    ///
+    /// This is the case an earlier revision assumed a `concat_batches` call was
+    /// protecting. It was not: `concat` short-circuits single-array input to
+    /// `slice(0, len)`, which rebuilds nothing.
+    #[test]
+    fn list_slice_hashes_equal_to_an_independently_built_batch() {
+        fn lists(rows: Vec<Vec<i64>>) -> RecordBatch {
+            let arr = ListArray::from_iter_primitive::<Int64Type, _, _>(
+                rows.into_iter()
+                    .map(|r| Some(r.into_iter().map(Some).collect::<Vec<_>>())),
+            );
+            let field = Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            );
+            batch(vec![field], vec![Arc::new(arr)])
+        }
+
+        let parent = lists(vec![vec![1], vec![2, 2], vec![3, 3, 3], vec![4]]);
+        let sliced = parent.slice(1, 2);
+
+        let sliced_data = sliced.column(0).to_data();
+        let parent_data = parent.column(0).to_data();
+        assert_eq!(
+            sliced_data.child_data()[0].len(),
+            parent_data.child_data()[0].len(),
+            "fixture must keep the parent's whole child array, or this proves nothing"
+        );
+        assert_eq!(
+            hash(&sliced),
+            hash(&lists(vec![vec![2, 2], vec![3, 3, 3]])),
+            "a sliced list column hashes as its own logical rows"
         );
     }
 }
