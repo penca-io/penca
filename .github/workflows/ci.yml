@@ -227,6 +227,13 @@ jobs:
             aws_secret_access_key=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
       - name: Run integration suite
         env:
+          # compose.yml defaults to the published GHCR image, so without this
+          # the suite would test :main rather than the code under review.
+          # Must stay equal to the pre-build step's `tags:` above — the
+          # ghcr_publish static test pins the pair. If the pre-build were ever
+          # skipped this tag is absent locally and compose falls back to
+          # building from source: slow, but never silently the wrong code.
+          PENCA_IMAGE: penca-rust-server:latest
           PENCA_SKIP_BUILD: "1"
         run: just integration-test
       - name: Print servicer logs on failure
@@ -245,6 +252,118 @@ jobs:
           path: /tmp/penca-logs-*/*.log
           if-no-files-found: ignore
 
+  # Publish the servicer image to GHCR so a fresh clone pulls in ~1 min
+  # instead of compiling for 12-15 (CHA-187). Main merges only: the `push:`
+  # trigger is already scoped to main, and `changes` keeps a docs-only merge
+  # from rebuilding an identical image.
+  #
+  # One job per architecture on its own NATIVE runner, never QEMU. Emulated
+  # rustc runs 5-20x slower and a ~13-min build can exceed the job timeout
+  # outright, so `docker/setup-qemu-action` must not appear anywhere in this
+  # file. Each leg pushes by digest only; `publish-image-merge` assembles the
+  # two into one manifest list and owns the human-readable tags, so nothing
+  # in docker/compose.yml has to know about architectures.
+  publish-image:
+    name: Publish image (${{ matrix.arch }})
+    needs: changes
+    if: github.event_name == 'push' && needs.changes.outputs.rust == 'true'
+    # Job-level permissions REPLACE the workflow-level block, so `contents`
+    # has to be re-declared here or actions/checkout loses its read.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # Surface both legs' results rather than cancelling the survivor; the
+      # merge job is skipped either way (see its `needs:`).
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rust-server
+          platforms: ${{ matrix.platform }}
+          # No `tags:` — a tag here would publish a single-arch image under a
+          # human-readable name, which is the manifest-list-less state this
+          # job exists to avoid.
+          outputs: type=image,name=ghcr.io/penca-io/penca-rust-server,push-by-digest=true,name-canonical=true,push=true
+          # Per-arch scopes: the two architectures share no layers, so a
+          # single scope just thrashes. Deliberately NOT the `integration`
+          # job's scope either — both run on the same push event, so sharing
+          # would be a concurrent cache write race for no gain.
+          cache-from: type=gha,scope=publish-${{ matrix.arch }}
+          cache-to: type=gha,scope=publish-${{ matrix.arch }},mode=max
+          # Same sccache→S3 wiring as the integration pre-build (CHA-440).
+          # Inert on arm64: the Dockerfile gates its sccache download on
+          # x86_64, so that leg leans on the layer cache alone.
+          secrets: |
+            "aws_credentials=[default]
+            aws_access_key_id=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+            aws_secret_access_key=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
+      # Job `outputs:` written from a matrix overwrite each other, last
+      # writer wins, so they cannot carry two digests. Hand off through
+      # artifacts instead: one empty file per leg, named for its digest.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image-merge:
+    name: Publish image (manifest merge)
+    # Plain `needs:` with no `always()`, deliberately. A matrix job's
+    # aggregate result is `failure` if any leg failed, which skips this job —
+    # that is what stops a one-arch manifest from ever reaching `:main`.
+    needs: publish-image
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/penca-io/penca-rust-server:main \
+            -t ghcr.io/penca-io/penca-rust-server:${GITHUB_SHA::7} \
+            $(printf 'ghcr.io/penca-io/penca-rust-server@sha256:%s ' *)
+      - name: Inspect manifest list
+        run: docker buildx imagetools inspect ghcr.io/penca-io/penca-rust-server:main
+
   # Single required status check for branch protection and the merge queue
   # (CHA-458). Requiring the conditional `integration` job directly would hang a
   # PR forever whenever paths-filter skips it (a skipped required check stays
@@ -257,7 +376,22 @@ jobs:
     # output as '' and silently skips, losing the post-merge net with no signal
     # — so fail the gate instead. Its `skipped` result on PR/merge_group is
     # tolerated by the success|skipped case below.
-    needs: [changes, python-lint, python-unit, fresh-clone, rust-check, integration]
+    # The publish jobs are push-only, so they report `skipped` on
+    # pull_request and merge_group and the case below tolerates them — the
+    # merge gate is unchanged. What including them buys is the post-merge
+    # signal: a failed publish leaves every new user pulling a stale :main,
+    # and compose's fallback-to-build would disguise that as "just slow".
+    needs:
+      [
+        changes,
+        python-lint,
+        python-unit,
+        fresh-clone,
+        rust-check,
+        integration,
+        publish-image,
+        publish-image-merge,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -269,13 +403,17 @@ jobs:
           echo "fresh-clone=${{ needs.fresh-clone.result }}"
           echo "rust-check=${{ needs.rust-check.result }}"
           echo "integration=${{ needs.integration.result }}"
+          echo "publish-image=${{ needs.publish-image.result }}"
+          echo "publish-image-merge=${{ needs.publish-image-merge.result }}"
           for result in \
             "${{ needs.changes.result }}" \
             "${{ needs.python-lint.result }}" \
             "${{ needs.python-unit.result }}" \
             "${{ needs.fresh-clone.result }}" \
             "${{ needs.rust-check.result }}" \
-            "${{ needs.integration.result }}"; do
+            "${{ needs.integration.result }}" \
+            "${{ needs.publish-image.result }}" \
+            "${{ needs.publish-image-merge.result }}"; do
             case "$result" in
               success|skipped) ;;
               *) echo "::error::a required job did not pass (result=$result)"; exit 1 ;;

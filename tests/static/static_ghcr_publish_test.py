@@ -178,10 +178,18 @@ def test_publish_image_cache_scopes_are_per_arch():
 def test_workflow_never_reaches_for_qemu():
     """Assertion 6: emulated rustc is 5-20x slower and can blow the job timeout.
 
-    Whole-file check on purpose — QEMU anywhere in CI defeats the native
-    two-runner matrix, not just inside publish-image.
+    Every job, not just publish-image — QEMU anywhere in CI defeats the native
+    two-runner matrix. Checks what each step *uses* rather than whether the
+    file mentions the action, so the comment explaining the prohibition does
+    not trip the guard meant to enforce it.
     """
-    assert "setup-qemu-action" not in _read(".github/workflows/ci.yml")
+    workflow = _yaml(".github/workflows/ci.yml")
+
+    for name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            assert "setup-qemu-action" not in step.get("uses", ""), (
+                f"job {name!r} sets up QEMU; build each arch on a native runner instead"
+            )
 
 
 def test_merge_job_assembles_one_manifest_list_under_both_tags():
