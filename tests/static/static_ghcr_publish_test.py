@@ -327,6 +327,14 @@ def test_penca_up_does_not_build_by_default():
         f"penca-up must default build_flag to empty, got {assignments[0]}"
     )
 
+    # Compose tags a build's output under whatever `image:` resolves to, so a
+    # build has to be redirected off the published ref or it shadows the pulled
+    # image for every later run — pull_policy: missing never re-pulls it.
+    assert re.search(r'export PENCA_IMAGE="\$\{PENCA_IMAGE:-', body), (
+        "penca-up must point a --build=1 run at its own tag, or the build "
+        "overwrites the pulled ghcr.io ref"
+    )
+
 
 def test_local_code_recipes_force_a_build():
     """Assertion 14: these loops test the working tree, not the published tag.

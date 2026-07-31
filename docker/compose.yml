@@ -41,9 +41,10 @@ x-rust-build: &rust-build
 # Compose the reader has.
 #
 # PENCA_IMAGE lets CI run the tag its own pre-build step produced rather than
-# the published one. `just penca-up --build=1` rebuilds from source, and
-# Compose then tags that build under the ref below, so it wins locally until
-# the image is removed or re-pulled.
+# the published one. It is also how `just penca-up --build=1` keeps a local
+# build off this ref: Compose tags a build's output under whatever `image:`
+# resolves to, so a build left here would shadow the pulled image for every
+# later run — `pull_policy: missing` would never re-pull it.
 x-rust-image: &rust-image
   image: ${PENCA_IMAGE:-ghcr.io/penca-io/penca-rust-server:main}
   pull_policy: missing

@@ -651,6 +651,20 @@ penca-up profile="dev" db="" build="": vm-gc
         build_flag=""
     fi
 
+    # Send a local build to its own tag. Compose tags a build's output under
+    # the service's `image:` ref, so without this every `--build=1` run — which
+    # now includes `just integration-test` / `tdd` / `perf-test` — would
+    # overwrite the pulled `:main`, and `pull_policy: missing` means the next
+    # plain `just penca-up` would keep running it rather than re-pulling. That
+    # state never self-heals, and after `just perf-test --profile` the image
+    # left behind is a DWARF/frame-pointer `profiling` build, so the quickstart
+    # would silently demo one. Keyed on the profile so release and profiling
+    # builds don't overwrite each other either. An explicit PENCA_IMAGE (CI)
+    # still wins.
+    if [ -n "$build_flag" ]; then
+        export PENCA_IMAGE="${PENCA_IMAGE:-penca-rust-server:${CARGO_PROFILE:-release}}"
+    fi
+
     # CHA-439: opt the image build into the sccache→S3 compile cache when
     # host AWS creds exist; compose's secret source defaults to /dev/null
     # (which the Dockerfile degrades to a plain compile).
