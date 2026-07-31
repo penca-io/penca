@@ -23,6 +23,17 @@ each execution, and the driver's extra round trips to get the plan and then the
 data.
 
 Both numbers are measured live on your machine; nothing is baked into this file.
+Measuring them honestly takes some care, because a point lookup is around a
+millisecond of real work spread across four hops with idle gaps in between —
+low, bursty utilization, which is the shape a laptop's CPU governor is slowest
+to clock up for. Untreated, that ramp is worth a factor of four and it lands
+inside the measurement window, so the run reports where on the ramp it happened
+to sit. Hence three things this script does before it believes a number. It
+spends a fixed stretch of wall clock warming up, discarded, because the ramp is
+a function of elapsed time rather than of request count. It reports percentiles
+over a large sample instead of a mean, which no single slow request can drag.
+And it interleaves the two arms rather than running them back to back, so that
+neither one absorbs the machine's drift on the other's behalf.
 
 Seeding and the lifecycle steps use the gRPC client, because neither bulk
 loading a table nor driving persist/snapshot/purge is something SQL can express.
@@ -34,7 +45,9 @@ Requires Docker services running: just penca-up
 from __future__ import annotations
 
 import argparse
+import math
 import time
+from collections.abc import Callable, Mapping
 from uuid import uuid4
 
 import pyarrow as pa
@@ -46,8 +59,22 @@ TABLE_NAME = "accounts"
 
 DEFAULT_ROWS = 100_000
 # A point read is sub-millisecond of real work dominated by the round trip, so
-# one measurement is mostly noise. Average over repetitions instead.
-DEFAULT_REPS = 50
+# one measurement is mostly noise. Take a distribution over repetitions instead.
+# Enough of them that the tail percentile below rests on more than one or two
+# samples, and few enough that the whole script still runs in well under a
+# minute — the two arms together cost roughly 30ms per rep on a warm machine.
+DEFAULT_REPS = 300
+# Wall clock, not a repetition count, because the dominant thing being warmed is
+# the CPU's clock ramp and that is measured in seconds however many requests it
+# takes to get there. Long enough to hold the ramp through the measurement that
+# follows; short enough to stay a rounding error in the script's runtime.
+DEFAULT_WARMUP_SECONDS = 1.5
+# The median says what a lookup normally costs, and the two tail figures say what
+# it costs when something goes wrong — which for an OLTP claim is the more
+# interesting half. p99 at DEFAULT_REPS leaves only three samples above it, so it
+# moves around between runs; it is here to show the shape of the tail, not to be
+# quoted as a number.
+PERCENTILES = (50, 90, 99)
 
 ACCOUNTS_SCHEMA = pa.schema(
     [
@@ -70,26 +97,68 @@ def seed_rows(rows: int) -> pa.Table:
     )
 
 
-def time_lookups(lookup, reps: int) -> tuple[float, pa.Table]:
-    """Mean milliseconds per call, plus the last result for inspection.
+# Mapping rather than dict: both functions below only read the arms, and dict is
+# invariant in its value type, so a dict of lambdas built at the call site does
+# not satisfy a dict[str, Callable[[], pa.Table]] parameter.
+Arms = Mapping[str, Callable[[], pa.Table]]
 
-    One untimed call first: the first request on a connection pays for session
-    setup and the table-identifier resolve, which are one-off costs and not what
-    a per-lookup figure should be reporting.
 
-    Returns the result as well as the timing so the caller can check *what* came
+def warm_up(arms: Arms, seconds: float) -> None:
+    """Drive both arms for ``seconds`` of wall clock, discarding everything.
+
+    Three costs get paid here rather than inside the measurement. The first
+    request on a connection pays for session setup and the table-identifier
+    resolve. The server-side caches behind a keyed read fill on first touch. And
+    the machine itself clocks up: a lookup is a millisecond of work per hop with
+    the CPU idle in between, so a governor sees almost no load and takes seconds
+    to leave its lowest frequency — which is worth about a factor of four here,
+    dwarfing everything this script is trying to show.
+
+    Both arms together, because that last cost is a property of the machine and
+    not of either arm. Warming them one after the other would ramp the clock on
+    the first arm's time and hand the second one a machine already at speed.
+    """
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        for lookup in arms.values():
+            lookup()
+
+
+def measure(
+    arms: Arms, reps: int
+) -> tuple[dict[str, list[float]], dict[str, pa.Table]]:
+    """Per-call milliseconds and the last result, per arm.
+
+    Round-robin rather than one arm then the other: thermal and frequency state
+    drifts over the seconds this takes, and running the arms back to back would
+    hand that drift to whichever went second as if it were a property of the
+    surface being measured. Interleaved, both arms see the same machine.
+
+    Returns the results alongside the timings so the caller can check *what* came
     back — a latency figure for a lookup that quietly returned nothing would be
     worse than no figure at all.
     """
-    lookup()
+    samples = {arm: [] for arm in arms}
+    found = {}
 
-    start = time.perf_counter()
     for _ in range(reps):
-        found = lookup()
+        for arm, lookup in arms.items():
+            start = time.perf_counter()
+            found[arm] = lookup()
+            samples[arm].append((time.perf_counter() - start) * 1000)
 
-    elapsed = time.perf_counter() - start
+    return samples, found
 
-    return (elapsed / reps) * 1000, found
+
+def percentile(ordered_ms: list[float], p: int) -> float:
+    """The p-th percentile of an already-sorted sample, by nearest rank.
+
+    Nearest rank rather than an interpolating definition: every figure this
+    prints is then a request that actually happened and could be gone looking for
+    in a trace, which is worth more on a latency table than the third decimal
+    place of a value nothing observed.
+    """
+    return ordered_ms[math.ceil(p / 100 * len(ordered_ms)) - 1]
 
 
 def check_found(found: pa.Table, target_id: int, arm: str) -> None:
@@ -128,6 +197,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     parser.add_argument("--reps", type=int, default=DEFAULT_REPS)
+    parser.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=DEFAULT_WARMUP_SECONDS,
+        help="wall clock spent on discarded lookups before measuring",
+    )
     args = parser.parse_args()
     # Validate before main() opens a client: otherwise a typo'd flag fails only
     # after the catalog exists, leaving debris behind a stack trace.
@@ -136,6 +211,11 @@ def parse_args() -> argparse.Namespace:
 
     if args.reps < 1:
         parser.error("--reps must be at least 1")
+
+    # Zero is allowed, and means "measure cold" — a legitimate thing to ask for,
+    # and the only way to see from this script what the warm-up is worth.
+    if args.warmup_seconds < 0:
+        parser.error("--warmup-seconds cannot be negative")
 
     return args
 
@@ -255,24 +335,37 @@ def main() -> None:
         # a Postgres connection is pinned to one database.
         sql = PencaClient.from_settings(catalog=catalog_name, branch="main")
 
-        print(f"\nLooking up account {target_id} ({args.reps}x per arm)...")
-        grpc_ms, found = time_lookups(grpc_lookup, args.reps)
-        sql_ms, sql_found = time_lookups(lambda: sql.execute_query(select), args.reps)
+        arms = {"gRPC": grpc_lookup, "SQL": lambda: sql.execute_query(select)}
+
+        print(f"\nWarming up for {args.warmup_seconds}s...")
+        warm_up(arms, args.warmup_seconds)
+
+        print(f"Looking up account {target_id} ({args.reps}x per arm)...")
+        samples, found = measure(arms, args.reps)
         # Every arm, not just the one printed below. A lookup that quietly
         # returned nothing would otherwise post a flatteringly fast number and
         # exit 0 — and the faster it got, the more wrong it would be.
-        check_found(found, target_id, "gRPC")
-        check_found(sql_found, target_id, "SQL")
+        for arm, result in found.items():
+            check_found(result, target_id, arm)
 
         print("\n--- The row we looked up ---")
-        print_table(found)
+        print_table(found["gRPC"])
 
-        print("\n--- Point lookup latency on cold columnar (mean per lookup) ---")
+        ordered = {arm: sorted(ms) for arm, ms in samples.items()}
+        print(
+            f"\n--- Point lookup latency on cold columnar "
+            f"({args.reps} reps per arm) ---"
+        )
         print_table(
             pa.table(
                 {
-                    "path": ["gRPC", "SQL"],
-                    "ms": [round(grpc_ms, 3), round(sql_ms, 3)],
+                    "path": list(ordered),
+                    **{
+                        f"p{p} ms": [
+                            round(percentile(ms, p), 3) for ms in ordered.values()
+                        ]
+                        for p in PERCENTILES
+                    },
                 }
             )
         )
@@ -282,7 +375,9 @@ def main() -> None:
             f"primary-key equality is extracted into the same restriction the "
             f"gRPC arm sends. What the SQL arm pays on top is the SQL itself: "
             f"parsing and planning on each execution, plus the driver's extra "
-            f"round trips."
+            f"round trips. Both arms were interleaved on a warmed-up machine, so "
+            f"the figures are steady-state; a laptop on a power-saving governor "
+            f"reads several times slower until its clock ramps."
         )
     finally:
         # finally, not straight-line: a failed run is exactly when leaving a
