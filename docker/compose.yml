@@ -38,6 +38,31 @@ x-rust-build: &rust-build
   # layer-cache keys, so toggling creds never invalidates cached layers.
   secrets: [aws_credentials, aws_config]
 
+# Shared image definition for every penca-rust-server service (CHA-187).
+#
+# `pull_policy: missing` is deliberate, not redundant. Compose 2.40.3 already
+# pulls when `image:` and `build:` coexist, and falls back to building when
+# that pull fails — which is what lets a fresh clone work before the first
+# publish lands, offline, or against a package that isn't public yet. But the
+# Compose spec documents `build` as the default whenever a build section is
+# present, so this key is what makes the behaviour independent of whichever
+# Compose the reader has.
+#
+# `:latest` is the newest `v*` release, not a moving `main` — a quickstart a
+# reader follows today should still behave the same next week. Pin a specific
+# release with PENCA_IMAGE=ghcr.io/penca-io/penca-rust-server:vX.Y.Z, or track
+# main with :main.
+#
+# PENCA_IMAGE lets CI run the tag its own pre-build step produced rather than
+# the published one. It is also how `just penca-up --build=1` keeps a local
+# build off this ref: Compose tags a build's output under whatever `image:`
+# resolves to, so a build left here would shadow the pulled image for every
+# later run — `pull_policy: missing` would never re-pull it.
+x-rust-image: &rust-image
+  image: ${PENCA_IMAGE:-ghcr.io/penca-io/penca-rust-server:latest}
+  pull_policy: missing
+  build: *rust-build
+
 # Cold-tier object store, shared by the three servicers that touch it (query,
 # write, lifecycle). They MUST agree on every value — a servicer reading a
 # different bucket than the one written to fails as an empty table, not an
@@ -146,17 +171,10 @@ services:
   # servicers `depends_on` it via `service_completed_successfully` so they
   # never observe a half-bootstrapped database. Standalone deployments
   # (your own Postgres) run the same binary out of this image — see
-  # README "Standalone deployments".
-  #
-  # `image: penca-rust-server` + the local `build:` block matches every
-  # other servicer in this file; CHA-187 swaps all services to
-  # `ghcr.io/penca-io/penca-rust-server:<tag>` in one go — don't swap
-  # bootstrap-init standalone or BuildKit will rebuild the same layers
-  # twice per `up`.
+  # docs/development.md "Running locally".
   bootstrap-init:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       postgres:
         condition: service_healthy
@@ -172,9 +190,8 @@ services:
     command: penca-bootstrap
 
   query:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       postgres:
         condition: service_healthy
@@ -223,9 +240,8 @@ services:
       - "${QUERY_HOST_PORT}:50052"
 
   write:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       postgres:
         condition: service_healthy
@@ -268,9 +284,8 @@ services:
       - "${WRITE_HOST_PORT}:50053"
 
   lifecycle:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       postgres:
         condition: service_healthy
@@ -306,9 +321,8 @@ services:
       - "${LIFECYCLE_HOST_PORT}:50054"
 
   lifecycle-scheduler:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       # The scheduler is a pure gRPC client; it only reaches two
       # services (query + lifecycle). `bootstrap-init` must complete
@@ -344,9 +358,8 @@ services:
     # No `ports:` — the scheduler doesn't listen.
 
   penca-sql-server:
-    image: penca-rust-server
+    <<: *rust-image
     profiles: [penca-backend]
-    build: *rust-build
     depends_on:
       query:
         condition: service_started

@@ -1,10 +1,9 @@
 //! Bootstrap global Penca tables in Postgres + seed the default catalog.
 //!
 //! Reads everything from env vars to match the rest of the Rust
-//! servicer binaries (admin / query / write / lifecycle / storage-
-//! metadata all use `*Config::from_env`). Once CHA-187 lands the
-//! `bootstrap-init` compose service, this binary is invoked there
-//! and inherits the same env block the runtime services already use:
+//! servicer binaries (query / write / lifecycle all use
+//! `*Config::from_env`). Run by the `bootstrap-init` compose service,
+//! which inherits the same env block the runtime services use:
 //!
 //! - `DATABASE_URL` — Postgres connection string (required).
 //! - `SQL_SERVER_DEFAULT_CATALOG` — name of the catalog to seed

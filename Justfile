@@ -132,9 +132,10 @@ install-tools:
 vm-gc:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Dangling-only: drops orphaned prior penca-rust-server layers,
-    # never tagged base images (postgres, seaweedfs) or the in-use image.
-    # CI (PENCA_SKIP_BUILD=1) keeps its prebuilt tagged image. Best-effort:
+    # Dangling-only: drops orphaned prior penca-rust-server layers, never
+    # tagged base images (postgres, seaweedfs), the pulled GHCR image, or
+    # the in-use one. CI (PENCA_SKIP_BUILD=1) keeps its prebuilt tagged
+    # image. Best-effort:
     # vm-gc is a penca-up prerequisite, so a transient daemon hiccup (busy
     # daemon, race with a parallel-worktree prune) must not abort bring-up.
     docker image prune -f || echo "(skip) docker image prune failed — continuing"
@@ -575,7 +576,9 @@ docker-ensure:
 # running before invoking this recipe.
 [arg("profile", long)]
 [arg("db", long)]
-penca-up profile="dev" db="": vm-gc
+[arg("build", long)]
+[arg("pull", long)]
+penca-up profile="dev" db="" build="" pull="": vm-gc
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -595,18 +598,19 @@ penca-up profile="dev" db="": vm-gc
 
         # The Docker build context is the repo root (`context: ..` in
         # compose.yml), so a data directory inside the repo would be shipped to
-        # the daemon on every build. Refuse rather than warn: penca-up builds by
-        # default and Postgres creates its datadir mode 0700 owned by a container
-        # uid, so the next build cannot read the context and FAILS outright.
+        # the daemon on every build. Refuse rather than warn: Postgres creates
+        # its datadir mode 0700 owned by a container uid, so any later build
+        # (`--build=1`, or the fallback when the pull fails) cannot read the
+        # context and FAILS outright.
         repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
         if [ -n "$repo_root" ]; then
             case "$db_dir/" in
                 "$repo_root"/*)
                     echo "error: $db_dir is inside the repo, which is the Docker" >&2
                     echo "       build context (compose.yml uses \`context: ..\`)." >&2
-                    echo "       penca-up builds by default, and Postgres creates" >&2
-                    echo "       its datadir mode 0700 owned by a container uid —" >&2
-                    echo "       so the next build cannot read the context and will" >&2
+                    echo "       Postgres creates its datadir mode 0700 owned by" >&2
+                    echo "       a container uid — so any later image build cannot" >&2
+                    echo "       read the context and will" >&2
                     echo "       FAIL, not merely run slowly. It would also show up" >&2
                     echo "       in git status." >&2
                     echo "       Use a path outside the repo: --db ~/.penca/data" >&2
@@ -638,22 +642,108 @@ penca-up profile="dev" db="": vm-gc
     # postgres/seaweedfs, so by the time it returns the full stack is
     # bootstrapped and ready for connections.
     #
-    # `PENCA_SKIP_BUILD=1` tells compose to use the pre-existing
-    # `penca-rust-server` image as-is — set by CI after a cache-aware
-    # pre-build step. Local runs default to `--build` for fast
-    # edit-run loops (BuildKit layer cache still applies).
-    build_flag="--build"
+    # Default is pull, not build (CHA-187): compose.yml points at the
+    # published image, so a fresh clone starts in ~1 min instead of ~13.
+    # `--build=1` is the from-source path — the value is required because
+    # just's `arg` attribute has no valueless-flag form.
+    #
+    # `PENCA_SKIP_BUILD=1` overrides even an explicit `--build=1`: CI
+    # reaches this recipe through `integration-test`, which passes the flag
+    # so a contributor's edits get compiled, but CI has already produced
+    # that image in a cache-aware pre-build step and must not repeat it.
+    build_flag=""
+    if [ -n "{{build}}" ]; then
+        build_flag="--build"
+    fi
     if [[ "${PENCA_SKIP_BUILD:-0}" == "1" ]]; then
         build_flag=""
     fi
 
+    # Send a local build to its own tag. Compose tags a build's output under
+    # the service's `image:` ref, so without this every `--build=1` run — which
+    # now includes `just integration-test` / `tdd` / `perf-test` — would
+    # overwrite the pulled `:main`, and `pull_policy: missing` means the next
+    # plain `just penca-up` would keep running it rather than re-pulling. That
+    # state never self-heals, and after `just perf-test --profile` the image
+    # left behind is a DWARF/frame-pointer `profiling` build, so the quickstart
+    # would silently demo one. Keyed on the profile so release and profiling
+    # builds don't overwrite each other either. An explicit PENCA_IMAGE (CI)
+    # still wins.
     # CHA-439: opt the image build into the sccache→S3 compile cache when
     # host AWS creds exist; compose's secret source defaults to /dev/null
     # (which the Dockerfile degrades to a plain compile).
     if [ -s "$HOME/.aws/credentials" ]; then export PENCA_AWS_CREDENTIALS="$HOME/.aws/credentials"; fi
     if [ -s "$HOME/.aws/config" ]; then export PENCA_AWS_CONFIG="$HOME/.aws/config"; fi
 
-    docker compose $compose_files $env_file $profiles up -d $build_flag
+    # Materialize the shared image with exactly ONE target before `up`, so
+    # `up` never has to produce it. All six servicers name the same image ref
+    # but compose does not dedupe their identical build configs, so any path
+    # that leaves `up` to produce a missing image fans out six concurrent
+    # targets racing to export one tag — and the losers die with
+    # `image "...": already exists`. That bites hardest precisely where the
+    # tag provably does not exist yet: a `--build=1` run against a fresh
+    # profile tag, and the `pull_policy: missing` degradation where the pull
+    # fails and compose falls back to building (fresh clone before the first
+    # publish lands, offline, or a package that is not public yet). Latent
+    # before CHA-187 only because `penca-rust-server:latest` already existed
+    # on any machine that had ever run this.
+    #
+    # `query` is an arbitrary member of the six — they share one build config,
+    # so building any one of them produces the image the rest then find
+    # locally.
+    # `pull --policy missing` is what keeps this to ONE build target instead of
+    # the six-way race described above,
+    # and it is deliberately not a `config` + `docker image inspect` dance:
+    # that needed `jq` to read the ref back, which would make `jq` a hard
+    # requirement of the quickstart's very first command and it is not a
+    # documented prerequisite (macOS ships without it).
+    # `pull_policy: missing` never re-pulls, so a reader who ran the quickstart
+    # once is frozen on that image while `git pull` keeps moving examples/ and
+    # the client forward. `--pull=1` is the refresh — best-effort on purpose:
+    # a failed refresh must KEEP the image you already have, not discard a
+    # perfectly good published image and start a ~13-minute rebuild because
+    # GHCR rate-limited you. The materialize step below then finds it present
+    # and does nothing.
+    if [ -n "{{pull}}" ]; then
+        docker compose $compose_files $env_file $profiles pull --policy always query \
+            || echo "note: refresh failed; keeping the image already on this machine." >&2
+    fi
+
+    if [ -n "$build_flag" ]; then
+        export PENCA_IMAGE="${PENCA_IMAGE:-penca-rust-server:${CARGO_PROFILE:-release}}"
+        docker compose $compose_files $env_file $profiles build query
+    elif ! docker compose $compose_files $env_file $profiles pull --policy missing query; then
+        # Redirect BEFORE building, for the same reason the --build=1 path
+        # does: compose tags a build's output under whatever `image:`
+        # resolves to, so building here would stamp a local build onto the
+        # PUBLISHED ref and `pull_policy: missing` would then serve it
+        # forever — surviving `git pull`, and outliving the registry
+        # actually becoming reachable. This is the default path whenever
+        # the published image is unreachable (before the first release, no
+        # network, package still private), so it is the one a first-time
+        # reader is most likely to hit.
+        export PENCA_IMAGE="penca-rust-server:${CARGO_PROFILE:-release}"
+        echo "note: could not pull the published image; using a local build ($PENCA_IMAGE)." >&2
+        if docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1; then
+            # Reusing whatever is on the box. Say so with its age — offline,
+            # this can be arbitrarily stale, and on --pull=1 (whose whole
+            # point is to refresh) silence would be actively misleading.
+            # `|| true` is load-bearing under `set -euo pipefail`: this is a
+            # cosmetic lookup, and without it a missing `Created` key (Docker
+            # omits it when absent) or a SIGPIPE from `grep -m1` would abort
+            # the whole recipe — killing the exact offline path this branch
+            # exists to keep working, after the note printed and before the
+            # stack ever came up. Read from the JSON rather than `-f`: a Go
+            # template's braces are just-interpolation syntax and wreck the
+            # parse.
+            built=$(docker image inspect "$PENCA_IMAGE" 2>/dev/null | grep -m1 '"Created"' | cut -d'"' -f4 || true)
+            echo "      reusing the existing $PENCA_IMAGE${built:+, built $built}." >&2
+            echo "      run with --build=1 to rebuild it from the working tree." >&2
+        else
+            docker compose $compose_files $env_file $profiles build query
+        fi
+    fi
+    docker compose $compose_files $env_file $profiles up -d
 
     # Query the ports Docker actually bound.
     pg_port=$(docker compose $compose_files $env_file $profiles port postgres 5432 | cut -d: -f2)
@@ -889,7 +979,7 @@ integration-test *services:
     # colliding, and the lifecycle scheduler is idle there so its tick loop
     # cannot race the manual Persist/Snapshot/Purge calls these suites make.
     # penca-up defaults to the dev profile, which is the opposite of both.
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     # `penca-down` dumps per-service logs to /tmp before teardown; trap
     # guarantees teardown whether pytest passes, fails, or the shell is
     # interrupted, while preserving pytest's exit code for CI.
@@ -1160,7 +1250,7 @@ perf-test *paths:
         export CARGO_PROFILE=profiling
     fi
 
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && source docker/.baseline.env && set +a
@@ -1323,7 +1413,7 @@ tdd *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && set +a

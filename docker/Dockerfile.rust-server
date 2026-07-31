@@ -112,6 +112,13 @@ RUN --mount=type=secret,id=aws_credentials,target=/root/.aws/credentials,require
 # --- Runtime ---
 FROM debian:bookworm-slim
 
+# GitHub links a GHCR package to its repository via the `source` label, which
+# is what makes the package page render the README and what the visibility
+# switch acts on. Declared here rather than as a workflow input so a local
+# `docker build` produces the same image.
+LABEL org.opencontainers.image.source="https://github.com/penca-io/penca" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # Re-declared because ARGs don't cross build stages; selects the target/
 # subdir the builder wrote to (target/release or target/profiling).
 ARG CARGO_PROFILE=release

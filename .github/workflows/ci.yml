@@ -19,16 +19,50 @@ on:
   # Post-merge signal on main. With the merge queue the merged commit is the
   # one the queue already tested, so this is a canonical safety net (e.g. for an
   # admin-bypass merge); the `changes` paths-filter scopes the heavy jobs.
+  # Release publish (CHA-187). Pushing a `v*` tag builds the same two-arch
+  # manifest and publishes it as :<version> + :latest, so a reader can pin a
+  # quickstart to an image that does not move under them the way :main does.
+  # The version is the tag name, which keeps it anchored to a real commit —
+  # there is no hand-typed version field anywhere.
   push:
     branches: [main]
+    tags: ["v*"]
+  # Cut a release from the Actions tab (CHA-187). This runs the full CI and
+  # THEN tags and publishes, so a release is never cut from an untested tree.
+  # It deliberately does the publish itself rather than just pushing the tag:
+  # a tag pushed with GITHUB_TOKEN does not trigger workflows, so a
+  # tag-and-walk-away job would go green and publish nothing.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag and publish, e.g. v0.1.0"
+        required: true
+      ref:
+        description: "Branch or commit to cut from"
+        default: main
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel an in-flight merge-queue run. Each queue entry already gets a
-  # unique ref (gh-readonly-queue/…) so entries won't cancel each other, but
-  # cancelling a merge_group run can eject the PR from the queue — so be
-  # explicit rather than relying on the ref scheme.
-  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+  # Fold the commit in for pushes, so every main push gets its OWN group and
+  # can never displace another. `cancel-in-progress: false` alone was not
+  # enough: runs then serialize with a queue depth of one, and a third push
+  # cancels the PENDING one — the same lost publish, one merge deeper.
+  # github.sha is empty on pull_request, so PRs keep superseding themselves;
+  # merge_group is unaffected.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
+  # Only a pull_request supersedes itself. Two events must never be cancelled:
+  #
+  #   merge_group — each queue entry gets a unique gh-readonly-queue/… ref so
+  #     entries won't cancel each other anyway, but cancelling one can eject
+  #     the PR from the queue, so say it explicitly.
+  #   push — a docs-only merge landing behind a Rust merge would otherwise
+  #     cancel that run mid-publish; the replacement's own `changes` diff sees
+  #     only its own docs paths, skips `publish-image`, and `ci-success` reads
+  #     all success|skipped and goes GREEN, leaving :main without the merged
+  #     Rust code. The per-commit group above is what actually prevents this —
+  #     this flag alone only serializes, and a third push still cancels the
+  #     queued one. A job-level `concurrency:` cannot help; it is a run-level
+  #     cancellation.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -227,6 +261,13 @@ jobs:
             aws_secret_access_key=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
       - name: Run integration suite
         env:
+          # compose.yml defaults to the published GHCR image, so without this
+          # the suite would test :main rather than the code under review.
+          # Must stay equal to the pre-build step's `tags:` above — the
+          # ghcr_publish static test pins the pair. If the pre-build were ever
+          # skipped this tag is absent locally and compose falls back to
+          # building from source: slow, but never silently the wrong code.
+          PENCA_IMAGE: penca-rust-server:latest
           PENCA_SKIP_BUILD: "1"
         run: just integration-test
       - name: Print servicer logs on failure
@@ -245,6 +286,278 @@ jobs:
           path: /tmp/penca-logs-*/*.log
           if-no-files-found: ignore
 
+  # Publish the servicer image to GHCR so a fresh clone pulls in ~1 min
+  # instead of compiling for 12-15 (CHA-187). Main merges only: the `push:`
+  # trigger is already scoped to main, and `changes` keeps a docs-only merge
+  # from rebuilding an identical image.
+  #
+  # One job per architecture on its own NATIVE runner, never QEMU. Emulated
+  # rustc runs 5-20x slower and a ~13-min build can exceed the job timeout
+  # outright, so `docker/setup-qemu-action` must not appear anywhere in this
+  # file. Each leg pushes by digest only; `publish-image-merge` assembles the
+  # two into one manifest list and owns the human-readable tags, so nothing
+  # in docker/compose.yml has to know about architectures.
+  publish-image:
+    name: Publish image (${{ matrix.arch }})
+    needs: changes
+    # Deliberately NOT `needs: integration`. On a main push the publish runs
+    # alongside the post-merge suite, so an admin-bypass merge that breaks the
+    # servicers can reach `:main` before that net reports. Accepted, because
+    # the merge queue already ran the full suite on the merged result, and the
+    # tag readers actually consume — `:latest` — moves only on a deliberate
+    # `v*` release cut from a known-good main. Exposure is limited to people
+    # tracking `:main`. Gating on it would add ~40 min to every publish.
+    #
+    # A `v*` tag publishes unconditionally: a release must never be silently
+    # skipped because a paths-filter hiccuped, and `changes` is scoped to
+    # main-merge diffs anyway. `always()` is what keeps a failed or skipped
+    # `changes` from swallowing the release; a main push still requires a
+    # positive rust=='true', so a docs-only merge rebuilds nothing.
+    if: >-
+      always() &&
+      ( github.event_name == 'workflow_dispatch'
+        || ( github.event_name == 'push' &&
+             ( startsWith(github.ref, 'refs/tags/v')
+               || needs.changes.outputs.rust == 'true' ) ) )
+    # Job-level permissions REPLACE the workflow-level block, so `contents`
+    # has to be re-declared here or actions/checkout loses its read.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # Surface both legs' results rather than cancelling the survivor; the
+      # merge job is skipped either way (see its `needs:`).
+      fail-fast: false
+      matrix:
+        include:
+          # Cache mode differs per arch on purpose. The Actions cache is a
+          # single 10 GB per-repository budget with LRU eviction, and a
+          # mode=max scope over this cargo-chef cook layer is multiple GB —
+          # three of them (integration's, plus one per arch) would evict each
+          # other and push every build back toward cold, including the
+          # merge-gating integration job.
+          #
+          # amd64 is the same platform and Dockerfile the integration job
+          # already stores at mode=max, so it reads that scope and stores only
+          # its own final stage. arm64 has no such sibling, so its scope is
+          # the only cook-layer cache it will ever get and stays mode=max.
+          # Risk therefore lands on the publish job (an occasional cold
+          # rebuild) rather than on the merge gate.
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+            cache_from: |
+              type=gha,scope=publish-amd64
+              type=gha
+            cache_mode: min
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache_from: type=gha,scope=publish-arm64
+            cache_mode: max
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # Empty on non-dispatch events, which checkout treats as "the triggering
+      # ref" — so this only redirects when a release names a ref.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rust-server
+          platforms: ${{ matrix.platform }}
+          # No `tags:` — a tag here would publish a single-arch image under a
+          # human-readable name, which is the manifest-list-less state this
+          # job exists to avoid.
+          outputs: type=image,name=ghcr.io/penca-io/penca-rust-server,push-by-digest=true,name-canonical=true,push=true
+          # Per-arch scopes: the two architectures share no layers, so one
+          # shared scope would just thrash. See the matrix above for why the
+          # store mode differs per arch.
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: type=gha,scope=publish-${{ matrix.arch }},mode=${{ matrix.cache_mode }}
+          # Same sccache→S3 wiring as the integration pre-build (CHA-440).
+          # Inert on arm64: the Dockerfile gates its sccache download on
+          # x86_64, so that leg leans on the layer cache alone.
+          secrets: |
+            "aws_credentials=[default]
+            aws_access_key_id=${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+            aws_secret_access_key=${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
+      # Job `outputs:` written from a matrix overwrite each other, last
+      # writer wins, so they cannot carry two digests. Hand off through
+      # artifacts instead: one empty file per leg, named for its digest.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image-merge:
+    name: Publish image (manifest merge)
+    # Plain `needs:` with no `always()`, deliberately. A matrix job's
+    # aggregate result is `failure` if any leg failed, which skips this job —
+    # that is what stops a one-arch manifest from ever reaching `:main`.
+    needs: publish-image
+    permissions:
+      # write, not read: a dispatch release creates and pushes the tag.
+      contents: write
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      # Needed only for the tag list the :latest decision below reads.
+      # fetch-depth: 0 because a shallow clone carries no tags.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+      - name: Tag the release
+        if: github.event_name == 'workflow_dispatch'
+        # Through env, never `${{ }}` inside the script: the expression is
+        # substituted at assembly time, before bash parses the line, so the
+        # regex below could not gate it and `v1.0.0"; curl …| sh; #` would run
+        # arbitrary commands in a job holding contents+packages write.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          version="$VERSION"
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version must look like v1.2.3 or v1.2.3-rc1, got: $version"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+            echo "::error::tag $version already exists"
+            exit 1
+          fi
+          git tag "$version"
+          git push origin "$version"
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Assert the arch set BEFORE tagging anything. "a failed leg makes
+          # the matrix aggregate `failure`, so this job is skipped" is a
+          # convention, not an invariant: `retention-days: 1` plus a
+          # next-day "Re-run failed jobs" leaves one surviving digest, the
+          # aggregate flips to success, and `imagetools create` would happily
+          # publish a single-arch manifest under :main or :latest — every
+          # pull on the other architecture then fails, with green CI.
+          if [ "$(ls -1 | wc -l)" -ne 2 ]; then
+            echo "::error::expected 2 arch digests, got: $(ls -1 | tr '\n' ' ')"
+            exit 1
+          fi
+
+          image=ghcr.io/penca-io/penca-rust-server
+          # A `v*` tag is a release: pin the version. A main push gets the
+          # moving :main plus an immutable short-sha to pin against. :latest
+          # is decided separately below — never on the main arm.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            release_tag="$VERSION"
+            tags=(-t "$image:$release_tag")
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF#refs/tags/}"
+            tags=(-t "$image:$release_tag")
+          else
+            release_tag=main
+            tags=(-t "$image:${GITHUB_SHA::7}")
+            # Per-commit concurrency groups make main runs genuinely
+            # concurrent, so nothing orders these writes: two Rust merges
+            # minutes apart can finish out of order (differing cache hits, a
+            # cold arm64 cook, a re-run) and the older one would re-point
+            # :main at older code, where it would sit until the next
+            # image-touching merge. Only the tip of main may move the moving
+            # tag; the immutable short-sha is always safe to publish.
+            git -C "$GITHUB_WORKSPACE" fetch --quiet origin main
+            tip=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
+            # "Am I the tip" is not the question — it is "will a newer image
+            # ever be published". publish-image is path-filtered, so a docs
+            # merge landing behind a Rust merge publishes nothing at all, and
+            # a bare tip check would leave :main stuck on the PREVIOUS image
+            # until some future Rust merge. So decline only when the newer
+            # commits actually touch the image.
+            # This pathspec MUST mirror the `rust:` paths-filter above, which
+            # is what actually decides whether a newer run publishes. Narrower
+            # and we publish while a newer run also will (the race back);
+            # wider and we decline when nothing newer publishes (stale :main).
+            # The ghcr_publish static test asserts the two stay identical.
+            if [ "$tip" = "$GITHUB_SHA" ] || git -C "$GITHUB_WORKSPACE" diff --quiet \
+                 "$GITHUB_SHA" "$tip" -- crates protos docker Cargo.toml Cargo.lock \
+                 packages pyproject.toml uv.lock .github/workflows/ci.yml Justfile \
+                 tests/integration; then
+              tags+=(-t "$image:main")
+            else
+              echo "::notice::$GITHUB_SHA is behind main ($tip), which rebuilds the image; publishing the short-sha only"
+              # Point the post-publish inspect at a tag THIS run wrote, not at
+              # some other run's :main — which may not exist at all yet.
+              release_tag="${GITHUB_SHA::7}"
+            fi
+          fi
+
+          # Move :latest ONLY when this tag is the highest stable release.
+          # Two ways a naive `always move it` gets this wrong, and docs now
+          # aim readers at :latest, so either one silently downgrades every
+          # new user:
+          #   - a backport: pushing v1.0.1 after v2.0.0 would drag :latest
+          #     backwards onto older code;
+          #   - a pre-release: `sort -V` ranks v1.0.0-rc1 ABOVE v1.0.0
+          #     (measured), the opposite of semver, so an RC could claim it.
+          # Restricting to X.Y.Z before sorting fixes both — it excludes
+          # pre-releases outright and leaves `sort -V` only the stable
+          # versions it does order correctly (v2.0.0 < v10.0.0).
+          if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            highest=$(git -C "$GITHUB_WORKSPACE" tag -l 'v*' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            # The whole gate rests on the checkout above using fetch-depth: 0.
+            # Without it actions/checkout fetches --no-tags --depth=1 and the
+            # workspace holds exactly ONE tag — the pushed one — so `highest`
+            # would always equal it and :latest would move unconditionally,
+            # silently restoring the bug this gate exists to prevent. An empty
+            # list is the other direction of the same failure, so fail loudly
+            # rather than quietly declining to move :latest for every release.
+            if [ -z "$highest" ]; then
+              echo "::error::no stable release tags visible — is the checkout still fetch-depth: 0?"
+              exit 1
+            fi
+            if [ "$highest" = "$release_tag" ]; then
+              tags+=(-t "$image:latest")
+            else
+              echo "::notice::$release_tag is not the highest release ($highest); leaving :latest alone"
+            fi
+          fi
+          echo "PUBLISHED_TAG=$release_tag" >> "$GITHUB_ENV"
+          refs=()
+          for digest in *; do refs+=("$image@sha256:$digest"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+      - name: Inspect manifest list
+        run: |
+          docker buildx imagetools inspect \
+            "ghcr.io/penca-io/penca-rust-server:${PUBLISHED_TAG}"
+
   # Single required status check for branch protection and the merge queue
   # (CHA-458). Requiring the conditional `integration` job directly would hang a
   # PR forever whenever paths-filter skips it (a skipped required check stays
@@ -257,7 +570,22 @@ jobs:
     # output as '' and silently skips, losing the post-merge net with no signal
     # — so fail the gate instead. Its `skipped` result on PR/merge_group is
     # tolerated by the success|skipped case below.
-    needs: [changes, python-lint, python-unit, fresh-clone, rust-check, integration]
+    # The publish jobs are push-only, so they report `skipped` on
+    # pull_request and merge_group and the case below tolerates them — the
+    # merge gate is unchanged. What including them buys is the post-merge
+    # signal: a failed publish leaves every new user pulling a stale :main,
+    # and compose's fallback-to-build would disguise that as "just slow".
+    needs:
+      [
+        changes,
+        python-lint,
+        python-unit,
+        fresh-clone,
+        rust-check,
+        integration,
+        publish-image,
+        publish-image-merge,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -269,13 +597,17 @@ jobs:
           echo "fresh-clone=${{ needs.fresh-clone.result }}"
           echo "rust-check=${{ needs.rust-check.result }}"
           echo "integration=${{ needs.integration.result }}"
+          echo "publish-image=${{ needs.publish-image.result }}"
+          echo "publish-image-merge=${{ needs.publish-image-merge.result }}"
           for result in \
             "${{ needs.changes.result }}" \
             "${{ needs.python-lint.result }}" \
             "${{ needs.python-unit.result }}" \
             "${{ needs.fresh-clone.result }}" \
             "${{ needs.rust-check.result }}" \
-            "${{ needs.integration.result }}"; do
+            "${{ needs.integration.result }}" \
+            "${{ needs.publish-image.result }}" \
+            "${{ needs.publish-image-merge.result }}"; do
             case "$result" in
               success|skipped) ;;
               *) echo "::error::a required job did not pass (result=$result)"; exit 1 ;;
