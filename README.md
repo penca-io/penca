@@ -108,17 +108,17 @@ The defensible claim is the *conjunction*, on one copy. Each alternative holds p
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie.** Branching over open columnar files, but no interactive
   read-your-writes: you commit table snapshots, you do not transact.
-- **Databricks LTAP.** The closest peer by far.
-  [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage), built
-  on Lakebase and announced in June 2026, argues the same thing we do: the way out of the
-  split is storing the data once in open formats instead of syncing a second copy to read
-  it. We could not have asked for better validation. Where the two diverge is data
-  versioning. LTAP keeps intermediate row versions to preserve Postgres MVCC and
-  point-in-time recovery, but they stay invisible to Iceberg and Delta readers and are
-  garbage-collected in time. Branching there is metadata-only, as it is here. Penca is
-  Apache-2.0 and self-hostable rather than a managed service, and it makes that version
-  history a first-class queryable surface: a row-level audit trail and `as_of` reads today,
-  revert to come.
+- **Databricks Lakebase.** Managed Postgres next to a lakehouse, branchable. Branch plus OLTP
+  plus OLAP, but not on one copy: the analytical side is a synced table — what their own docs
+  call a managed copy, kept current by CDC — and a branch forks the Postgres storage layer and
+  only that, so its analytical half needs a sync pipeline of its own.
+
+Databricks' [LTAP](https://www.databricks.com/blog/lakebase-ltap-rethinking-database-storage),
+announced in June 2026 and rolling out since, argues the same thing we do: store the data once
+in open formats instead of syncing a second copy to read it. We could not have asked for
+better validation. Where we expect to differ is that Penca is Apache-2.0 and self-hostable,
+and makes version history a queryable surface — row-level audit and `as_of` reads today,
+revert to come — rather than MVCC bookkeeping that lakehouse readers never see.
 
 ## Architecture
 
