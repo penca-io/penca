@@ -63,9 +63,30 @@ which the demo asserts rather than prints: see
 
 ```bash
 just penca-up                            # Postgres + object store + servicers + Flight SQL gateway
-set -a && source docker/.client.env      # PENCA_*_URL for the client
-uv run python examples/sandbox_demo.py
+
+uv run python - <<'EOF'                  # write a table and read it back
+from adbc_driver_flightsql.dbapi import connect
+
+with connect("grpc://localhost:50060", autocommit=True) as conn, conn.cursor() as cur:
+    cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
+    cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
+    cur.execute("SELECT * FROM greetings ORDER BY id")
+    print(cur.fetch_arrow_table())
+EOF
+
+set -a && source docker/.client.env      # PENCA_*_URL, for the demo below
+uv run python examples/sandbox_demo.py   # the branching demo above
 ```
+
+That is a stock Arrow Flight SQL driver talking to port 50060. No Penca client, no
+custom protocol, and `greetings` lands in the default catalog and schema so there is
+nothing to create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way.
+`autocommit=True` is load-bearing: DB-API defaults it to `False`, which opens a
+transaction that nothing ever commits, so the writes would be discarded when the
+connection closes.
+
+The shipped Python client wraps that surface plus the gRPC one, which is what the
+branching, audit and time-travel calls use; see [docs/usage.md](docs/usage.md).
 
 You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
 and [`just`](https://github.com/casey/just). The first `just penca-up` compiles the server
@@ -81,8 +102,8 @@ just penca-up --db ~/.penca/data
 
 The defensible claim is the *conjunction*, on one copy. Each alternative holds part of it:
 
-- **Neon.** Branchable Postgres. Branch plus OLTP, but no columnar analytics on the
-  branch: queries run on the row store, at row-store cost.
+- **Neon.** Branchable Postgres on object storage. Branch plus OLTP, but data is persisted
+  as Postgres data pages. Does not provide OLAP capabilities out of the box.
 - **Dolt.** Branching, merge and audit, open source, but on a bespoke row-oriented
   format. Analytical queries pay row-store costs, and lakehouse tools cannot read it.
 - **Iceberg / Nessie.** Branching over open columnar files, but no interactive

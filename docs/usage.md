@@ -43,6 +43,53 @@ The Python `PencaClient` wraps both surfaces:
 for SQL; `read_data` / `audit_data` / `write_data` / branch + tx
 methods for the gRPC surface.
 
+### You do not need the client
+
+`PencaClient` is a convenience, not a requirement. The SQL side is plain Arrow Flight
+SQL, so ADBC directly, SQLAlchemy, JDBC and ODBC all connect to port 50060 without it;
+the gRPC side is plain gRPC, so any client generated from `protos/` works. The client
+itself is just an ADBC consumer:
+[`_flight_sql_cursor`](../packages/penca-client/src/penca_client/client.py#L2077) opens
+`adbc_driver_flightsql.dbapi.connect` against `grpc://<host>:50060` and nothing more
+exotic.
+
+```python
+from adbc_driver_flightsql.dbapi import connect
+
+with connect("grpc://localhost:50060", autocommit=True) as conn, conn.cursor() as cur:
+    cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
+    cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
+    cur.execute("SELECT * FROM greetings ORDER BY id")
+    print(cur.fetch_arrow_table())
+```
+
+**Use `executescript` for DDL and DML, not `execute`.** Flight SQL splits statements
+across two server verbs: `GetFlightInfo` for anything returning rows, and
+`DoPutStatementUpdate` for anything returning a row count. DB-API assumes one verb, so
+`Cursor.execute` is hardwired to the query path and a `CREATE TABLE` sent through it is
+rejected with `update statement routed to GetFlightInfo`. `Cursor.executescript` calls
+`execute_update`, which is the right verb. One statement per call: multi-statement
+requests are rejected. `PencaClient.execute_update` does the same thing through the
+low-level statement handle.
+
+The client also sets three connection options you would otherwise have to set yourself,
+so it is worth reading that function before hand-rolling a session:
+
+- `adbc.flight.sql.rpc.with_cookie_middleware=true`, so the server's `penca-session-id`
+  `Set-Cookie` / `Cookie` round-trip binds successive statements to one session. Without
+  it a multi-statement `BEGIN` / `INSERT` / `COMMIT` will not hold together
+  ([ADR 0007](decisions/0007-session-entity.md)).
+- `adbc.flight.sql.rpc.call_header.x-penca-branch` and `…x-penca-catalog`, the headers
+  the server reads at session-mint time to pin the connection's branch and catalog. Both
+  are immutable for the session's lifetime.
+- `autocommit=True`. **Omit this and your writes are silently discarded.** The DB-API
+  default of `False` sends a `BeginTransaction` on connect, so every statement runs inside
+  a transaction that nothing commits; closing the connection aborts it, and the session
+  drop fires `AbortTx`. A `SELECT` in the same block still shows the rows, because it
+  reads its own uncommitted writes, so the loss only appears after you reconnect. It also
+  collides with an explicit SQL `BEGIN`, since Penca's transaction surface is the explicit
+  Postgres-style `BEGIN` / `COMMIT` / `ROLLBACK`.
+
 ## Your first table
 
 One table, written over both surfaces. The gRPC arm below appends to the *same* table
@@ -155,9 +202,10 @@ The full parameter list (`user`, `password`, `token`, `threadPoolSize`, `trustSt
 [Arrow Flight SQL JDBC driver docs](https://arrow.apache.org/docs/16.0/java/flight_sql_jdbc_driver.html).
 Unrecognized parameters are forwarded to the server as gRPC headers.
 
-> These steps are written against the driver's documented URL scheme and its registered
-> driver class, but have not been executed against a DataGrip install. Corrections
-> welcome.
+> These steps were verified against a DataGrip install, but DataGrip versions and driver
+> configurations vary, so we cannot promise they match yours exactly. If they do not work,
+> please [open an issue](https://github.com/penca-io/penca/issues) with your DataGrip and
+> driver versions.
 
 ## Examples
 
