@@ -185,11 +185,11 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
 
 Everything above is the roadmap, in roughly that order. Beyond it: bulk load that bypasses
 the hot tier, so you can ingest existing data-lake files at full speed, and adopting an
-Iceberg table in place with no migration. Retention gains the pruning half it is missing and
-the scheduler gains leader election. A structured predicate on the read wire kills the
-SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog metadata
-gets checkpointed to object storage and reloaded into Postgres at startup, still served from
-Postgres in steady state but recoverable from the object store alone.
+Iceberg table in place with no migration. Retention gains the pruning half it is missing. A
+structured predicate on the read wire kills the SQL-string double parse, with aggregate /
+limit / TopN pushed into the scan. Catalog metadata gets checkpointed to object storage and
+reloaded into Postgres at startup, still served from Postgres in steady state but recoverable
+from the object store alone.
 
 ## Documentation
 
