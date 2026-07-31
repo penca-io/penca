@@ -1105,16 +1105,15 @@ impl WriteManager {
         // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
         // resolved BEFORE the teardown transaction and used only for their drops.
         //
-        // It cannot move inside. `list_table_uuids_for_branch` plans through
-        // `QueryManager::plan`, which reads the catalog-wide metadata parents BY
-        // NAME — so running it in the transaction takes `ACCESS SHARE` on every
-        // one of them, which is precisely what
-        // `lock_branch_teardown_partitions` is built to avoid: it stalls plans on
-        // every branch in the catalog while this cold-capable read waits on
-        // object storage, and it sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
-        // upgrade at the drops that deadlocks two concurrent teardowns of
-        // DIFFERENT branches. Partition-scoping the enumerations bought exactly
-        // that property; planning inside the lock gives it back.
+        // It cannot move inside, and since CHA-546 the reason is duration
+        // rather than lock footprint. `list_table_uuids_for_branch` resolves
+        // `sys_tables` through the full read path, which names only this
+        // branch's partitions — so it would take no parent lock. What it does
+        // take is unbounded time: it is a cold-capable read that waits on
+        // object storage. Inside the transaction that wait runs while this
+        // branch's 14 leaves are held EXCLUSIVE, under the same 5s
+        // `lock_timeout` the lock step sets — so a cold miss does not slow
+        // teardown down, it fails it.
         //
         // The cost is a real leak, stated plainly rather than filed under
         // "best effort": a `CreateTable` committing between this read and the
@@ -1124,8 +1123,8 @@ impl WriteManager {
         // delete-set consequence — but they are permanent.
         //
         // Pre-existing, not introduced here: `main` resolves this list the same
-        // way. Closing it needs a branch-scoped table enumeration that does not
-        // plan through the parents, which does not exist today — the hot data
+        // way. Closing it needs a branch-scoped table enumeration that cannot
+        // reach object storage, which does not exist today — the hot data
         // relations are named `hash(table_uuid, branch_uuid)`, so they cannot be
         // recovered from `pg_class` by branch either. Needs its own ticket.
         let table_uuid_strs = self
