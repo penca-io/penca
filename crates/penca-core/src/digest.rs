@@ -1,6 +1,13 @@
 //! Content digest of a decoded cold segment (CHA-545).
 
-use arrow::array::RecordBatch;
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, BinaryViewArray, FixedSizeListArray, GenericListArray, LargeListArray,
+    ListArray, OffsetSizeTrait, RecordBatch, StringViewArray,
+};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, FieldRef};
 use arrow::error::ArrowError;
 use arrow::ipc::MetadataVersion;
 use arrow::ipc::writer::{DictionaryHandling, IpcWriteOptions, StreamWriter};
@@ -36,28 +43,16 @@ const IPC_ALIGNMENT: usize = 8;
 /// reuse as a possible future use of this digest; that use requires
 /// establishing round-trip stability first, and this function does not.
 ///
-/// **Slice-invariant except for view-encoded columns.** A batch from `slice()`
-/// stays a view onto its parent's buffers, which physically hold bytes outside
-/// the slice, but the IPC writer encodes only the logical range. Measured on
-/// arrow-rs 57.3 across the supported set (see [`crate::types`]): primitives,
-/// decimals, dates/times/timestamps, `Boolean` at a non-byte-aligned offset,
-/// `Utf8`/`LargeUtf8`/`Binary`, and `List`/`LargeList`/`FixedSizeList` all hold.
-///
-/// `Utf8View`/`BinaryView` do not, top-level or as a list child: the writer
-/// truncates the *views* buffer but emits each variadic data buffer whole, so a
-/// slice carries bytes belonging to rows it does not cover. The condition is a
-/// property of the parent array, not of the sliced rows — a single value above
-/// the 12-byte inline threshold anywhere in the parent gives the array data
-/// buffers, and every slice of it then carries them in full. Invariance holds
-/// only when *no* value in the parent is longer than that. `Dictionary` fails
-/// the same way under `DictionaryHandling::Resend` but is rejected at the type
-/// boundary and cannot reach here.
-///
-/// Neither costs correctness, and neither costs the dedup this digest exists
-/// for: a reference copy *inherits* the stored hash rather than recomputing it,
-/// so fork and copy sharing is unaffected. What is lost is dedup between two
-/// segments written independently whose identical rows happened to be sliced out
-/// of differently-shaped parent batches.
+/// **Slice-invariant.** A batch from `slice()` stays a view onto its parent's
+/// buffers, which physically hold bytes outside the slice, but the IPC writer
+/// encodes only the logical range. Measured on arrow-rs 57.3 across the
+/// supported set (see [`crate::types`]): primitives, decimals,
+/// dates/times/timestamps, `Boolean` at a non-byte-aligned offset,
+/// `Utf8`/`LargeUtf8`/`Binary`, and `List`/`LargeList`/`FixedSizeList` all hold
+/// unaided. `Utf8View`/`BinaryView` do not, and [`compact_view_buffers`] below
+/// is what makes them. `Dictionary` fails the same way under
+/// `DictionaryHandling::Resend` but is rejected at the type boundary and cannot
+/// reach here.
 ///
 /// Changing the IPC options or the hash changes every future digest. That is
 /// safe — stored digests are opaque identity, never recomputed and compared
@@ -69,13 +64,121 @@ pub fn segment_content_hash(batch: &RecordBatch) -> Result<Uuid, ArrowError> {
         // today, and a future flip to `Delta` would make a batch's digest
         // depend on what the writer had already emitted.
         .with_dictionary_handling(DictionaryHandling::Resend);
+    let compacted = compact_view_buffers(batch)?;
     let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new_with_options(&mut bytes, &batch.schema(), options)?;
-    writer.write(batch)?;
+    let mut writer = StreamWriter::try_new_with_options(&mut bytes, &compacted.schema(), options)?;
+    writer.write(&compacted)?;
     writer.finish()?;
     drop(writer);
 
     Ok(Uuid::from_u128(xxh3_128(&bytes)))
+}
+
+/// Rebuild every byte-view column so its data buffers hold only the rows the
+/// batch covers.
+///
+/// The IPC writer truncates each buffer it can, with one exception: for
+/// `Utf8View`/`BinaryView` it emits every variadic data buffer **whole**, since
+/// proving no surviving view still points into a pruned buffer is expensive
+/// (arrow-ipc 57.3 `writer::write_array_data` says so and points at `gc`). A
+/// digest of a slice would otherwise encode the whole parent's string payload,
+/// and both `compact` and the snapshot packer take one digest per slice of a
+/// single `concat_batches` result — so a wave of `N` inputs would re-serialize
+/// every input's bytes `N` times, on exactly the many-small-segments workload
+/// compaction exists for.
+///
+/// Compacting first bounds each digest to its own rows. It also makes the
+/// digest *canonical* for these types rather than merely cheaper: `gc` lays the
+/// referenced bytes out in row order in buffers sized by the values alone, so
+/// two arrays holding the same values agree even when their parents laid those
+/// values out differently — which is the dedup this digest exists for.
+///
+/// [`CanonicalType`](crate::types::CanonicalType) admits a view at the top level
+/// or as the child of a single-level list, and rejects nesting below that, so
+/// one level of descent is total over the supported set.
+fn compact_view_buffers(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+    if !batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| holds_byte_view(f.data_type()))
+    {
+        return Ok(batch.clone());
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .map(compact_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    // `try_new` re-validates against the schema, which is what catches a
+    // compaction that changed a length or a type rather than just a layout.
+    RecordBatch::try_new(batch.schema(), columns)
+}
+
+/// Whether a column of this type carries variadic data buffers the IPC writer
+/// would emit whole.
+fn holds_byte_view(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
+            matches!(child.data_type(), DataType::Utf8View | DataType::BinaryView)
+        }
+        _ => false,
+    }
+}
+
+fn compact_column(array: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    match array.data_type() {
+        DataType::Utf8View => Ok(Arc::new(downcast::<StringViewArray>(array)?.gc())),
+        DataType::BinaryView => Ok(Arc::new(downcast::<BinaryViewArray>(array)?.gc())),
+        DataType::List(child) if holds_byte_view(array.data_type()) => {
+            compact_list(downcast::<ListArray>(array)?, child)
+        }
+        DataType::LargeList(child) if holds_byte_view(array.data_type()) => {
+            compact_list(downcast::<LargeListArray>(array)?, child)
+        }
+        DataType::FixedSizeList(child, size) if holds_byte_view(array.data_type()) => {
+            // Unlike the offset flavours, `FixedSizeListArray::slice` slices its
+            // child too, so `values()` is already this array's own range.
+            let list = downcast::<FixedSizeListArray>(array)?;
+            Ok(Arc::new(FixedSizeListArray::try_new(
+                child.clone(),
+                *size,
+                compact_column(list.values())?,
+                list.nulls().cloned(),
+            )?))
+        }
+        _ => Ok(Arc::clone(array)),
+    }
+}
+
+/// `GenericListArray::slice` keeps the whole child and slices only the offsets,
+/// so compacting the child as-is would compact rows this list does not cover.
+/// Narrow it to the range the offsets span, then rebase them onto it.
+fn compact_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    child: &FieldRef,
+) -> Result<ArrayRef, ArrowError> {
+    let offsets = list.offsets();
+    let start = offsets[0].as_usize();
+    let end = offsets[list.len()].as_usize();
+    let values = compact_column(&list.values().slice(start, end - start))?;
+    let rebased: Vec<O> = offsets.iter().map(|o| *o - offsets[0]).collect();
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        child.clone(),
+        OffsetBuffer::new(rebased.into()),
+        values,
+        list.nulls().cloned(),
+    )?))
+}
+
+fn downcast<A: Array + 'static>(array: &ArrayRef) -> Result<&A, ArrowError> {
+    array.as_any().downcast_ref::<A>().ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "{} column is not the array kind its type declares",
+            array.data_type()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -250,7 +353,7 @@ mod tests {
         );
     }
 
-    /// The nested twin, and the reason `segment_content_hash` needs no
+    /// The nested twin, and the reason a `List` of a non-view child needs no
     /// compaction step. Slicing a `List` rebases the offsets buffer but leaves
     /// the *child* array whole — the guard below pins that it still holds all
     /// four rows' values, shared with the parent — and the IPC writer still
@@ -291,45 +394,110 @@ mod tests {
         );
     }
 
-    /// The one exception in the contract above, pinned so the contract cannot go
-    /// stale: arrow-rs 57.3 truncates a view array's *views* buffer on slice but
-    /// emits each variadic data buffer whole.
-    ///
-    /// A failure here means arrow started compacting those buffers — delete this
-    /// test and the exception paragraph it guards.
-    #[test]
-    fn sliced_view_column_is_the_documented_non_invariant_case() {
-        let view = |v: Vec<&str>| {
-            batch(
-                vec![Field::new("s", DataType::Utf8View, true)],
-                vec![Arc::new(StringViewArray::from(v))],
-            )
-        };
-        // Above the 12-byte inline threshold, so the values live in a data
-        // buffer rather than in the view word itself.
-        let long = [
-            "aaaaaaaaaaaaaaaaaaaa",
-            "bbbbbbbbbbbbbbbbbbbb",
-            "cccccccccccccccccccc",
-        ];
+    /// Above the 12-byte inline threshold, so the values live in a data buffer
+    /// rather than in the view word itself — which is the only case where a
+    /// view array has variadic buffers to carry.
+    const LONG: [&str; 3] = [
+        "aaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccc",
+    ];
 
-        assert_ne!(
-            hash(&view(long.to_vec()).slice(1, 2)),
-            hash(&view(vec![long[1], long[2]])),
-            "arrow now truncates variadic data buffers — update the contract above"
+    fn views(v: Vec<&str>) -> RecordBatch {
+        batch(
+            vec![Field::new("s", DataType::Utf8View, true)],
+            vec![Arc::new(StringViewArray::from(v))],
+        )
+    }
+
+    /// The type the IPC writer will *not* truncate: it emits each variadic data
+    /// buffer whole rather than prove no surviving view still points into a
+    /// pruned one, so a slice's encoding would otherwise carry bytes belonging
+    /// to rows it does not cover. [`compact_view_buffers`] is what closes that,
+    /// so the fixture guard asserting the slice really does still share the
+    /// parent's data buffer is what makes the equality below non-trivial.
+    #[test]
+    fn sliced_view_column_hashes_equal_to_an_independently_built_batch() {
+        let parent = views(LONG.to_vec());
+        let sliced = parent.slice(1, 2);
+
+        assert_eq!(
+            parent.column(0).to_data().buffers()[1].as_ptr(),
+            sliced.column(0).to_data().buffers()[1].as_ptr(),
+            "fixture must still share the parent's data buffer, or this proves nothing"
         );
         assert_eq!(
-            hash(&view(vec!["aa", "bb", "cc"]).slice(1, 2)),
-            hash(&view(vec!["bb", "cc"])),
-            "an all-inline parent has no data buffer at all, so it stays invariant"
+            hash(&sliced),
+            hash(&views(vec![LONG[1], LONG[2]])),
+            "a sliced view column hashes as its own logical rows"
         );
-        // The narrow reading of the line above — "short rows are invariant" —
-        // is false: one long value anywhere in the parent gives the array a
-        // data buffer, and a slice of only short rows still carries it.
-        assert_ne!(
-            hash(&view(vec!["aa", "bb", &long[0]]).slice(0, 2)),
-            hash(&view(vec!["aa", "bb"])),
-            "the exception is a property of the parent array, not of the sliced rows"
+        // One long value anywhere in the parent gives the array a data buffer,
+        // so a slice of only *short* rows carries it too — compaction has to be
+        // driven by the parent's layout, not by the sliced rows' lengths.
+        assert_eq!(
+            hash(&views(vec!["aa", "bb", LONG[0]]).slice(0, 2)),
+            hash(&views(vec!["aa", "bb"])),
+            "an all-inline slice of a buffer-carrying parent is invariant too"
+        );
+    }
+
+    /// Independently written segments holding the same rows must agree even when
+    /// their parents laid the bytes out differently — that agreement *is* the
+    /// dedup. Views make this a real risk rather than a tautology: the same
+    /// values reached through different builders can sit at different buffer
+    /// offsets, which `gc` normalizes away.
+    #[test]
+    fn view_column_hashes_equal_across_differently_laid_out_parents() {
+        assert_eq!(
+            hash(&views(vec![LONG[0], LONG[1]])),
+            hash(&views(vec![LONG[2], LONG[0], LONG[1]]).slice(1, 2)),
+            "same values, different parent layout, one hash"
+        );
+    }
+
+    /// The nested case. [`crate::types::CanonicalType`] admits a view as the
+    /// child of a single-level list, where slicing leaves *both* the child array
+    /// and its data buffers whole — so the compaction has to narrow the child to
+    /// the offsets' range before it can help.
+    #[test]
+    fn sliced_list_of_view_column_hashes_equal_to_an_independently_built_batch() {
+        fn list_of_views(rows: Vec<Vec<&str>>) -> RecordBatch {
+            let child = Arc::new(Field::new("item", DataType::Utf8View, true));
+            let mut values: Vec<&str> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            for row in &rows {
+                values.extend(row.iter().copied());
+                offsets.push(values.len() as i32);
+            }
+            let arr = ListArray::try_new(
+                Arc::clone(&child),
+                OffsetBuffer::new(offsets.into()),
+                Arc::new(StringViewArray::from(values)),
+                None,
+            )
+            .expect("valid fixture");
+            batch(
+                vec![Field::new("l", DataType::List(child), true)],
+                vec![Arc::new(arr)],
+            )
+        }
+
+        let parent = list_of_views(vec![
+            vec![LONG[0]],
+            vec![LONG[1], LONG[2]],
+            vec![LONG[0], LONG[2]],
+        ]);
+        let sliced = parent.slice(1, 1);
+
+        assert_eq!(
+            sliced.column(0).to_data().child_data()[0].len(),
+            parent.column(0).to_data().child_data()[0].len(),
+            "fixture must keep the parent's whole child array, or this proves nothing"
+        );
+        assert_eq!(
+            hash(&sliced),
+            hash(&list_of_views(vec![vec![LONG[1], LONG[2]]])),
+            "a sliced list-of-view column hashes as its own logical rows"
         );
     }
 }
