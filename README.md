@@ -18,11 +18,10 @@
 > rough edges, and read [Current shortcomings](#current-shortcomings) before you plan
 > anything around it: much of the [roadmap](#roadmap) is still ahead of us.
 
-Penca is a database that serves transactional and analytical queries from one copy of your
-data, stored as open columnar files on object storage. Unlike a split OLTP/OLAP stack there
-is no second system and no CDC pipeline between them: the files an analytical query reads
-are the files production wrote. The trade-off is that a single-row transaction costs more
-than it would on a local-disk row store.
+Penca serves transactional and analytical queries from one copy of your data, stored as open
+columnar files on object storage: the files an analytical query reads are the files
+production wrote, so there is no second system and no CDC pipeline between them. The
+trade-off is that a single-row transaction costs more than on a local-disk row store.
 
 To keep transactional latency workable, writes land in an internal Postgres hot tier under a
 real ACID transaction. A background pipeline persists, snapshots and purges them out to
@@ -36,9 +35,6 @@ for recovery on the [roadmap](#roadmap).
 A branch is a full read-write copy that copies no rows, so forking production is cheap
 enough to do per experiment. Every mutation appends to an immutable log carrying an author
 and a timestamp, so any state is auditable and readable as of an earlier commit.
-
-See [docs/architecture.md](docs/architecture.md) for the full design, and
-[Current shortcomings](#current-shortcomings) for where the edges are.
 
 ## See it work
 
@@ -78,12 +74,11 @@ set -a && source docker/.client.env      # PENCA_*_URL, for the demo below
 uv run python examples/sandbox_demo.py   # the branching demo above
 ```
 
-That is a stock Arrow Flight SQL driver talking to port 50060. No Penca client, no
-custom protocol, and `greetings` lands in the default catalog and schema so there is
-nothing to create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way.
-`autocommit=True` is load-bearing: DB-API defaults it to `False`, which opens a
-transaction that nothing ever commits, so the writes would be discarded when the
-connection closes.
+That is a stock Arrow Flight SQL driver talking to port 50060: no Penca client, no custom
+protocol, and `greetings` lands in the default catalog and schema, so there is nothing to
+create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way. `autocommit=True` is
+load-bearing: DB-API defaults it to `False`, so nothing commits and the writes are discarded
+on close.
 
 The shipped Python client wraps that surface plus the gRPC one, which is what the
 branching, audit and time-travel calls use; see [docs/usage.md](docs/usage.md).
@@ -184,18 +179,17 @@ invariants in [docs/algorithms.md](docs/algorithms.md).
   files, but nothing registers them yet with an Iceberg REST catalog.
 - **Arrow Flight SQL is the only SQL wire.** No pgwire gateway, so Postgres clients and
   drivers cannot connect unmodified.
-- **No full-text search and no vector indexes.** Secondary indexes are currently equality seeks only.
+- **No full-text search and no vector indexes.** Secondary indexes are equality seeks only.
 
 ## Roadmap
 
-Everything above is the roadmap, in roughly that order. The shortcomings section is a plan
-stated plainly rather than a list of regrets. Beyond it: bulk load that bypasses the hot
-tier, so you can ingest existing data-lake files at full speed, and adopting an Iceberg
-table in place with no migration. Retention gains the pruning half it is missing and the
-scheduler gains leader election. A structured predicate on the read wire kills the
-SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog
-metadata gets checkpointed to object storage and reloaded into Postgres at startup, still
-served from Postgres in steady state but recoverable from the object store alone.
+Everything above is the roadmap, in roughly that order. Beyond it: bulk load that bypasses
+the hot tier, so you can ingest existing data-lake files at full speed, and adopting an
+Iceberg table in place with no migration. Retention gains the pruning half it is missing and
+the scheduler gains leader election. A structured predicate on the read wire kills the
+SQL-string double parse, with aggregate / limit / TopN pushed into the scan. Catalog metadata
+gets checkpointed to object storage and reloaded into Postgres at startup, still served from
+Postgres in steady state but recoverable from the object store alone.
 
 ## Documentation
 
