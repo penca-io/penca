@@ -357,12 +357,9 @@ where
     LifecycleManager::commit_compact_segment(&tx, &catalog_str, &branch_str, &merged_uri).await?;
 
     // Delete-set LAST, per the ordering invariant on
-    // `insert_segment_delete_set_rows`. This tx already holds a lock on the
-    // segment-metadata parent — its very first statement is
-    // `enumerate_unsealed_segments`, a `SELECT ... FOR UPDATE OF seg` against the
-    // catalog-wide parent — and the defer set is derived from that read, so
-    // compact cannot take a delete-set row lock before a parent lock even in
-    // principle. That is what fixes the global order for every other writer.
+    // `insert_segment_delete_set_rows`. Since CHA-546 every statement above
+    // names this branch's partitions, so the tx holds no segment-metadata parent
+    // lock and the invariant costs this path nothing.
     //
     // Still inside `tx`, which is what ADR 0019 §"Four-part mechanism" item 3
     // requires: the row must commit atomically with the URI swap.

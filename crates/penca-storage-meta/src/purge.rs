@@ -37,7 +37,8 @@ impl LifecycleManager {
         last_purged_aborted_seq_num: Option<i64>,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_purge_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_purge_metadata_partition(&catalog, &branch);
         let sql = format!(
             "INSERT INTO {table} \
              (table_purge_uuid, branch_uuid, table_uuid, \
@@ -75,7 +76,8 @@ impl LifecycleManager {
         table_purge_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_purge_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_purge_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_purge_uuid = $2",
@@ -104,7 +106,8 @@ impl LifecycleManager {
         table_purge_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_purge_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_purge_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_purge_uuid = $2 \
@@ -180,7 +183,8 @@ impl LifecycleManager {
         col: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_purge_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_purge_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX({col}) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \
@@ -231,7 +235,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(commit_seq_num) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \

@@ -1241,12 +1241,13 @@ impl WriteManager {
                 LifecycleManager::drop_branch_partitions(tx, catalog_str, branch_str).await?;
 
                 // Delete-set LAST, after the partition drops, per the ordering
-                // invariant on `insert_segment_delete_set_rows`. Dropping a
-                // partition takes ACCESS EXCLUSIVE on the catalog-wide parent; a
-                // concurrent compact holds ROW SHARE on that same parent from its
-                // opening `SELECT ... FOR UPDATE` and cannot release it, so
-                // teardown must not be holding a delete-set row while it waits
-                // for the parent. Still one transaction, so removing the
+                // invariant on `insert_segment_delete_set_rows`. Teardown is the
+                // one writer still subject to it: dropping a partition takes
+                // ACCESS EXCLUSIVE on the catalog-wide parent, and the sweep's
+                // refcount gate holds AccessShare on that same parent — CHA-531
+                // keeps those probes catalog-wide — while it locks delete-set
+                // rows. So teardown must not be holding a delete-set row while it
+                // waits for the parent. Still one transaction, so removing the
                 // references and queueing the files remain one atomic fact.
                 LifecycleManager::insert_segment_delete_set_rows(tx, catalog_str, &queued_uris)
                     .await?;
