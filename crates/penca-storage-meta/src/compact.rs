@@ -53,7 +53,8 @@ impl LifecycleManager {
         object_uri: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::compact_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::compact_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "INSERT INTO {table} \
                 (object_uri, branch_uuid, table_uuid, commit_micros) \
@@ -65,7 +66,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::Text(object_uri.to_string()),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                 ],
             )
@@ -89,7 +90,8 @@ impl LifecycleManager {
         object_uri: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::compact_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::compact_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND object_uri = $2",
@@ -100,7 +102,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::Text(object_uri.to_string()),
                 ],
             )
@@ -132,7 +134,8 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let arr = format_sql_uuid_array(segment_uuids);
         let sql = format!(
             "UPDATE {table} SET is_sealed = TRUE \
@@ -141,7 +144,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -168,7 +171,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -217,28 +220,43 @@ impl LifecycleManager {
     /// same with its segment-row deletes).
     ///
     /// **Lock-ordering invariant — call this LAST, after every
-    /// segment-metadata parent the transaction touches.** Three writers
-    /// mutate both this table and those parents: the compact merge
-    /// (`lifecycle::compact`), snapshot retirement (`lifecycle::retire`),
-    /// and branch teardown (`write::delete_branch`). A writer holding a
-    /// delete-set row while it waits for a parent lock deadlocks against
-    /// one holding that parent while it waits for the row, and PG breaks
-    /// the cycle by aborting a side — a nondeterministic user-visible
-    /// failure or a killed lifecycle wave. A URI shared across a fork
-    /// edge makes it reachable with no misuse, since carry-forward and
-    /// the CHA-539 fork copy both leave one file referenced from several
-    /// branches.
+    /// segment-metadata parent the transaction touches.** Since CHA-546
+    /// made every branch-scoped statement name its partition, branch
+    /// teardown (`write::delete_branch`) is the only writer left that can
+    /// CONFLICT on a parent: `DROP TABLE` on a leaf needs `ACCESS
+    /// EXCLUSIVE` on the parent to rewrite its partition descriptor, and
+    /// teardown enqueues here in the same transaction.
     ///
-    /// The direction is forced, not chosen. `compact_one_scope`'s FIRST
-    /// statement is `enumerate_unsealed_segments` — a
-    /// `SELECT ... FOR UPDATE OF seg` against the catalog-wide
-    /// `table_persist_segment_metadata` parent, taking `ROW SHARE` held
-    /// to commit — and the URIs it defers are derived from that read. So
-    /// compact cannot reach a delete-set row before a parent lock even in
-    /// principle, and `ROW SHARE` conflicts with the `ACCESS EXCLUSIVE`
-    /// that teardown's `DROP PARTITION` needs on the same parent.
-    /// Parent-locks-first is therefore the only order all three can
-    /// honor; the other two conform to compact.
+    /// The other two callers clear the invariant for different reasons,
+    /// and the difference is worth keeping straight. Naming a leaf
+    /// removes the parent lock outright for `SELECT`, `SELECT ... FOR
+    /// UPDATE` and `DELETE`, but an `INSERT` or `UPDATE` evaluates the
+    /// leaf's partition constraint, which opens the parent for its
+    /// partition key and leaves `AccessShare` held to commit (measured;
+    /// see the table in
+    /// `tests/integration/integration_cha546_partition_lock_footprint_test.py`).
+    /// So the compact merge (`lifecycle::compact`) does hold a parent
+    /// `AccessShare` — a harmless one, since it cannot conflict with the
+    /// `AccessShare` the sweep's gate takes. Snapshot retirement
+    /// (`lifecycle::retire`) issues only leaf `SELECT`s and `DELETE`s
+    /// before arriving here, so it holds no parent lock at all. Don't
+    /// collapse the two into "they touch no parent": that is true of
+    /// retire and false of compact, and a future reader who believed it
+    /// of both might drop the rule.
+    ///
+    /// The direction is forced, not chosen. CHA-531's refcount gate
+    /// ([`Self::eligible_segment_delete_set_rows`],
+    /// [`Self::reap_referenced_segment_delete_set_rows`]) probes those
+    /// three parents catalog-wide — deliberately, since carry-forward
+    /// crosses fork edges — in the same statements that read and delete
+    /// these rows, and a statement takes its table locks before any row
+    /// lock. Parents-first is therefore a property of the sweep's
+    /// statements rather than a choice it makes, and teardown is the side
+    /// that conforms. Reversed, teardown's `ON CONFLICT` grace refresh
+    /// would hold a delete-set row — one a fork-shared URI makes likely
+    /// to already exist — while waiting for a parent the sweep holds, and
+    /// PG would break the cycle by aborting a side: a nondeterministic
+    /// user-visible failure or a killed lifecycle wave.
     ///
     /// Position within the transaction is free as far as ADR 0019
     /// §"Four-part mechanism" item 3 is concerned: it requires these rows
@@ -389,6 +407,12 @@ impl LifecycleManager {
     /// One source for WHICH tables, because that half must never drift: if a
     /// fourth referencing table were added to the gate but not to the reaper, the
     /// reaper would drop delete-set rows for URIs that table still references.
+    ///
+    /// All three names must be the catalog-wide PARENTS — the one place CHA-546's
+    /// partition-direct rule deliberately does not apply, for the reason spelled
+    /// out on [`Self::eligible_segment_delete_set_rows`]. A partition here would
+    /// narrow the refcount to a single branch and collect files a sibling still
+    /// reads.
     ///
     /// `committed_only` is where the two callers deliberately differ, and the
     /// asymmetry is load-bearing in both directions:

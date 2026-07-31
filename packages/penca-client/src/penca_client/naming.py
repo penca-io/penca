@@ -44,7 +44,8 @@ per-catalog identity:
   without state. See :func:`system_schema_uuid`,
   :func:`system_schemas_table_uuid`,
   :func:`system_tables_table_uuid`.
-- **Per-branch partition leaves**: the tx-log family. Each leaf's
+- **Per-branch partition leaves**: the tx-log family and the metadata
+  family (CHA-546 made both resolve by leaf name). Each leaf's
   ``partition_uuid`` derives directly from
   ``(catalog_uuid, branch_uuid, partition_tag)``, where
   ``partition_tag`` is the fixed PG-name suffix (e.g. ``"commit_tx_log"``).
@@ -220,6 +221,22 @@ def tx_table_log_partition(catalog_uuid: str, branch_uuid: str) -> str:
     """Partition of tx_table_log for a specific branch (CHA-181)."""
     partition_uuid = row_uuid_for_pk(catalog_uuid, [branch_uuid, "tx_table_log"])
     return f"{partition_uuid}_tx_table_log_partition"
+
+
+def table_snapshot_segment_metadata_partition(
+    catalog_uuid: str, branch_uuid: str
+) -> str:
+    """Partition of table_snapshot_segment_metadata for a branch (CHA-546).
+
+    Same leaf shape as the tx-log family above. Tests that count PG
+    statements by relation name need this rather than the parent: since
+    CHA-546 the read path names the leaf, so a parent-name needle matches
+    nothing and an ``== 0`` assertion passes vacuously.
+    """
+    partition_uuid = row_uuid_for_pk(
+        catalog_uuid, [branch_uuid, TABLE_SNAPSHOT_SEGMENT_METADATA]
+    )
+    return f"{partition_uuid}_{TABLE_SNAPSHOT_SEGMENT_METADATA}_partition"
 
 
 def deterministic_uuid_from(*parts: str) -> str:

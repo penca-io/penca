@@ -44,7 +44,8 @@ impl LifecycleManager {
         commit_seq_num: Option<i64>,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "INSERT INTO {table} \
              (table_persist_uuid, branch_uuid, table_uuid, \
@@ -61,7 +62,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_persist_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(persisted_at_micros),
                     SqlValue::Text(log_kind.as_str().to_string()),
@@ -82,7 +83,8 @@ impl LifecycleManager {
         table_persist_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_persist_uuid = $2",
@@ -93,7 +95,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_uuid)?,
                 ],
             )
@@ -111,7 +113,8 @@ impl LifecycleManager {
         table_persist_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_persist_uuid = $2 \
@@ -122,7 +125,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_uuid)?,
                 ],
             )
@@ -146,7 +149,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(persisted_at_micros) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \
@@ -157,10 +161,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -194,7 +195,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(commit_seq_num) AS watermark FROM {table} \
              WHERE branch_uuid = $1 \
@@ -205,10 +207,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -265,8 +264,9 @@ impl LifecycleManager {
         // `latest_committed_table_persist_watermark` — lifecycle ops call that
         // without a floor, so overloading it would ripple.
         let catalog = parse_uuid(catalog_uuid);
-        let persist_name = naming::table_persist_metadata_table(&catalog);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let persist_name = naming::table_persist_metadata_partition(&catalog, &branch);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let window_start = crate::retention_window_start_expr("$3");
         let floor_select =
             crate::retention_floor_select(&qi(&snap_name), "$1", "$2", &window_start);
@@ -284,7 +284,7 @@ impl LifecycleManager {
             .execute_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(duration_seconds),
                 ],
@@ -334,7 +334,8 @@ impl LifecycleManager {
         statistics: &[u8],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         // min/max_commit_seq_num are stamped alongside the committed_at bounds
         // and, like them, are NOT refreshed by the DO UPDATE: compact re-points
         // storage location only and preserves the original commit-order bounds.
@@ -358,7 +359,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                     SqlValue::uuid_str(table_persist_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(chunk_idx as i64),
                     SqlValue::Int64(min_tx_commit_micros),
@@ -415,7 +416,8 @@ impl LifecycleManager {
         seal_now: bool,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let seal_clause = if seal_now { ", is_sealed = TRUE" } else { "" };
         let sql = format!(
             "UPDATE {table} SET \
@@ -439,7 +441,7 @@ impl LifecycleManager {
                     SqlValue::Int64(size_bytes),
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Bytes(statistics.to_vec()),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -458,7 +460,8 @@ impl LifecycleManager {
         size_bytes: i64,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET size_bytes = $1 \
              WHERE branch_uuid = $2 AND table_persist_segment_uuid = $3",
@@ -469,7 +472,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::Int64(size_bytes),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -487,7 +490,8 @@ impl LifecycleManager {
         table_persist_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_persist_segment_uuid = $2",
@@ -498,7 +502,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -516,7 +520,8 @@ impl LifecycleManager {
         table_persist_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_persist_segment_uuid = $2 \
@@ -527,7 +532,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -556,8 +561,9 @@ impl LifecycleManager {
         max_persisted_at_micros: Option<i64>,
     ) -> Result<Vec<(Uuid, LogKind)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT DISTINCT seg.table_uuid, tfm.log_kind \
              FROM {seg} seg \
@@ -570,7 +576,7 @@ impl LifecycleManager {
             seg = qi(&seg_table),
             tfm = qi(&tfm_table),
         );
-        let mut params: Vec<SqlValue> = vec![SqlValue::uuid_str(branch_uuid)?];
+        let mut params: Vec<SqlValue> = vec![SqlValue::Uuid(branch)];
         if let Some(min) = min_persisted_at_micros {
             params.push(SqlValue::Int64(min));
             sql.push_str(&format!(" AND seg.commit_micros >= ${}", params.len()));
@@ -619,8 +625,9 @@ impl LifecycleManager {
         max_persisted_at_micros: Option<i64>,
     ) -> Result<Vec<LogKind>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT DISTINCT tfm.log_kind \
              FROM {seg} seg \
@@ -634,10 +641,8 @@ impl LifecycleManager {
             seg = qi(&seg_table),
             tfm = qi(&tfm_table),
         );
-        let mut params: Vec<SqlValue> = vec![
-            SqlValue::uuid_str(branch_uuid)?,
-            SqlValue::uuid_str(table_uuid)?,
-        ];
+        let mut params: Vec<SqlValue> =
+            vec![SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?];
         if let Some(min) = min_persisted_at_micros {
             params.push(SqlValue::Int64(min));
             sql.push_str(&format!(" AND seg.commit_micros >= ${}", params.len()));
@@ -689,8 +694,9 @@ impl LifecycleManager {
         for_update: bool,
     ) -> Result<Vec<PgRow>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT seg.table_persist_segment_uuid, seg.table_persist_uuid, seg.object_uri, \
                     seg.\"offset\", seg.length, seg.format, seg.row_count, seg.size_bytes, \
@@ -709,7 +715,7 @@ impl LifecycleManager {
             tfm = qi(&tfm_table),
         );
         let mut params: Vec<SqlValue> = vec![
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::uuid_str(table_uuid)?,
             SqlValue::Text(log_kind.as_str().to_string()),
         ];
@@ -755,7 +761,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -783,7 +789,8 @@ impl LifecycleManager {
         table_uuids: &[&str],
     ) -> Result<Vec<(String, String)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         if table_uuids.is_empty() {
             return Ok(Vec::new());
         }
@@ -796,7 +803,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -821,7 +828,8 @@ impl LifecycleManager {
         table_persist_segment_uuids: &[String],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let segment_uuid_refs: Vec<&str> = table_persist_segment_uuids
             .iter()
             .map(String::as_str)
@@ -834,7 +842,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }

@@ -130,10 +130,19 @@ impl LifecycleManager {
         fork_commit_micros: i64,
         commit_micros: i64,
     ) -> Result<InheritedBaseline> {
-        let snap_meta = naming::table_snapshot_metadata_table(catalog);
-        let snap_seg = naming::table_snapshot_segment_metadata_table(catalog);
-        let idx_meta = naming::table_snapshot_index_metadata_table(catalog);
-        let idx_seg = naming::table_snapshot_segment_index_metadata_table(catalog);
+        // Every statement below spans the fork edge, so each table needs both
+        // sides named: rows are read from the parent's partition and written
+        // into the child's.
+        let parent = parse_uuid(parent_branch_uuid);
+        let snap_meta_child = naming::table_snapshot_metadata_partition(catalog, child);
+        let snap_meta_parent = naming::table_snapshot_metadata_partition(catalog, &parent);
+        let snap_seg_child = naming::table_snapshot_segment_metadata_partition(catalog, child);
+        let snap_seg_parent = naming::table_snapshot_segment_metadata_partition(catalog, &parent);
+        let idx_meta_child = naming::table_snapshot_index_metadata_partition(catalog, child);
+        let idx_meta_parent = naming::table_snapshot_index_metadata_partition(catalog, &parent);
+        let idx_seg_child = naming::table_snapshot_segment_index_metadata_partition(catalog, child);
+        let idx_seg_parent =
+            naming::table_snapshot_segment_index_metadata_partition(catalog, &parent);
 
         // Bounded on BOTH axes. Seq is the authority for the ceiling — a
         // same-micros higher-seq parent commit must not be inherited — and the
@@ -149,10 +158,10 @@ impl LifecycleManager {
                        AND snapshotted_at_micros <= $4 \
                      ORDER BY snapshotted_at_micros DESC, commit_seq_num DESC \
                      LIMIT 1",
-                    snap = qi(&snap_meta),
+                    snap = qi(&snap_meta_parent),
                 ),
                 &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(*table),
                     SqlValue::Int64(fork_commit_seq_num),
                     SqlValue::Int64(fork_commit_micros),
@@ -179,15 +188,16 @@ impl LifecycleManager {
                      SELECT $1, $2, old.table_uuid, old.snapshotted_at_micros, \
                             old.commit_seq_num, old.durable, old.partition_keys, \
                             old.clustering_keys, $5 \
-                     FROM {snap} old \
+                     FROM {snap_old} old \
                      WHERE old.branch_uuid = $3 AND old.table_snapshot_uuid = $4 \
                      ON CONFLICT (branch_uuid, table_snapshot_uuid) DO NOTHING",
-                    snap = qi(&snap_meta),
+                    snap = qi(&snap_meta_child),
+                    snap_old = qi(&snap_meta_parent),
                 ),
                 &[
                     SqlValue::Uuid(new_snap),
                     SqlValue::Uuid(*child),
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(parent_snap),
                     SqlValue::Int64(commit_micros),
                 ],
@@ -204,12 +214,9 @@ impl LifecycleManager {
                      WHERE branch_uuid = $1 AND table_snapshot_uuid = $2 \
                        AND commit_micros IS NOT NULL \
                      ORDER BY chunk_idx, \"offset\"",
-                    seg = qi(&snap_seg),
+                    seg = qi(&snap_seg_parent),
                 ),
-                &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
-                    SqlValue::Uuid(parent_snap),
-                ],
+                &[SqlValue::Uuid(parent), SqlValue::Uuid(parent_snap)],
             )
             .await?;
         let mut seg_map: Vec<(Uuid, Uuid, u32)> = Vec::with_capacity(segs.len());
@@ -250,13 +257,14 @@ impl LifecycleManager {
                          SELECT m.new_uuid, $1, $2, old.table_uuid, m.chunk_idx, old.object_uri, \
                                 old.\"offset\", old.length, old.size_bytes, old.format, \
                                 old.metadata, old.statistics, old.row_count, $4 \
-                         FROM {seg} old \
+                         FROM {seg_old} old \
                          JOIN unnest({new_arr}, {old_arr}, {chunk_arr}) \
                            AS m(new_uuid, old_uuid, chunk_idx) \
                            ON old.table_snapshot_segment_uuid = m.old_uuid \
                          WHERE old.branch_uuid = $3 \
                          ON CONFLICT (branch_uuid, table_snapshot_segment_uuid) DO NOTHING",
-                        seg = qi(&snap_seg),
+                        seg = qi(&snap_seg_child),
+                        seg_old = qi(&snap_seg_parent),
                         new_arr = format_sql_uuid_array(&new_refs),
                         old_arr = format_sql_uuid_array(&old_refs),
                         chunk_arr = chunk_arr,
@@ -264,7 +272,7 @@ impl LifecycleManager {
                     &[
                         SqlValue::Uuid(new_snap),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -279,12 +287,9 @@ impl LifecycleManager {
                     "SELECT table_snapshot_index_uuid, index_uuid FROM {idx} \
                      WHERE branch_uuid = $1 AND table_snapshot_uuid = $2 \
                        AND commit_micros IS NOT NULL",
-                    idx = qi(&idx_meta),
+                    idx = qi(&idx_meta_parent),
                 ),
-                &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
-                    SqlValue::Uuid(parent_snap),
-                ],
+                &[SqlValue::Uuid(parent), SqlValue::Uuid(parent_snap)],
             )
             .await?;
         let mut parent_map: Vec<(Uuid, Uuid, String)> = Vec::with_capacity(idx_parents.len());
@@ -309,19 +314,20 @@ impl LifecycleManager {
                          (table_snapshot_index_uuid, branch_uuid, table_snapshot_uuid, \
                           index_uuid, key_columns, commit_micros) \
                          SELECT m.new_parent, $1, $2, old.index_uuid, old.key_columns, $4 \
-                         FROM {idx} old \
+                         FROM {idx_old} old \
                          JOIN unnest({new_arr}, {old_arr}) AS m(new_parent, old_parent) \
                            ON old.table_snapshot_index_uuid = m.old_parent \
                          WHERE old.branch_uuid = $3 \
                          ON CONFLICT (branch_uuid, table_snapshot_index_uuid) DO NOTHING",
-                        idx = qi(&idx_meta),
+                        idx = qi(&idx_meta_child),
+                        idx_old = qi(&idx_meta_parent),
                         new_arr = format_sql_uuid_array(&new_refs),
                         old_arr = format_sql_uuid_array(&old_refs),
                     ),
                     &[
                         SqlValue::Uuid(*child),
                         SqlValue::Uuid(new_snap),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -367,14 +373,15 @@ impl LifecycleManager {
                          SELECT m.new_sidecar, $1, m.new_seg, m.new_parent, old.object_uri, \
                                 old.\"offset\", old.length, old.format, old.size_bytes, \
                                 old.statistics, $3 \
-                         FROM {sidecar} old \
+                         FROM {sidecar_old} old \
                          JOIN unnest({a1}, {a2}, {a3}, {a4}, {a5}) \
                            AS m(new_sidecar, new_seg, new_parent, old_seg, old_parent) \
                            ON old.segment_uuid = m.old_seg \
                           AND old.table_snapshot_index_uuid = m.old_parent \
                          WHERE old.branch_uuid = $2 AND old.commit_micros IS NOT NULL \
                          ON CONFLICT (branch_uuid, segment_index_uuid) DO NOTHING",
-                        sidecar = qi(&idx_seg),
+                        sidecar = qi(&idx_seg_child),
+                        sidecar_old = qi(&idx_seg_parent),
                         a1 = a(&sc_new),
                         a2 = a(&sc_new_seg),
                         a3 = a(&sc_new_parent),
@@ -383,7 +390,7 @@ impl LifecycleManager {
                     ),
                     &[
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -407,8 +414,12 @@ impl LifecycleManager {
         baseline_watermark: Option<i64>,
         commit_micros: i64,
     ) -> Result<()> {
-        let persist_meta = naming::table_persist_metadata_table(catalog);
-        let persist_seg = naming::table_persist_segment_metadata_table(catalog);
+        // Both sides named, as in `copy_inherited_snapshot`.
+        let parent = parse_uuid(parent_branch_uuid);
+        let persist_meta_child = naming::table_persist_metadata_partition(catalog, child);
+        let persist_meta_parent = naming::table_persist_metadata_partition(catalog, &parent);
+        let persist_seg_child = naming::table_persist_segment_metadata_partition(catalog, child);
+        let persist_seg_parent = naming::table_persist_segment_metadata_partition(catalog, &parent);
         // Headers from the baseline INCLUSIVE; segments only strictly above it.
         //
         // The inclusive header is load-bearing and easy to lose. The read plan's
@@ -452,10 +463,10 @@ impl LifecycleManager {
                        AND commit_micros IS NOT NULL \
                        AND persisted_at_micros >= $3 \
                      ORDER BY persisted_at_micros",
-                    meta = qi(&persist_meta),
+                    meta = qi(&persist_meta_parent),
                 ),
                 &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(*table),
                     SqlValue::Int64(header_from),
                 ],
@@ -500,10 +511,10 @@ impl LifecycleManager {
                                AND commit_micros IS NOT NULL \
                                AND min_commit_seq_num <= $3 \
                              ORDER BY chunk_idx",
-                            seg = qi(&persist_seg),
+                            seg = qi(&persist_seg_parent),
                         ),
                         &[
-                            SqlValue::uuid_str(parent_branch_uuid)?,
+                            SqlValue::Uuid(parent),
                             SqlValue::Uuid(old_header),
                             SqlValue::Int64(fork_commit_seq_num),
                         ],
@@ -547,15 +558,16 @@ impl LifecycleManager {
                           commit_seq_num, log_kind, commit_micros) \
                          SELECT $1, $2, old.table_uuid, old.persisted_at_micros, \
                                 LEAST(old.commit_seq_num, $5), old.log_kind, $6 \
-                         FROM {meta} old \
+                         FROM {meta_old} old \
                          WHERE old.branch_uuid = $3 AND old.table_persist_uuid = $4 \
                          ON CONFLICT (branch_uuid, table_persist_uuid) DO NOTHING",
-                        meta = qi(&persist_meta),
+                        meta = qi(&persist_meta_child),
+                        meta_old = qi(&persist_meta_parent),
                     ),
                     &[
                         SqlValue::Uuid(new_header),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Uuid(old_header),
                         SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(commit_micros),
@@ -606,19 +618,20 @@ impl LifecycleManager {
                                 old.object_uri, old.\"offset\", old.length, old.row_count, \
                                 old.format, old.size_bytes, old.metadata, old.statistics, \
                                 TRUE, $5 \
-                         FROM {seg} old \
+                         FROM {seg_old} old \
                          JOIN unnest({new_arr}, {old_arr}) AS m(new_uuid, old_uuid) \
                            ON old.table_persist_segment_uuid = m.old_uuid \
                          WHERE old.branch_uuid = $3 \
                          ON CONFLICT (branch_uuid, table_persist_segment_uuid) DO NOTHING",
-                        seg = qi(&persist_seg),
+                        seg = qi(&persist_seg_child),
+                        seg_old = qi(&persist_seg_parent),
                         new_arr = format_sql_uuid_array(&new_refs),
                         old_arr = format_sql_uuid_array(&old_refs),
                     ),
                     &[
                         SqlValue::Uuid(new_header),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(commit_micros),
                     ],

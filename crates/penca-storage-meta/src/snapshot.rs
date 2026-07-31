@@ -33,7 +33,8 @@ impl LifecycleManager {
         durable: bool,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         // `table_snapshot_uuid` is deterministic from
         // `(catalog, branch, table, snapshotted_at)`, so retries collapse via
         // `DO UPDATE`.
@@ -63,7 +64,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(snapshotted_at_micros),
                     SqlValue::TextArray(partition_keys.to_vec()),
@@ -89,7 +90,8 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT MAX(snapshotted_at_micros) AS last_durable FROM {table} \
              WHERE branch_uuid = $1 AND table_uuid = $2 \
@@ -99,10 +101,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows.first().and_then(|row| {
@@ -135,7 +134,8 @@ impl LifecycleManager {
         statistics: &[u8],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "INSERT INTO {table} \
              (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, table_uuid, \
@@ -156,7 +156,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(chunk_idx as i64),
                     SqlValue::Text(object_uri.to_string()),
@@ -182,7 +182,8 @@ impl LifecycleManager {
         size_bytes: i64,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET size_bytes = $1 \
              WHERE branch_uuid = $2 AND table_snapshot_segment_uuid = $3",
@@ -193,7 +194,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::Int64(size_bytes),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -211,7 +212,8 @@ impl LifecycleManager {
         table_snapshot_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_snapshot_segment_uuid = $2",
@@ -222,7 +224,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -240,7 +242,8 @@ impl LifecycleManager {
         table_snapshot_segment_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_snapshot_segment_uuid = $2 \
@@ -251,7 +254,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -269,7 +272,8 @@ impl LifecycleManager {
         table_snapshot_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "DELETE FROM {table} \
              WHERE branch_uuid = $1 AND table_snapshot_uuid = $2 \
@@ -280,7 +284,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_uuid)?,
                 ],
             )
@@ -298,7 +302,8 @@ impl LifecycleManager {
         table_snapshot_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "UPDATE {table} SET commit_micros = {epoch} \
              WHERE branch_uuid = $1 AND table_snapshot_uuid = $2",
@@ -309,7 +314,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_uuid)?,
                 ],
             )
@@ -338,7 +343,7 @@ impl LifecycleManager {
             seg_table = qi(&seg_name),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -361,8 +366,9 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Vec<(String, String)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_name = naming::table_snapshot_segment_metadata_table(&catalog);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_name = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT seg.table_snapshot_segment_uuid, seg.object_uri \
              FROM {seg_table} seg \
@@ -378,10 +384,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -416,8 +419,9 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<Vec<(String, String)>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg_name = naming::table_snapshot_segment_metadata_table(&catalog);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg_name = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = format!(
             "SELECT seg.table_snapshot_segment_uuid, seg.object_uri \
              FROM {seg_table} seg \
@@ -440,10 +444,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(table_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
-                ],
+                &[SqlValue::uuid_str(table_uuid)?, SqlValue::Uuid(branch)],
             )
             .await?;
         Ok(rows
@@ -469,7 +470,8 @@ impl LifecycleManager {
         table_snapshot_segment_uuids: &[String],
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let uuid_refs: Vec<&str> = table_snapshot_segment_uuids
             .iter()
             .map(String::as_str)
@@ -482,7 +484,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -542,7 +544,13 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        // The one two-branch statement in this module: rows are read from the
+        // source branch's partition and written into this branch's.
+        let branch = parse_uuid(branch_uuid);
+        let source_branch = parse_uuid(source_branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
+        let source_table =
+            naming::table_snapshot_segment_metadata_partition(&catalog, &source_branch);
 
         let new_uuids: Vec<&str> = specs.iter().map(|s| s.new_seg_uuid_str.as_str()).collect();
         let prior_uuids: Vec<&str> = specs
@@ -564,7 +572,7 @@ impl LifecycleManager {
                     old.size_bytes, old.format, old.metadata, old.statistics \
              FROM UNNEST({new_arr}, {idx_arr}, {prior_arr}) \
                   AS new(uuid, idx, old_uuid) \
-             JOIN {table} old \
+             JOIN {source_table} old \
                ON old.table_snapshot_segment_uuid = new.old_uuid \
               AND old.branch_uuid = $3 \
              ON CONFLICT (branch_uuid, table_snapshot_segment_uuid) DO UPDATE \
@@ -580,6 +588,7 @@ impl LifecycleManager {
                     statistics = EXCLUDED.statistics \
              RETURNING table_snapshot_segment_uuid",
             table = qi(&table),
+            source_table = qi(&source_table),
         );
         // RETURNING + a row-count check turns a non-joining prior uuid
         // (a stale/wrong spec, or a prior row retired between the read
@@ -592,8 +601,8 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(source_branch_uuid)?,
+                    SqlValue::Uuid(branch),
+                    SqlValue::Uuid(source_branch),
                 ],
             )
             .await?;
@@ -623,7 +632,8 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let uuid_refs: Vec<&str> = table_snapshot_segment_uuids
             .iter()
             .map(String::as_str)
@@ -637,7 +647,7 @@ impl LifecycleManager {
             epoch = epoch(),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -662,7 +672,8 @@ impl LifecycleManager {
             return Ok(());
         }
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         let uuid_refs: Vec<&str> = table_snapshot_segment_uuids
             .iter()
             .map(String::as_str)
@@ -676,7 +687,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -694,8 +705,9 @@ impl LifecycleManager {
         table_uuid: &str,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
-        let seg_name = naming::table_snapshot_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
+        let seg_name = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         // NOT EXISTS, not NOT IN: the segment table's
         // `table_snapshot_uuid` is nullable, and one NULL in a NOT IN
         // subquery NULLs the whole predicate — silently turning this
@@ -716,10 +728,7 @@ impl LifecycleManager {
         driver
             .execute_no_result_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(())
@@ -752,13 +761,14 @@ impl LifecycleManager {
         };
         let window_start = now_micros - duration_seconds * 1_000_000;
         let catalog = parse_uuid(catalog_uuid);
-        let table = naming::table_snapshot_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let table = naming::table_snapshot_metadata_partition(&catalog, &branch);
         let sql = retention_floor_select(&qi(&table), "$1", "$2", "$3");
         let rows = driver
             .execute_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(window_start),
                 ],

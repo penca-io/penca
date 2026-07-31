@@ -551,4 +551,17 @@ mod tests {
             "6830ca7e-5210-6616-91cf-34c0e0d7c612_tx_table_log_partition"
         );
     }
+
+    #[test]
+    fn test_parity_table_snapshot_segment_metadata_partition() {
+        // CHA-546: the first METADATA leaf a Python caller has to name.
+        // Integration tests count PG statements by relation name, so the
+        // client must compute byte-identical leaf names to the server —
+        // a mismatch makes a `== 0` statement-count assertion pass
+        // vacuously rather than fail. Golden mirrors the Python suite.
+        assert_eq!(
+            table_snapshot_segment_metadata_partition(&CAT, &BR),
+            "1a93a047-8229-c30f-2de8-08a4482c2051_table_snapshot_segment_metadata_partition"
+        );
+    }
 }

@@ -369,7 +369,8 @@ impl QueryManager {
         w_snap: i64,
     ) -> Result<(i64, bool)> {
         let catalog = parse_uuid(catalog_uuid);
-        let purge_table = naming::table_purge_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let purge_table = naming::table_purge_metadata_partition(&catalog, &branch);
         let sql = format!(
             "WITH fence AS (\
                  SELECT GREATEST(\
@@ -389,7 +390,7 @@ impl QueryManager {
             delete = qi(delete_table_name),
         );
         let params = vec![
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::uuid_str(table_uuid)?,
             SqlValue::Int64(w_snap),
         ];
@@ -435,9 +436,10 @@ impl QueryManager {
         Option<BranchLineage>,
     )> {
         let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
         let table = parse_meta_uuid(table_uuid, "table_uuid")?;
-        let persist_name = naming::table_persist_metadata_table(&catalog);
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
+        let persist_name = naming::table_persist_metadata_partition(&catalog, &branch);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
         // Fold the child's fork lineage into this already-per-read query (a
         // branch_store PK join) so a non-forked read pays no extra round-trip
         // for the base-source gate.
@@ -449,7 +451,7 @@ impl QueryManager {
         };
         let mut params: Vec<SqlValue> = vec![
             SqlValue::Uuid(table),
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::Int64(as_of_micros),
         ];
         if let Some(seq) = commit_seq_upper {
@@ -705,22 +707,22 @@ impl QueryManager {
         pinned_snapshot_uuid: Option<Uuid>,
     ) -> Result<SnapshotResult> {
         let catalog = parse_uuid(catalog_uuid);
+        let branch = parse_uuid(branch_uuid);
         // Parse fallibly (unlike the panicking `parse_uuid` above): a malformed
         // `table_uuid` surfaces as the same typed protocol error the
         // `meta_resolve` getters produce.
         let table = parse_meta_uuid(table_uuid, "table_uuid")?;
-        let snap_name = naming::table_snapshot_metadata_table(&catalog);
-        let seg_name = naming::table_snapshot_segment_metadata_table(&catalog);
+        let snap_name = naming::table_snapshot_metadata_partition(&catalog, &branch);
+        let seg_name = naming::table_snapshot_segment_metadata_partition(&catalog, &branch);
         // The internal row_uuid index parent/child, joined in below so a
         // planned snapshot segment carries its sidecar inline.
-        let idx_parent = naming::table_snapshot_index_metadata_table(&catalog);
-        let idx_child = naming::table_snapshot_segment_index_metadata_table(&catalog);
+        let idx_parent = naming::table_snapshot_index_metadata_partition(&catalog, &branch);
+        let idx_child = naming::table_snapshot_segment_index_metadata_partition(&catalog, &branch);
         // Params `$1` = table, `$2` = branch (fixed in the JOINs / WHERE); the
         // rest are bound in push order below, each `$N` computed from
         // `params.len()`, so the pinned-uuid and as_of/seq picks share one
         // numbering scheme.
-        let mut params: Vec<SqlValue> =
-            vec![SqlValue::Uuid(table), SqlValue::uuid_str(branch_uuid)?];
+        let mut params: Vec<SqlValue> = vec![SqlValue::Uuid(table), SqlValue::Uuid(branch)];
         let snapshot_selection = if let Some(uuid) = pinned_snapshot_uuid {
             params.push(SqlValue::Uuid(uuid));
             format!("snap.table_snapshot_uuid = ${}", params.len())
@@ -1027,7 +1029,8 @@ impl QueryManager {
         fork_commit_seq_num: i64,
     ) -> Result<Option<i64>> {
         let catalog = parse_uuid(catalog_uuid);
-        let seg = naming::table_persist_segment_metadata_table(&catalog);
+        let branch = parse_uuid(branch_uuid);
+        let seg = naming::table_persist_segment_metadata_partition(&catalog, &branch);
         let rows = driver
             .execute_params(
                 &format!(
@@ -1038,7 +1041,7 @@ impl QueryManager {
                     seg = qi(&seg),
                 ),
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(fork_commit_seq_num),
                 ],
@@ -1248,8 +1251,15 @@ impl QueryManager {
         //   `commit_seq_num` already exceeds the cutoff. Composes with the
         //   committed_at tier fence; absent for the micros / OpenTx axes
         //   (`commit_seq_upper = None`).
-        let seg_table = naming::table_persist_segment_metadata_table(catalog_uuid);
-        let tfm_table = naming::table_persist_metadata_table(catalog_uuid);
+        //
+        // Both relations are named as the `branch_uuid` ARGUMENT's partitions,
+        // never an ambient current-branch value: `enumerate_base_cold_source`
+        // calls this with a fork's PARENT branch to resolve inherited cold,
+        // while the ordinary read path calls it with the reading branch. Taking
+        // the name from anywhere else compiles and silently reads the wrong
+        // branch's segments.
+        let seg_table = naming::table_persist_segment_metadata_partition(catalog_uuid, branch_uuid);
+        let tfm_table = naming::table_persist_metadata_partition(catalog_uuid, branch_uuid);
         let mut log_sql = format!(
             "SELECT tfm.log_kind, \
                     seg.table_persist_segment_uuid AS segment_uuid, \
@@ -1370,8 +1380,8 @@ impl QueryManager {
         let catalog = parse_uuid(catalog_uuid);
         let branch = parse_uuid(branch_uuid);
         let table = parse_uuid(table_uuid);
-        let seg_table = naming::table_persist_segment_metadata_table(&catalog);
-        let tfm_table = naming::table_persist_metadata_table(&catalog);
+        let seg_table = naming::table_persist_segment_metadata_partition(&catalog, &branch);
+        let tfm_table = naming::table_persist_metadata_partition(&catalog, &branch);
         let mut sql = format!(
             "SELECT MAX(seg.max_commit_seq_num) AS max_seq \
              FROM {seg} seg \

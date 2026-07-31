@@ -194,7 +194,7 @@ impl LifecycleManager {
         page_size: i64,
         offset: i64,
     ) -> Result<Vec<Uuid>> {
-        let table = naming::table_persist_metadata_table(catalog_uuid);
+        let table = naming::table_persist_metadata_partition(catalog_uuid, branch_uuid);
 
         let mut params: Vec<SqlValue> = Vec::new();
         params.push(SqlValue::Uuid(*branch_uuid));
@@ -294,7 +294,7 @@ impl LifecycleManager {
         let tx_table_part = naming::tx_table_log_partition(catalog_uuid, branch_uuid);
         let commit_tx_log_part = naming::commit_tx_log_partition(catalog_uuid, branch_uuid);
         let abort_part = naming::abort_tx_log_partition(catalog_uuid, branch_uuid);
-        let purge_table = naming::table_purge_metadata_table(catalog_uuid);
+        let purge_table = naming::table_purge_metadata_partition(catalog_uuid, branch_uuid);
         // The committed_at filter pins the `Pu`/`Pa` view as-of
         // `cleanup_started_at`, against a concurrent Purge mid-pass.
         let sql = format!(

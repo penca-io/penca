@@ -1022,28 +1022,38 @@ impl WriteManager {
         // safe — what the caller needs is to TELL a lock loss from a real failure,
         // which is why this maps to `Aborted` rather than the default `Internal`.
         //
-        // One conflict ordering cannot remove, TODO(CHA-546): a lifecycle write
-        // names the catalog-wide PARENT, so it holds ROW EXCLUSIVE there while
-        // waiting on this branch's leaf, and the drops below need ACCESS
-        // EXCLUSIVE on that same parent — a cycle, measured, which Postgres
-        // resolves by killing teardown. Rare (it needs a metadata write on this
-        // branch inside teardown's window) and clean (full rollback, reported as
-        // `Aborted`, succeeds on reissue). CHA-546 converts those writes to name
-        // the partition, as the tx-log family already does, which removes it.
+        // One conflict ordering cannot remove: the drops below need ACCESS
+        // EXCLUSIVE on the catalog-wide parents, which conflicts with EVERY
+        // mode, so any concurrent holder of any mode on a parent delays them.
+        // Two such holders survive CHA-546 by design. CHA-531's refcount gate
+        // reads those parents catalog-wide, and — measured, not assumed — an
+        // INSERT or UPDATE naming a LEAF still takes `AccessShare` on its
+        // parent to evaluate the partition constraint, held to commit. So any
+        // in-flight writer on any branch in the catalog delays these drops.
+        //
+        // Both are waits, not cycles — neither holder takes a lock this
+        // transaction holds — so they surface as a `lock_timeout` rather than a
+        // deadlock kill, and are clean either way (full rollback, reported as
+        // `Aborted`, succeeds on reissue). What CHA-546 bought here is the
+        // EXCLUSIVE step above rather than these drops: `AccessShare` clears
+        // it, the pre-CHA-546 `RowExclusive` did not.
         //
         // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
         // resolved BEFORE the teardown transaction and used only for their drops.
         //
-        // It cannot move inside. `list_table_uuids_for_branch` plans through
-        // `QueryManager::plan`, which reads the catalog-wide metadata parents BY
-        // NAME — so running it in the transaction takes `ACCESS SHARE` on every
-        // one of them, which is precisely what
-        // `lock_branch_teardown_partitions` is built to avoid: it stalls plans on
-        // every branch in the catalog while this cold-capable read waits on
-        // object storage, and it sets up the `ACCESS SHARE` -> `ACCESS EXCLUSIVE`
-        // upgrade at the drops that deadlocks two concurrent teardowns of
-        // DIFFERENT branches. Partition-scoping the enumerations bought exactly
-        // that property; planning inside the lock gives it back.
+        // It cannot move inside, and since CHA-546 the reason is duration
+        // rather than lock footprint. `list_table_uuids_for_branch` resolves
+        // `sys_tables` through the full read path, which names only this
+        // branch's partitions — so it would take no parent lock. What it does
+        // take is unbounded time: it is a cold-capable read that waits on
+        // object storage, and NOTHING bounds it. `lock_timeout` governs lock
+        // acquisition, not execution, and no `statement_timeout` is set on
+        // this path — so inside the transaction that wait runs to completion
+        // while this branch's 14 leaves are held EXCLUSIVE, blocking every
+        // writer on the branch for the length of an S3 fetch. It also widens
+        // the window before the drops, which must then win ACCESS EXCLUSIVE on
+        // the catalog-wide parents within the 5s bound — the one place that
+        // bound does bite (see above).
         //
         // The cost is a real leak, stated plainly rather than filed under
         // "best effort": a `CreateTable` committing between this read and the
@@ -1053,8 +1063,8 @@ impl WriteManager {
         // delete-set consequence — but they are permanent.
         //
         // Pre-existing, not introduced here: `main` resolves this list the same
-        // way. Closing it needs a branch-scoped table enumeration that does not
-        // plan through the parents, which does not exist today — the hot data
+        // way. Closing it needs a branch-scoped table enumeration that cannot
+        // reach object storage, which does not exist today — the hot data
         // relations are named `hash(table_uuid, branch_uuid)`, so they cannot be
         // recovered from `pg_class` by branch either. Needs its own ticket.
         let table_uuid_strs = self
@@ -1177,12 +1187,13 @@ impl WriteManager {
                 LifecycleManager::drop_branch_partitions(tx, catalog_str, branch_str).await?;
 
                 // Delete-set LAST, after the partition drops, per the ordering
-                // invariant on `insert_segment_delete_set_rows`. Dropping a
-                // partition takes ACCESS EXCLUSIVE on the catalog-wide parent; a
-                // concurrent compact holds ROW SHARE on that same parent from its
-                // opening `SELECT ... FOR UPDATE` and cannot release it, so
-                // teardown must not be holding a delete-set row while it waits
-                // for the parent. Still one transaction, so removing the
+                // invariant on `insert_segment_delete_set_rows`. Teardown is the
+                // one writer still subject to it: dropping a partition takes
+                // ACCESS EXCLUSIVE on the catalog-wide parent, and the sweep's
+                // refcount gate holds AccessShare on that same parent — CHA-531
+                // keeps those probes catalog-wide — while it locks delete-set
+                // rows. So teardown must not be holding a delete-set row while it
+                // waits for the parent. Still one transaction, so removing the
                 // references and queueing the files remain one atomic fact.
                 LifecycleManager::insert_segment_delete_set_rows(tx, catalog_str, &queued_uris)
                     .await?;
