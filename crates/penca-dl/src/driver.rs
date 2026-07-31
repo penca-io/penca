@@ -487,9 +487,10 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache, keyed by the sidecar's own `content_hash` — a digest of the sidecar
-/// batch, which differs from any base segment's, so the two never collide in one
-/// cache.
+/// cache, under the sidecar's own `content_hash` — a digest of the sidecar
+/// batch, not of the base segment it indexes. Sidecars and base segments share
+/// one flat key space; see [`SegmentCache`] for why a same-content collision
+/// between the two classes would be correct rather than a bug.
 ///
 /// Cached natively and shaped to `key_types` after the lookup, for the same
 /// reason as a base segment: the file was written with the *writing* branch's
