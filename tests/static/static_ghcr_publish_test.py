@@ -324,9 +324,7 @@ def test_merge_job_assembles_one_manifest_list_under_both_tags():
     assert IMAGE in runs, f"merge job must name {IMAGE}"
     # The main-merge arm, as distinct from the release arm below: a moving
     # :main plus an immutable short-sha to pin against.
-    assert re.search(r'\$image:main"?\s', runs), (
-        "merge job must tag :main on a main push"
-    )
+    assert "$image:main" in runs, "merge job must tag :main on a main push"
     assert "GITHUB_SHA::7" in runs, "merge job must also apply the short-sha tag"
 
 

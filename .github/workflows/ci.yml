@@ -438,7 +438,21 @@ jobs:
             tags=(-t "$image:$release_tag")
           else
             release_tag=main
-            tags=(-t "$image:main" -t "$image:${GITHUB_SHA::7}")
+            tags=(-t "$image:${GITHUB_SHA::7}")
+            # Per-commit concurrency groups make main runs genuinely
+            # concurrent, so nothing orders these writes: two Rust merges
+            # minutes apart can finish out of order (differing cache hits, a
+            # cold arm64 cook, a re-run) and the older one would re-point
+            # :main at older code, where it would sit until the next
+            # image-touching merge. Only the tip of main may move the moving
+            # tag; the immutable short-sha is always safe to publish.
+            git -C "$GITHUB_WORKSPACE" fetch --quiet origin main
+            tip=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
+            if [ "$tip" = "$GITHUB_SHA" ]; then
+              tags+=(-t "$image:main")
+            else
+              echo "::notice::$GITHUB_SHA is behind main ($tip); publishing the short-sha only"
+            fi
           fi
 
           # Move :latest ONLY when this tag is the highest stable release.

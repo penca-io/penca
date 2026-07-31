@@ -690,18 +690,22 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
     # that needed `jq` to read the ref back, which would make `jq` a hard
     # requirement of the quickstart's very first command and it is not a
     # documented prerequisite (macOS ships without it).
-    pull_policy=missing
+    # `pull_policy: missing` never re-pulls, so a reader who ran the quickstart
+    # once is frozen on that image while `git pull` keeps moving examples/ and
+    # the client forward. `--pull=1` is the refresh — best-effort on purpose:
+    # a failed refresh must KEEP the image you already have, not discard a
+    # perfectly good published image and start a ~13-minute rebuild because
+    # GHCR rate-limited you. The materialize step below then finds it present
+    # and does nothing.
     if [ -n "{{pull}}" ]; then
-        # `pull_policy: missing` never re-pulls, so a reader who ran the
-        # quickstart once is frozen on that image while `git pull` keeps
-        # moving examples/ and the client forward. This is the refresh.
-        pull_policy=always
+        docker compose $compose_files $env_file $profiles pull --policy always query \
+            || echo "note: refresh failed; keeping the image already on this machine." >&2
     fi
 
     if [ -n "$build_flag" ]; then
         export PENCA_IMAGE="${PENCA_IMAGE:-penca-rust-server:${CARGO_PROFILE:-release}}"
         docker compose $compose_files $env_file $profiles build query
-    elif ! docker compose $compose_files $env_file $profiles pull --policy "$pull_policy" query; then
+    elif ! docker compose $compose_files $env_file $profiles pull --policy missing query; then
         # Redirect BEFORE building, for the same reason the --build=1 path
         # does: compose tags a build's output under whatever `image:`
         # resolves to, so building here would stamp a local build onto the
