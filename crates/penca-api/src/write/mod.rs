@@ -1086,14 +1086,13 @@ impl WriteManager {
         // safe — what the caller needs is to TELL a lock loss from a real failure,
         // which is why this maps to `Aborted` rather than the default `Internal`.
         //
-        // One conflict ordering cannot remove, TODO(CHA-546): a lifecycle write
-        // names the catalog-wide PARENT, so it holds ROW EXCLUSIVE there while
-        // waiting on this branch's leaf, and the drops below need ACCESS
-        // EXCLUSIVE on that same parent — a cycle, measured, which Postgres
-        // resolves by killing teardown. Rare (it needs a metadata write on this
-        // branch inside teardown's window) and clean (full rollback, reported as
-        // `Aborted`, succeeds on reissue). CHA-546 converts those writes to name
-        // the partition, as the tx-log family already does, which removes it.
+        // One conflict ordering cannot remove: the drops below need ACCESS
+        // EXCLUSIVE on the catalog-wide parents, and CHA-531's refcount gate
+        // still reads those parents catalog-wide by design. That is a wait,
+        // not a cycle — the gate takes no lock this transaction holds — so it
+        // surfaces as a `lock_timeout` rather than a deadlock kill, and is
+        // clean either way (full rollback, reported as `Aborted`, succeeds on
+        // reissue).
         //
         // The branch's HOT data tables (`schema_uuid = None` = catalog-wide),
         // resolved BEFORE the teardown transaction and used only for their drops.
