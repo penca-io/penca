@@ -204,6 +204,27 @@ def test_publish_image_cache_scopes_are_per_arch():
         )
 
 
+def test_pushes_are_never_cancelled_mid_publish():
+    """A cancelled main push loses its publish and still reports green.
+
+    Every main push shares one concurrency group, so a docs-only merge landing
+    behind a Rust merge cancels that run mid-build; the replacement's own
+    `changes` diff covers only its own paths, skips publish-image, and
+    ci-success reads success|skipped and passes. :main silently never receives
+    the merged code. Only pull_request may supersede itself.
+    """
+    workflow = _yaml(CI_WORKFLOW)
+    cancel = str(workflow["concurrency"]["cancel-in-progress"])
+
+    assert "pull_request" in cancel, (
+        f"only pull_request may cancel in progress, got {cancel!r}"
+    )
+    for event in ("push", "merge_group"):
+        assert f"!= '{event}'" not in cancel, (
+            f"{event} runs must never be cancelled, got {cancel!r}"
+        )
+
+
 def test_publish_is_scoped_to_main_merges():
     """Dropping the `if:` would publish unreviewed branches straight to :main.
 
@@ -517,6 +538,27 @@ def test_penca_up_never_leaves_the_image_to_up():
         "expected a single-service build for both the --build=1 path and the "
         f"pull-failure fallback, found {len(builds)}"
     )
+    # Every build site must redirect off the published ref first, not just the
+    # --build=1 one. The pull-failure fallback is the default path whenever the
+    # registry is unreachable, and a build stamped onto the published tag is
+    # served forever by pull_policy: missing.
+    for line in builds:
+        idx = code.index(line)
+        preceding = "\n".join(code[:idx])
+        assert preceding.count("export PENCA_IMAGE=") >= 1, (
+            f"build site not preceded by a PENCA_IMAGE redirect: {line.strip()!r}"
+        )
+
+    redirects = [line for line in code if "export PENCA_IMAGE=" in line]
+    assert len(redirects) >= 2, (
+        "expected a redirect for both the --build=1 path and the pull-failure "
+        f"fallback, found {len(redirects)}"
+    )
+    for line in redirects:
+        assert IMAGE not in line, (
+            f"a redirect must not point back at the published ref: {line.strip()!r}"
+        )
+
     for line in builds:
         assert re.search(r"build \S+\s*(\\|\||$)", line.strip()), (
             f"build must name exactly one service, not fan out: {line.strip()!r}"

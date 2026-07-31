@@ -30,11 +30,20 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel an in-flight merge-queue run. Each queue entry already gets a
-  # unique ref (gh-readonly-queue/…) so entries won't cancel each other, but
-  # cancelling a merge_group run can eject the PR from the queue — so be
-  # explicit rather than relying on the ref scheme.
-  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+  # Only a pull_request supersedes itself. Two events must never be cancelled:
+  #
+  #   merge_group — each queue entry gets a unique gh-readonly-queue/… ref so
+  #     entries won't cancel each other anyway, but cancelling one can eject
+  #     the PR from the queue, so say it explicitly.
+  #   push — every main push shares the group `CI-refs/heads/main`, so a
+  #     docs-only merge landing minutes after a Rust merge used to cancel that
+  #     run mid-publish. The replacement run's own `changes` diff sees only
+  #     its own docs paths, skips `publish-image`, and `ci-success` reads all
+  #     success|skipped and goes GREEN — leaving :main without the merged Rust
+  #     code and no :<short-sha> for it. A job-level `concurrency:` cannot fix
+  #     that; the cancellation happens at the run level. Cost is concurrent
+  #     main runs, which is the right trade against silently losing a publish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

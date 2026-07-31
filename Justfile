@@ -695,8 +695,20 @@ penca-up profile="dev" db="" build="": vm-gc
         # Not already local, so `up` would otherwise resolve it six times over.
         # Pull it once; on failure fall back to a single build target rather
         # than letting compose degrade into the six-way race.
-        docker compose $compose_files $env_file $profiles pull query \
-            || docker compose $compose_files $env_file $profiles build query
+        if ! docker compose $compose_files $env_file $profiles pull query; then
+            # Redirect BEFORE building, for the same reason the --build=1 path
+            # does: compose tags a build's output under whatever `image:`
+            # resolves to, so building here would stamp a local build onto the
+            # PUBLISHED ref and `pull_policy: missing` would then serve it
+            # forever — surviving `git pull`, and outliving the registry
+            # actually becoming reachable. This is the default path whenever
+            # the published image is unreachable (before the first release, no
+            # network, package still private), so it is the one a first-time
+            # reader is most likely to hit.
+            export PENCA_IMAGE="penca-rust-server:${CARGO_PROFILE:-release}"
+            docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1 \
+                || docker compose $compose_files $env_file $profiles build query
+        fi
     fi
     docker compose $compose_files $env_file $profiles up -d
 
