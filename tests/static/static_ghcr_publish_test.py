@@ -337,9 +337,8 @@ def test_release_tags_publish_a_pinned_version_and_latest():
         "publish-image needs always() or a skipped `changes` swallows the release"
     )
 
-    runs = "\n".join(
-        step.get("run", "") for step in _job(workflow, "publish-image-merge")["steps"]
-    )
+    job = _job(workflow, "publish-image-merge")
+    runs = "\n".join(step.get("run", "") for step in job["steps"])
     assert "refs/tags/v" in runs, "merge job must branch on the tag ref"
 
     # :latest must never be attached on the main arm. Verified reachable by
@@ -358,6 +357,17 @@ def test_release_tags_publish_a_pinned_version_and_latest():
     # v1.0.0 — the opposite of semver).
     assert "sort -V" in runs and "tail -1" in runs, (
         ":latest must be gated on the highest existing release"
+    )
+
+    # That gate is only meaningful because the checkout fetches every tag.
+    # With the default shallow fetch the workspace holds exactly one tag — the
+    # pushed one — so `highest` always equals it and :latest moves
+    # unconditionally, with the shell script untouched and every other
+    # assertion here still green.
+    checkout = _step_using(job, "actions/checkout")
+    assert checkout.get("with", {}).get("fetch-depth") == 0, (
+        "the merge job's checkout must fetch all tags (fetch-depth: 0), or the "
+        f"highest-release gate is vacuous; got {checkout.get('with')!r}"
     )
     assert runs.count(r"^v[0-9]+\.[0-9]+\.[0-9]+$") >= 2, (
         "the highest-release comparison must restrict to stable X.Y.Z on both "
@@ -663,12 +673,16 @@ def test_standalone_snippet_uses_the_tag_we_actually_publish():
     """
     development = _read("docs/development.md")
 
-    assert QUICKSTART_TAG in development, (
-        f"standalone docker run snippet must use {QUICKSTART_TAG}"
-    )
-
+    # Scoped to the fenced block, both directions. The surrounding prose
+    # mentions :latest independently, so a file-wide positive check would pass
+    # with the snippet pointing at any other tag — a stale :v0.1.0, a
+    # short-sha, a fork's registry — while claiming to pin this one.
     snippet = re.search(r"```bash\n(docker run.*?)```", development, re.DOTALL)
     assert snippet, "standalone docker run snippet not found"
+
+    assert QUICKSTART_TAG in snippet.group(1), (
+        f"standalone docker run snippet must use {QUICKSTART_TAG}, got:\n{snippet.group(1)}"
+    )
     assert MAIN_TAG not in snippet.group(1), (
         f"the runnable snippet must not aim readers at the moving {MAIN_TAG}"
     )

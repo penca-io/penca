@@ -449,6 +449,17 @@ jobs:
           if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             highest=$(git -C "$GITHUB_WORKSPACE" tag -l 'v*' \
               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            # The whole gate rests on the checkout above using fetch-depth: 0.
+            # Without it actions/checkout fetches --no-tags --depth=1 and the
+            # workspace holds exactly ONE tag — the pushed one — so `highest`
+            # would always equal it and :latest would move unconditionally,
+            # silently restoring the bug this gate exists to prevent. An empty
+            # list is the other direction of the same failure, so fail loudly
+            # rather than quietly declining to move :latest for every release.
+            if [ -z "$highest" ]; then
+              echo "::error::no stable release tags visible — is the checkout still fetch-depth: 0?"
+              exit 1
+            fi
             if [ "$highest" = "$release_tag" ]; then
               tags+=(-t "$image:latest")
             else
