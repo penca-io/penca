@@ -1110,10 +1110,14 @@ impl WriteManager {
         // `sys_tables` through the full read path, which names only this
         // branch's partitions — so it would take no parent lock. What it does
         // take is unbounded time: it is a cold-capable read that waits on
-        // object storage. Inside the transaction that wait runs while this
-        // branch's 14 leaves are held EXCLUSIVE, under the same 5s
-        // `lock_timeout` the lock step sets — so a cold miss does not slow
-        // teardown down, it fails it.
+        // object storage, and NOTHING bounds it. `lock_timeout` governs lock
+        // acquisition, not execution, and no `statement_timeout` is set on
+        // this path — so inside the transaction that wait runs to completion
+        // while this branch's 14 leaves are held EXCLUSIVE, blocking every
+        // writer on the branch for the length of an S3 fetch. It also widens
+        // the window before the drops, which must then win ACCESS EXCLUSIVE on
+        // the catalog-wide parents within the 5s bound — the one place that
+        // bound does bite (see above).
         //
         // The cost is a real leak, stated plainly rather than filed under
         // "best effort": a `CreateTable` committing between this read and the
