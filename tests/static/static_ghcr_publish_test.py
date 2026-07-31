@@ -374,9 +374,26 @@ def test_penca_up_does_not_build_by_default():
     # Compose tags a build's output under whatever `image:` resolves to, so a
     # build has to be redirected off the published ref or it shadows the pulled
     # image for every later run — pull_policy: missing never re-pulls it.
-    assert re.search(r'export PENCA_IMAGE="\$\{PENCA_IMAGE:-', body), (
+    #
+    # Both the target and the guard are pinned, not just the shape: defaulting
+    # to the published ref reinstates exactly that shadowing, and hoisting the
+    # export out of the build-only branch points a plain `just penca-up` at a
+    # local tag no registry serves, turning the quickstart's pull back into a
+    # from-source build.
+    redirect = re.search(
+        r'if \[ -n "\$build_flag" \]; then\n(.*?)\n\s*fi', body, re.DOTALL
+    )
+    assert redirect, (
+        "penca-up must redirect a --build=1 run inside the build-only branch"
+    )
+
+    branch = redirect.group(1)
+    assert "export PENCA_IMAGE=" in branch, (
         "penca-up must point a --build=1 run at its own tag, or the build "
         "overwrites the pulled ghcr.io ref"
+    )
+    assert IMAGE not in branch, (
+        f"a local build must not be tagged under the published ref ({IMAGE})"
     )
 
 
