@@ -203,27 +203,38 @@ impl<R: FormatReader + 'static> DatafusionDlDriver<R> {
     }
 }
 
-/// Cacheable miss: decode the WHOLE segment (all columns, no filter
+/// Cacheable miss: decode the WHOLE segment file (all columns, no filter
 /// pushdown, no caller shaping) so the cached entry is reusable across any
-/// projection AND any caller schema, insert it under `weight`, and return the
-/// native batch. The caller has already decided this segment is admissible,
-/// and shapes the result itself once it holds it.
-async fn read_and_cache_full<R: FormatReader>(
+/// projection AND any caller schema (CHA-545), offer it to the cache under
+/// `content_hash`, and return the native batch. The caller shapes the result
+/// itself once it holds it.
+///
+/// Takes `uri` + `(offset, length)` rather than any segment type, mirroring
+/// [`FormatReader::read_segment_native`] — persist segments, snapshot segments
+/// and index sidecars all reach it, and none of them is the reader's or the
+/// cache's concern.
+///
+/// [`SegmentCache::insert`] self-gates on
+/// [`admits`](SegmentCache::admits), so an artifact too large for the budget is
+/// decoded-but-not-cached rather than evicting everything and then itself. A
+/// caller with a narrower read available should check `admits` first and take
+/// that path instead.
+async fn decode_and_cache_native<R: FormatReader>(
     reader: &R,
     cache: &SegmentCache,
-    segment: &SnapshotSegment,
+    uri: &str,
+    offset: Option<i64>,
+    length: Option<i64>,
+    content_hash: Uuid,
     weight: u64,
 ) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
-        .read_segment_native(&segment.uri, Some(segment.offset), Some(segment.length))
+        .read_segment_native(uri, offset, length)
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(segment.content_hash, Arc::clone(&batch), weight);
-    tracing::debug!(
-        rows = batch.num_rows(),
-        "snapshot segment cached full decode"
-    );
+    cache.insert(content_hash, Arc::clone(&batch), weight);
+    tracing::debug!(rows = batch.num_rows(), "segment decoded and cached");
     Ok(batch)
 }
 
@@ -320,7 +331,16 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
         Ok(CachedSegment::Native(
-            read_and_cache_full(reader, cache, segment, weight).await?,
+            decode_and_cache_native(
+                reader,
+                cache,
+                &segment.uri,
+                Some(segment.offset),
+                Some(segment.length),
+                segment.content_hash,
+                weight,
+            )
+            .await?,
         ))
     } else {
         span.record("cache", "miss-uncached");
@@ -344,28 +364,6 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
         CachedSegment::Native(native) => shape_native(&native, full_schema),
         CachedSegment::Projected(batch) => Ok(batch),
     }
-}
-
-/// Cacheable persist miss: decode the WHOLE persist segment (all columns, no
-/// caller shaping) so the cached entry serves any projection and any caller
-/// schema, insert it under `weight`, and return the native batch.
-async fn read_and_cache_full_persist<R: FormatReader>(
-    reader: &R,
-    cache: &SegmentCache,
-    segment: &PersistSegment,
-    weight: u64,
-) -> Result<Arc<RecordBatch>, DlError> {
-    let batch = reader
-        .read_segment_native(&segment.uri, segment.offset, segment.length)
-        .await
-        .map_err(ColdStorageError::from)?;
-    let batch = Arc::new(batch);
-    cache.insert(segment.content_hash, Arc::clone(&batch), weight);
-    tracing::debug!(
-        rows = batch.num_rows(),
-        "persist segment decoded and cached"
-    );
-    Ok(batch)
 }
 
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
@@ -468,7 +466,16 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        let native = read_and_cache_full_persist(reader, cache, segment, weight).await?;
+        let native = decode_and_cache_native(
+            reader,
+            cache,
+            &segment.uri,
+            segment.offset,
+            segment.length,
+            segment.content_hash,
+            weight,
+        )
+        .await?;
         shape_native(&native, full_schema)
     } else {
         span.record("cache", "miss-uncached");
@@ -514,22 +521,16 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
-    let batch = reader
-        .read_segment_native(
-            &sidecar.object_uri,
-            Some(sidecar.offset),
-            Some(sidecar.length),
-        )
-        .await
-        .map_err(ColdStorageError::from)?;
-    let batch = Arc::new(batch);
-    // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
-    // decoded-but-not-cached rather than evicting the whole budget.
-    cache.insert(
+    let batch = decode_and_cache_native(
+        reader,
+        cache,
+        &sidecar.object_uri,
+        Some(sidecar.offset),
+        Some(sidecar.length),
         sidecar.content_hash,
-        Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
-    );
+    )
+    .await?;
     shape_native(&batch, &schema)
 }
 
