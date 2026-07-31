@@ -69,6 +69,15 @@ impl SegmentCacheKey {
 /// `test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice` is the
 /// regression guard.
 ///
+/// The read-time schema still governs the *output* — it governs it at that
+/// shaping step, per caller. Only the decode has to be segment-scoped, and only
+/// because the decode is what gets shared. Fingerprinting the read schema into
+/// the key instead is correct, but then the key moves whenever the schema does
+/// while the data does not: one `ALTER TABLE ADD COLUMN` re-fingerprints a
+/// footprint nobody rewrote, and a fork stops sharing with its parent at their
+/// first divergent `ALTER` — the case this key exists for. See
+/// `docs/design-decisions.md` — "Cold segments are cached by content hash".
+///
 /// One flat key space, no per-artifact-class prefix. With every artifact keyed
 /// by a hash of its own typed content, two entries collide only when their
 /// decoded batches are identical, in which case sharing one entry is the

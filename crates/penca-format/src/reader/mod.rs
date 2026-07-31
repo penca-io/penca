@@ -61,6 +61,12 @@ pub trait FormatReader: Send + Sync {
     /// length)` slice still applies, so row count and row order match what
     /// [`read_segment`](Self::read_segment) would return for the same slice.
     ///
+    /// "The file's own types" means the schema the format engine embedded and
+    /// returns, not the table's stored `arrow_schema` — nothing here casts, so
+    /// the types are the encoder's answer rather than the catalog's. That is why
+    /// `SegmentCache` keys on the format alongside the content hash; see the
+    /// open question in `docs/design-decisions.md`.
+    ///
     /// Shape the result to a caller's schema afterwards with
     /// [`shape_to_schema`] — the same tail `read_segment` runs internally.
     /// Splitting the two is what lets one decode be cached and served to

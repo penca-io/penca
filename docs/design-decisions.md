@@ -234,6 +234,78 @@ caller-shaping (projection + null-fill of columns added by a later
 caller-shaped entry carries the schema of whichever branch decoded first, so the
 second branch's read fails on a type mismatch its own metadata never justified.
 
+Concretely, with a file holding `{row_uuid, name, value}` that both branches
+reference, parent having run `ADD COLUMN extra Int64` and fork `ADD COLUMN extra
+Utf8`:
+
+    caching the shaped batch — the bug
+      fork   miss → decode + fill → {row_uuid, name, value, extra: Utf8}
+      parent HIT  → gets extra: Utf8, its own metadata says Int64   ✗
+
+    caching the native decode — what ships
+      fork   miss → decode → {row_uuid, name, value}
+                  → shape to fork   → extra: Utf8    ✓
+      parent HIT  →          {row_uuid, name, value}
+                  → shape to parent → extra: Int64   ✓
+
+The read-time schema still governs the output — it just governs it at the
+shaping step, per caller, rather than at the decode. Only the decode has to be
+segment-scoped, because only the decode is shared.
+
+### Rejected alternative: fold the read schema into the key
+
+The symmetric design adds a fingerprint of the read-time schema to the key and
+caches a value already adapted to it. Both halves are known before the read, so
+it is implementable, and it is correct: the fingerprint separates the two
+branches above. It comes in two strengths, and the weaker one is not worth
+arguing against.
+
+Caching the fully **shaped** table — projection included — fragments the key
+space by query: `SELECT name` and `SELECT name, value` over one segment become
+different entries, combinatorial in the column subsets queries touch. That is
+decisive but it is also avoidable, so it is not the real comparison.
+
+The strong form caches the **type-cast** table: present columns cast to the
+read-time schema's declared types, with projection and null-fill still applied
+per caller after the lookup. Its cost is that the key still moves when the
+schema does, and only the *key* moves — the data does not:
+
+- **`ALTER TABLE ADD COLUMN` evicts a footprint that did not change.** The added
+  column is in no file and affects no cast, yet it re-fingerprints every segment
+  of the table, so the whole cold footprint is re-fetched and re-decoded without
+  a byte having been rewritten. Narrowing the fingerprint to only the columns a
+  file actually holds would fix this, but which columns those are is not known
+  until after the read.
+- **It collapses the dedup this entry exists for.** A fork and its parent share
+  entries only while their schemas agree; the first `ALTER` on either side
+  duplicates the entire shared footprint — the sharing degrades exactly when a
+  branch is used for what branches are for. That is the motivating case, not an
+  edge case.
+
+Its advantage is real but currently unrealizable: a cached cast would let a read
+succeed where the file's decoded type differs from the declared one, which the
+shipped path cannot do — `null_fill_to_schema` takes present columns verbatim and
+`RecordBatch::try_new` then rejects a mismatch. Penca's schema evolution is
+`ADD COLUMN` only, so no supported operation produces that divergence. If type
+evolution is added later, the answer is to cast in the shaping tail, where it
+applies per caller and is visible as a data-semantics decision — not to hide it
+behind a cache key.
+
+### What directs the decode today, and what should
+
+Neither reader consults the stored schema. Parquet decodes under the file's
+embedded Arrow schema (`builder.schema()`) and Lance under
+`reader.metadata().file_schema`; the caller's `SchemaRef` only selects column
+*names* to request (`requested_columns`) and drives the shaping tail. No cast or
+type coercion happens anywhere in `penca-format`'s readers or writers, so the
+decoded types are whatever the encoder chose to write and the decoder chose to
+return.
+
+That is why `format` is in the key: the file's embedded schema is a per-format
+artifact, and `shape_to_schema` cannot absorb a divergence — `null_fill_to_schema`
+takes present columns by name verbatim, and `RecordBatch::try_new` then validates
+their types against the output schema, so a mismatch is a hard read error.
+
 **Why the scope is uniform across artifact classes.** Base segments and index
 sidecars both come out of object storage through the same `SegmentCache` and are
 both reference-copied by carry-forward and fork copy, so they duplicate for the
@@ -255,3 +327,18 @@ digest. It is not available yet: the digest is taken on the in-memory batch
 before the format writer encodes it, and Parquet may widen a type or
 re-dictionary-encode on round-trip, so using it as a stored-file checksum needs
 round-trip stability established first.
+
+**Open question.** The decode should be directed by the segment's *stored*
+write-time schema rather than by the file's embedded one. `__penca_system__.tables`
+already holds it — `arrow_schema` is Arrow IPC and every row is a complete table
+definition at a point in time — and a segment row carries `branch_uuid`,
+`table_uuid`, and `max_commit_seq_num`, so the definition in force when it was
+written is an as-of read away. Doing that would make the decoded schema a function
+of metadata instead of of the encoder's round-trip behavior, let a file whose
+physical schema contradicts its declared one be rejected rather than silently
+trusted, and make `format` droppable from the cache key — both formats would
+decode to the same declared types, so `content_hash` would name one decode on its
+own. It must be the segment's write-time schema and not the reader's: the cache
+key is a property of the segment alone, so anything that varies per reader cannot
+direct a shared decode. The cost is resolving that schema per segment, which is
+plumbing through the read path rather than a change local to `penca-format`.
