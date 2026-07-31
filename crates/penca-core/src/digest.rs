@@ -141,11 +141,16 @@ fn compact_column(array: &ArrayRef) -> Result<ArrayRef, ArrowError> {
             // Unlike the offset flavours, `FixedSizeListArray::slice` slices its
             // child too, so `values()` is already this array's own range.
             let list = downcast::<FixedSizeListArray>(array)?;
-            Ok(Arc::new(FixedSizeListArray::try_new(
+            // Carry the length rather than let `try_new` re-derive it:
+            // `CanonicalType` accepts size 0, and at size 0 `try_new` reads the
+            // length off the null buffer, so a null-free column would rebuild
+            // with zero rows.
+            Ok(Arc::new(FixedSizeListArray::try_new_with_length(
                 child.clone(),
                 *size,
                 compact_column(list.values())?,
                 list.nulls().cloned(),
+                list.len(),
             )?))
         }
         _ => Ok(Arc::clone(array)),
@@ -455,34 +460,54 @@ mod tests {
         );
     }
 
-    /// The nested case. [`crate::types::CanonicalType`] admits a view as the
-    /// child of a single-level list, where slicing leaves *both* the child array
-    /// and its data buffers whole — so the compaction has to narrow the child to
-    /// the offsets' range before it can help.
+    /// The `BinaryView` twin of the arm above. Same buffer mechanics, separate
+    /// downcast — a swapped array type here would be caught by nothing else.
     #[test]
-    fn sliced_list_of_view_column_hashes_equal_to_an_independently_built_batch() {
-        fn list_of_views(rows: Vec<Vec<&str>>) -> RecordBatch {
-            let child = Arc::new(Field::new("item", DataType::Utf8View, true));
-            let mut values: Vec<&str> = Vec::new();
-            let mut offsets: Vec<i32> = vec![0];
-            for row in &rows {
-                values.extend(row.iter().copied());
-                offsets.push(values.len() as i32);
-            }
-            let arr = ListArray::try_new(
-                Arc::clone(&child),
-                OffsetBuffer::new(offsets.into()),
-                Arc::new(StringViewArray::from(values)),
-                None,
-            )
-            .expect("valid fixture");
+    fn sliced_binary_view_column_hashes_equal_to_an_independently_built_batch() {
+        let binaries = |v: Vec<&str>| {
             batch(
-                vec![Field::new("l", DataType::List(child), true)],
-                vec![Arc::new(arr)],
+                vec![Field::new("b", DataType::BinaryView, true)],
+                vec![Arc::new(BinaryViewArray::from_iter_values(
+                    v.into_iter().map(str::as_bytes),
+                ))],
             )
-        }
+        };
+        assert_eq!(
+            hash(&binaries(LONG.to_vec()).slice(1, 2)),
+            hash(&binaries(vec![LONG[1], LONG[2]])),
+            "a sliced binary-view column hashes as its own logical rows"
+        );
+    }
 
-        let parent = list_of_views(vec![
+    /// A single-level list of views, in both offset widths.
+    /// [`crate::types::CanonicalType`] admits a view there, and slicing leaves
+    /// *both* the child array and its data buffers whole — so the compaction has
+    /// to narrow the child to the offsets' range before it can help.
+    fn list_of_views<O: OffsetSizeTrait>(rows: Vec<Vec<&str>>) -> RecordBatch {
+        let child = Arc::new(Field::new("item", DataType::Utf8View, true));
+        let mut values: Vec<&str> = Vec::new();
+        let mut offsets: Vec<O> = vec![O::zero()];
+        for row in &rows {
+            values.extend(row.iter().copied());
+            offsets.push(O::from_usize(values.len()).expect("fixture fits the offset width"));
+        }
+        let arr = GenericListArray::<O>::try_new(
+            Arc::clone(&child),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(StringViewArray::from(values)),
+            None,
+        )
+        .expect("valid fixture");
+        let data_type = if O::IS_LARGE {
+            DataType::LargeList(child)
+        } else {
+            DataType::List(child)
+        };
+        batch(vec![Field::new("l", data_type, true)], vec![Arc::new(arr)])
+    }
+
+    fn assert_sliced_list_of_views_is_invariant<O: OffsetSizeTrait>() {
+        let parent = list_of_views::<O>(vec![
             vec![LONG[0]],
             vec![LONG[1], LONG[2]],
             vec![LONG[0], LONG[2]],
@@ -496,8 +521,89 @@ mod tests {
         );
         assert_eq!(
             hash(&sliced),
-            hash(&list_of_views(vec![vec![LONG[1], LONG[2]]])),
+            hash(&list_of_views::<O>(vec![vec![LONG[1], LONG[2]]])),
             "a sliced list-of-view column hashes as its own logical rows"
+        );
+    }
+
+    #[test]
+    fn sliced_list_of_view_column_hashes_equal_to_an_independently_built_batch() {
+        assert_sliced_list_of_views_is_invariant::<i32>();
+    }
+
+    #[test]
+    fn sliced_large_list_of_view_column_hashes_equal_to_an_independently_built_batch() {
+        assert_sliced_list_of_views_is_invariant::<i64>();
+    }
+
+    fn fixed_size_list_of_views(rows: Vec<[&str; 2]>) -> RecordBatch {
+        let child = Arc::new(Field::new("item", DataType::Utf8View, true));
+        let values: Vec<&str> = rows.iter().flatten().copied().collect();
+        let arr = FixedSizeListArray::try_new(
+            Arc::clone(&child),
+            2,
+            Arc::new(StringViewArray::from(values)),
+            None,
+        )
+        .expect("valid fixture");
+        batch(
+            vec![Field::new("l", DataType::FixedSizeList(child, 2), true)],
+            vec![Arc::new(arr)],
+        )
+    }
+
+    /// The third nesting flavour, which takes a structurally different path: it
+    /// narrows nothing, resting entirely on `FixedSizeListArray::slice` slicing
+    /// its child. The guard below pins that — if it ever stopped holding, the
+    /// compaction would `gc` the parent's whole child and silently re-absorb the
+    /// neighbouring rows' bytes.
+    #[test]
+    fn sliced_fixed_size_list_of_view_column_hashes_equal_to_an_independently_built_batch() {
+        let parent = fixed_size_list_of_views(vec![
+            [LONG[0], LONG[1]],
+            [LONG[1], LONG[2]],
+            [LONG[2], LONG[0]],
+        ]);
+        let sliced = parent.slice(1, 1);
+
+        assert_eq!(
+            sliced.column(0).to_data().child_data()[0].len(),
+            2,
+            "fixture assumes `slice` narrows the child to the sliced rows"
+        );
+        assert_eq!(
+            hash(&sliced),
+            hash(&fixed_size_list_of_views(vec![[LONG[1], LONG[2]]])),
+            "a sliced fixed-size-list-of-view column hashes as its own logical rows"
+        );
+    }
+
+    /// At `size == 0` — which `CanonicalType` accepts — `FixedSizeListArray`
+    /// carries no values to derive a length from and `try_new` reads it off the
+    /// null buffer, so rebuilding a null-free column through it would yield zero
+    /// rows. Two segments of different row counts would then digest identically:
+    /// a false dedup match on the one value that is supposed to be identity.
+    #[test]
+    fn zero_size_fixed_size_list_of_view_keeps_its_row_count() {
+        let empty_rows = |rows: usize| {
+            let child = Arc::new(Field::new("item", DataType::Utf8View, true));
+            let arr = FixedSizeListArray::try_new_with_length(
+                Arc::clone(&child),
+                0,
+                Arc::new(StringViewArray::from(Vec::<&str>::new())),
+                None,
+                rows,
+            )
+            .expect("valid fixture");
+            batch(
+                vec![Field::new("l", DataType::FixedSizeList(child, 0), true)],
+                vec![Arc::new(arr)],
+            )
+        };
+        assert_ne!(
+            hash(&empty_rows(3)),
+            hash(&empty_rows(2)),
+            "row count must survive compaction even with no values to count"
         );
     }
 }
