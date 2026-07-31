@@ -426,8 +426,14 @@ jobs:
           ref: ${{ inputs.ref }}
       - name: Tag the release
         if: github.event_name == 'workflow_dispatch'
+        # Through env, never `${{ }}` inside the script: the expression is
+        # substituted at assembly time, before bash parses the line, so the
+        # regex below could not gate it and `v1.0.0"; curl …| sh; #` would run
+        # arbitrary commands in a job holding contents+packages write.
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          version="${{ inputs.version }}"
+          version="$VERSION"
           if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::version must look like v1.2.3 or v1.2.3-rc1, got: $version"
             exit 1
@@ -451,6 +457,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           # Assert the arch set BEFORE tagging anything. "a failed leg makes
           # the matrix aggregate `failure`, so this job is skipped" is a
@@ -469,7 +477,7 @@ jobs:
           # moving :main plus an immutable short-sha to pin against. :latest
           # is decided separately below — never on the main arm.
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            release_tag="${{ inputs.version }}"
+            release_tag="$VERSION"
             tags=(-t "$image:$release_tag")
           elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             release_tag="${GITHUB_REF#refs/tags/}"

@@ -259,6 +259,14 @@ def test_release_can_be_cut_from_the_actions_tab():
     assert "already exists" in runs, "re-tagging an existing release must fail"
     assert "^v[0-9]+" in runs, "the version input must be validated before tagging"
 
+    # Dispatch inputs must reach the script through env, never `${{ }}`: the
+    # expression is substituted before bash parses the line, so no validation
+    # can gate it, and this job holds contents + packages write.
+    for step in merge["steps"]:
+        assert "inputs." not in step.get("run", ""), (
+            f"a dispatch input is interpolated into a run script: {step.get('name')!r}"
+        )
+
 
 def test_publish_is_scoped_to_main_merges():
     """Without this, `merge_group` builds would publish straight to :main.
