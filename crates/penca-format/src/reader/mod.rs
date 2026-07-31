@@ -63,9 +63,11 @@ pub trait FormatReader: Send + Sync {
     ///
     /// "The file's own types" means the schema the format engine embedded and
     /// returns, not the table's stored `arrow_schema` — nothing here casts, so
-    /// the types are the encoder's answer rather than the catalog's. That is why
-    /// `SegmentCache` keys on the format alongside the content hash; see the
-    /// open question in `docs/design-decisions.md`.
+    /// the types are the encoder's answer rather than the catalog's. Both
+    /// encoders are expected to give the same answer, which is what lets
+    /// `SegmentCache` key on the content hash alone; CHA-548 is the coverage
+    /// that asserts it, and the open question in `docs/design-decisions.md` is
+    /// what would make it structural.
     ///
     /// Shape the result to a caller's schema afterwards with
     /// [`shape_to_schema`] — the same tail `read_segment` runs internally.

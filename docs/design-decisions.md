@@ -188,8 +188,8 @@ shape.
 Every cold-artifact metadata row — persist segments, snapshot segments, and
 segment index sidecars — carries a `content_hash`: an `xxh3_128` digest of the
 **typed in-memory Arrow batch**, computed once at write time
-(`penca_core::digest::segment_content_hash`). `SegmentCache` is keyed by
-`(content_hash, format)`.
+(`penca_core::digest::segment_content_hash`). `SegmentCache` is keyed by that
+hash alone.
 
 **The problem.** Reference copies mint a new row uuid over an unchanged
 `(object_uri, offset, length)`: `insert_carried_snapshot_segments` and
@@ -209,14 +209,25 @@ It also makes dedup insensitive to encoding choices, so two independently writte
 segments holding the same rows share an entry even if the writer picked different
 row-group boundaries or dictionary encodings.
 
-**Why `format` is the other half of the key.** Digesting the batch pre-encode is
-exactly what lets one hash name files in two formats, once
+**Why the storage format is deliberately not in the key.** Digesting the batch
+pre-encode is exactly what lets one hash name files in two formats, once
 `OBJECT_STORAGE_FORMAT` has been flipped between two writes of the same content.
-The cached *value*, meanwhile, is the file-native decode — a per-format artifact,
-since a round-trip may widen a type or re-dictionary-encode. So the format joins
-the cache key rather than the digest: the pair names one native decode, and
-`content_hash` stays a pure function of the batch, which is what lets a reference
-copy inherit it verbatim.
+Those two files decode to the same Arrow batch under Penca's storage contract — a
+write followed by a read returns the batch that was written — so the hash alone
+names one decode and the two files share one entry. A Parquet/Lance divergence
+would not be a fact for the key to record; it would mean one format's round trip
+is *wrong*, which is fixed in that format (or by dropping the offending type from
+`CanonicalType`), not absorbed by a wider key.
+
+That contract is currently unasserted:
+`crates/penca-format/tests/format_reader.rs` checks row and column counts through
+the shaped path, nothing compares a decoded batch against the batch that was
+written, and nothing compares the two formats against each other. CHA-548 adds
+that coverage. Pairing the format into the key in the meantime was considered and
+rejected — it would permanently give up a real cross-format share to pre-empt a
+defect nobody has demonstrated, and if the defect did exist it would mask it,
+turning the loud cross-format type mismatch that CHA-548 is meant to produce into
+silence.
 
 **What the key deliberately does *not* do is separate a reference copy from its
 source.** Carry-forward and fork copy select `old.content_hash` verbatim
@@ -301,10 +312,13 @@ type coercion happens anywhere in `penca-format`'s readers or writers, so the
 decoded types are whatever the encoder chose to write and the decoder chose to
 return.
 
-That is why `format` is in the key: the file's embedded schema is a per-format
-artifact, and `shape_to_schema` cannot absorb a divergence — `null_fill_to_schema`
+That is what the cache key assumes away: the decoded types are the encoder's
+answer, and one key for one hash trusts both encoders to give the same answer.
+`shape_to_schema` would not absorb a divergence either — `null_fill_to_schema`
 takes present columns by name verbatim, and `RecordBatch::try_new` then validates
-their types against the output schema, so a mismatch is a hard read error.
+their types against the output schema, so a mismatch is a hard read error, not a
+cast. CHA-548 tests the assumption; directing the decode from the stored schema
+(below) would remove the need for it.
 
 **Why the scope is uniform across artifact classes.** Base segments and index
 sidecars both come out of object storage through the same `SegmentCache` and are
@@ -324,9 +338,9 @@ never cache-read and never reference-copied.
 
 **Open question.** CHA-545 names checksum reuse as a possible second use of this
 digest. It is not available yet: the digest is taken on the in-memory batch
-before the format writer encodes it, and Parquet may widen a type or
-re-dictionary-encode on round-trip, so using it as a stored-file checksum needs
-round-trip stability established first.
+before the format writer encodes it, so verifying a stored file against it means
+re-deriving the digest from a decode — sound only once round-trip identity is
+established. CHA-548 is that gate too.
 
 **Open question.** The decode should be directed by the segment's *stored*
 write-time schema rather than by the file's embedded one. `__penca_system__.tables`
@@ -336,9 +350,10 @@ definition at a point in time — and a segment row carries `branch_uuid`,
 written is an as-of read away. Doing that would make the decoded schema a function
 of metadata instead of of the encoder's round-trip behavior, let a file whose
 physical schema contradicts its declared one be rejected rather than silently
-trusted, and make `format` droppable from the cache key — both formats would
-decode to the same declared types, so `content_hash` would name one decode on its
-own. It must be the segment's write-time schema and not the reader's: the cache
-key is a property of the segment alone, so anything that varies per reader cannot
-direct a shared decode. The cost is resolving that schema per segment, which is
-plumbing through the read path rather than a change local to `penca-format`.
+trusted, and turn the cross-format assumption above into a guarantee rather than
+something CHA-548 has to keep testing — both formats would decode to the declared
+types by construction. It must be the segment's write-time schema and not the
+reader's: the cache key is a property of the segment alone, so anything that
+varies per reader cannot direct a shared decode. The cost is resolving that
+schema per segment, which is plumbing through the read path rather than a change
+local to `penca-format`.
