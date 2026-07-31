@@ -58,23 +58,27 @@ which the demo asserts rather than prints: see
 
 ```bash
 just penca-up                            # Postgres + object store + servicers + Flight SQL gateway
-set -a && source docker/.client.env      # PENCA_*_URL for the client
 
 uv run python - <<'EOF'                  # write a table and read it back
-from penca_client import PencaClient
-client = PencaClient.from_settings()
-client.execute_update("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
-client.execute_update("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
-print(client.execute_query("SELECT * FROM greetings ORDER BY id"))
+from adbc_driver_flightsql.dbapi import connect
+
+with connect("grpc://localhost:50060") as conn, conn.cursor() as cur:
+    cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
+    cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
+    cur.execute("SELECT * FROM greetings ORDER BY id")
+    print(cur.fetch_arrow_table())
 EOF
 
+set -a && source docker/.client.env      # PENCA_*_URL, for the demo below
 uv run python examples/sandbox_demo.py   # the branching demo above
 ```
 
-`greetings` lands in the default catalog and schema, so there is nothing to create
-first. `PencaClient` is a convenience rather than a requirement: that is plain Arrow
-Flight SQL on port 50060, so ADBC, SQLAlchemy, JDBC and ODBC connect without it, and
-[docs/usage.md](docs/usage.md) shows the direct-ADBC form.
+That is a stock Arrow Flight SQL driver talking to port 50060. No Penca client, no
+custom protocol, and `greetings` lands in the default catalog and schema so there is
+nothing to create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way.
+
+The shipped Python client wraps that surface plus the gRPC one, which is what the
+branching, audit and time-travel calls use; see [docs/usage.md](docs/usage.md).
 
 You need [Docker](https://docs.docker.com/engine/install/), [`uv`](https://docs.astral.sh/uv/)
 and [`just`](https://github.com/casey/just). The first `just penca-up` compiles the server

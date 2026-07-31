@@ -53,8 +53,27 @@ itself is just an ADBC consumer:
 `adbc_driver_flightsql.dbapi.connect` against `grpc://<host>:50060` and nothing more
 exotic.
 
-What it does do is set three connection options you would otherwise have to set
-yourself, so it is worth copying that function rather than starting from scratch:
+```python
+from adbc_driver_flightsql.dbapi import connect
+
+with connect("grpc://localhost:50060") as conn, conn.cursor() as cur:
+    cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
+    cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
+    cur.execute("SELECT * FROM greetings ORDER BY id")
+    print(cur.fetch_arrow_table())
+```
+
+**Use `executescript` for DDL and DML, not `execute`.** Flight SQL splits statements
+across two server verbs: `GetFlightInfo` for anything returning rows, and
+`DoPutStatementUpdate` for anything returning a row count. DB-API assumes one verb, so
+`Cursor.execute` is hardwired to the query path and a `CREATE TABLE` sent through it is
+rejected with `update statement routed to GetFlightInfo`. `Cursor.executescript` calls
+`execute_update`, which is the right verb. One statement per call: multi-statement
+requests are rejected. `PencaClient.execute_update` does the same thing through the
+low-level statement handle.
+
+The client also sets three connection options you would otherwise have to set yourself,
+so it is worth reading that function before hand-rolling a session:
 
 - `adbc.flight.sql.rpc.with_cookie_middleware=true`, so the server's `penca-session-id`
   `Set-Cookie` / `Cookie` round-trip binds successive statements to one session. Without
