@@ -132,9 +132,10 @@ install-tools:
 vm-gc:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Dangling-only: drops orphaned prior penca-rust-server layers,
-    # never tagged base images (postgres, seaweedfs) or the in-use image.
-    # CI (PENCA_SKIP_BUILD=1) keeps its prebuilt tagged image. Best-effort:
+    # Dangling-only: drops orphaned prior penca-rust-server layers, never
+    # tagged base images (postgres, seaweedfs), the pulled GHCR image, or
+    # the in-use one. CI (PENCA_SKIP_BUILD=1) keeps its prebuilt tagged
+    # image. Best-effort:
     # vm-gc is a penca-up prerequisite, so a transient daemon hiccup (busy
     # daemon, race with a parallel-worktree prune) must not abort bring-up.
     docker image prune -f || echo "(skip) docker image prune failed — continuing"
@@ -575,7 +576,8 @@ docker-ensure:
 # running before invoking this recipe.
 [arg("profile", long)]
 [arg("db", long)]
-penca-up profile="dev" db="": vm-gc
+[arg("build", long)]
+penca-up profile="dev" db="" build="": vm-gc
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -595,18 +597,19 @@ penca-up profile="dev" db="": vm-gc
 
         # The Docker build context is the repo root (`context: ..` in
         # compose.yml), so a data directory inside the repo would be shipped to
-        # the daemon on every build. Refuse rather than warn: penca-up builds by
-        # default and Postgres creates its datadir mode 0700 owned by a container
-        # uid, so the next build cannot read the context and FAILS outright.
+        # the daemon on every build. Refuse rather than warn: Postgres creates
+        # its datadir mode 0700 owned by a container uid, so any later build
+        # (`--build=1`, or the fallback when the pull fails) cannot read the
+        # context and FAILS outright.
         repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
         if [ -n "$repo_root" ]; then
             case "$db_dir/" in
                 "$repo_root"/*)
                     echo "error: $db_dir is inside the repo, which is the Docker" >&2
                     echo "       build context (compose.yml uses \`context: ..\`)." >&2
-                    echo "       penca-up builds by default, and Postgres creates" >&2
-                    echo "       its datadir mode 0700 owned by a container uid —" >&2
-                    echo "       so the next build cannot read the context and will" >&2
+                    echo "       Postgres creates its datadir mode 0700 owned by" >&2
+                    echo "       a container uid — so any later image build cannot" >&2
+                    echo "       read the context and will" >&2
                     echo "       FAIL, not merely run slowly. It would also show up" >&2
                     echo "       in git status." >&2
                     echo "       Use a path outside the repo: --db ~/.penca/data" >&2
@@ -631,11 +634,19 @@ penca-up profile="dev" db="": vm-gc
     # postgres/seaweedfs, so by the time it returns the full stack is
     # bootstrapped and ready for connections.
     #
-    # `PENCA_SKIP_BUILD=1` tells compose to use the pre-existing
-    # `penca-rust-server` image as-is — set by CI after a cache-aware
-    # pre-build step. Local runs default to `--build` for fast
-    # edit-run loops (BuildKit layer cache still applies).
-    build_flag="--build"
+    # Default is pull, not build (CHA-187): compose.yml points at the
+    # published image, so a fresh clone starts in ~1 min instead of ~13.
+    # `--build=1` is the from-source path — the value is required because
+    # just's `arg` attribute has no valueless-flag form.
+    #
+    # `PENCA_SKIP_BUILD=1` overrides even an explicit `--build=1`: CI
+    # reaches this recipe through `integration-test`, which passes the flag
+    # so a contributor's edits get compiled, but CI has already produced
+    # that image in a cache-aware pre-build step and must not repeat it.
+    build_flag=""
+    if [ -n "{{build}}" ]; then
+        build_flag="--build"
+    fi
     if [[ "${PENCA_SKIP_BUILD:-0}" == "1" ]]; then
         build_flag=""
     fi
@@ -858,7 +869,7 @@ integration-test *services:
     # colliding, and the lifecycle scheduler is idle there so its tick loop
     # cannot race the manual Persist/Snapshot/Purge calls these suites make.
     # penca-up defaults to the dev profile, which is the opposite of both.
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     # `penca-down` dumps per-service logs to /tmp before teardown; trap
     # guarantees teardown whether pytest passes, fails, or the shell is
     # interrupted, while preserving pytest's exit code for CI.
@@ -1129,7 +1140,7 @@ perf-test *paths:
         export CARGO_PROFILE=profiling
     fi
 
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && source docker/.baseline.env && set +a
@@ -1292,7 +1303,7 @@ tdd *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    just penca-up --profile=test
+    just penca-up --profile=test --build=1
     trap 'just penca-down --profile=test' EXIT
 
     set -a && source docker/.client.env && set +a
