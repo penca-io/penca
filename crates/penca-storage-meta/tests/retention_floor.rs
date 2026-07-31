@@ -46,7 +46,7 @@ async fn seed_snapshot(
     durable: bool,
     committed: bool,
 ) {
-    let table = naming::table_snapshot_metadata_table(catalog_uuid);
+    let table = naming::table_snapshot_metadata_partition(catalog_uuid, branch_uuid);
     let sql = format!(
         "INSERT INTO {tbl} \
          (table_snapshot_uuid, branch_uuid, table_uuid, snapshotted_at_micros, \
