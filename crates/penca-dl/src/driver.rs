@@ -257,11 +257,20 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
+/// Shape a natively-decoded segment to `schema`, in [`DlError`] terms.
+///
+/// Always projection-less: the cache stores the file-native decode (CHA-545) and
+/// every consumer shapes to its own *full* schema after the lookup, leaving
+/// column pruning to DataFusion (ADR 0023).
+fn shape_native(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, DlError> {
+    Ok(shape_to_schema(batch, schema, None).map_err(ColdStorageError::from)?)
+}
+
 /// One cache-aware segment read, before any shaping — the two outcomes differ
 /// in what shaping they still owe.
 enum CachedSegment {
     /// The file-native decode, cached (or freshly cached) as-is. Still owes
-    /// `shape_to_schema` to the caller's `full_schema`; deferring that to the
+    /// [`shape_native`] to the caller's `full_schema`; deferring that to the
     /// caller is what lets the index-seek path `take` its O(matches) rows
     /// first and null-fill only those.
     Native(Arc<RecordBatch>),
@@ -332,9 +341,7 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
-        CachedSegment::Native(native) => {
-            Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
-        }
+        CachedSegment::Native(native) => shape_native(&native, full_schema),
         CachedSegment::Projected(batch) => Ok(batch),
     }
 }
@@ -447,7 +454,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     if let Some(full) = cache.get(&segment.content_hash) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
-        return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
+        return shape_native(&full, full_schema);
     }
 
     let code = segment.format.as_wire_code();
@@ -462,7 +469,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
         let native = read_and_cache_full_persist(reader, cache, segment, weight).await?;
-        Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
+        shape_native(&native, full_schema)
     } else {
         span.record("cache", "miss-uncached");
         read_projected_uncached_persist(reader, segment, out_schema, full_schema).await
@@ -500,7 +507,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     let schema = penca_format::index::segment_index_schema(key_types);
     if let Some(batch) = cache.get(&sidecar.content_hash) {
         span.record("cache", "hit");
-        return Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?);
+        return shape_native(&batch, &schema);
     }
     span.record("cache", "miss");
     let code = sidecar.format.as_wire_code();
@@ -523,7 +530,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
     );
-    Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?)
+    shape_native(&batch, &schema)
 }
 
 /// Index-driven selective read: binary-search the segment's index sidecar for
@@ -603,7 +610,7 @@ async fn take_matched_rows<R: FormatReader + 'static>(
     match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
         CachedSegment::Native(native) => {
             let taken = arrow::compute::take_record_batch(&native, &indices)?;
-            Ok(shape_to_schema(&taken, full_schema, None).map_err(ColdStorageError::from)?)
+            shape_native(&taken, full_schema)
         }
         CachedSegment::Projected(batch) => Ok(arrow::compute::take_record_batch(&batch, &indices)?),
     }
