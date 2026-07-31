@@ -2,15 +2,13 @@
 //!
 //! A repeat read of the same cold segment within the process lifetime is served
 //! as an `Arc::clone` of the already-decoded Arrow batches, skipping the S3 GET +
-//! Parquet/Lance decode. It holds both snapshot segments (keyed by
-//! `table_snapshot_segment_uuid`) and persist data segments (keyed by
-//! `segment_uuid`) under one byte budget. Each per-uuid segment file is
-//! immutable, so the key→value mapping is stable and needs no invalidation: a
-//! snapshot uuid resolves to identical bytes for the life of the process, and
-//! although a *resolved persist tier* is mutable under retention compaction, an
-//! individual persist *file* (keyed by uuid) is not. There is no TTL —
-//! immutability makes W-TinyLFU eviction the whole reclaim mechanism for both
-//! tiers.
+//! Parquet/Lance decode. It holds snapshot segments, persist data segments and
+//! index sidecars under one byte budget, all keyed by `content_hash`. The
+//! mapping is stable and needs no invalidation: a hash names one decoded value
+//! by construction, and cold artifacts are immutable — although a *resolved
+//! persist tier* is mutable under retention compaction, an individual persist
+//! *file* is not. There is no TTL — immutability makes W-TinyLFU eviction the
+//! whole reclaim mechanism for every tier.
 //!
 //! Eviction is W-TinyLFU (frequency-based, scan-resistant, aged) via `moka`,
 //! bounded by a byte budget: each entry is weighed by its segment's
@@ -31,16 +29,31 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use moka::sync::Cache;
 
-/// In-process W-TinyLFU cache of decoded cold segments, keyed by segment uuid
-/// (`table_snapshot_segment_uuid` for snapshot, `segment_uuid` for persist) and
-/// bounded by a byte budget.
+/// In-process W-TinyLFU cache of decoded cold segments, keyed by `content_hash`
+/// and bounded by a byte budget.
 ///
-/// The key is the segment uuid alone: it is globally unique, immutable, and
-/// resolves to identical bytes, so it fully identifies the decoded value.
-/// `format` is intentionally absent from the key — it is functionally
-/// determined by the uuid, and every value is a format-agnostic decoded
-/// [`RecordBatch`]; `format` is consulted only on the miss path (by the
-/// caller) to pick the reader.
+/// `content_hash` is the digest of the typed in-memory Arrow batch, recorded
+/// once at write time and inherited verbatim by every reference copy — snapshot
+/// carry-forward (CHA-531) and a fork's cold materialization (CHA-539) both mint
+/// a new row uuid over bytes nobody rewrote. Keying by uuid stored one decode
+/// per *row*; keying by hash stores one per distinct *content*, which is what
+/// lets a fork and its parent share a single entry for a shared slice (CHA-545).
+///
+/// **The cached value must be the file-native decode**, not one caller's
+/// shaping. A hash-keyed entry is shared across callers whose schemas can
+/// differ — a fork that retypes a column still reads the parent's bytes — so a
+/// caller-shaped value would hand the second caller the first caller's types.
+/// Callers shape after the lookup via `penca_format::reader::shape_to_schema`;
+/// `test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice` is the
+/// regression guard.
+///
+/// One flat key space, no per-artifact-class prefix. With every artifact keyed
+/// by a hash of its own typed content, two entries collide only when their
+/// decoded batches are identical, in which case sharing one entry is the
+/// correct answer rather than a bug — a base segment and a sidecar that decode
+/// to the same batch may safely share. `format` is likewise absent from the
+/// key: every value is a format-agnostic decoded [`RecordBatch`], and `format`
+/// is consulted only on the miss path (by the caller) to pick the reader.
 ///
 /// Cheaply cloneable: `moka::sync::Cache` is internally an `Arc`, so callers
 /// typically hold a `SegmentCache` behind one outer `Arc` shared
@@ -63,7 +76,7 @@ impl SegmentCache {
             .max_capacity(budget_bytes)
             // Weight in the same byte unit as `max_capacity` so the budget is a
             // real RAM bound; the stored `u32` is the entry's `size_bytes`.
-            .weigher(|_uuid: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
+            .weigher(|_hash: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
             .build();
         Self {
             inner,
@@ -103,21 +116,22 @@ impl SegmentCache {
             && weight_bytes <= u32::MAX as u64
     }
 
-    /// Fetch a decoded segment by uuid, bumping its frequency estimate. A hit
-    /// is an `Arc::clone` — no buffer copy.
-    pub fn get(&self, uuid: &str) -> Option<Arc<RecordBatch>> {
-        self.inner.get(uuid).map(|(batch, _weight)| batch)
+    /// Fetch a decoded segment by content hash, bumping its frequency estimate.
+    /// A hit is an `Arc::clone` — no buffer copy.
+    pub fn get(&self, content_hash: &str) -> Option<Arc<RecordBatch>> {
+        self.inner.get(content_hash).map(|(batch, _weight)| batch)
     }
 
-    /// Insert a decoded segment under its uuid, charged `weight_bytes` against
-    /// the budget. No-op when the segment is not [`admits`](Self::admits)-ible.
-    /// moka enforces `max_capacity` via W-TinyLFU; there is no manual eviction
-    /// loop here.
-    pub fn insert(&self, uuid: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
+    /// Insert a decoded segment under its content hash, charged `weight_bytes`
+    /// against the budget. No-op when the segment is not
+    /// [`admits`](Self::admits)-ible. moka enforces `max_capacity` via
+    /// W-TinyLFU; there is no manual eviction loop here.
+    pub fn insert(&self, content_hash: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
         if !self.admits(weight_bytes) {
             return;
         }
-        self.inner.insert(uuid, (batch, weight_bytes as u32));
+        self.inner
+            .insert(content_hash, (batch, weight_bytes as u32));
     }
 
     /// Force pending eviction/maintenance to run synchronously. moka does

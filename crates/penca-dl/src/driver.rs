@@ -219,11 +219,7 @@ async fn read_and_cache_full<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(
-        segment.table_snapshot_segment_uuid.clone(),
-        Arc::clone(&batch),
-        weight,
-    );
+    cache.insert(segment.content_hash.to_string(), Arc::clone(&batch), weight);
     tracing::debug!(
         rows = batch.num_rows(),
         "snapshot segment cached full decode"
@@ -274,6 +270,7 @@ async fn read_projected_uncached<R: FormatReader>(
     skip_all,
     fields(
         segment_uuid = %segment.table_snapshot_segment_uuid,
+        content_hash = %segment.content_hash,
         format = %segment.format,
         cache = tracing::field::Empty,
     ),
@@ -286,9 +283,8 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.table_snapshot_segment_uuid.as_str();
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&segment.content_hash.to_string()) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
@@ -326,7 +322,7 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(segment.segment_uuid.clone(), Arc::clone(&batch), weight);
+    cache.insert(segment.content_hash.to_string(), Arc::clone(&batch), weight);
     tracing::debug!(
         rows = batch.num_rows(),
         "persist segment decoded and cached"
@@ -390,20 +386,20 @@ async fn read_projected_uncached_persist<R: FormatReader>(
 }
 
 /// Cache-aware read of a single persist segment. A persist segment file is
-/// immutable once written and keyed by its globally-unique `segment_uuid`, so it
-/// shares the process-lifetime [`SegmentCache`] with snapshot segments under one
-/// byte budget, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate
-/// is the whole mechanism. (The *resolved* persist tier is mutable under
-/// retention compaction, which is why the tier is re-resolved live on every
-/// read; the per-uuid *file bytes* this caches are not.) Returns the full
-/// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
-/// the non-cacheable (oversized) path; the caller projects / null-fills
-/// downstream.
+/// immutable once written, so it shares the process-lifetime [`SegmentCache`]
+/// with snapshot segments under one byte budget and one `content_hash` key
+/// space, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate is the
+/// whole mechanism. (The *resolved* persist tier is mutable under retention
+/// compaction, which is why the tier is re-resolved live on every read; the
+/// *file bytes* this caches are not.) Returns the full decoded superset on hit /
+/// miss-cached, or the projected `out_schema` batch on the non-cacheable
+/// (oversized) path; the caller projects / null-fills downstream.
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(
         segment_uuid = %segment.segment_uuid,
+        content_hash = %segment.content_hash,
         format = %segment.format,
         cache = tracing::field::Empty,
     ),
@@ -416,9 +412,8 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.segment_uuid.as_str();
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&segment.content_hash.to_string()) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
@@ -444,8 +439,9 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
-/// namespace from the base segment uuid, so the two never collide in one cache.
+/// cache, keyed by the sidecar's own `content_hash` — a digest of the sidecar
+/// batch, which differs from any base segment's, so the two never collide in one
+/// cache.
 ///
 /// Cached natively and shaped to `key_types` after the lookup, for the same
 /// reason as a base segment: the file was written with the *writing* branch's
@@ -457,6 +453,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     skip_all,
     fields(
         segment_index_uuid = %sidecar.segment_index_uuid,
+        content_hash = %sidecar.content_hash,
         cache = tracing::field::Empty,
     ),
 )]
@@ -470,7 +467,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     // The sidecar's key schema is the indexed columns' native types; the
     // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
-    if let Some(batch) = cache.get(&sidecar.segment_index_uuid) {
+    if let Some(batch) = cache.get(&sidecar.content_hash.to_string()) {
         span.record("cache", "hit");
         return Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?);
     }
@@ -491,7 +488,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
     // decoded-but-not-cached rather than evicting the whole budget.
     cache.insert(
-        sidecar.segment_index_uuid.clone(),
+        sidecar.content_hash.to_string(),
         Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
     );
@@ -1861,14 +1858,21 @@ mod tests {
         assert_eq!(first, second, "both rows resolve to the same decoded batch");
     }
 
-    /// `CountingFormatReader::read_segment` ignores its `schema` argument and
-    /// returns a fixed batch, so no sidecar-shaped fixture is needed — the
-    /// `key_types` slice only has to reach the reader.
+    /// The fixture is sidecar-shaped because the sidecar read shapes its cached
+    /// native batch to `segment_index_schema(key_types)` after the lookup.
     #[tokio::test]
     async fn index_sidecars_sharing_content_hash_decode_once() {
-        let schema = test_schema();
+        let schema = penca_format::index::segment_index_schema(&[DataType::Utf8]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1", "k2"])),
+                Arc::new(arrow::array::Int64Array::from(vec![0i64, 1, 2])),
+            ],
+        )
+        .unwrap();
         let cache = Arc::new(SegmentCache::new(1 << 20));
-        let (dl, reads) = driver_with(cache, test_batch(&schema));
+        let (dl, reads) = driver_with(cache, batch);
 
         let shared = Uuid::from_u128(0xbeef);
         let sidecar = |uuid: &str| IndexSidecar {
@@ -1921,7 +1925,10 @@ mod tests {
             2,
             "oversized segment is never cached — both accesses re-read storage"
         );
-        assert!(cache.get("big").is_none(), "oversized segment not stored");
+        assert!(
+            cache.get(&seg.content_hash.to_string()).is_none(),
+            "oversized segment not stored"
+        );
     }
 
     #[tokio::test]
@@ -1941,7 +1948,14 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache.get("a").is_none() { "a" } else { "b" };
+        let evicted = if cache
+            .get(&segment("a", 150).content_hash.to_string())
+            .is_none()
+        {
+            "a"
+        } else {
+            "b"
+        };
         read_seg(&dl, &segment(evicted, 150), &schema, &schema)
             .await
             .unwrap();
