@@ -231,6 +231,35 @@ def test_pushes_are_never_cancelled_mid_publish():
     )
 
 
+def test_release_can_be_cut_from_the_actions_tab():
+    """A dispatch release must tag AND publish in the same run.
+
+    A job that only pushed the tag would go green and publish nothing: a tag
+    pushed with GITHUB_TOKEN does not trigger workflows, so the `push: tags`
+    arm would never fire.
+    """
+    workflow = _yaml(CI_WORKFLOW)
+    triggers = workflow.get("on", workflow.get(True))
+
+    assert "version" in triggers["workflow_dispatch"]["inputs"], (
+        "the release dispatch must take the version to cut"
+    )
+    assert "github.event_name == 'workflow_dispatch'" in _publish_job()["if"], (
+        "publish-image must fire on a dispatch release, or the tag publishes nothing"
+    )
+
+    merge = _job(workflow, "publish-image-merge")
+    assert merge["permissions"].get("contents") == "write", (
+        "pushing the release tag needs contents: write"
+    )
+
+    runs = "\n".join(step.get("run", "") for step in merge["steps"])
+    assert "git push origin" in runs, "the dispatch must actually create the tag"
+    # Reject a version that does not exist yet, and one that already does.
+    assert "already exists" in runs, "re-tagging an existing release must fail"
+    assert "^v[0-9]+" in runs, "the version input must be validated before tagging"
+
+
 def test_publish_is_scoped_to_main_merges():
     """Without this, `merge_group` builds would publish straight to :main.
 
