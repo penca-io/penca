@@ -202,9 +202,10 @@ The full parameter list (`user`, `password`, `token`, `threadPoolSize`, `trustSt
 [Arrow Flight SQL JDBC driver docs](https://arrow.apache.org/docs/16.0/java/flight_sql_jdbc_driver.html).
 Unrecognized parameters are forwarded to the server as gRPC headers.
 
-> These steps are written against the driver's documented URL scheme and its registered
-> driver class, but have not been executed against a DataGrip install. Corrections
-> welcome.
+> These steps were verified against a DataGrip install, but DataGrip versions and driver
+> configurations vary, so we cannot promise they match yours exactly. If they do not work,
+> please [open an issue](https://github.com/penca-io/penca/issues) with your DataGrip and
+> driver versions.
 
 ## Examples
 
