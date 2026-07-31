@@ -665,11 +665,11 @@ class TestPersistTwoPhase:
             SQL(
                 "INSERT INTO {tbl}"
                 " (table_persist_segment_uuid, table_persist_uuid, branch_uuid,"
-                "  table_uuid,"
+                "  table_uuid, content_hash,"
                 "  min_tx_commit_micros, max_tx_commit_micros,"
                 "  min_commit_seq_num, max_commit_seq_num,"
                 "  object_uri, row_count, format)"
-                " VALUES (%s, %s, %s, %s, 0, 0,"
+                " VALUES (%s, %s, %s, %s, %s, 0, 0,"
                 "  0, 0,"
                 "  'fake://upsert', 999, 'parquet')"
             ).format(tbl=Identifier(segment_parent)),
@@ -678,6 +678,10 @@ class TestPersistTwoPhase:
                 fake_table_persist_uuid,
                 branch.branch_uuid,
                 table_uuid,
+                # NOT NULL with no default (CHA-545). Irrelevant to what this
+                # test asserts, but random rather than fixed so the fake row
+                # can never collide with a real segment's cache key.
+                str(uuid4()),
             ),
         )
 
