@@ -303,6 +303,28 @@ def test_release_tags_publish_a_pinned_version_and_latest():
         step.get("run", "") for step in _job(workflow, "publish-image-merge")["steps"]
     )
     assert "refs/tags/v" in runs, "merge job must branch on the tag ref"
+
+    # :latest must never be attached on the main arm. Verified reachable by
+    # review: moving `-t "$image:latest"` into the else-branch left every
+    # other guard here green.
+    main_arm = re.search(r"\n(\s*)else\n(.*?)\n\1fi\n", runs, re.DOTALL)
+    assert main_arm, "merge job no longer has a main-push arm"
+    assert "latest" not in main_arm.group(2), (
+        "the main-push arm must not tag :latest — it would mean 'whatever "
+        f"landed on main today', got {main_arm.group(2)!r}"
+    )
+
+    # And it must be gated on being the highest STABLE release, or a backport
+    # (v1.0.1 after v2.0.0) drags :latest backwards onto older code, and a
+    # pre-release claims it outright (`sort -V` ranks v1.0.0-rc1 above
+    # v1.0.0 — the opposite of semver).
+    assert "sort -V" in runs and "tail -1" in runs, (
+        ":latest must be gated on the highest existing release"
+    )
+    assert runs.count(r"^v[0-9]+\.[0-9]+\.[0-9]+$") >= 2, (
+        "the highest-release comparison must restrict to stable X.Y.Z on both "
+        "the pushed tag and the candidate list"
+    )
     assert f"{IMAGE}:latest" in runs or "$image:latest" in runs, (
         "a release must move :latest onto the pinned version"
     )

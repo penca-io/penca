@@ -375,6 +375,11 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     steps:
+      # Needed only for the tag list the :latest decision below reads.
+      # fetch-depth: 0 because a shallow clone carries no tags.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
@@ -390,16 +395,36 @@ jobs:
         working-directory: /tmp/digests
         run: |
           image=ghcr.io/penca-io/penca-rust-server
-          # A `v*` tag is a release: pin the version and move :latest onto it,
-          # so :latest only ever means "newest release" and never "whatever
-          # landed on main today". A main push gets the moving :main plus an
-          # immutable short-sha to pin against.
+          # A `v*` tag is a release: pin the version. A main push gets the
+          # moving :main plus an immutable short-sha to pin against. :latest
+          # is decided separately below — never on the main arm.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             release_tag="${GITHUB_REF#refs/tags/}"
-            tags=(-t "$image:$release_tag" -t "$image:latest")
+            tags=(-t "$image:$release_tag")
           else
             release_tag=main
             tags=(-t "$image:main" -t "$image:${GITHUB_SHA::7}")
+          fi
+
+          # Move :latest ONLY when this tag is the highest stable release.
+          # Two ways a naive `always move it` gets this wrong, and docs now
+          # aim readers at :latest, so either one silently downgrades every
+          # new user:
+          #   - a backport: pushing v1.0.1 after v2.0.0 would drag :latest
+          #     backwards onto older code;
+          #   - a pre-release: `sort -V` ranks v1.0.0-rc1 ABOVE v1.0.0
+          #     (measured), the opposite of semver, so an RC could claim it.
+          # Restricting to X.Y.Z before sorting fixes both — it excludes
+          # pre-releases outright and leaves `sort -V` only the stable
+          # versions it does order correctly (v2.0.0 < v10.0.0).
+          if [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            highest=$(git -C "$GITHUB_WORKSPACE" tag -l 'v*' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            if [ "$highest" = "$release_tag" ]; then
+              tags+=(-t "$image:latest")
+            else
+              echo "::notice::$release_tag is not the highest release ($highest); leaving :latest alone"
+            fi
           fi
           echo "PUBLISHED_TAG=$release_tag" >> "$GITHUB_ENV"
           docker buildx imagetools create "${tags[@]}" \
