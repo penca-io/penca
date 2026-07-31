@@ -721,11 +721,16 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
             # Reusing whatever is on the box. Say so with its age — offline,
             # this can be arbitrarily stale, and on --pull=1 (whose whole
             # point is to refresh) silence would be actively misleading.
-            # Read Created out of the JSON rather than via `-f`: a Go
+            # `|| true` is load-bearing under `set -euo pipefail`: this is a
+            # cosmetic lookup, and without it a missing `Created` key (Docker
+            # omits it when absent) or a SIGPIPE from `grep -m1` would abort
+            # the whole recipe — killing the exact offline path this branch
+            # exists to keep working, after the note printed and before the
+            # stack ever came up. Read from the JSON rather than `-f`: a Go
             # template's braces are just-interpolation syntax and wreck the
-            # parse, and escaping them is worse to read than this.
-            built=$(docker image inspect "$PENCA_IMAGE" | grep -m1 '"Created"' | cut -d'"' -f4)
-            echo "      reusing the existing $PENCA_IMAGE, built $built." >&2
+            # parse.
+            built=$(docker image inspect "$PENCA_IMAGE" 2>/dev/null | grep -m1 '"Created"' | cut -d'"' -f4 || true)
+            echo "      reusing the existing $PENCA_IMAGE${built:+, built $built}." >&2
             echo "      run with --build=1 to rebuild it from the working tree." >&2
         else
             docker compose $compose_files $env_file $profiles build query

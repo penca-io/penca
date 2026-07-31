@@ -625,10 +625,30 @@ def test_penca_up_never_leaves_the_image_to_up():
         assert export_at, (
             f"arm builds without redirecting off the published ref: {arm[0].strip()!r}"
         )
-        assert min(export_at) < min(build_at), (
-            "the redirect must precede the build in this arm, or compose stamps "
-            f"the build onto the published ref: {arm[0].strip()!r}"
-        )
+        # Dominance, not just order. An `else`/`elif` only separates the two
+        # when it closes a branch that was already open at the export — one
+        # belonging to a block opened *after* it does not, since the export
+        # still runs on every path into that block. Track depth rather than
+        # indent: order alone let an export in one nested branch vouch for a
+        # build in its sibling.
+        first_export = min(export_at)
+        for build in build_at:
+            assert first_export < build, (
+                "the redirect must precede the build in this arm, or compose "
+                f"stamps the build onto the published ref: {arm[0].strip()!r}"
+            )
+
+            depth = 0
+            for ln in arm[first_export + 1 : build]:
+                if re.match(r"\s*if\b", ln):
+                    depth += 1
+                elif re.match(r"\s*fi\b", ln):
+                    depth -= 1
+                elif re.match(r"\s*(else|elif)\b", ln) and depth == 0:
+                    raise AssertionError(
+                        "the redirect is in a sibling branch of the build, so "
+                        f"it never runs on that path: {arm[0].strip()!r}"
+                    )
 
     assert checked >= 2, (
         "expected a build in both the --build=1 arm and the pull-failure "
