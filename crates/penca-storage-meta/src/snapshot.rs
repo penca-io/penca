@@ -64,7 +64,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(snapshotted_at_micros),
                     SqlValue::TextArray(partition_keys.to_vec()),
@@ -101,10 +101,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows.first().and_then(|row| {
@@ -159,7 +156,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(chunk_idx as i64),
                     SqlValue::Text(object_uri.to_string()),
@@ -197,7 +194,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::Int64(size_bytes),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -227,7 +224,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -257,7 +254,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_segment_uuid)?,
                 ],
             )
@@ -287,7 +284,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_uuid)?,
                 ],
             )
@@ -317,7 +314,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_snapshot_uuid)?,
                 ],
             )
@@ -346,7 +343,7 @@ impl LifecycleManager {
             seg_table = qi(&seg_name),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -387,10 +384,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -450,10 +444,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(table_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
-                ],
+                &[SqlValue::uuid_str(table_uuid)?, SqlValue::Uuid(branch)],
             )
             .await?;
         Ok(rows
@@ -493,7 +484,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -610,8 +601,8 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_snapshot_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(source_branch_uuid)?,
+                    SqlValue::Uuid(branch),
+                    SqlValue::Uuid(source_branch),
                 ],
             )
             .await?;
@@ -656,7 +647,7 @@ impl LifecycleManager {
             epoch = epoch(),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -696,7 +687,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }
@@ -737,10 +728,7 @@ impl LifecycleManager {
         driver
             .execute_no_result_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(())
@@ -780,7 +768,7 @@ impl LifecycleManager {
             .execute_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(window_start),
                 ],

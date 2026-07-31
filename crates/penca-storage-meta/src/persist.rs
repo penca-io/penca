@@ -62,7 +62,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_persist_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(persisted_at_micros),
                     SqlValue::Text(log_kind.as_str().to_string()),
@@ -95,7 +95,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_uuid)?,
                 ],
             )
@@ -125,7 +125,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_uuid)?,
                 ],
             )
@@ -161,10 +161,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -210,10 +207,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -290,7 +284,7 @@ impl LifecycleManager {
             .execute_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(duration_seconds),
                 ],
@@ -365,7 +359,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                     SqlValue::uuid_str(table_persist_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(chunk_idx as i64),
                     SqlValue::Int64(min_tx_commit_micros),
@@ -447,7 +441,7 @@ impl LifecycleManager {
                     SqlValue::Int64(size_bytes),
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Bytes(statistics.to_vec()),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -478,7 +472,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::Int64(size_bytes),
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -508,7 +502,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -538,7 +532,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
             )
@@ -582,7 +576,7 @@ impl LifecycleManager {
             seg = qi(&seg_table),
             tfm = qi(&tfm_table),
         );
-        let mut params: Vec<SqlValue> = vec![SqlValue::uuid_str(branch_uuid)?];
+        let mut params: Vec<SqlValue> = vec![SqlValue::Uuid(branch)];
         if let Some(min) = min_persisted_at_micros {
             params.push(SqlValue::Int64(min));
             sql.push_str(&format!(" AND seg.commit_micros >= ${}", params.len()));
@@ -647,10 +641,8 @@ impl LifecycleManager {
             seg = qi(&seg_table),
             tfm = qi(&tfm_table),
         );
-        let mut params: Vec<SqlValue> = vec![
-            SqlValue::uuid_str(branch_uuid)?,
-            SqlValue::uuid_str(table_uuid)?,
-        ];
+        let mut params: Vec<SqlValue> =
+            vec![SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?];
         if let Some(min) = min_persisted_at_micros {
             params.push(SqlValue::Int64(min));
             sql.push_str(&format!(" AND seg.commit_micros >= ${}", params.len()));
@@ -723,7 +715,7 @@ impl LifecycleManager {
             tfm = qi(&tfm_table),
         );
         let mut params: Vec<SqlValue> = vec![
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::uuid_str(table_uuid)?,
             SqlValue::Text(log_kind.as_str().to_string()),
         ];
@@ -769,7 +761,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -811,7 +803,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         let rows = driver
-            .execute_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(rows
             .iter()
@@ -850,7 +842,7 @@ impl LifecycleManager {
             table = qi(&table),
         );
         driver
-            .execute_no_result_params(&sql, &[SqlValue::uuid_str(branch_uuid)?])
+            .execute_no_result_params(&sql, &[SqlValue::Uuid(branch)])
             .await?;
         Ok(())
     }

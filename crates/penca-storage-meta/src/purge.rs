@@ -54,7 +54,7 @@ impl LifecycleManager {
                 &sql,
                 &[
                     SqlValue::uuid_str(table_purge_uuid)?,
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     last_purged_commit_seq_num
                         .map_or(SqlValue::Null(SqlType::Int64), SqlValue::Int64),
@@ -88,7 +88,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_purge_uuid)?,
                 ],
             )
@@ -118,7 +118,7 @@ impl LifecycleManager {
             .execute_no_result_params(
                 &sql,
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_purge_uuid)?,
                 ],
             )
@@ -195,10 +195,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows
@@ -247,10 +244,7 @@ impl LifecycleManager {
         let rows = driver
             .execute_params(
                 &sql,
-                &[
-                    SqlValue::uuid_str(branch_uuid)?,
-                    SqlValue::uuid_str(table_uuid)?,
-                ],
+                &[SqlValue::Uuid(branch), SqlValue::uuid_str(table_uuid)?],
             )
             .await?;
         Ok(rows

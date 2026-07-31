@@ -390,7 +390,7 @@ impl QueryManager {
             delete = qi(delete_table_name),
         );
         let params = vec![
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::uuid_str(table_uuid)?,
             SqlValue::Int64(w_snap),
         ];
@@ -451,7 +451,7 @@ impl QueryManager {
         };
         let mut params: Vec<SqlValue> = vec![
             SqlValue::Uuid(table),
-            SqlValue::uuid_str(branch_uuid)?,
+            SqlValue::Uuid(branch),
             SqlValue::Int64(as_of_micros),
         ];
         if let Some(seq) = commit_seq_upper {
@@ -722,8 +722,7 @@ impl QueryManager {
         // rest are bound in push order below, each `$N` computed from
         // `params.len()`, so the pinned-uuid and as_of/seq picks share one
         // numbering scheme.
-        let mut params: Vec<SqlValue> =
-            vec![SqlValue::Uuid(table), SqlValue::uuid_str(branch_uuid)?];
+        let mut params: Vec<SqlValue> = vec![SqlValue::Uuid(table), SqlValue::Uuid(branch)];
         let snapshot_selection = if let Some(uuid) = pinned_snapshot_uuid {
             params.push(SqlValue::Uuid(uuid));
             format!("snap.table_snapshot_uuid = ${}", params.len())
@@ -1042,7 +1041,7 @@ impl QueryManager {
                     seg = qi(&seg),
                 ),
                 &[
-                    SqlValue::uuid_str(branch_uuid)?,
+                    SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_uuid)?,
                     SqlValue::Int64(fork_commit_seq_num),
                 ],

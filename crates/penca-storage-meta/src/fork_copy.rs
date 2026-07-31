@@ -161,7 +161,7 @@ impl LifecycleManager {
                     snap = qi(&snap_meta_parent),
                 ),
                 &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(*table),
                     SqlValue::Int64(fork_commit_seq_num),
                     SqlValue::Int64(fork_commit_micros),
@@ -197,7 +197,7 @@ impl LifecycleManager {
                 &[
                     SqlValue::Uuid(new_snap),
                     SqlValue::Uuid(*child),
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(parent_snap),
                     SqlValue::Int64(commit_micros),
                 ],
@@ -216,10 +216,7 @@ impl LifecycleManager {
                      ORDER BY chunk_idx, \"offset\"",
                     seg = qi(&snap_seg_parent),
                 ),
-                &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
-                    SqlValue::Uuid(parent_snap),
-                ],
+                &[SqlValue::Uuid(parent), SqlValue::Uuid(parent_snap)],
             )
             .await?;
         let mut seg_map: Vec<(Uuid, Uuid, u32)> = Vec::with_capacity(segs.len());
@@ -275,7 +272,7 @@ impl LifecycleManager {
                     &[
                         SqlValue::Uuid(new_snap),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -292,10 +289,7 @@ impl LifecycleManager {
                        AND commit_micros IS NOT NULL",
                     idx = qi(&idx_meta_parent),
                 ),
-                &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
-                    SqlValue::Uuid(parent_snap),
-                ],
+                &[SqlValue::Uuid(parent), SqlValue::Uuid(parent_snap)],
             )
             .await?;
         let mut parent_map: Vec<(Uuid, Uuid, String)> = Vec::with_capacity(idx_parents.len());
@@ -333,7 +327,7 @@ impl LifecycleManager {
                     &[
                         SqlValue::Uuid(*child),
                         SqlValue::Uuid(new_snap),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -396,7 +390,7 @@ impl LifecycleManager {
                     ),
                     &[
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(commit_micros),
                     ],
                 )
@@ -472,7 +466,7 @@ impl LifecycleManager {
                     meta = qi(&persist_meta_parent),
                 ),
                 &[
-                    SqlValue::uuid_str(parent_branch_uuid)?,
+                    SqlValue::Uuid(parent),
                     SqlValue::Uuid(*table),
                     SqlValue::Int64(header_from),
                 ],
@@ -520,7 +514,7 @@ impl LifecycleManager {
                             seg = qi(&persist_seg_parent),
                         ),
                         &[
-                            SqlValue::uuid_str(parent_branch_uuid)?,
+                            SqlValue::Uuid(parent),
                             SqlValue::Uuid(old_header),
                             SqlValue::Int64(fork_commit_seq_num),
                         ],
@@ -573,7 +567,7 @@ impl LifecycleManager {
                     &[
                         SqlValue::Uuid(new_header),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Uuid(old_header),
                         SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(commit_micros),
@@ -637,7 +631,7 @@ impl LifecycleManager {
                     &[
                         SqlValue::Uuid(new_header),
                         SqlValue::Uuid(*child),
-                        SqlValue::uuid_str(parent_branch_uuid)?,
+                        SqlValue::Uuid(parent),
                         SqlValue::Int64(fork_commit_seq_num),
                         SqlValue::Int64(commit_micros),
                     ],
