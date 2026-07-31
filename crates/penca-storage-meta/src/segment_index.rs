@@ -572,10 +572,11 @@ impl LifecycleManager {
         let sql = format!(
             "INSERT INTO {table} \
              (segment_index_uuid, branch_uuid, segment_uuid, table_snapshot_index_uuid, \
-              object_uri, \"offset\", length, format, size_bytes, statistics) \
+              object_uri, \"offset\", length, format, size_bytes, statistics, \
+              content_hash) \
              SELECT n.new_sidecar, $1, n.new_seg, $2, \
                     old.object_uri, old.\"offset\", old.length, old.format, \
-                    old.size_bytes, old.statistics \
+                    old.size_bytes, old.statistics, old.content_hash \
              FROM UNNEST({new_seg_arr}, {new_sidecar_arr}, {prior_sidecar_arr}) \
                     AS n(new_seg, new_sidecar, prior_sidecar) \
              JOIN {source_table} old \
@@ -590,7 +591,8 @@ impl LifecycleManager {
                     length = EXCLUDED.length, \
                     format = EXCLUDED.format, \
                     size_bytes = EXCLUDED.size_bytes, \
-                    statistics = EXCLUDED.statistics",
+                    statistics = EXCLUDED.statistics, \
+                    content_hash = EXCLUDED.content_hash",
             table = qi(&table),
             source_table = qi(&source_table),
         );
