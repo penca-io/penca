@@ -120,8 +120,10 @@ pub struct IndexSidecar {
     pub length: i64,
     /// Columnar file format of the sidecar.
     pub format: Format,
-    /// Globally-unique id of the sidecar — its segment-cache key, a distinct
-    /// deterministic-UUID namespace from `table_snapshot_segment_uuid`.
+    /// Globally-unique id of the sidecar row, in a distinct deterministic-UUID
+    /// namespace from `table_snapshot_segment_uuid`. Row identity only — the
+    /// segment-cache key is `content_hash`, because a reference copy mints a
+    /// fresh uuid over bytes it did not rewrite (CHA-545).
     pub segment_index_uuid: String,
     /// In-memory Arrow footprint, for the shared segment cache's byte budget.
     pub size_bytes: i64,

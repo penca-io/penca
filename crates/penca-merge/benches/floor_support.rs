@@ -259,7 +259,9 @@ pub fn base_segment_with_sidecar(size_bytes: i64, rows: i64) -> SnapshotSegment 
             format: Format::Parquet,
             segment_index_uuid: "floor-sidecar".to_string(),
             size_bytes: 1 << 16,
+            content_hash: penca_core::naming::deterministic_uuid_from(&["floor-sidecar"]),
         }),
+        content_hash: penca_core::naming::deterministic_uuid_from(&["floor-seg"]),
         ..Default::default()
     }
 }

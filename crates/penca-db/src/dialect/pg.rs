@@ -487,6 +487,10 @@ impl PgDialect {
         // active merged file, `true` for rows of a previously-sealed merged
         // file. Sealed rows never participate in another compact wave, and the
         // false → true transition is one-way.
+        // `content_hash` — on this and the two other cold-artifact tables below
+        // — is the segment cache key (CHA-545). NOT NULL with no default:
+        // every writer computes it, and a catalog predating the column is
+        // recreated rather than migrated, so there is no legacy row to default.
         driver
             .execute_no_result(&format!(
                 r#"CREATE TABLE IF NOT EXISTS {qi} (
@@ -504,6 +508,7 @@ impl PgDialect {
                     length                      BIGINT,
                     row_count                   BIGINT NOT NULL,
                     format                      TEXT NOT NULL,
+                    content_hash                UUID NOT NULL,
                     size_bytes                  BIGINT DEFAULT 0,
                     metadata                    JSONB DEFAULT '{{}}'::jsonb,
                     statistics                  BYTEA,
@@ -626,6 +631,7 @@ impl PgDialect {
                     length                  BIGINT NOT NULL,
                     size_bytes              BIGINT DEFAULT 0,
                     format                  TEXT NOT NULL,
+                    content_hash            UUID NOT NULL,
                     metadata                JSONB DEFAULT '{{}}'::jsonb,
                     statistics              BYTEA,
                     row_count               BIGINT NOT NULL,
@@ -752,6 +758,7 @@ impl PgDialect {
                     "offset"                    BIGINT NOT NULL,
                     length                      BIGINT NOT NULL,
                     format                      TEXT NOT NULL,
+                    content_hash                UUID NOT NULL,
                     size_bytes                  BIGINT DEFAULT 0,
                     statistics                  BYTEA,
                     written_at_micros           BIGINT DEFAULT {epoch},

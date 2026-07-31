@@ -1631,6 +1631,7 @@ mod tests {
             statistics: Vec::new(),
             row_uuid_index_sidecar: None,
             index_sidecars: Vec::new(),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
         }
     }
 
@@ -1661,6 +1662,7 @@ mod tests {
             offset: None,
             length: None,
             max_commit_seq_num: None,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
         }
     }
 

@@ -784,7 +784,7 @@ impl QueryManager {
         };
         let snapshot_sql = format!(
             "SELECT seg.table_snapshot_segment_uuid, seg.object_uri, \
-                    seg.\"offset\", seg.length, seg.format, \
+                    seg.\"offset\", seg.length, seg.format, seg.content_hash, \
                     snap.snapshotted_at_micros, snap.commit_seq_num, \
                     seg.table_snapshot_uuid, seg.row_count, \
                     seg.size_bytes, seg.metadata, seg.statistics, \
@@ -794,7 +794,8 @@ impl QueryManager {
                     c.object_uri AS sidecar_object_uri, \
                     c.\"offset\" AS sidecar_offset, c.length AS sidecar_length, \
                     c.format AS sidecar_format, c.size_bytes AS sidecar_size_bytes, \
-                    c.segment_index_uuid AS sidecar_segment_index_uuid \
+                    c.segment_index_uuid AS sidecar_segment_index_uuid, \
+                    c.content_hash AS sidecar_content_hash \
              FROM {seg_table} seg \
              INNER JOIN {snap_table} snap \
                ON seg.table_snapshot_uuid = snap.table_snapshot_uuid \
@@ -909,6 +910,7 @@ impl QueryManager {
                     size_bytes: row.get("size_bytes"),
                     metadata_json: metadata.to_string(),
                     statistics: statistics.unwrap_or_default(),
+                    content_hash: row.get("content_hash"),
                     row_uuid_index_sidecar: None,
                     index_sidecars: Vec::new(),
                 });
@@ -1264,7 +1266,7 @@ impl QueryManager {
             "SELECT tfm.log_kind, \
                     seg.table_persist_segment_uuid AS segment_uuid, \
                     seg.object_uri, seg.\"offset\", seg.length, \
-                    seg.row_count, seg.format, \
+                    seg.row_count, seg.format, seg.content_hash, \
                     seg.min_tx_commit_micros, \
                     seg.max_tx_commit_micros, \
                     seg.max_commit_seq_num, \
@@ -1340,6 +1342,7 @@ impl QueryManager {
                 // segment this equals the file's true maximum, so the ceiling
                 // costs a no-op filter and needs no per-row special case.
                 max_commit_seq_num: Some(row.get("max_commit_seq_num")),
+                content_hash: row.get("content_hash"),
             };
 
             match log_kind {
@@ -1450,9 +1453,10 @@ pub(crate) struct HotTableNames {
 /// Decode one row's LEFT-JOINed child-sidecar columns into an
 /// [`IndexSidecar`], or `None` when no child matched (NULL
 /// `sidecar_object_uri`). The object_uri-presence gate stands in for "the
-/// whole child row matched": offset/length/format/segment_index_uuid are all
-/// NOT NULL in the schema, so the non-Option `row.get`s cannot hit a NULL
-/// while object_uri is present. Revisit if a nullable child column is added.
+/// whole child row matched": offset/length/format/segment_index_uuid/
+/// content_hash are all NOT NULL in the schema, so the non-Option `row.get`s
+/// cannot hit a NULL while object_uri is present. Revisit if a nullable child
+/// column is added.
 fn decode_child_sidecar(row: &PgRow) -> Result<Option<IndexSidecar>> {
     row.get::<Option<String>, _>("sidecar_object_uri")
         .map(|object_uri| -> Result<IndexSidecar> {
@@ -1471,6 +1475,10 @@ fn decode_child_sidecar(row: &PgRow) -> Result<Option<IndexSidecar>> {
                 format: sidecar_format,
                 segment_index_uuid: row.get::<Uuid, _>("sidecar_segment_index_uuid").to_string(),
                 size_bytes: row.get::<Option<i64>, _>("sidecar_size_bytes").unwrap_or(0),
+                // Non-Option deliberately, unlike `size_bytes` directly above:
+                // an `unwrap_or(Uuid::nil())` here would hand every sidecar the
+                // same cache key and serve segment X's index for segment Y.
+                content_hash: row.get::<Uuid, _>("sidecar_content_hash"),
             })
         })
         .transpose()
@@ -1785,6 +1793,7 @@ mod assemble_tests {
             offset: None,
             length: None,
             max_commit_seq_num: None,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
         }
     }
 
@@ -1956,6 +1965,7 @@ mod assemble_tests {
             format: Format::Parquet,
             segment_index_uuid: uri.to_string(),
             size_bytes: 1,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uri]),
         }
     }
 

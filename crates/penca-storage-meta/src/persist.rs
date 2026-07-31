@@ -700,6 +700,7 @@ impl LifecycleManager {
         let mut sql = format!(
             "SELECT seg.table_persist_segment_uuid, seg.table_persist_uuid, seg.object_uri, \
                     seg.\"offset\", seg.length, seg.format, seg.row_count, seg.size_bytes, \
+                    seg.content_hash, \
                     seg.table_uuid, seg.min_tx_commit_micros, seg.max_tx_commit_micros, \
                     seg.max_commit_seq_num, seg.is_sealed, tfm.log_kind \
              FROM {seg} seg \

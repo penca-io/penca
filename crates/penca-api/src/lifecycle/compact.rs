@@ -159,6 +159,7 @@ impl<'a> PersistScope<'a> {
             // honoring the ceiling AND the slice arithmetic has to be reworked
             // for short reads.
             max_commit_seq_num: Some(row.get("max_commit_seq_num")),
+            content_hash: row.get("content_hash"),
         })
     }
 }
