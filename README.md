@@ -62,7 +62,7 @@ just penca-up                            # Postgres + object store + servicers +
 uv run python - <<'EOF'                  # write a table and read it back
 from adbc_driver_flightsql.dbapi import connect
 
-with connect("grpc://localhost:50060") as conn, conn.cursor() as cur:
+with connect("grpc://localhost:50060", autocommit=True) as conn, conn.cursor() as cur:
     cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
     cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
     cur.execute("SELECT * FROM greetings ORDER BY id")
@@ -76,6 +76,9 @@ uv run python examples/sandbox_demo.py   # the branching demo above
 That is a stock Arrow Flight SQL driver talking to port 50060. No Penca client, no
 custom protocol, and `greetings` lands in the default catalog and schema so there is
 nothing to create first. ADBC, SQLAlchemy, JDBC and ODBC all connect the same way.
+`autocommit=True` is load-bearing: DB-API defaults it to `False`, which opens a
+transaction that nothing ever commits, so the writes would be discarded when the
+connection closes.
 
 The shipped Python client wraps that surface plus the gRPC one, which is what the
 branching, audit and time-travel calls use; see [docs/usage.md](docs/usage.md).

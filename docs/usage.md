@@ -56,7 +56,7 @@ exotic.
 ```python
 from adbc_driver_flightsql.dbapi import connect
 
-with connect("grpc://localhost:50060") as conn, conn.cursor() as cur:
+with connect("grpc://localhost:50060", autocommit=True) as conn, conn.cursor() as cur:
     cur.executescript("CREATE TABLE greetings (id BIGINT PRIMARY KEY, note VARCHAR)")
     cur.executescript("INSERT INTO greetings (id, note) VALUES (1, 'hello'), (2, 'world')")
     cur.execute("SELECT * FROM greetings ORDER BY id")
@@ -82,9 +82,13 @@ so it is worth reading that function before hand-rolling a session:
 - `adbc.flight.sql.rpc.call_header.x-penca-branch` and `…x-penca-catalog`, the headers
   the server reads at session-mint time to pin the connection's branch and catalog. Both
   are immutable for the session's lifetime.
-- `autocommit=True`. The DB-API default of `False` sends a `BeginTransaction` on connect,
-  which then collides with an explicit SQL `BEGIN`; Penca's transaction surface is the
-  explicit Postgres-style `BEGIN` / `COMMIT` / `ROLLBACK`.
+- `autocommit=True`. **Omit this and your writes are silently discarded.** The DB-API
+  default of `False` sends a `BeginTransaction` on connect, so every statement runs inside
+  a transaction that nothing commits; closing the connection aborts it, and the session
+  drop fires `AbortTx`. A `SELECT` in the same block still shows the rows, because it
+  reads its own uncommitted writes, so the loss only appears after you reconnect. It also
+  collides with an explicit SQL `BEGIN`, since Penca's transaction surface is the explicit
+  Postgres-style `BEGIN` / `COMMIT` / `ROLLBACK`.
 
 ## Your first table
 
