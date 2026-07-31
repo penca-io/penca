@@ -257,14 +257,25 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
-/// Cache-aware read of a single snapshot segment. Returns the full decoded
-/// superset on hit / miss-cached, or the projected `out_schema` batch on the
-/// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
-/// caller projects / null-fills downstream.
+/// One cache-aware segment read, before any shaping — the two outcomes differ
+/// in what shaping they still owe.
+enum CachedSegment {
+    /// The file-native decode, cached (or freshly cached) as-is. Still owes
+    /// `shape_to_schema` to the caller's `full_schema`; deferring that to the
+    /// caller is what lets the index-seek path `take` its O(matches) rows
+    /// first and null-fill only those.
+    Native(Arc<RecordBatch>),
+    /// The non-cacheable (oversized) path, already read projected to
+    /// `out_schema`. Owes nothing.
+    Projected(RecordBatch),
+}
+
+/// Cache-aware read of a single snapshot segment, unshaped. No predicate is
+/// pushed (ADR 0023); the caller projects / null-fills downstream.
 ///
-/// The cached value is the file-native decode; shaping it to `full_schema`
-/// happens here, after the lookup, so two branches sharing one entry each get
-/// their own types rather than whichever branch decoded first (CHA-545).
+/// The cached value is the file-native decode, so shaping happens after the
+/// lookup and two branches sharing one entry each get their own types rather
+/// than whichever branch decoded first (CHA-545).
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -275,19 +286,18 @@ async fn read_projected_uncached<R: FormatReader>(
         cache = tracing::field::Empty,
     ),
 )]
-pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
+async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
     segment: &SnapshotSegment,
-    full_schema: &SchemaRef,
     out_schema: &SchemaRef,
-) -> Result<RecordBatch, DlError> {
+) -> Result<CachedSegment, DlError> {
     let span = tracing::Span::current();
 
     if let Some(full) = cache.get(&segment.content_hash.to_string()) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
-        return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
+        return Ok(CachedSegment::Native(full));
     }
 
     let code = segment.format.as_wire_code();
@@ -300,11 +310,32 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        let native = read_and_cache_full(reader, cache, segment, weight).await?;
-        Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
+        Ok(CachedSegment::Native(
+            read_and_cache_full(reader, cache, segment, weight).await?,
+        ))
     } else {
         span.record("cache", "miss-uncached");
-        read_projected_uncached(reader, segment, out_schema).await
+        Ok(CachedSegment::Projected(
+            read_projected_uncached(reader, segment, out_schema).await?,
+        ))
+    }
+}
+
+/// Cache-aware read of a single snapshot segment. Returns the full decoded
+/// superset on hit / miss-cached, or the projected `out_schema` batch on the
+/// non-cacheable (oversized) path.
+pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
+    readers: &HashMap<i32, R>,
+    cache: &SegmentCache,
+    segment: &SnapshotSegment,
+    full_schema: &SchemaRef,
+    out_schema: &SchemaRef,
+) -> Result<RecordBatch, DlError> {
+    match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
+        CachedSegment::Native(native) => {
+            Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
+        }
+        CachedSegment::Projected(batch) => Ok(batch),
     }
 }
 
@@ -552,6 +583,11 @@ async fn seek_entry_offsets<R: FormatReader + 'static>(
 /// decode entirely on zero matches. A candidate segment that passes coarse
 /// pruning but doesn't contain the probed key must not pay a full base
 /// decode just to `take` zero rows (the common cross-segment-lookup miss).
+///
+/// `take` runs BEFORE the shaping tail so the seek path stays O(matches): a
+/// segment written before an `ALTER TABLE ADD COLUMN` null-fills the added
+/// column, and null-filling the whole cached batch first would allocate a
+/// segment-length array on every probe.
 async fn take_matched_rows<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
@@ -563,11 +599,14 @@ async fn take_matched_rows<R: FormatReader + 'static>(
     if offsets.is_empty() {
         return Ok(RecordBatch::new_empty(full_schema.clone()));
     }
-    let base =
-        read_cached_snapshot_segment(readers, cache, segment, full_schema, out_schema).await?;
     let indices = arrow::array::Int64Array::from(offsets);
-    let taken = arrow::compute::take_record_batch(&base, &indices)?;
-    Ok(taken)
+    match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
+        CachedSegment::Native(native) => {
+            let taken = arrow::compute::take_record_batch(&native, &indices)?;
+            Ok(shape_to_schema(&taken, full_schema, None).map_err(ColdStorageError::from)?)
+        }
+        CachedSegment::Projected(batch) => Ok(arrow::compute::take_record_batch(&batch, &indices)?),
+    }
 }
 
 /// Seek SEVERAL resolved entries against one segment and decode the
@@ -1163,6 +1202,55 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["r1", "r3"])),
                 Arc::new(Int32Array::from(vec![1, 3])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(res, expected);
+    }
+
+    /// The seek path `take`s the matched offsets before it null-fills, so this
+    /// pins that the added column's nulls land on the taken rows and the other
+    /// columns stay aligned with them.
+    #[tokio::test]
+    async fn seek_snapshot_point_null_fills_a_column_absent_from_the_file() {
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let mut by_uri = HashMap::new();
+        let seg = indexed_segment(
+            &mut by_uri,
+            &test_schema(), // what the segment file actually holds
+            "added",
+            &["r0", "r1", "r2"],
+            &[0, 1, 2],
+        );
+        let dl = routing_driver(cache, by_uri);
+
+        // `added` arrived via a later ALTER TABLE ADD COLUMN: it is in the
+        // table schema but not in this segment's file.
+        let full_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("v", DataType::Int32, false),
+            Field::new("added", DataType::Int32, true),
+        ]));
+
+        let res = dl
+            .seek_snapshot_point(
+                std::slice::from_ref(&seg),
+                &[vec!["r1".to_string()]],
+                None,
+                &[],
+                &full_schema,
+                &full_schema,
+            )
+            .await
+            .unwrap()
+            .expect("indexed segment => Some");
+
+        let expected = RecordBatch::try_new(
+            full_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r1"])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![None::<i32>])),
             ],
         )
         .unwrap();
