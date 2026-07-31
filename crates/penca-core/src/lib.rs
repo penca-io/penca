@@ -1,4 +1,5 @@
 pub mod config;
+pub mod digest;
 pub mod error;
 pub mod format;
 pub mod log_kind;
