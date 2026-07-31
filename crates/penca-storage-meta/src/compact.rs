@@ -394,6 +394,12 @@ impl LifecycleManager {
     /// fourth referencing table were added to the gate but not to the reaper, the
     /// reaper would drop delete-set rows for URIs that table still references.
     ///
+    /// All three names must be the catalog-wide PARENTS — the one place CHA-546's
+    /// partition-direct rule deliberately does not apply, for the reason spelled
+    /// out on [`Self::eligible_segment_delete_set_rows`]. A partition here would
+    /// narrow the refcount to a single branch and collect files a sibling still
+    /// reads.
+    ///
     /// `committed_only` is where the two callers deliberately differ, and the
     /// asymmetry is load-bearing in both directions:
     ///
