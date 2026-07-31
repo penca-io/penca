@@ -55,6 +55,23 @@ pub trait FormatReader: Send + Sync {
         schema: &SchemaRef,
         projection: Option<&[&str]>,
     ) -> impl Future<Output = Result<RecordBatch, FormatError>> + Send;
+
+    /// Read one segment file as it was written: the file's own columns, in the
+    /// file's own types, with no projection and no null-fill. The `(offset,
+    /// length)` slice still applies, so row count and row order match what
+    /// [`read_segment`](Self::read_segment) would return for the same slice.
+    ///
+    /// Shape the result to a caller's schema afterwards with
+    /// [`shape_to_schema`] — the same tail `read_segment` runs internally.
+    /// Splitting the two is what lets one decode be cached and served to
+    /// callers whose schemas disagree: a caller-shaped cache entry would hand
+    /// the second caller the first caller's types (CHA-545).
+    fn read_segment_native(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+    ) -> impl Future<Output = Result<RecordBatch, FormatError>> + Send;
 }
 
 /// Errors from format read/write operations.
@@ -115,11 +132,35 @@ impl FormatReader for AnyFormatReader {
             }
         }
     }
+
+    async fn read_segment_native(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        match self {
+            Self::Parquet(r) => r.read_segment_native(uri, offset, length).await,
+            Self::Lance(r) => r.read_segment_native(uri, offset, length).await,
+        }
+    }
 }
 
 /// Create an empty `RecordBatch` matching the given schema.
 pub fn empty_batch(schema: &SchemaRef) -> RecordBatch {
     RecordBatch::new_empty(schema.clone())
+}
+
+/// Adapt a natively-decoded `batch` to `schema`/`projection`: the tail every
+/// [`FormatReader::read_segment`] impl runs after its own read, exposed so a
+/// caller that decoded via [`FormatReader::read_segment_native`] can run it
+/// later — after a cache lookup — with identical behavior.
+pub fn shape_to_schema(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: Option<&[&str]>,
+) -> Result<RecordBatch, FormatError> {
+    null_fill_to_schema(batch, &project_schema(schema, projection)?)
 }
 
 /// Resolve the effective output schema given an optional column projection.

@@ -18,7 +18,7 @@ use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::{
-    FormatError, FormatReader, empty_batch, null_fill_to_schema, present_columns, project_schema,
+    FormatError, FormatReader, empty_batch, present_columns, project_schema, shape_to_schema,
 };
 use crate::uri::uri_to_object_path;
 
@@ -44,6 +44,59 @@ pub struct ParquetFormatReader {
 impl ParquetFormatReader {
     pub fn new(store: Arc<dyn ObjectStore>, base_uri: String) -> Self {
         Self { store, base_uri }
+    }
+
+    /// The read itself, in the file's own schema. `projection`, when `Some`,
+    /// is narrowed to the columns physically present and pushed down as a
+    /// [`ProjectionMask`] so only those byte ranges are fetched; `None` reads
+    /// every column the file has.
+    ///
+    /// Shaping to a caller's schema is the caller's job — `read_segment` runs
+    /// it immediately, `read_segment_native`'s callers run it after their
+    /// cache lookup.
+    async fn read_in_file_schema(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch, FormatError> {
+        let path = uri_to_object_path(&self.base_uri, uri);
+        let reader = ParquetObjectReader::new(self.store.clone(), path);
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        let file_schema = builder.schema().clone();
+
+        // A column added by a later `ALTER TABLE ADD COLUMN` is absent from an
+        // older segment; it is null-filled by the shaping tail rather than
+        // erroring the projection here. `present_names` is never empty: every
+        // Penca segment carries `row_uuid` and every read requests it
+        // (`snapshot_read_schema` prepends it), so the read below always
+        // yields a row count to null-fill against.
+        let read_schema = match projection {
+            Some(names) => {
+                let present_names = present_columns(&file_schema, names);
+                let parquet_schema = builder.parquet_schema().clone();
+                let mask = ProjectionMask::columns(&parquet_schema, present_names.iter().copied());
+                builder = builder.with_projection(mask);
+                project_schema(&file_schema, Some(&present_names))?
+            }
+            None => file_schema,
+        };
+
+        if let (Some(offset), Some(length)) = (offset, length) {
+            builder = builder.with_row_selection(slice_selection(offset as usize, length as usize));
+        }
+
+        let mut stream = builder.build()?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+
+        if batches.is_empty() {
+            return Ok(empty_batch(&read_schema));
+        }
+        Ok(concat_batches(&batches[0].schema(), &batches)?)
     }
 }
 
@@ -75,46 +128,28 @@ impl FormatReader for ParquetFormatReader {
         schema: &SchemaRef,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch, FormatError> {
-        let output_schema = project_schema(schema, projection)?;
         let column_names: Vec<&str> = match projection {
             Some(cols) => cols.to_vec(),
             None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
         };
-
-        let path = uri_to_object_path(&self.base_uri, uri);
-        let reader = ParquetObjectReader::new(self.store.clone(), path);
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-
-        let parquet_schema = builder.parquet_schema().clone();
-        // Project only the requested columns that physically exist in
-        // this segment file. A column added by a later `ALTER TABLE ADD COLUMN`
-        // is absent from an older segment; it is null-filled to `output_schema`
-        // after the read rather than erroring the projection. `present_names`
-        // is never empty: every Penca segment carries `row_uuid` and every
-        // read requests it (`snapshot_read_schema` prepends it), so the read
-        // below always yields a row count to null-fill against.
-        let present_names = present_columns(builder.schema(), &column_names);
-        let output_mask = ProjectionMask::columns(&parquet_schema, present_names.iter().copied());
-        builder = builder.with_projection(output_mask);
-
-        if let (Some(offset), Some(length)) = (offset, length) {
-            builder = builder.with_row_selection(slice_selection(offset as usize, length as usize));
-        }
-
-        let mut stream = builder.build()?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
-
-        if batches.is_empty() {
-            tracing::Span::current().record("rows", 0);
-            return Ok(empty_batch(&output_schema));
-        }
-
-        let present = concat_batches(&batches[0].schema(), &batches)?;
-        let out = null_fill_to_schema(&present, &output_schema)?;
+        let present = self
+            .read_in_file_schema(uri, offset, length, Some(&column_names))
+            .await?;
+        let out = shape_to_schema(&present, schema, projection)?;
         tracing::Span::current().record("rows", out.num_rows());
         Ok(out)
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(uri = %uri, offset = ?offset, length = ?length, format = "parquet"),
+    )]
+    async fn read_segment_native(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        self.read_in_file_schema(uri, offset, length, None).await
     }
 }

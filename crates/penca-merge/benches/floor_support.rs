@@ -84,6 +84,15 @@ impl FormatReader for InMemoryFormatReader {
     ) -> Result<RecordBatch, FormatError> {
         Ok(self.batch.clone())
     }
+
+    async fn read_segment_native(
+        &self,
+        _uri: &str,
+        _offset: Option<i64>,
+        _length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        Ok(self.batch.clone())
+    }
 }
 
 /// Build a real `DatafusionDlDriver` whose only reader (Parquet) serves `batch`
@@ -221,6 +230,19 @@ impl FormatReader for SeekFormatReader {
         _length: Option<i64>,
         _schema: &SchemaRef,
         _projection: Option<&[&str]>,
+    ) -> Result<RecordBatch, FormatError> {
+        if uri == "mem://sidecar" {
+            Ok(self.sidecar.clone())
+        } else {
+            Ok(self.base.clone())
+        }
+    }
+
+    async fn read_segment_native(
+        &self,
+        uri: &str,
+        _offset: Option<i64>,
+        _length: Option<i64>,
     ) -> Result<RecordBatch, FormatError> {
         if uri == "mem://sidecar" {
             Ok(self.sidecar.clone())

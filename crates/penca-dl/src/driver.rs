@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::{SessionContext, SessionState};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
-use penca_format::reader::{FormatError, FormatReader};
+use penca_format::reader::{FormatError, FormatReader, shape_to_schema};
 use penca_storage_cold::{COMMIT_SEQ_NUM_COLUMN, ColdStorageError};
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -204,29 +204,18 @@ impl<R: FormatReader + 'static> DatafusionDlDriver<R> {
 }
 
 /// Cacheable miss: decode the WHOLE segment (all columns, no filter
-/// pushdown) so the cached entry is reusable across any projection, insert
-/// it under `weight`, and return the full superset. The caller has already
-/// decided this segment is admissible.
+/// pushdown, no caller shaping) so the cached entry is reusable across any
+/// projection AND any caller schema, insert it under `weight`, and return the
+/// native batch. The caller has already decided this segment is admissible,
+/// and shapes the result itself once it holds it.
 async fn read_and_cache_full<R: FormatReader>(
     reader: &R,
     cache: &SegmentCache,
     segment: &SnapshotSegment,
-    full_schema: &SchemaRef,
     weight: u64,
-) -> Result<RecordBatch, DlError> {
-    let full_cols: Vec<&str> = full_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
-        .read_segment(
-            &segment.uri,
-            Some(segment.offset),
-            Some(segment.length),
-            full_schema,
-            Some(&full_cols),
-        )
+        .read_segment_native(&segment.uri, Some(segment.offset), Some(segment.length))
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
@@ -239,7 +228,7 @@ async fn read_and_cache_full<R: FormatReader>(
         rows = batch.num_rows(),
         "snapshot segment cached full decode"
     );
-    Ok((*batch).clone())
+    Ok(batch)
 }
 
 /// Non-cacheable miss: a projected read of just `out_schema`, not cached.
@@ -276,6 +265,10 @@ async fn read_projected_uncached<R: FormatReader>(
 /// superset on hit / miss-cached, or the projected `out_schema` batch on the
 /// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
 /// caller projects / null-fills downstream.
+///
+/// The cached value is the file-native decode; shaping it to `full_schema`
+/// happens here, after the lookup, so two branches sharing one entry each get
+/// their own types rather than whichever branch decoded first (CHA-545).
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -298,7 +291,7 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
     if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
-        return Ok((*full).clone());
+        return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
     }
 
     let code = segment.format.as_wire_code();
@@ -311,36 +304,25 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        read_and_cache_full(reader, cache, segment, full_schema, weight).await
+        let native = read_and_cache_full(reader, cache, segment, weight).await?;
+        Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
     } else {
         span.record("cache", "miss-uncached");
         read_projected_uncached(reader, segment, out_schema).await
     }
 }
 
-/// Cacheable persist miss: decode the WHOLE persist segment (all columns) so the
-/// cached entry serves any projection, insert it under `weight`, and return the
-/// full superset.
+/// Cacheable persist miss: decode the WHOLE persist segment (all columns, no
+/// caller shaping) so the cached entry serves any projection and any caller
+/// schema, insert it under `weight`, and return the native batch.
 async fn read_and_cache_full_persist<R: FormatReader>(
     reader: &R,
     cache: &SegmentCache,
     segment: &PersistSegment,
-    full_schema: &SchemaRef,
     weight: u64,
-) -> Result<RecordBatch, DlError> {
-    let full_cols: Vec<&str> = full_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
-        .read_segment(
-            &segment.uri,
-            segment.offset,
-            segment.length,
-            full_schema,
-            Some(&full_cols),
-        )
+        .read_segment_native(&segment.uri, segment.offset, segment.length)
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
@@ -349,7 +331,7 @@ async fn read_and_cache_full_persist<R: FormatReader>(
         rows = batch.num_rows(),
         "persist segment decoded and cached"
     );
-    Ok((*batch).clone())
+    Ok(batch)
 }
 
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
@@ -439,7 +421,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     if let Some(full) = cache.get(uuid) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
-        return Ok((*full).clone());
+        return Ok(shape_to_schema(&full, full_schema, None).map_err(ColdStorageError::from)?);
     }
 
     let code = segment.format.as_wire_code();
@@ -453,7 +435,8 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        read_and_cache_full_persist(reader, cache, segment, full_schema, weight).await
+        let native = read_and_cache_full_persist(reader, cache, segment, weight).await?;
+        Ok(shape_to_schema(&native, full_schema, None).map_err(ColdStorageError::from)?)
     } else {
         span.record("cache", "miss-uncached");
         read_projected_uncached_persist(reader, segment, out_schema, full_schema).await
@@ -463,6 +446,12 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
 /// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
 /// namespace from the base segment uuid, so the two never collide in one cache.
+///
+/// Cached natively and shaped to `key_types` after the lookup, for the same
+/// reason as a base segment: the file was written with the *writing* branch's
+/// key column types, `key_types` comes from the *reading* branch's schema, and
+/// a fork that diverges an indexed column's type makes the two disagree
+/// (CHA-545).
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -478,25 +467,23 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
+    // The sidecar's key schema is the indexed columns' native types; the
+    // identity/name sidecars are the all-Utf8 special case.
+    let schema = penca_format::index::segment_index_schema(key_types);
     if let Some(batch) = cache.get(&sidecar.segment_index_uuid) {
         span.record("cache", "hit");
-        return Ok((*batch).clone());
+        return Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?);
     }
     span.record("cache", "miss");
     let code = sidecar.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
-    // The sidecar's key schema is the indexed columns' native types; the
-    // identity/name sidecars are the all-Utf8 special case.
-    let schema = penca_format::index::segment_index_schema(key_types);
     let batch = reader
-        .read_segment(
+        .read_segment_native(
             &sidecar.object_uri,
             Some(sidecar.offset),
             Some(sidecar.length),
-            &schema,
-            None,
         )
         .await
         .map_err(ColdStorageError::from)?;
@@ -508,7 +495,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         Arc::clone(&batch),
         sidecar.size_bytes.max(0) as u64,
     );
-    Ok((*batch).clone())
+    Ok(shape_to_schema(&batch, &schema, None).map_err(ColdStorageError::from)?)
 }
 
 /// Index-driven selective read: binary-search the segment's index sidecar for
@@ -954,6 +941,18 @@ mod tests {
 
             Ok(self.batch.project(&indices)?)
         }
+
+        /// Delegates so the read counter stays in one place: a native decode is
+        /// a storage hit like any other, and the cache tests count both.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &self.batch.schema(), None)
+                .await
+        }
     }
 
     fn test_schema() -> SchemaRef {
@@ -1039,6 +1038,17 @@ mod tests {
                 .get(uri)
                 .unwrap_or_else(|| panic!("unexpected read of {uri}"))
                 .clone())
+        }
+
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            // `read_segment` ignores its schema argument here — it routes on uri.
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
         }
     }
 
@@ -2348,6 +2358,38 @@ mod tests {
             collect_scan_uuids(stream).await,
             vec!["r1".to_string(), "r2".to_string()],
             "empty exclusion keeps all rows (anti-join over an empty set)",
+        );
+    }
+
+    /// Shaping moved after the cache lookup (CHA-545), so a caller asking for a
+    /// non-nullable column the file lacks must fail the same way whether or not
+    /// an earlier caller already warmed the entry. The first read caches the
+    /// native decode and *then* fails to shape it, so the second read takes the
+    /// hit path — the one that would silently return an unshaped batch if the
+    /// tail were skipped there.
+    #[tokio::test]
+    async fn non_nullable_missing_column_errors_on_a_cache_hit_too() {
+        let demanding: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("absent", DataType::Int32, false),
+        ]));
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&test_schema()));
+        let seg = segment("seg-missing", 128);
+
+        for pass in ["miss", "hit"] {
+            let err = read_seg(&dl, &seg, &demanding, &demanding)
+                .await
+                .expect_err("non-nullable column absent from the segment must error");
+            assert!(
+                err.to_string().contains("absent"),
+                "{pass} pass must name the missing column, got: {err}"
+            );
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the second pass errored off the cached entry, not a re-read"
         );
     }
 

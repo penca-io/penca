@@ -1022,6 +1022,15 @@ mod tests {
         ) -> Result<RecordBatch, FormatError> {
             Ok(self.batch.clone())
         }
+
+        async fn read_segment_native(
+            &self,
+            _uri: &str,
+            _offset: Option<i64>,
+            _length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            Ok(self.batch.clone())
+        }
     }
 
     fn snapshot_seg(uuid: &str, size_bytes: i64) -> SnapshotSegment {
@@ -1283,6 +1292,17 @@ mod tests {
         ) -> Result<RecordBatch, FormatError> {
             self.reads.lock().unwrap().push(uri.to_string());
             Ok(self.batches.get(uri).cloned().expect("uri registered"))
+        }
+
+        /// Delegates so one read is recorded per storage hit, native or not.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
         }
     }
 
@@ -2001,6 +2021,17 @@ mod by_plan_order_tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Ok(self.batches[uri].clone())
+        }
+
+        /// Delegates so the deliberate per-uri sleep applies to native reads too.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
         }
     }
 
