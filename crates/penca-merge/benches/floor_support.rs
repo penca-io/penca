@@ -84,6 +84,15 @@ impl FormatReader for InMemoryFormatReader {
     ) -> Result<RecordBatch, FormatError> {
         Ok(self.batch.clone())
     }
+
+    async fn read_segment_native(
+        &self,
+        _uri: &str,
+        _offset: Option<i64>,
+        _length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        Ok(self.batch.clone())
+    }
 }
 
 /// Build a real `DatafusionDlDriver` whose only reader (Parquet) serves `batch`
@@ -228,6 +237,19 @@ impl FormatReader for SeekFormatReader {
             Ok(self.base.clone())
         }
     }
+
+    async fn read_segment_native(
+        &self,
+        uri: &str,
+        _offset: Option<i64>,
+        _length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        if uri == "mem://sidecar" {
+            Ok(self.sidecar.clone())
+        } else {
+            Ok(self.base.clone())
+        }
+    }
 }
 
 /// A `DatafusionDlDriver` whose reader serves `base` + its `row_uuid` sidecar.
@@ -259,7 +281,9 @@ pub fn base_segment_with_sidecar(size_bytes: i64, rows: i64) -> SnapshotSegment 
             format: Format::Parquet,
             segment_index_uuid: "floor-sidecar".to_string(),
             size_bytes: 1 << 16,
+            content_hash: penca_core::naming::deterministic_uuid_from(&["floor-sidecar"]),
         }),
+        content_hash: penca_core::naming::deterministic_uuid_from(&["floor-seg"]),
         ..Default::default()
     }
 }

@@ -815,6 +815,7 @@ mod tests {
             offset: None,
             length: None,
             max_commit_seq_num: None,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
         }
     }
 
@@ -1021,6 +1022,15 @@ mod tests {
         ) -> Result<RecordBatch, FormatError> {
             Ok(self.batch.clone())
         }
+
+        async fn read_segment_native(
+            &self,
+            _uri: &str,
+            _offset: Option<i64>,
+            _length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            Ok(self.batch.clone())
+        }
     }
 
     fn snapshot_seg(uuid: &str, size_bytes: i64) -> SnapshotSegment {
@@ -1028,6 +1038,7 @@ mod tests {
             table_snapshot_segment_uuid: uuid.to_string(),
             format: Format::Parquet,
             size_bytes,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
@@ -1282,6 +1293,17 @@ mod tests {
             self.reads.lock().unwrap().push(uri.to_string());
             Ok(self.batches.get(uri).cloned().expect("uri registered"))
         }
+
+        /// Delegates so one read is recorded per storage hit, native or not.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
+        }
     }
 
     #[tokio::test]
@@ -1323,6 +1345,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar1"]),
             }),
             ..Default::default()
         };
@@ -1396,6 +1419,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar1".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar1"]),
             }),
             ..Default::default()
         };
@@ -1483,6 +1507,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "sc".to_string(),
             size_bytes: 64,
+            content_hash: penca_core::naming::deterministic_uuid_from(&["sc"]),
         });
         let provider = SnapshotTableProvider::new(
             vec![seg],
@@ -1551,6 +1576,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-identity"]),
             }),
             index_sidecars: vec![(
                 user_index_uuid.to_string(),
@@ -1561,6 +1587,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-user".to_string(),
                     size_bytes: 256,
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-user"]),
                 },
             )],
             ..Default::default()
@@ -1642,6 +1669,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "sidecar-identity".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-identity"]),
             }),
             // No keyed sidecars: the user entry below cannot resolve.
             ..Default::default()
@@ -1693,6 +1721,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "id-sc".to_string(),
                 size_bytes: 1,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["id-sc"]),
             }),
             index_sidecars: vec![(
                 user.to_string(),
@@ -1703,6 +1732,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "user-sc".to_string(),
                     size_bytes: 1,
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["user-sc"]),
                 },
             )],
             ..Default::default()
@@ -1777,6 +1807,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-value".to_string(),
                     size_bytes: 256,
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-value"]),
                 },
             )],
             ..Default::default()
@@ -1888,6 +1919,7 @@ mod tests {
                     format: Format::Parquet,
                     segment_index_uuid: "sidecar-x".to_string(),
                     size_bytes: 128,
+                    content_hash: penca_core::naming::deterministic_uuid_from(&["sidecar-x"]),
                 },
             )],
             ..Default::default()
@@ -1965,6 +1997,7 @@ mod by_plan_order_tests {
             uri: uri.to_string(),
             format: Format::Parquet,
             size_bytes: 64,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
@@ -1988,6 +2021,17 @@ mod by_plan_order_tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Ok(self.batches[uri].clone())
+        }
+
+        /// Delegates so the deliberate per-uri sleep applies to native reads too.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
         }
     }
 

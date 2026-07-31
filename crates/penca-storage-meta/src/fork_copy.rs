@@ -253,10 +253,12 @@ impl LifecycleManager {
                         "INSERT INTO {seg} \
                          (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, \
                           table_uuid, chunk_idx, object_uri, \"offset\", length, size_bytes, \
-                          format, metadata, statistics, row_count, commit_micros) \
+                          format, metadata, statistics, row_count, content_hash, \
+                          commit_micros) \
                          SELECT m.new_uuid, $1, $2, old.table_uuid, m.chunk_idx, old.object_uri, \
                                 old.\"offset\", old.length, old.size_bytes, old.format, \
-                                old.metadata, old.statistics, old.row_count, $4 \
+                                old.metadata, old.statistics, old.row_count, \
+                                old.content_hash, $4 \
                          FROM {seg_old} old \
                          JOIN unnest({new_arr}, {old_arr}, {chunk_arr}) \
                            AS m(new_uuid, old_uuid, chunk_idx) \
@@ -369,10 +371,10 @@ impl LifecycleManager {
                         "INSERT INTO {sidecar} \
                          (segment_index_uuid, branch_uuid, segment_uuid, \
                           table_snapshot_index_uuid, object_uri, \"offset\", length, \
-                          format, size_bytes, statistics, commit_micros) \
+                          format, size_bytes, statistics, content_hash, commit_micros) \
                          SELECT m.new_sidecar, $1, m.new_seg, m.new_parent, old.object_uri, \
                                 old.\"offset\", old.length, old.format, old.size_bytes, \
-                                old.statistics, $3 \
+                                old.statistics, old.content_hash, $3 \
                          FROM {sidecar_old} old \
                          JOIN unnest({a1}, {a2}, {a3}, {a4}, {a5}) \
                            AS m(new_sidecar, new_seg, new_parent, old_seg, old_parent) \
@@ -611,13 +613,13 @@ impl LifecycleManager {
                           table_uuid, chunk_idx, min_tx_commit_micros, max_tx_commit_micros, \
                           min_commit_seq_num, max_commit_seq_num, object_uri, \"offset\", \
                           length, row_count, format, size_bytes, metadata, statistics, \
-                          is_sealed, commit_micros) \
+                          content_hash, is_sealed, commit_micros) \
                          SELECT m.new_uuid, $1, $2, old.table_uuid, old.chunk_idx, \
                                 old.min_tx_commit_micros, old.max_tx_commit_micros, \
                                 old.min_commit_seq_num, LEAST(old.max_commit_seq_num, $4), \
                                 old.object_uri, old.\"offset\", old.length, old.row_count, \
                                 old.format, old.size_bytes, old.metadata, old.statistics, \
-                                TRUE, $5 \
+                                old.content_hash, TRUE, $5 \
                          FROM {seg_old} old \
                          JOIN unnest({new_arr}, {old_arr}) AS m(new_uuid, old_uuid) \
                            ON old.table_persist_segment_uuid = m.old_uuid \

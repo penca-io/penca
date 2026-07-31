@@ -268,9 +268,10 @@ impl SegmentPacker {
     }
 
     /// Concatenate the buffered partitions into one file step with one
-    /// segment row per partition. `size_bytes` and `statistics` are
-    /// computed per partition slice, not per file, so pruning stats
-    /// stay partition-tight.
+    /// segment row per partition. `size_bytes`, `statistics` and
+    /// `content_hash` are computed per partition slice, not per file, so
+    /// pruning stats stay partition-tight and each row's hash identifies
+    /// its own rows rather than the packed file they share.
     fn flush(&mut self) -> Result<Option<SnapshotFileStep>, ApiError> {
         if self.buffered.is_empty() {
             return Ok(None);
@@ -297,6 +298,8 @@ impl SegmentPacker {
                 length: num_rows,
                 size_bytes: batch_in_memory_bytes(batch)?,
                 statistics: penca_dl::stats::compute_segment_statistics(batch),
+                content_hash: penca_core::digest::segment_content_hash(batch)
+                    .map_err(ApiError::Arrow)?,
             });
             self.chunk_idx += 1;
             offset += num_rows;
@@ -327,6 +330,8 @@ impl SegmentPacker {
             length: num_rows,
             size_bytes: chunk_bytes,
             statistics: penca_dl::stats::compute_segment_statistics(&chunk),
+            content_hash: penca_core::digest::segment_content_hash(&chunk)
+                .map_err(ApiError::Arrow)?,
         };
         self.chunk_idx += 1;
         Ok(SnapshotFileStep {

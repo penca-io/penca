@@ -132,6 +132,7 @@ impl LifecycleManager {
         row_count: i64,
         format_text: &str,
         statistics: &[u8],
+        content_hash: &Uuid,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let branch = parse_uuid(branch_uuid);
@@ -139,15 +140,17 @@ impl LifecycleManager {
         let sql = format!(
             "INSERT INTO {table} \
              (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, table_uuid, \
-              chunk_idx, object_uri, \"offset\", length, row_count, format, statistics) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+              chunk_idx, object_uri, \"offset\", length, row_count, format, statistics, \
+              content_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (branch_uuid, table_snapshot_segment_uuid) DO UPDATE \
                 SET object_uri = EXCLUDED.object_uri, \
                     \"offset\" = EXCLUDED.\"offset\", \
                     length = EXCLUDED.length, \
                     row_count = EXCLUDED.row_count, \
                     format = EXCLUDED.format, \
-                    statistics = EXCLUDED.statistics",
+                    statistics = EXCLUDED.statistics, \
+                    content_hash = EXCLUDED.content_hash",
             table = qi(&table),
         );
         driver
@@ -165,6 +168,7 @@ impl LifecycleManager {
                     SqlValue::Int64(row_count),
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Bytes(statistics.to_vec()),
+                    SqlValue::Uuid(*content_hash),
                 ],
             )
             .await?;
@@ -566,10 +570,11 @@ impl LifecycleManager {
             "INSERT INTO {table} \
              (table_snapshot_segment_uuid, table_snapshot_uuid, branch_uuid, \
               table_uuid, chunk_idx, object_uri, \"offset\", length, \
-              row_count, size_bytes, format, metadata, statistics) \
+              row_count, size_bytes, format, metadata, statistics, content_hash) \
              SELECT new.uuid, $1, $2, old.table_uuid, new.idx, \
                     old.object_uri, old.\"offset\", old.length, old.row_count, \
-                    old.size_bytes, old.format, old.metadata, old.statistics \
+                    old.size_bytes, old.format, old.metadata, old.statistics, \
+                    old.content_hash \
              FROM UNNEST({new_arr}, {idx_arr}, {prior_arr}) \
                   AS new(uuid, idx, old_uuid) \
              JOIN {source_table} old \
@@ -585,7 +590,8 @@ impl LifecycleManager {
                     size_bytes = EXCLUDED.size_bytes, \
                     format = EXCLUDED.format, \
                     metadata = EXCLUDED.metadata, \
-                    statistics = EXCLUDED.statistics \
+                    statistics = EXCLUDED.statistics, \
+                    content_hash = EXCLUDED.content_hash \
              RETURNING table_snapshot_segment_uuid",
             table = qi(&table),
             source_table = qi(&source_table),

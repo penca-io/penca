@@ -55,6 +55,31 @@ pub trait FormatReader: Send + Sync {
         schema: &SchemaRef,
         projection: Option<&[&str]>,
     ) -> impl Future<Output = Result<RecordBatch, FormatError>> + Send;
+
+    /// Read one segment file as it was written: the file's own columns, in the
+    /// file's own types, with no projection and no null-fill. The `(offset,
+    /// length)` slice still applies, so row count and row order match what
+    /// [`read_segment`](Self::read_segment) would return for the same slice.
+    ///
+    /// "The file's own types" means the schema the format engine embedded and
+    /// returns, not the table's stored `arrow_schema` — nothing here casts, so
+    /// the types are the encoder's answer rather than the catalog's. Both
+    /// encoders are expected to give the same answer, which is what lets
+    /// `SegmentCache` key on the content hash alone; CHA-548 is the coverage
+    /// that asserts it, and the open question in `docs/design-decisions.md` is
+    /// what would make it structural.
+    ///
+    /// Shape the result to a caller's schema afterwards with
+    /// [`shape_to_schema`] — the same tail `read_segment` runs internally.
+    /// Splitting the two is what lets one decode be cached and served to
+    /// callers whose schemas disagree: a caller-shaped cache entry would hand
+    /// the second caller the first caller's types (CHA-545).
+    fn read_segment_native(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+    ) -> impl Future<Output = Result<RecordBatch, FormatError>> + Send;
 }
 
 /// Errors from format read/write operations.
@@ -115,11 +140,35 @@ impl FormatReader for AnyFormatReader {
             }
         }
     }
+
+    async fn read_segment_native(
+        &self,
+        uri: &str,
+        offset: Option<i64>,
+        length: Option<i64>,
+    ) -> Result<RecordBatch, FormatError> {
+        match self {
+            Self::Parquet(r) => r.read_segment_native(uri, offset, length).await,
+            Self::Lance(r) => r.read_segment_native(uri, offset, length).await,
+        }
+    }
 }
 
 /// Create an empty `RecordBatch` matching the given schema.
 pub fn empty_batch(schema: &SchemaRef) -> RecordBatch {
     RecordBatch::new_empty(schema.clone())
+}
+
+/// Adapt a natively-decoded `batch` to `schema`/`projection`: the tail every
+/// [`FormatReader::read_segment`] impl runs after its own read, exposed so a
+/// caller that decoded via [`FormatReader::read_segment_native`] can run it
+/// later — after a cache lookup — with identical behavior.
+pub fn shape_to_schema(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: Option<&[&str]>,
+) -> Result<RecordBatch, FormatError> {
+    null_fill_to_schema(batch, &project_schema(schema, projection)?)
 }
 
 /// Resolve the effective output schema given an optional column projection.
@@ -174,6 +223,20 @@ pub(crate) fn null_fill_to_schema(
     Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
+/// The columns a segment read should request from the file: the projection when
+/// given, otherwise every column in `schema`. The `None` case is what makes a
+/// projection-less [`FormatReader::read_segment`] return the caller's whole
+/// schema, null-filling any column the file predates.
+pub(crate) fn requested_columns<'a>(
+    schema: &'a SchemaRef,
+    projection: Option<&[&'a str]>,
+) -> Vec<&'a str> {
+    match projection {
+        Some(cols) => cols.to_vec(),
+        None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
+    }
+}
+
 /// The subset of `names` that actually exist as columns in `file_schema`,
 /// preserving the requested order. Used by readers to project only the columns
 /// physically present in a segment before null-filling the rest.
@@ -220,6 +283,21 @@ mod tests {
         let schema = test_schema();
         let err = project_schema(&schema, Some(&["a", "zzz"])).unwrap_err();
         assert!(matches!(err, FormatError::UnknownProjectionColumn(name) if name == "zzz"));
+    }
+
+    #[test]
+    fn requested_columns_passes_projection_through_and_expands_none() {
+        let schema = test_schema();
+        assert_eq!(
+            requested_columns(&schema, Some(&["c", "a"])),
+            vec!["c", "a"],
+            "a projection is returned verbatim, in the requested order"
+        );
+        assert_eq!(
+            requested_columns(&schema, None),
+            vec!["a", "b", "c"],
+            "no projection means every column in the caller's schema"
+        );
     }
 
     #[test]

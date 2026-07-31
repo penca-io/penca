@@ -24,6 +24,7 @@ use penca_db::driver::pg::PgDriver;
 use penca_format::writer::FormatWriter;
 use penca_storage_cold::ColdStorageClient;
 use penca_storage_meta::LifecycleManager;
+use uuid::Uuid;
 
 use crate::error::ApiError;
 
@@ -219,6 +220,12 @@ impl<'a> SegmentScope for PersistSegmentScope<'a> {
 
     async fn insert_segment(&self, pool: &PgDriver, step: &Self::Step) -> Result<(), ApiError> {
         let statistics = penca_dl::stats::compute_segment_statistics(&step.batch);
+        // Hashed here, on the in-memory batch, rather than after `write_file`:
+        // the digest identifies the logical content handed to the format writer,
+        // which is what the segment cache stores post-decode. It is deliberately
+        // not a checksum of the object on S3 — see `segment_content_hash`.
+        let content_hash =
+            penca_core::digest::segment_content_hash(&step.batch).map_err(ApiError::Arrow)?;
         LifecycleManager::insert_table_persist_segment(
             pool,
             self.catalog_str,
@@ -235,6 +242,7 @@ impl<'a> SegmentScope for PersistSegmentScope<'a> {
             step.num_rows,
             self.storage_format.extension(),
             &statistics,
+            &content_hash,
         )
         .await?;
         Ok(())
@@ -324,6 +332,8 @@ impl<'a> SegmentScope for SnapshotSegmentScope<'a> {
 
     async fn insert_segment(&self, pool: &PgDriver, step: &Self::Step) -> Result<(), ApiError> {
         let statistics = penca_dl::stats::compute_segment_statistics(&step.batch);
+        let content_hash =
+            penca_core::digest::segment_content_hash(&step.batch).map_err(ApiError::Arrow)?;
         LifecycleManager::insert_snapshot_segment(
             pool,
             self.catalog_str,
@@ -341,6 +351,7 @@ impl<'a> SegmentScope for SnapshotSegmentScope<'a> {
             step.num_rows,
             self.storage_format.extension(),
             &statistics,
+            &content_hash,
         )
         .await?;
         Ok(())
@@ -409,9 +420,10 @@ pub(super) struct SnapshotFileStep {
 /// One per-partition segment metadata row inside a packed file.
 /// `offset`/`length` are the partition's row range within the file —
 /// `length` doubles as the catalog `row_count` (a packed row IS its
-/// row range; both columns are NOT NULL). `size_bytes`
-/// and `statistics` are computed over the slice only, so pruning
-/// stats stay partition-tight.
+/// row range; both columns are NOT NULL). `size_bytes`,
+/// `statistics` and `content_hash` are computed over the slice only, so
+/// pruning stats stay partition-tight and the hash identifies the rows
+/// this one row covers rather than the whole packed file.
 pub(super) struct SnapshotSegmentRowSpec {
     pub seg_uuid_str: String,
     pub chunk_idx: u32,
@@ -425,6 +437,7 @@ pub(super) struct SnapshotSegmentRowSpec {
     pub length: i64,
     pub size_bytes: i64,
     pub statistics: Vec<u8>,
+    pub content_hash: Uuid,
 }
 
 impl<'a> DurableSegmentWriter<SnapshotSegmentScope<'a>> {
@@ -456,6 +469,7 @@ impl<'a> DurableSegmentWriter<SnapshotSegmentScope<'a>> {
                 row.length,
                 self.scope.storage_format.extension(),
                 &row.statistics,
+                &row.content_hash,
             )
             .await?;
             self.current_group()

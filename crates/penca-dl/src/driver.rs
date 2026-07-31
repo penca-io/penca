@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::{SessionContext, SessionState};
 use penca_core::{ColdStoragePlan, IndexSidecar, PersistSegment, SnapshotSegment};
-use penca_format::reader::{FormatError, FormatReader};
+use penca_format::reader::{FormatError, FormatReader, shape_to_schema};
 use penca_storage_cold::{COMMIT_SEQ_NUM_COLUMN, ColdStorageError};
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -203,43 +203,39 @@ impl<R: FormatReader + 'static> DatafusionDlDriver<R> {
     }
 }
 
-/// Cacheable miss: decode the WHOLE segment (all columns, no filter
-/// pushdown) so the cached entry is reusable across any projection, insert
-/// it under `weight`, and return the full superset. The caller has already
-/// decided this segment is admissible.
-async fn read_and_cache_full<R: FormatReader>(
+/// Cacheable miss: decode the WHOLE segment file (all columns, no filter
+/// pushdown, no caller shaping) so the cached entry is reusable across any
+/// projection AND any caller schema (CHA-545), offer it to the cache under
+/// `content_hash`, and return the native batch. The caller shapes the result
+/// itself once it holds it.
+///
+/// Takes `uri` + `(offset, length)` rather than any segment type, mirroring
+/// [`FormatReader::read_segment_native`] — persist segments, snapshot segments
+/// and index sidecars all reach it, and none of them is the reader's or the
+/// cache's concern.
+///
+/// [`SegmentCache::insert`] self-gates on
+/// [`admits`](SegmentCache::admits), so an artifact too large for the budget is
+/// decoded-but-not-cached rather than evicting everything and then itself. A
+/// caller with a narrower read available should check `admits` first and take
+/// that path instead.
+async fn decode_and_cache_native<R: FormatReader>(
     reader: &R,
     cache: &SegmentCache,
-    segment: &SnapshotSegment,
-    full_schema: &SchemaRef,
+    uri: &str,
+    offset: Option<i64>,
+    length: Option<i64>,
+    content_hash: Uuid,
     weight: u64,
-) -> Result<RecordBatch, DlError> {
-    let full_cols: Vec<&str> = full_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
-        .read_segment(
-            &segment.uri,
-            Some(segment.offset),
-            Some(segment.length),
-            full_schema,
-            Some(&full_cols),
-        )
+        .read_segment_native(uri, offset, length)
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(
-        segment.table_snapshot_segment_uuid.clone(),
-        Arc::clone(&batch),
-        weight,
-    );
-    tracing::debug!(
-        rows = batch.num_rows(),
-        "snapshot segment cached full decode"
-    );
-    Ok((*batch).clone())
+    cache.insert(content_hash, Arc::clone(&batch), weight);
+    tracing::debug!(rows = batch.num_rows(), "segment decoded and cached");
+    Ok(batch)
 }
 
 /// Non-cacheable miss: a projected read of just `out_schema`, not cached.
@@ -272,36 +268,59 @@ async fn read_projected_uncached<R: FormatReader>(
     Ok(batch)
 }
 
-/// Cache-aware read of a single snapshot segment. Returns the full decoded
-/// superset on hit / miss-cached, or the projected `out_schema` batch on the
-/// non-cacheable (oversized) path. No predicate is pushed (ADR 0023); the
-/// caller projects / null-fills downstream.
+/// Shape a natively-decoded segment to `schema`, in [`DlError`] terms.
+///
+/// Always projection-less: the cache stores the file-native decode (CHA-545) and
+/// every consumer shapes to its own *full* schema after the lookup, leaving
+/// column pruning to DataFusion (ADR 0023).
+fn shape_native(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, DlError> {
+    Ok(shape_to_schema(batch, schema, None).map_err(ColdStorageError::from)?)
+}
+
+/// One cache-aware segment read, before any shaping — the two outcomes differ
+/// in what shaping they still owe.
+enum CachedSegment {
+    /// The file-native decode, cached (or freshly cached) as-is. Still owes
+    /// [`shape_native`] to the caller's `full_schema`; deferring that to the
+    /// caller is what lets the index-seek path `take` its O(matches) rows
+    /// first and null-fill only those.
+    Native(Arc<RecordBatch>),
+    /// The non-cacheable (oversized) path, already read projected to
+    /// `out_schema`. Owes nothing.
+    Projected(RecordBatch),
+}
+
+/// Cache-aware read of a single snapshot segment, unshaped. No predicate is
+/// pushed (ADR 0023); the caller projects / null-fills downstream.
+///
+/// The cached value is the file-native decode, so shaping happens after the
+/// lookup and two branches sharing one entry each get their own types rather
+/// than whichever branch decoded first (CHA-545).
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(
         segment_uuid = %segment.table_snapshot_segment_uuid,
+        content_hash = %segment.content_hash,
         format = %segment.format,
         cache = tracing::field::Empty,
     ),
 )]
-pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
+async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
     segment: &SnapshotSegment,
-    full_schema: &SchemaRef,
     out_schema: &SchemaRef,
-) -> Result<RecordBatch, DlError> {
+) -> Result<CachedSegment, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.table_snapshot_segment_uuid.as_str();
+    let code = segment.format.as_wire_code();
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&segment.content_hash) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
-        return Ok((*full).clone());
+        return Ok(CachedSegment::Native(full));
     }
 
-    let code = segment.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
@@ -311,45 +330,40 @@ pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        read_and_cache_full(reader, cache, segment, full_schema, weight).await
+        Ok(CachedSegment::Native(
+            decode_and_cache_native(
+                reader,
+                cache,
+                &segment.uri,
+                Some(segment.offset),
+                Some(segment.length),
+                segment.content_hash,
+                weight,
+            )
+            .await?,
+        ))
     } else {
         span.record("cache", "miss-uncached");
-        read_projected_uncached(reader, segment, out_schema).await
+        Ok(CachedSegment::Projected(
+            read_projected_uncached(reader, segment, out_schema).await?,
+        ))
     }
 }
 
-/// Cacheable persist miss: decode the WHOLE persist segment (all columns) so the
-/// cached entry serves any projection, insert it under `weight`, and return the
-/// full superset.
-async fn read_and_cache_full_persist<R: FormatReader>(
-    reader: &R,
+/// Cache-aware read of a single snapshot segment. Returns the full decoded
+/// superset on hit / miss-cached, or the projected `out_schema` batch on the
+/// non-cacheable (oversized) path.
+pub(crate) async fn read_cached_snapshot_segment<R: FormatReader + 'static>(
+    readers: &HashMap<i32, R>,
     cache: &SegmentCache,
-    segment: &PersistSegment,
+    segment: &SnapshotSegment,
     full_schema: &SchemaRef,
-    weight: u64,
+    out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
-    let full_cols: Vec<&str> = full_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    let batch = reader
-        .read_segment(
-            &segment.uri,
-            segment.offset,
-            segment.length,
-            full_schema,
-            Some(&full_cols),
-        )
-        .await
-        .map_err(ColdStorageError::from)?;
-    let batch = Arc::new(batch);
-    cache.insert(segment.segment_uuid.clone(), Arc::clone(&batch), weight);
-    tracing::debug!(
-        rows = batch.num_rows(),
-        "persist segment decoded and cached"
-    );
-    Ok((*batch).clone())
+    match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
+        CachedSegment::Native(native) => shape_native(&native, full_schema),
+        CachedSegment::Projected(batch) => Ok(batch),
+    }
 }
 
 /// Non-cacheable persist miss: a projected read of just `out_schema`, not cached.
@@ -408,20 +422,20 @@ async fn read_projected_uncached_persist<R: FormatReader>(
 }
 
 /// Cache-aware read of a single persist segment. A persist segment file is
-/// immutable once written and keyed by its globally-unique `segment_uuid`, so it
-/// shares the process-lifetime [`SegmentCache`] with snapshot segments under one
-/// byte budget, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate
-/// is the whole mechanism. (The *resolved* persist tier is mutable under
-/// retention compaction, which is why the tier is re-resolved live on every
-/// read; the per-uuid *file bytes* this caches are not.) Returns the full
-/// decoded superset on hit / miss-cached, or the projected `out_schema` batch on
-/// the non-cacheable (oversized) path; the caller projects / null-fills
-/// downstream.
+/// immutable once written, so it shares the process-lifetime [`SegmentCache`]
+/// with snapshot segments under one byte budget and one `content_hash` key
+/// space, with NO TTL — W-TinyLFU eviction plus the `admits` budget gate is the
+/// whole mechanism. (The *resolved* persist tier is mutable under retention
+/// compaction, which is why the tier is re-resolved live on every read; the
+/// *file bytes* this caches are not.) Returns the full decoded superset on hit /
+/// miss-cached, or the projected `out_schema` batch on the non-cacheable
+/// (oversized) path; the caller projects / null-fills downstream.
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(
         segment_uuid = %segment.segment_uuid,
+        content_hash = %segment.content_hash,
         format = %segment.format,
         cache = tracing::field::Empty,
     ),
@@ -434,15 +448,14 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    let uuid = segment.segment_uuid.as_str();
+    let code = segment.format.as_wire_code();
 
-    if let Some(full) = cache.get(uuid) {
+    if let Some(full) = cache.get(&segment.content_hash) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
-        return Ok((*full).clone());
+        return shape_native(&full, full_schema);
     }
 
-    let code = segment.format.as_wire_code();
     let reader = readers
         .get(&code)
         .ok_or(ColdStorageError::UnknownFormat(code))?;
@@ -453,7 +466,17 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 
     if cache.admits(weight) {
         span.record("cache", "miss-cached");
-        read_and_cache_full_persist(reader, cache, segment, full_schema, weight).await
+        let native = decode_and_cache_native(
+            reader,
+            cache,
+            &segment.uri,
+            segment.offset,
+            segment.length,
+            segment.content_hash,
+            weight,
+        )
+        .await?;
+        shape_native(&native, full_schema)
     } else {
         span.record("cache", "miss-uncached");
         read_projected_uncached_persist(reader, segment, out_schema, full_schema).await
@@ -461,13 +484,22 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
 }
 
 /// Load a sorted `(key, row_offset)` index sidecar through the shared snapshot
-/// cache, keyed by its own `segment_index_uuid` — a distinct deterministic-UUID
-/// namespace from the base segment uuid, so the two never collide in one cache.
+/// cache, under the sidecar's own `content_hash` — a digest of the sidecar
+/// batch, not of the base segment it indexes. Sidecars and base segments share
+/// one flat key space; see [`SegmentCache`] for why a same-content collision
+/// between the two classes would be correct rather than a bug.
+///
+/// Cached natively and shaped to `key_types` after the lookup, for the same
+/// reason as a base segment: the file was written with the *writing* branch's
+/// key column types, `key_types` comes from the *reading* branch's schema, and
+/// a fork that diverges an indexed column's type makes the two disagree
+/// (CHA-545).
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(
         segment_index_uuid = %sidecar.segment_index_uuid,
+        content_hash = %sidecar.content_hash,
         cache = tracing::field::Empty,
     ),
 )]
@@ -478,37 +510,42 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
     key_types: &[arrow::datatypes::DataType],
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
-    if let Some(batch) = cache.get(&sidecar.segment_index_uuid) {
-        span.record("cache", "hit");
-        return Ok((*batch).clone());
-    }
-    span.record("cache", "miss");
     let code = sidecar.format.as_wire_code();
-    let reader = readers
-        .get(&code)
-        .ok_or(ColdStorageError::UnknownFormat(code))?;
     // The sidecar's key schema is the indexed columns' native types; the
     // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
-    let batch = reader
-        .read_segment(
-            &sidecar.object_uri,
-            Some(sidecar.offset),
-            Some(sidecar.length),
-            &schema,
-            None,
-        )
-        .await
-        .map_err(ColdStorageError::from)?;
-    let batch = Arc::new(batch);
-    // `insert` self-gates on `cache.admits(weight)`, so an oversize sidecar is
-    // decoded-but-not-cached rather than evicting the whole budget.
-    cache.insert(
-        sidecar.segment_index_uuid.clone(),
-        Arc::clone(&batch),
-        sidecar.size_bytes.max(0) as u64,
+    if let Some(batch) = cache.get(&sidecar.content_hash) {
+        span.record("cache", "hit");
+        return shape_native(&batch, &schema);
+    }
+    let weight = sidecar.size_bytes.max(0) as u64;
+    // Telemetry only — unlike a base segment there is no narrower read to fall
+    // back to, so a non-admissible sidecar is still decoded whole (`insert`
+    // self-gates). Reporting the base paths' three-valued vocabulary is what
+    // makes a sidecar that can *never* cache — re-decoded from S3 on every read
+    // — distinguishable from an ordinary first touch.
+    span.record(
+        "cache",
+        if cache.admits(weight) {
+            "miss-cached"
+        } else {
+            "miss-uncached"
+        },
     );
-    Ok((*batch).clone())
+    let reader = readers
+        .get(&code)
+        .ok_or(ColdStorageError::UnknownFormat(code))?;
+    let batch = decode_and_cache_native(
+        reader,
+        cache,
+        &sidecar.object_uri,
+        Some(sidecar.offset),
+        Some(sidecar.length),
+        sidecar.content_hash,
+        weight,
+    )
+    .await?;
+    shape_native(&batch, &schema)
 }
 
 /// Index-driven selective read: binary-search the segment's index sidecar for
@@ -568,6 +605,11 @@ async fn seek_entry_offsets<R: FormatReader + 'static>(
 /// decode entirely on zero matches. A candidate segment that passes coarse
 /// pruning but doesn't contain the probed key must not pay a full base
 /// decode just to `take` zero rows (the common cross-segment-lookup miss).
+///
+/// `take` runs BEFORE the shaping tail so the seek path stays O(matches): a
+/// segment written before an `ALTER TABLE ADD COLUMN` null-fills the added
+/// column, and null-filling the whole cached batch first would allocate a
+/// segment-length array on every probe.
 async fn take_matched_rows<R: FormatReader + 'static>(
     readers: &HashMap<i32, R>,
     cache: &SegmentCache,
@@ -579,11 +621,14 @@ async fn take_matched_rows<R: FormatReader + 'static>(
     if offsets.is_empty() {
         return Ok(RecordBatch::new_empty(full_schema.clone()));
     }
-    let base =
-        read_cached_snapshot_segment(readers, cache, segment, full_schema, out_schema).await?;
     let indices = arrow::array::Int64Array::from(offsets);
-    let taken = arrow::compute::take_record_batch(&base, &indices)?;
-    Ok(taken)
+    match read_cached_snapshot_segment_unshaped(readers, cache, segment, out_schema).await? {
+        CachedSegment::Native(native) => {
+            let taken = arrow::compute::take_record_batch(&native, &indices)?;
+            shape_native(&taken, full_schema)
+        }
+        CachedSegment::Projected(batch) => Ok(arrow::compute::take_record_batch(&batch, &indices)?),
+    }
 }
 
 /// Seek SEVERAL resolved entries against one segment and decode the
@@ -954,6 +999,18 @@ mod tests {
 
             Ok(self.batch.project(&indices)?)
         }
+
+        /// Delegates so the read counter stays in one place: a native decode is
+        /// a storage hit like any other, and the cache tests count both.
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            self.read_segment(uri, offset, length, &self.batch.schema(), None)
+                .await
+        }
     }
 
     fn test_schema() -> SchemaRef {
@@ -974,11 +1031,15 @@ mod tests {
         .unwrap()
     }
 
+    /// `content_hash` is derived from the name so distinct fixtures stay
+    /// distinct under content-hash cache keying; tests asserting dedup
+    /// overwrite it with a deliberately shared value.
     fn segment(uuid: &str, size_bytes: i64) -> SnapshotSegment {
         SnapshotSegment {
             table_snapshot_segment_uuid: uuid.to_string(),
             format: Format::Parquet,
             size_bytes,
+            content_hash: penca_core::naming::deterministic_uuid_from(&[uuid]),
             ..Default::default()
         }
     }
@@ -1036,6 +1097,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected read of {uri}"))
                 .clone())
         }
+
+        async fn read_segment_native(
+            &self,
+            uri: &str,
+            offset: Option<i64>,
+            length: Option<i64>,
+        ) -> Result<RecordBatch, FormatError> {
+            // `read_segment` ignores its schema argument here — it routes on uri.
+            self.read_segment(uri, offset, length, &Arc::new(Schema::empty()), None)
+                .await
+        }
     }
 
     fn routing_driver(
@@ -1076,6 +1148,7 @@ mod tests {
         by_uri.insert(side_uri.clone(), sidecar_batch);
         SnapshotSegment {
             table_snapshot_segment_uuid: format!("seg-{name}"),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[&format!("seg-{name}")]),
             uri: base_uri,
             format: Format::Parquet,
             length: keys.len() as i64,
@@ -1088,6 +1161,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&[&format!(
+                    "idx-{name}"
+                )]),
             }),
             ..Default::default()
         }
@@ -1148,6 +1224,55 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["r1", "r3"])),
                 Arc::new(Int32Array::from(vec![1, 3])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(res, expected);
+    }
+
+    /// The seek path `take`s the matched offsets before it null-fills, so this
+    /// pins that the added column's nulls land on the taken rows and the other
+    /// columns stay aligned with them.
+    #[tokio::test]
+    async fn seek_snapshot_point_null_fills_a_column_absent_from_the_file() {
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let mut by_uri = HashMap::new();
+        let seg = indexed_segment(
+            &mut by_uri,
+            &test_schema(), // what the segment file actually holds
+            "added",
+            &["r0", "r1", "r2"],
+            &[0, 1, 2],
+        );
+        let dl = routing_driver(cache, by_uri);
+
+        // `added` arrived via a later ALTER TABLE ADD COLUMN: it is in the
+        // table schema but not in this segment's file.
+        let full_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("v", DataType::Int32, false),
+            Field::new("added", DataType::Int32, true),
+        ]));
+
+        let res = dl
+            .seek_snapshot_point(
+                std::slice::from_ref(&seg),
+                &[vec!["r1".to_string()]],
+                None,
+                &[],
+                &full_schema,
+                &full_schema,
+            )
+            .await
+            .unwrap()
+            .expect("indexed segment => Some");
+
+        let expected = RecordBatch::try_new(
+            full_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["r1"])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![None::<i32>])),
             ],
         )
         .unwrap();
@@ -1239,6 +1364,7 @@ mod tests {
         by_uri.insert(side_uri.clone(), sidecar_batch);
         SnapshotSegment {
             table_snapshot_segment_uuid: format!("seg-{name}"),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[&format!("seg-{name}")]),
             uri: base_uri,
             format: Format::Parquet,
             length: key0s.len() as i64,
@@ -1251,6 +1377,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: format!("idx-{name}"),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&[&format!(
+                    "idx-{name}"
+                )]),
             }),
             ..Default::default()
         }
@@ -1521,6 +1650,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity-never-read".to_string(),
             size_bytes: 256,
+            content_hash: penca_core::naming::deterministic_uuid_from(&["idx-identity-never-read"]),
         });
         let dl = routing_driver(cache, by_uri);
 
@@ -1550,6 +1680,7 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx-identity".to_string(),
             size_bytes: 256,
+            content_hash: penca_core::naming::deterministic_uuid_from(&["idx-identity"]),
         });
         let name_index = Uuid::new_v4();
         let res = dl
@@ -1591,6 +1722,7 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-other".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&["idx-other"]),
             },
         )];
         let requested = Uuid::new_v4(); // != the keyed index present
@@ -1635,6 +1767,9 @@ mod tests {
                 format: Format::Parquet,
                 segment_index_uuid: "idx-keyed-never-read".to_string(),
                 size_bytes: 256,
+                content_hash: penca_core::naming::deterministic_uuid_from(&[
+                    "idx-keyed-never-read",
+                ]),
             },
         )];
         let dl = routing_driver(cache, by_uri);
@@ -1756,6 +1891,135 @@ mod tests {
         );
     }
 
+    /// Two metadata rows over one byte range — exactly what snapshot
+    /// carry-forward (CHA-531) and a fork's reference copy (CHA-539) produce: a
+    /// NEW row uuid over an unchanged `(uri, offset, length)`. Keyed by uuid the
+    /// cache stores both decodes of identical bytes; keyed by `content_hash` it
+    /// stores one (CHA-545).
+    ///
+    /// One test per artifact class because the scope rule is precisely that all
+    /// three behave identically — a fix that dedups segments but leaves sidecars
+    /// uuid-keyed would pass a single-class test.
+    #[tokio::test]
+    async fn snapshot_segments_sharing_content_hash_decode_once() {
+        let schema = test_schema();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&schema));
+
+        let shared = Uuid::from_u128(0xc0ffee);
+        let mut parent = segment("parent-seg", 128);
+        parent.uri = "s3://t/shared.parquet".into();
+        parent.content_hash = shared;
+        let mut fork = segment("fork-seg", 128);
+        fork.uri = parent.uri.clone();
+        fork.content_hash = shared;
+
+        let first = read_seg(&dl, &parent, &schema, &schema).await.unwrap();
+        let second = read_seg(&dl, &fork, &schema, &schema).await.unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct segment uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
+    }
+
+    #[tokio::test]
+    async fn persist_segments_sharing_content_hash_decode_once() {
+        let schema = test_schema();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&schema));
+
+        let shared = Uuid::from_u128(0xc0ffee);
+        let seg = |uuid: &str| PersistSegment {
+            segment_uuid: uuid.to_string(),
+            uri: "s3://t/shared.parquet".into(),
+            format: Format::Parquet,
+            size_bytes: 256,
+            content_hash: shared,
+            ..Default::default()
+        };
+
+        let first = read_cached_persist_segment(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &seg("parent-p"),
+            &schema,
+            &schema,
+        )
+        .await
+        .unwrap();
+        let second = read_cached_persist_segment(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &seg("fork-p"),
+            &schema,
+            &schema,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct persist segment uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
+    }
+
+    /// The fixture is sidecar-shaped because the sidecar read shapes its cached
+    /// native batch to `segment_index_schema(key_types)` after the lookup.
+    #[tokio::test]
+    async fn index_sidecars_sharing_content_hash_decode_once() {
+        let schema = penca_format::index::segment_index_schema(&[DataType::Utf8]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1", "k2"])),
+                Arc::new(arrow::array::Int64Array::from(vec![0i64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, batch);
+
+        let shared = Uuid::from_u128(0xbeef);
+        let sidecar = |uuid: &str| IndexSidecar {
+            object_uri: "s3://t/shared.idx".into(),
+            offset: 0,
+            length: 3,
+            format: Format::Parquet,
+            segment_index_uuid: uuid.to_string(),
+            size_bytes: 256,
+            content_hash: shared,
+        };
+
+        let first = read_cached_index_sidecar(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &sidecar("parent-idx"),
+            &[DataType::Utf8],
+        )
+        .await
+        .unwrap();
+        let second = read_cached_index_sidecar(
+            dl.readers.as_ref(),
+            &dl.cache,
+            &sidecar("fork-idx"),
+            &[DataType::Utf8],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "distinct sidecar uuids over one content hash must share a cache entry"
+        );
+        assert_eq!(first, second, "both rows resolve to the same decoded batch");
+    }
+
     #[tokio::test]
     async fn oversized_segment_not_cached_uses_uncached_read() {
         let schema = test_schema();
@@ -1771,7 +2035,10 @@ mod tests {
             2,
             "oversized segment is never cached — both accesses re-read storage"
         );
-        assert!(cache.get("big").is_none(), "oversized segment not stored");
+        assert!(
+            cache.get(&seg.content_hash).is_none(),
+            "oversized segment not stored"
+        );
     }
 
     #[tokio::test]
@@ -1791,7 +2058,11 @@ mod tests {
         // moka evicted one of {a,b} to honor the budget (we don't assert which
         // — that is moka's W-TinyLFU choice). Re-reading the evicted key must
         // hit storage again.
-        let evicted = if cache.get("a").is_none() { "a" } else { "b" };
+        let evicted = if cache.get(&segment("a", 150).content_hash).is_none() {
+            "a"
+        } else {
+            "b"
+        };
         read_seg(&dl, &segment(evicted, 150), &schema, &schema)
             .await
             .unwrap();
@@ -2208,6 +2479,38 @@ mod tests {
             collect_scan_uuids(stream).await,
             vec!["r1".to_string(), "r2".to_string()],
             "empty exclusion keeps all rows (anti-join over an empty set)",
+        );
+    }
+
+    /// Shaping moved after the cache lookup (CHA-545), so a caller asking for a
+    /// non-nullable column the file lacks must fail the same way whether or not
+    /// an earlier caller already warmed the entry. The first read caches the
+    /// native decode and *then* fails to shape it, so the second read takes the
+    /// hit path — the one that would silently return an unshaped batch if the
+    /// tail were skipped there.
+    #[tokio::test]
+    async fn non_nullable_missing_column_errors_on_a_cache_hit_too() {
+        let demanding: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row_uuid", DataType::Utf8, false),
+            Field::new("absent", DataType::Int32, false),
+        ]));
+        let cache = Arc::new(SegmentCache::new(1 << 20));
+        let (dl, reads) = driver_with(cache, test_batch(&test_schema()));
+        let seg = segment("seg-missing", 128);
+
+        for pass in ["miss", "hit"] {
+            let err = read_seg(&dl, &seg, &demanding, &demanding)
+                .await
+                .expect_err("non-nullable column absent from the segment must error");
+            assert!(
+                err.to_string().contains("absent"),
+                "{pass} pass must name the missing column, got: {err}"
+            );
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the second pass errored off the cached entry, not a re-read"
         );
     }
 

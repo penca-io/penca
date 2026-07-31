@@ -332,6 +332,7 @@ impl LifecycleManager {
         row_count: i64,
         format_text: &str,
         statistics: &[u8],
+        content_hash: &Uuid,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
         let branch = parse_uuid(branch_uuid);
@@ -344,13 +345,14 @@ impl LifecycleManager {
              (table_persist_segment_uuid, table_persist_uuid, branch_uuid, table_uuid, \
               chunk_idx, min_tx_commit_micros, max_tx_commit_micros, \
               min_commit_seq_num, max_commit_seq_num, \
-              object_uri, row_count, format, statistics) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+              object_uri, row_count, format, statistics, content_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
              ON CONFLICT (branch_uuid, table_persist_segment_uuid) DO UPDATE \
                 SET object_uri = EXCLUDED.object_uri, \
                     row_count = EXCLUDED.row_count, \
                     format = EXCLUDED.format, \
-                    statistics = EXCLUDED.statistics",
+                    statistics = EXCLUDED.statistics, \
+                    content_hash = EXCLUDED.content_hash",
             table = qi(&table),
         );
         driver
@@ -370,6 +372,7 @@ impl LifecycleManager {
                     SqlValue::Int64(row_count),
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Bytes(statistics.to_vec()),
+                    SqlValue::Uuid(*content_hash),
                 ],
             )
             .await?;
@@ -413,6 +416,7 @@ impl LifecycleManager {
         size_bytes: i64,
         format_text: &str,
         statistics: &[u8],
+        content_hash: &Uuid,
         seal_now: bool,
     ) -> Result<()> {
         let catalog = parse_uuid(catalog_uuid);
@@ -426,9 +430,10 @@ impl LifecycleManager {
                 length = $3, \
                 size_bytes = $4, \
                 format = $5, \
-                statistics = $6{seal_clause} \
-             WHERE branch_uuid = $7 \
-               AND table_persist_segment_uuid = $8",
+                statistics = $6, \
+                content_hash = $7{seal_clause} \
+             WHERE branch_uuid = $8 \
+               AND table_persist_segment_uuid = $9",
             table = qi(&table),
         );
         driver
@@ -441,6 +446,7 @@ impl LifecycleManager {
                     SqlValue::Int64(size_bytes),
                     SqlValue::Text(format_text.to_string()),
                     SqlValue::Bytes(statistics.to_vec()),
+                    SqlValue::Uuid(*content_hash),
                     SqlValue::Uuid(branch),
                     SqlValue::uuid_str(table_persist_segment_uuid)?,
                 ],
@@ -700,6 +706,7 @@ impl LifecycleManager {
         let mut sql = format!(
             "SELECT seg.table_persist_segment_uuid, seg.table_persist_uuid, seg.object_uri, \
                     seg.\"offset\", seg.length, seg.format, seg.row_count, seg.size_bytes, \
+                    seg.content_hash, \
                     seg.table_uuid, seg.min_tx_commit_micros, seg.max_tx_commit_micros, \
                     seg.max_commit_seq_num, seg.is_sealed, tfm.log_kind \
              FROM {seg} seg \

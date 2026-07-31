@@ -2,15 +2,13 @@
 //!
 //! A repeat read of the same cold segment within the process lifetime is served
 //! as an `Arc::clone` of the already-decoded Arrow batches, skipping the S3 GET +
-//! Parquet/Lance decode. It holds both snapshot segments (keyed by
-//! `table_snapshot_segment_uuid`) and persist data segments (keyed by
-//! `segment_uuid`) under one byte budget. Each per-uuid segment file is
-//! immutable, so the key→value mapping is stable and needs no invalidation: a
-//! snapshot uuid resolves to identical bytes for the life of the process, and
-//! although a *resolved persist tier* is mutable under retention compaction, an
-//! individual persist *file* (keyed by uuid) is not. There is no TTL —
-//! immutability makes W-TinyLFU eviction the whole reclaim mechanism for both
-//! tiers.
+//! Parquet/Lance decode. It holds snapshot segments, persist data segments and
+//! index sidecars under one byte budget, all keyed by `content_hash`.
+//! The mapping is stable and needs no invalidation: the hash names one decode
+//! by construction, and cold artifacts are immutable — although a *resolved
+//! persist tier* is mutable under retention compaction, an individual persist
+//! *file* is not. There is no TTL — immutability makes W-TinyLFU eviction the
+//! whole reclaim mechanism for every tier.
 //!
 //! Eviction is W-TinyLFU (frequency-based, scan-resistant, aged) via `moka`,
 //! bounded by a byte budget: each entry is weighed by its segment's
@@ -30,25 +28,59 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use moka::sync::Cache;
+use uuid::Uuid;
 
-/// In-process W-TinyLFU cache of decoded cold segments, keyed by segment uuid
-/// (`table_snapshot_segment_uuid` for snapshot, `segment_uuid` for persist) and
-/// bounded by a byte budget.
+/// In-process W-TinyLFU cache of decoded cold segments, keyed by `content_hash`
+/// and bounded by a byte budget.
 ///
-/// The key is the segment uuid alone: it is globally unique, immutable, and
-/// resolves to identical bytes, so it fully identifies the decoded value.
-/// `format` is intentionally absent from the key — it is functionally
-/// determined by the uuid, and every value is a format-agnostic decoded
-/// [`RecordBatch`]; `format` is consulted only on the miss path (by the
-/// caller) to pick the reader.
+/// `content_hash` is the digest of the typed in-memory Arrow batch, recorded
+/// once at write time and inherited verbatim by every reference copy — snapshot
+/// carry-forward (CHA-531) and a fork's cold materialization (CHA-539) both mint
+/// a new row uuid over bytes nobody rewrote. Keying by uuid stored one decode
+/// per *row*; keying by hash stores one per distinct *content*, which is what
+/// lets a fork and its parent share a single entry for a shared slice (CHA-545).
+///
+/// **The cached value must be the file-native decode**, not one caller's
+/// shaping. A hash-keyed entry is shared across callers whose schemas can
+/// differ — a fork that retypes a column still reads the parent's bytes — so a
+/// caller-shaped value would hand the second caller the first caller's types.
+/// Callers shape after the lookup via `penca_format::reader::shape_to_schema`;
+/// `test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice` is the
+/// regression guard.
+///
+/// The read-time schema still governs the *output* — it governs it at that
+/// shaping step, per caller. Only the decode has to be segment-scoped, and only
+/// because the decode is what gets shared. Fingerprinting the read schema into
+/// the key instead is correct, but then the key moves whenever the schema does
+/// while the data does not: one `ALTER TABLE ADD COLUMN` re-fingerprints a
+/// footprint nobody rewrote, and a fork stops sharing with its parent at their
+/// first divergent `ALTER` — the case this key exists for. See
+/// `docs/design-decisions.md` — "Cold segments are cached by content hash".
+///
+/// One flat key space, no per-artifact-class prefix. With every artifact keyed
+/// by a hash of its own typed content, two entries collide only when their
+/// decoded batches are identical, in which case sharing one entry is the
+/// correct answer rather than a bug — a base segment and a sidecar that decode
+/// to the same batch may safely share.
+///
+/// The storage format is deliberately *not* in the key. `content_hash` digests
+/// the typed batch *before* a `FormatWriter` encodes it, so after an
+/// `OBJECT_STORAGE_FORMAT` flip one hash can name both a Parquet file and a
+/// Lance file — and they are supposed to decode to the same batch, since a write
+/// followed by a read returns what was written. A divergence there is a broken
+/// round trip to fix in that format (or a type to drop from `CanonicalType`), not
+/// a fact for this key to encode: adding the format would trade one real
+/// cross-format share for a permanent second entry, and would hide the defect
+/// rather than surface it. CHA-548 adds the round-trip identity coverage that
+/// asserts the invariant this key assumes.
 ///
 /// Cheaply cloneable: `moka::sync::Cache` is internally an `Arc`, so callers
 /// typically hold a `SegmentCache` behind one outer `Arc` shared
 /// across the process.
 pub struct SegmentCache {
-    /// Value carries its own weight so the weigher can charge the
+    /// The value carries its own weight so the weigher can charge the
     /// caller-supplied `size_bytes` rather than the batch's runtime memory.
-    inner: Cache<String, (Arc<RecordBatch>, u32)>,
+    inner: Cache<Uuid, (Arc<RecordBatch>, u32)>,
     budget_bytes: u64,
 }
 
@@ -63,7 +95,7 @@ impl SegmentCache {
             .max_capacity(budget_bytes)
             // Weight in the same byte unit as `max_capacity` so the budget is a
             // real RAM bound; the stored `u32` is the entry's `size_bytes`.
-            .weigher(|_uuid: &String, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
+            .weigher(|_key: &Uuid, (_batch, weight): &(Arc<RecordBatch>, u32)| *weight)
             .build();
         Self {
             inner,
@@ -103,21 +135,21 @@ impl SegmentCache {
             && weight_bytes <= u32::MAX as u64
     }
 
-    /// Fetch a decoded segment by uuid, bumping its frequency estimate. A hit
-    /// is an `Arc::clone` — no buffer copy.
-    pub fn get(&self, uuid: &str) -> Option<Arc<RecordBatch>> {
-        self.inner.get(uuid).map(|(batch, _weight)| batch)
+    /// Fetch a decoded segment, bumping its frequency estimate. A hit is an
+    /// `Arc::clone` — no buffer copy.
+    pub fn get(&self, content_hash: &Uuid) -> Option<Arc<RecordBatch>> {
+        self.inner.get(content_hash).map(|(batch, _weight)| batch)
     }
 
-    /// Insert a decoded segment under its uuid, charged `weight_bytes` against
-    /// the budget. No-op when the segment is not [`admits`](Self::admits)-ible.
-    /// moka enforces `max_capacity` via W-TinyLFU; there is no manual eviction
-    /// loop here.
-    pub fn insert(&self, uuid: String, batch: Arc<RecordBatch>, weight_bytes: u64) {
+    /// Insert a decoded segment charged `weight_bytes` against the budget. No-op
+    /// when the segment is not [`admits`](Self::admits)-ible. moka enforces
+    /// `max_capacity` via W-TinyLFU; there is no manual eviction loop here.
+    pub fn insert(&self, content_hash: Uuid, batch: Arc<RecordBatch>, weight_bytes: u64) {
         if !self.admits(weight_bytes) {
             return;
         }
-        self.inner.insert(uuid, (batch, weight_bytes as u32));
+        self.inner
+            .insert(content_hash, (batch, weight_bytes as u32));
     }
 
     /// Force pending eviction/maintenance to run synchronously. moka does
@@ -143,6 +175,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use uuid::Uuid;
 
     use super::SegmentCache;
 
@@ -151,6 +184,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let col = Int32Array::from((0..n as i32).collect::<Vec<_>>());
         Arc::new(RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap())
+    }
+
+    /// A distinct content hash per `n`.
+    fn hash(n: u128) -> Uuid {
+        Uuid::from_u128(n)
     }
 
     #[test]
@@ -171,10 +209,10 @@ mod tests {
     #[test]
     fn zero_weight_segment_is_not_cached() {
         let cache = SegmentCache::new(1 << 20);
-        cache.insert("zero".into(), batch(4), 0);
+        cache.insert(hash(1), batch(4), 0);
         cache.run_pending();
         assert!(
-            cache.get("zero").is_none(),
+            cache.get(&hash(1)).is_none(),
             "weight-0 segment must not be pinned in the cache"
         );
     }
@@ -194,22 +232,25 @@ mod tests {
         );
         assert!(cache.admits(u32::MAX as u64), "exactly u32::MAX is fine");
 
-        cache.insert("huge".into(), batch(8), over_u32);
+        cache.insert(hash(2), batch(8), over_u32);
         cache.run_pending();
-        assert!(cache.get("huge").is_none(), "over-u32 weight never stored");
+        assert!(
+            cache.get(&hash(2)).is_none(),
+            "over-u32 weight never stored"
+        );
     }
 
     #[test]
     fn over_budget_insert_is_noop() {
         let cache = SegmentCache::new(100);
-        cache.insert("too-big".into(), batch(8), 200);
+        cache.insert(hash(3), batch(8), 200);
         cache.run_pending();
-        assert!(cache.get("too-big").is_none(), "over-budget never stored");
+        assert!(cache.get(&hash(3)).is_none(), "over-budget never stored");
 
         let disabled = SegmentCache::disabled();
-        disabled.insert("x".into(), batch(8), 1);
+        disabled.insert(hash(4), batch(8), 1);
         disabled.run_pending();
-        assert!(disabled.get("x").is_none(), "disabled never stores");
+        assert!(disabled.get(&hash(4)).is_none(), "disabled never stores");
     }
 
     #[test]
@@ -220,7 +261,7 @@ mod tests {
         // moka's W-TinyLFU choice, not Penca's contract).
         let cache = SegmentCache::new(100);
         for i in 0..5 {
-            cache.insert(format!("seg-{i}"), batch(10), 40);
+            cache.insert(hash(i), batch(10), 40);
         }
         cache.run_pending();
         assert!(
@@ -234,9 +275,9 @@ mod tests {
     fn hit_returns_arc_clone_same_buffers() {
         let cache = SegmentCache::new(1_000);
         let original = batch(16);
-        cache.insert("seg".into(), original.clone(), 40);
+        cache.insert(hash(5), original.clone(), 40);
         cache.run_pending();
-        let hit = cache.get("seg").expect("cached");
+        let hit = cache.get(&hash(5)).expect("cached");
         // Same backing column buffer — a hit is a refcount bump, no copy.
         assert_eq!(
             original.column(0).to_data().buffers()[0].as_ptr(),

@@ -378,6 +378,7 @@ the `log_kind` classification (CHA-218: only `upsert_log` and
 | `length` | int64 (set at compact time) |
 | `row_count` | int64 |
 | `format` | text (parquet, lance) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key) |
 | `size_bytes` | int64 |
 | `metadata` | JSONB |
 | `statistics` | JSONB |
@@ -386,6 +387,17 @@ the `log_kind` classification (CHA-218: only `upsert_log` and
 
 Indices: implicit `(branch_uuid, table_persist_segment_uuid)` PK +
 per-branch partition.
+
+`content_hash` is the `xxh3_128` of the segment's typed in-memory Arrow
+batch, computed once at write time and inherited verbatim by every
+reference copy (carry-forward, CHA-539 fork copy). It keys the in-process
+`SegmentCache`, so a fork and its parent share one decoded entry for a byte
+range they both reference — which the row uuid cannot express, since a
+reference copy mints a fresh uuid over bytes it did not rewrite. `NOT NULL`
+with no default: every writer computes it, and a catalog predating the
+column is recreated rather than migrated (there is no in-place migration
+path for catalog metadata), so there is no legacy row to default. Not
+indexed — reads carry the value through, they never look a row up by it.
 
 Each level's `written_at_micros` / `commit_micros` pair
 supports the three-level commit decoupling. Rows with
@@ -416,6 +428,12 @@ committed rows gates `PurgeTxLog`; reads seek the sorted `commit_seq_num` /
 | `row_count` | int64 |
 | `format` | text (parquet, lance) |
 | `committed_at_micros` | int64 (NULL until per-segment commit) |
+
+Deliberately carries **no** `content_hash`, unlike the three cold-artifact
+tables around it (14, 16, 17): a cold `tx_log` file is read by
+`read_tx_log_batches`, never through `SegmentCache`, and is never
+reference-copied — so it has neither of the two properties the hash exists
+to serve.
 
 **15. Table snapshot metadata** — `{catalog_uuid}_table_snapshot_metadata`
 
@@ -464,6 +482,7 @@ completes).
 | `length` | int64 NOT NULL (row count of the range) |
 | `size_bytes` | int64 |
 | `format` | text (lance, parquet) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key — see table 14) |
 | `metadata` | JSON (format-specific, e.g., row group size) |
 | `statistics` | JSON (column stats: min/max for filterable columns) |
 | `row_count` | int64 |
@@ -520,6 +539,7 @@ forward by reference with its base segment and participates in the ref-counted G
 | `offset` | int64 |
 | `length` | int64 |
 | `format` | text (lance, parquet) |
+| `content_hash` | UUID NOT NULL (CHA-545, segment-cache key — see table 14) |
 | `size_bytes` | int64 |
 | `statistics` | bytes (indexed-key min/max bounds; binary, decoded in-planner by the CHA-454 seek in the `SnapshotTableProvider`) |
 | `written_at_micros` | int64 (micros, auto-generated) |
@@ -530,6 +550,13 @@ Indices: implicit `(branch_uuid, …_uuid)` PKs + per-branch partitions; child
 
 `index_uuid IS NULL` (role: internal vs user secondary) and `index_type` (physical
 layout, on `__penca_system__.indexes`) are orthogonal.
+
+Sidecars carry `content_hash` for the same reason base segments do: they are
+read out of object storage through the same `SegmentCache` and copied by
+reference by both carry-forward and the CHA-539 fork copy. `segment_index_uuid`
+is stable across a carry-forward *within* a branch, but a fork derives it from
+the child's own `segment_uuid` and so mints a new id over unchanged bytes —
+which is exactly the duplication the hash collapses.
 
 ## Data tables (per-branch, per-table)
 

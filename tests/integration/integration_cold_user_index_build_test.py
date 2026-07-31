@@ -222,6 +222,35 @@ def _user_child(catalog_uuid, branch_uuid, segment_uuid, index_uuid):
     return None
 
 
+def _segment_content_hash(catalog_uuid, branch_uuid, segment_uuid):
+    """A base segment's ``content_hash``, as text."""
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT content_hash::text FROM {tbl}"
+            " WHERE branch_uuid = %s AND table_snapshot_segment_uuid = %s"
+        ).format(tbl=Identifier(f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_METADATA}")),
+        (branch_uuid, segment_uuid),
+    )
+    return rows[0][0]
+
+
+def _sidecar_content_hash(catalog_uuid, branch_uuid, segment_uuid, link):
+    """The ``content_hash`` of ``segment_uuid``'s sidecar under one parent
+    index, as text. ``link`` is the parent ``table_snapshot_index_uuid``
+    returned by :func:`_user_child`."""
+    rows = get_pg_driver().execute(
+        SQL(
+            "SELECT content_hash::text FROM {tbl}"
+            " WHERE branch_uuid = %s AND segment_uuid = %s"
+            " AND table_snapshot_index_uuid = %s"
+        ).format(
+            tbl=Identifier(f"{catalog_uuid}_{TABLE_SNAPSHOT_SEGMENT_INDEX_METADATA}")
+        ),
+        (branch_uuid, segment_uuid, link),
+    )
+    return rows[0][0]
+
+
 class TestUserIndexBuild:
     """A cold snapshot materializes user ``CREATE INDEX`` definitions: a
     committed parent (``index_uuid`` non-NULL) + one committed sidecar per base
@@ -509,12 +538,18 @@ class TestUserIndexBuild:
             table_uuid,
             pa.table({"name": ["alice", "carol"], "value": [1, 3]}, schema=USER_SCHEMA),
         )
-        # Map each snap1 base file -> its user sidecar uri.
+        # Map each snap1 base file -> its user sidecar uri, and both rows'
+        # content hashes for the inheritance assertion below.
         snap1_sidecar_by_file = {}
+        snap1_hashes_by_file = {}
         for seg, uri, off in _base_segment_tuples(catalog_uuid, branch, snap1):
             child = _user_child(catalog_uuid, branch, seg, index_uuid)
             assert child is not None, "snap1 must build a user sidecar per segment"
             snap1_sidecar_by_file[(uri, off)] = child[1]  # object_uri
+            snap1_hashes_by_file[(uri, off)] = (
+                _segment_content_hash(catalog_uuid, branch, seg),
+                _sidecar_content_hash(catalog_uuid, branch, seg, child[0]),
+            )
 
         # snap2 rewrites only alice -> carol's segment carries forward, and its
         # already-built sidecar must carry by reference (same object_uri).
@@ -539,4 +574,20 @@ class TestUserIndexBuild:
                 "carried user sidecar must reference the SAME file as snap1 (carry"
                 f" by reference, no rebuild): {child[1]} !="
                 f" {snap1_sidecar_by_file[(uri, off)]}"
+            )
+            # CHA-545: a carried row is a fresh uuid over bytes nobody rewrote,
+            # so it must inherit the prior row's content_hash verbatim. That
+            # inheritance is the whole dedup — recomputing, or defaulting, would
+            # give the same bytes two cache entries.
+            prior_seg_hash, prior_sidecar_hash = snap1_hashes_by_file[(uri, off)]
+            assert _segment_content_hash(catalog_uuid, branch, seg) == prior_seg_hash, (
+                "a carried base segment must inherit its prior row's"
+                f" content_hash, expected {prior_seg_hash}"
+            )
+            assert (
+                _sidecar_content_hash(catalog_uuid, branch, seg, child[0])
+                == prior_sidecar_hash
+            ), (
+                "a carried sidecar must inherit its prior row's content_hash,"
+                f" expected {prior_sidecar_hash}"
             )

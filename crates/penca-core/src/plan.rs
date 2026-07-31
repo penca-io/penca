@@ -13,6 +13,7 @@
 //! [`CommittedAtBounds`] rather than the proto `TimestampFilter`.
 
 use crate::Format;
+use uuid::Uuid;
 
 /// Microsecond window on `commit_micros`: inclusive lower
 /// (`min_micros`), exclusive upper (`max_micros`); both optional. Native
@@ -96,6 +97,12 @@ pub struct PersistSegment {
     /// `..PersistSegment::default()`: a cold `tx_log` segment reuses this type
     /// but holds commit metadata, not data rows, and has no ceiling.
     pub max_commit_seq_num: Option<i64>,
+    /// `xxh3_128` of the segment's typed in-memory Arrow batch, recorded at
+    /// write time and inherited verbatim by reference copies. Keys the segment
+    /// cache, so a fork and its parent share one decoded entry for a byte range
+    /// they both reference — which the row uuid cannot express, because a
+    /// reference copy mints a new uuid over unchanged bytes (CHA-545).
+    pub content_hash: Uuid,
 }
 
 /// The internal `row_uuid` index sidecar attached to a snapshot segment — the
@@ -113,11 +120,18 @@ pub struct IndexSidecar {
     pub length: i64,
     /// Columnar file format of the sidecar.
     pub format: Format,
-    /// Globally-unique id of the sidecar — its segment-cache key, a distinct
-    /// deterministic-UUID namespace from `table_snapshot_segment_uuid`.
+    /// Globally-unique id of the sidecar row, in a distinct deterministic-UUID
+    /// namespace from `table_snapshot_segment_uuid`. Row identity only — the
+    /// segment-cache key is `content_hash`, because a reference copy mints a
+    /// fresh uuid over bytes it did not rewrite (CHA-545).
     pub segment_index_uuid: String,
     /// In-memory Arrow footprint, for the shared segment cache's byte budget.
     pub size_bytes: i64,
+    /// `xxh3_128` of the sidecar's typed in-memory Arrow batch. Same role as on
+    /// [`SnapshotSegment`]: sidecars are read through the same cache and
+    /// reference-copied by the same paths, so they duplicate for the same
+    /// reason and dedup by the same key (CHA-545).
+    pub content_hash: Uuid,
 }
 
 /// A snapshot segment in cold storage (read-optimized baseline).
@@ -154,6 +168,10 @@ pub struct SnapshotSegment {
     /// tables, never a planner candidate). The internal identity sidecar stays
     /// in its dedicated `row_uuid_index_sidecar` slot.
     pub index_sidecars: Vec<(String, IndexSidecar)>,
+    /// `xxh3_128` of the segment's typed in-memory Arrow batch, recorded at
+    /// write time and inherited verbatim by reference copies (carry-forward,
+    /// fork copy). Keys the segment cache — see [`PersistSegment::content_hash`].
+    pub content_hash: Uuid,
 }
 
 /// A user secondary index declared for the plan's snapshot (CHA-485) — the
@@ -276,6 +294,15 @@ pub struct Plan {
 // can `..Default::default()`. `Format` itself stays default-free by
 // design (no `Unspecified` — see `format.rs`), so the segments pick
 // `Format::Parquet` as the placeholder; any test that cares sets it.
+//
+// `content_hash` defaults to `Uuid::nil()`, which would be a shared cache key
+// if it ever reached the cache. It cannot: the only production caller of these
+// `Default`s is the cold `tx_log` carrier path, whose segments hold commit
+// metadata and are read by `read_tx_log_batches`, never through `SegmentCache`
+// (CHA-545). Every cache-read segment is built field-by-field from a metadata
+// row whose `content_hash` is `NOT NULL`. `IndexSidecar` deliberately has no
+// `Default` for the same reason — it has no such non-cached carrier path, so a
+// nil hash there would be reachable.
 impl Default for PersistSegment {
     fn default() -> Self {
         Self {
@@ -289,6 +316,7 @@ impl Default for PersistSegment {
             offset: None,
             length: None,
             max_commit_seq_num: None,
+            content_hash: Uuid::nil(),
         }
     }
 }
@@ -309,6 +337,7 @@ impl Default for SnapshotSegment {
             statistics: Vec::new(),
             row_uuid_index_sidecar: None,
             index_sidecars: Vec::new(),
+            content_hash: Uuid::nil(),
         }
     }
 }

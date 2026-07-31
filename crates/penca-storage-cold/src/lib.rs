@@ -414,6 +414,9 @@ mod tests {
             format: Format::Parquet,
             segment_index_uuid: "idx".to_string(),
             size_bytes: 0,
+            // Never reaches a cache — this asserts format dispatch fails before
+            // any I/O — so the nil `Uuid::default()` cannot alias anything.
+            content_hash: Default::default(),
         };
         let schema = penca_format::index::segment_index_schema(&[DataType::Utf8]);
         let err = ColdStorageClient::read_segment_index(&readers, &sidecar, &schema)

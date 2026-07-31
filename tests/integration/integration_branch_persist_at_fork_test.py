@@ -1106,3 +1106,137 @@ def test_fork_audit_does_not_double_match_a_straddling_parent_tx_log():
             f"{post_fork!r} was committed on main above the fork and must not "
             f"appear in the child's audit. Full list: {names}"
         )
+
+
+def test_fork_and_parent_diverge_a_columns_type_over_one_shared_slice():
+    """Two branches whose schemas diverged must not share a cached decode.
+
+    CHA-545 keys the segment cache on `content_hash`, so a fork's copied row and
+    the parent's row over the same bytes share one entry — that is the point,
+    since a fork's cold footprint is mostly the parent's files and the copy
+    inherits the parent's hash rather than minting its own.
+
+    But the cached value is not the file's native decode: `read_segment`
+    null-fills to the CALLER's schema, so an entry carries the schema of
+    whichever branch decoded it first. Since CHA-539 the fork names the parent's
+    `(uri, offset, length)` while ALTERing independently, so that entry can be
+    handed to a branch expecting a different type for the same column: whichever
+    branch missed first caches `extra` as an all-null array of its own type and
+    the other branch's projection fails on the mismatch — a query error driven by
+    cache state, on a branch whose own metadata is perfectly consistent. What
+    keeps that from happening is caching the file's NATIVE decode and null-filling
+    to the caller's schema after the lookup, not before it.
+
+    Reads child-then-parent, and that one order is sufficient AND deterministic:
+    within a process the child misses, caches `extra` as Utf8, and the parent's
+    read is the hit that used to fail with "expected Int64 but found Utf8". Only
+    the PARENT assertion is the regression guard — the child's read is always the
+    miss, so its assertion holds with or without the fix and is a sanity check.
+    The reverse direction (parent poisons child) is not covered here; it needs a
+    second fixture on a fresh catalog, since after this pair the file is already
+    cached under its content hash.
+    """
+    client = make_client()
+    schema_uuid, table_uuid, catalog_uuid, main_branch = setup_schema(client)
+    scope = {
+        "catalog_uuid": catalog_uuid,
+        "schema_uuid": schema_uuid,
+        "table_uuid": table_uuid,
+    }
+
+    fork_seq = _write_committed_rows(
+        client,
+        branch_uuid=main_branch,
+        rows={"name": ["shared"], "value": [1]},
+        **scope,
+    )
+    client.persist(branch_uuid=main_branch, **scope)
+    client.snapshot(branch_uuid=main_branch, **scope)
+
+    child = client.create_branch(
+        "kid", "t", "fork", commit_seq_num=fork_seq, catalog_uuid=catalog_uuid
+    ).branch_uuid
+
+    # Same new column, incompatible types, one on each branch — over the single
+    # base slice the fork inherited by reference.
+    parent_schema = pa.schema(
+        [*list(USER_SCHEMA), pa.field("extra", pa.int64(), nullable=True)]
+    )
+    child_schema = pa.schema(
+        [*list(USER_SCHEMA), pa.field("extra", pa.string(), nullable=True)]
+    )
+    client.update_table(
+        parent_schema,
+        branch_uuid=main_branch,
+        primary_keys=["name"],
+        author="test",
+        comment="parent adds extra BIGINT",
+        **scope,
+    )
+    client.update_table(
+        child_schema,
+        branch_uuid=child,
+        primary_keys=["name"],
+        author="test",
+        comment="fork adds extra TEXT",
+        **scope,
+    )
+
+    # The precondition the scenario rests on: the fork's cold row and the
+    # parent's must land on the SAME cache entry, or the two branches decode
+    # independently, every assertion below still passes, and this test covers
+    # nothing. Metadata-only, so it does not warm the cache it is about to probe.
+    #
+    # `content_hash` is the join that matters — it is the cache key (CHA-545).
+    # Matching `object_uri`/`offset`/`length` too pins WHY they collide: the
+    # fork's row is a reference copy of the parent's slice that inherited its
+    # hash, not two writes that happened to produce the same bytes. Joining on
+    # addressing alone would pass even if the copy minted a fresh hash, which
+    # is the failure mode that would silently retire this test.
+    #
+    # BOTH tiers, because which one carries the shared slice depends on the
+    # fixture: here the snapshot covers the whole persist, so `copy_inherited_
+    # persist` finds nothing above the baseline watermark and the inheritance is
+    # entirely snapshot segments. Checking only the persist table looked correct
+    # and reported "no shared slice" on a fixture that has one.
+    shared = 0
+    for base in (TABLE_PERSIST_SEGMENT_METADATA, TABLE_SNAPSHOT_SEGMENT_METADATA):
+        rows = get_pg_driver().execute(
+            SQL(
+                "SELECT count(*) FROM {tbl} p JOIN {tbl} c"
+                " ON p.content_hash = c.content_hash AND p.object_uri = c.object_uri"
+                ' AND p."offset" IS NOT DISTINCT FROM c."offset"'
+                " AND p.length IS NOT DISTINCT FROM c.length"
+                " WHERE p.branch_uuid = %s AND c.branch_uuid = %s AND p.table_uuid = %s"
+            ).format(tbl=Identifier(f"{catalog_uuid}_{base}")),
+            (main_branch, child, table_uuid),
+        )
+        shared += rows[0][0]
+
+    if shared == 0:
+        raise RuntimeError(
+            "setup failed: the fork holds no cold row sharing a content_hash "
+            "with the parent's slice in either tier, so both branches would "
+            "decode independently and the cross-branch cache sharing this test "
+            "pins is unreachable"
+        )
+
+    # Child first, then parent: the child's decode populates the cache and the
+    # parent must not be served it.
+    child_rows = client.read_data(branch_uuid=child, **scope)
+    parent_rows = client.read_data(branch_uuid=main_branch, **scope)
+
+    assert child_rows.column("name").to_pylist() == ["shared"], (
+        "the fork lost its inherited row"
+    )
+    assert parent_rows.column("name").to_pylist() == ["shared"], (
+        "the parent lost its own row"
+    )
+    assert pa.types.is_string(child_rows.schema.field("extra").type), (
+        "the fork's read must honour ITS schema for the diverged column, not the "
+        f"branch that decoded the shared slice first: {child_rows.schema}"
+    )
+    assert pa.types.is_int64(parent_rows.schema.field("extra").type), (
+        "the parent's read must honour ITS schema for the diverged column, not "
+        f"the branch that decoded the shared slice first: {parent_rows.schema}"
+    )
