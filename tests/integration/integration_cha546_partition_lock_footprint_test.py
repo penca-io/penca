@@ -18,9 +18,10 @@ difference costs twice:
   operation, not a race — and it is a *read* that causes it.
 
 Both costs are the same fact, so one fixture covers both: hold
-``ACCESS EXCLUSIVE`` on all 8 parents from an out-of-band session — the
-exact lock state a mid-``DROP TABLE`` teardown creates — and require every
-branch-scoped operation to finish anyway.
+``ACCESS EXCLUSIVE`` on ``ONLY`` the 8 parents from an out-of-band session
+— what a mid-``DROP TABLE`` teardown holds against every branch other than
+the one it is deleting — and require every branch-scoped operation to
+finish anyway.
 
 Rejected alternatives, so a later reader does not "fix" this back into one:
 
@@ -83,7 +84,9 @@ OP_DEADLINE_S = 20.0
 
 # The holder must win its own locks first. A branch-scoped statement that
 # names a parent can make even this contended, so failing here is the same
-# defect surfacing one step earlier — the message says so.
+# defect surfacing one step earlier — the message says so. `lock_timeout` is
+# per *statement*, so this bounds the whole acquisition only because all 8
+# parents are locked by a single `LOCK TABLE`.
 HOLDER_ACQUIRE_TIMEOUT_S = 30.0
 
 _SEED = pa.table({"name": ["alice", "bob"], "value": [1, 2]}, schema=USER_SCHEMA)
@@ -92,6 +95,16 @@ _MORE = pa.table({"name": ["carol", "dave"], "value": [3, 4]}, schema=USER_SCHEM
 
 class _ParentLockHolder:
     """Holds ``ACCESS EXCLUSIVE`` on every metadata parent in one transaction.
+
+    ``ONLY`` is what makes this a valid model of teardown and a test that can
+    actually go green: without it Postgres locks the named table *and every
+    descendant*, so the fixture would hold the branch's own leaves and block a
+    partition-targeted statement too. Teardown locks the deleted branch's
+    leaves plus the parent descriptor — never a sibling branch's leaves — so
+    parents-only is the state under test.
+
+    All 8 are locked by a single statement because ``lock_timeout`` is
+    per-statement: eight statements would let acquisition run to 8× the bound.
 
     Owns its own single connection rather than borrowing ``get_pg_driver()``'s
     shared pool: the locks must live exactly as long as this transaction, and a
@@ -103,6 +116,9 @@ class _ParentLockHolder:
         self._driver = make_lock_driver()
         self._held = threading.Event()
         self._release = threading.Event()
+        # `_held` is also set on the failure path so `__enter__` never hangs, so
+        # it alone does not mean the locks are held — this does.
+        self._acquired = False
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -112,13 +128,16 @@ class _ParentLockHolder:
                 tx.execute_no_result(
                     f"SET LOCAL lock_timeout = '{int(HOLDER_ACQUIRE_TIMEOUT_S)}s'"
                 )
-                for parent in self._parents:
-                    tx.execute_no_result(
-                        SQL("LOCK TABLE {tbl} IN ACCESS EXCLUSIVE MODE").format(
-                            tbl=Identifier(parent)
+                tx.execute_no_result(
+                    SQL("LOCK TABLE {tbls} IN ACCESS EXCLUSIVE MODE").format(
+                        tbls=SQL(", ").join(
+                            SQL("ONLY {tbl}").format(tbl=Identifier(parent))
+                            for parent in self._parents
                         )
                     )
+                )
 
+                self._acquired = True
                 self._held.set()
                 self._release.wait()
                 raise _Rollback()
@@ -132,8 +151,11 @@ class _ParentLockHolder:
 
     def __enter__(self) -> _ParentLockHolder:
         self._thread.start()
-        self._held.wait(timeout=HOLDER_ACQUIRE_TIMEOUT_S + 5.0)
-        if self._error is not None:
+        signalled = self._held.wait(timeout=HOLDER_ACQUIRE_TIMEOUT_S + 5.0)
+        if not signalled or not self._acquired:
+            # Silently proceeding here would run both tests with no locks held
+            # and report green — the worst outcome for a red test.
+            self._release.set()
             raise AssertionError(
                 "could not take ACCESS EXCLUSIVE on the metadata parents "
                 f"({self._parents}). Something else is holding a lock on them — "
