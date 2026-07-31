@@ -24,7 +24,7 @@ use penca_storage_cold::{COMMIT_SEQ_NUM_COLUMN, ColdStorageError};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::cache::SegmentCache;
+use crate::cache::{SegmentCache, SegmentCacheKey};
 use crate::provider::{build_persist_session, build_snapshot_session};
 use crate::schema::LogSchemas;
 use crate::session_template::derive_cold_session;
@@ -225,8 +225,7 @@ async fn decode_and_cache_native<R: FormatReader>(
     uri: &str,
     offset: Option<i64>,
     length: Option<i64>,
-    content_hash: Uuid,
-    format_code: i32,
+    key: SegmentCacheKey,
     weight: u64,
 ) -> Result<Arc<RecordBatch>, DlError> {
     let batch = reader
@@ -234,7 +233,7 @@ async fn decode_and_cache_native<R: FormatReader>(
         .await
         .map_err(ColdStorageError::from)?;
     let batch = Arc::new(batch);
-    cache.insert(content_hash, format_code, Arc::clone(&batch), weight);
+    cache.insert(key, Arc::clone(&batch), weight);
     tracing::debug!(rows = batch.num_rows(), "segment decoded and cached");
     Ok(batch)
 }
@@ -315,8 +314,9 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
 ) -> Result<CachedSegment, DlError> {
     let span = tracing::Span::current();
     let code = segment.format.as_wire_code();
+    let key = SegmentCacheKey::new(segment.content_hash, code);
 
-    if let Some(full) = cache.get(&segment.content_hash, code) {
+    if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "snapshot segment cache hit");
         return Ok(CachedSegment::Native(full));
@@ -338,8 +338,7 @@ async fn read_cached_snapshot_segment_unshaped<R: FormatReader + 'static>(
                 &segment.uri,
                 Some(segment.offset),
                 Some(segment.length),
-                segment.content_hash,
-                code,
+                key,
                 weight,
             )
             .await?,
@@ -452,7 +451,9 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
     let span = tracing::Span::current();
     let code = segment.format.as_wire_code();
 
-    if let Some(full) = cache.get(&segment.content_hash, code) {
+    let key = SegmentCacheKey::new(segment.content_hash, code);
+
+    if let Some(full) = cache.get(&key) {
         span.record("cache", "hit");
         tracing::debug!(rows = full.num_rows(), "persist segment cache hit");
         return shape_native(&full, full_schema);
@@ -474,8 +475,7 @@ pub(crate) async fn read_cached_persist_segment<R: FormatReader + 'static>(
             &segment.uri,
             segment.offset,
             segment.length,
-            segment.content_hash,
-            code,
+            key,
             weight,
         )
         .await?;
@@ -514,10 +514,11 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
 ) -> Result<RecordBatch, DlError> {
     let span = tracing::Span::current();
     let code = sidecar.format.as_wire_code();
+    let key = SegmentCacheKey::new(sidecar.content_hash, code);
     // The sidecar's key schema is the indexed columns' native types; the
     // identity/name sidecars are the all-Utf8 special case.
     let schema = penca_format::index::segment_index_schema(key_types);
-    if let Some(batch) = cache.get(&sidecar.content_hash, code) {
+    if let Some(batch) = cache.get(&key) {
         span.record("cache", "hit");
         return shape_native(&batch, &schema);
     }
@@ -544,8 +545,7 @@ async fn read_cached_index_sidecar<R: FormatReader + 'static>(
         &sidecar.object_uri,
         Some(sidecar.offset),
         Some(sidecar.length),
-        sidecar.content_hash,
-        code,
+        key,
         weight,
     )
     .await?;
@@ -2041,7 +2041,10 @@ mod tests {
         );
         assert!(
             cache
-                .get(&seg.content_hash, seg.format.as_wire_code())
+                .get(&SegmentCacheKey::new(
+                    seg.content_hash,
+                    seg.format.as_wire_code()
+                ))
                 .is_none(),
             "oversized segment not stored"
         );
@@ -2066,7 +2069,10 @@ mod tests {
         // hit storage again.
         let a = segment("a", 150);
         let evicted = if cache
-            .get(&a.content_hash, a.format.as_wire_code())
+            .get(&SegmentCacheKey::new(
+                a.content_hash,
+                a.format.as_wire_code(),
+            ))
             .is_none()
         {
             "a"
