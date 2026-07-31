@@ -1080,6 +1080,7 @@ mod tests {
         by_uri.insert(side_uri.clone(), sidecar_batch);
         SnapshotSegment {
             table_snapshot_segment_uuid: format!("seg-{name}"),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[&format!("seg-{name}")]),
             uri: base_uri,
             format: Format::Parquet,
             length: keys.len() as i64,
@@ -1246,6 +1247,7 @@ mod tests {
         by_uri.insert(side_uri.clone(), sidecar_batch);
         SnapshotSegment {
             table_snapshot_segment_uuid: format!("seg-{name}"),
+            content_hash: penca_core::naming::deterministic_uuid_from(&[&format!("seg-{name}")]),
             uri: base_uri,
             format: Format::Parquet,
             length: key0s.len() as i64,
