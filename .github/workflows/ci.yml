@@ -29,20 +29,26 @@ on:
     tags: ["v*"]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Fold the commit in for pushes, so every main push gets its OWN group and
+  # can never displace another. `cancel-in-progress: false` alone was not
+  # enough: runs then serialize with a queue depth of one, and a third push
+  # cancels the PENDING one — the same lost publish, one merge deeper.
+  # github.sha is empty on pull_request, so PRs keep superseding themselves;
+  # merge_group is unaffected.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
   # Only a pull_request supersedes itself. Two events must never be cancelled:
   #
   #   merge_group — each queue entry gets a unique gh-readonly-queue/… ref so
   #     entries won't cancel each other anyway, but cancelling one can eject
   #     the PR from the queue, so say it explicitly.
-  #   push — every main push shares the group `CI-refs/heads/main`, so a
-  #     docs-only merge landing minutes after a Rust merge used to cancel that
-  #     run mid-publish. The replacement run's own `changes` diff sees only
-  #     its own docs paths, skips `publish-image`, and `ci-success` reads all
-  #     success|skipped and goes GREEN — leaving :main without the merged Rust
-  #     code and no :<short-sha> for it. A job-level `concurrency:` cannot fix
-  #     that; the cancellation happens at the run level. Cost is concurrent
-  #     main runs, which is the right trade against silently losing a publish.
+  #   push — a docs-only merge landing behind a Rust merge would otherwise
+  #     cancel that run mid-publish; the replacement's own `changes` diff sees
+  #     only its own docs paths, skips `publish-image`, and `ci-success` reads
+  #     all success|skipped and goes GREEN, leaving :main without the merged
+  #     Rust code. The per-commit group above is what actually prevents this —
+  #     this flag alone only serializes, and a third push still cancels the
+  #     queued one. A job-level `concurrency:` cannot help; it is a run-level
+  #     cancellation.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

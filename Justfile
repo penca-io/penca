@@ -662,10 +662,6 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
     # would silently demo one. Keyed on the profile so release and profiling
     # builds don't overwrite each other either. An explicit PENCA_IMAGE (CI)
     # still wins.
-    if [ -n "$build_flag" ]; then
-        export PENCA_IMAGE="${PENCA_IMAGE:-penca-rust-server:${CARGO_PROFILE:-release}}"
-    fi
-
     # CHA-439: opt the image build into the sccache→S3 compile cache when
     # host AWS creds exist; compose's secret source defaults to /dev/null
     # (which the Dockerfile degrades to a plain compile).
@@ -709,6 +705,7 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
     fi
 
     if [ -n "$build_flag" ]; then
+        export PENCA_IMAGE="${PENCA_IMAGE:-penca-rust-server:${CARGO_PROFILE:-release}}"
         docker compose $compose_files $env_file $profiles build query
     elif ! docker compose $compose_files $env_file $profiles pull --policy "$pull_policy" query; then
         # Redirect BEFORE building, for the same reason the --build=1 path

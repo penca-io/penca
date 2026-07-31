@@ -216,13 +216,19 @@ def test_pushes_are_never_cancelled_mid_publish():
     workflow = _yaml(CI_WORKFLOW)
     cancel = str(workflow["concurrency"]["cancel-in-progress"])
 
-    assert "pull_request" in cancel, (
-        f"only pull_request may cancel in progress, got {cancel!r}"
+    # Pin the whole expression, not the absence of one spelling: an
+    # `== 'pull_request' || == 'push'` allow-list defeats a `!=` blacklist.
+    assert cancel == "${{ github.event_name == 'pull_request' }}", (
+        f"cancel-in-progress must admit pull_request and nothing else, got {cancel!r}"
     )
-    for event in ("push", "merge_group"):
-        assert f"!= '{event}'" not in cancel, (
-            f"{event} runs must never be cancelled, got {cancel!r}"
-        )
+
+    # And per-commit grouping is what actually stops a main push displacing
+    # another — cancel-in-progress: false alone only serializes, and a third
+    # push still cancels the queued one.
+    group = str(workflow["concurrency"]["group"])
+    assert "github.sha" in group and "push" in group, (
+        f"push runs must not share a concurrency group, got group: {group!r}"
+    )
 
 
 def test_publish_is_scoped_to_main_merges():
@@ -267,9 +273,22 @@ def test_merge_job_cannot_publish_a_single_arch_manifest():
     # re-run can expire one leg's artifact and leave the aggregate green with
     # a single digest present.
     runs = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "wc -l" in runs and "-ne 2" in runs, (
+    digest_check = re.search(
+        r"if \[ \"\$\(ls -1 \| wc -l\)\" -ne 2 \]; then(.*?)fi", runs, re.DOTALL
+    )
+    assert digest_check, (
         "the merge job must assert it received both arch digests before tagging"
     )
+    # Presence is not enough — the branch has to abort, or a one-arch manifest
+    # still ships with a log line next to it.
+    assert "exit 1" in digest_check.group(1), (
+        f"the digest-count check must abort, got:{digest_check.group(1)}"
+    )
+    # Anchor on the command, not the bare phrase — the rationale comment above
+    # it mentions `imagetools create` too.
+    assert runs.index(digest_check.group(0)) < runs.index(
+        "docker buildx imagetools create"
+    ), "the digest check must run before the tags are applied"
 
 
 def test_workflow_never_reaches_for_qemu():
@@ -355,9 +374,18 @@ def test_release_tags_publish_a_pinned_version_and_latest():
     # (v1.0.1 after v2.0.0) drags :latest backwards onto older code, and a
     # pre-release claims it outright (`sort -V` ranks v1.0.0-rc1 above
     # v1.0.0 — the opposite of semver).
-    assert "sort -V" in runs and "tail -1" in runs, (
-        ":latest must be gated on the highest existing release"
+    # The tag must be applied INSIDE the highest-release comparison, not merely
+    # somewhere after a `sort -V` that nothing consumes.
+    gate = re.search(
+        r"if \[ \"\$highest\" = \"\$release_tag\" \]; then(.*?)(?:else|fi)",
+        runs,
+        re.DOTALL,
     )
+    assert gate, ":latest must be gated on this tag being the highest release"
+    assert "latest" in gate.group(1), (
+        f"the :latest tag must be applied inside the gate, got:{gate.group(1)}"
+    )
+    assert "sort -V" in runs and "tail -1" in runs, "the gate must rank the tags"
 
     # That gate is only meaningful because the checkout fetches every tag.
     # With the default shallow fetch the workspace holds exactly one tag — the
@@ -569,11 +597,32 @@ def test_penca_up_never_leaves_the_image_to_up():
     # --build=1 one. The pull-failure fallback is the default path whenever the
     # registry is unreachable, and a build stamped onto the published tag is
     # served forever by pull_policy: missing.
-    for line in builds:
-        idx = code.index(line)
-        preceding = "\n".join(code[:idx])
-        assert preceding.count("export PENCA_IMAGE=") >= 1, (
-            f"build site not preceded by a PENCA_IMAGE redirect: {line.strip()!r}"
+    # Every build site must be redirected off the published ref by an export
+    # in its OWN branch, above it. Two things this has to get right, both
+    # learned the hard way: checking "an export appears earlier in the file"
+    # let the --build=1 arm's export vouch for the fallback's build site, and
+    # matching build lines by text collapses them — the two are byte-identical,
+    # so `code.index(line)` always resolved to the first. Iterate by position.
+    build_sites = [
+        i for i, ln in enumerate(code) if "docker compose" in ln and " build " in ln
+    ]
+    assert len(build_sites) >= 2, (
+        "expected a build site for both the --build=1 path and the "
+        f"pull-failure fallback, found {len(build_sites)}"
+    )
+
+    for idx in build_sites:
+        boundary = max(
+            (
+                i
+                for i, ln in enumerate(code[:idx])
+                if re.match(r"\s*(if|elif|else|fi)\b", ln)
+            ),
+            default=0,
+        )
+        assert any("export PENCA_IMAGE=" in ln for ln in code[boundary:idx]), (
+            "build site has no PENCA_IMAGE redirect above it in its own "
+            f"branch: {code[idx].strip()!r}"
         )
 
     redirects = [line for line in code if "export PENCA_IMAGE=" in line]
