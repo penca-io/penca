@@ -176,6 +176,12 @@ def test_publish_image_cache_scopes_are_per_arch():
     assert "matrix.arch" in with_["cache-to"], (
         f"cache-to must be scoped per arch, got {with_['cache-to']!r}"
     )
+    # Tie the step back to the matrix first, or the per-leg checks below govern
+    # dead config: hardcoding both scopes into cache-from would reintroduce the
+    # cross-arch thrash while every matrix.cache_from entry still looked fine.
+    assert "matrix.cache_from" in with_["cache-from"], (
+        f"cache-from must consume the per-leg sources, got {with_['cache-from']!r}"
+    )
 
     for leg in job["strategy"]["matrix"]["include"]:
         arch, sources = leg["arch"], leg["cache_from"]
@@ -387,13 +393,24 @@ def test_penca_up_does_not_build_by_default():
         "penca-up must redirect a --build=1 run inside the build-only branch"
     )
 
-    branch = redirect.group(1)
-    assert "export PENCA_IMAGE=" in branch, (
+    assignment = re.search(r"export PENCA_IMAGE=(.*)", redirect.group(1))
+    assert assignment, (
         "penca-up must point a --build=1 run at its own tag, or the build "
         "overwrites the pulled ghcr.io ref"
     )
-    assert IMAGE not in branch, (
+
+    target = assignment.group(1)
+    assert IMAGE not in target, (
         f"a local build must not be tagged under the published ref ({IMAGE})"
+    )
+    # CI passes --build=1 through integration-test but supplies its own tag.
+    assert "${PENCA_IMAGE:-" in target, "an explicit PENCA_IMAGE must still win"
+    # perf-test --profile exports CARGO_PROFILE=profiling before building, so
+    # an unkeyed tag lets that DWARF image become whatever the next
+    # integration-test run picks up.
+    assert "CARGO_PROFILE" in target, (
+        "the local tag must be profile-keyed, or release and profiling builds "
+        "overwrite each other"
     )
 
 
