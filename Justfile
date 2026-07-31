@@ -684,14 +684,8 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
     # `query` is an arbitrary member of the six — they share one build config,
     # so building any one of them produces the image the rest then find
     # locally.
-    # Materialize the shared image with exactly ONE target before `up`, so
-    # `up` never has to produce it. All six servicers name the same image ref
-    # but compose does not dedupe their identical build configs, so any path
-    # that leaves `up` to produce a missing image fans out six concurrent
-    # targets racing to export one tag — and the losers die with
-    # `image "...": already exists`.
-    #
-    # `pull --policy missing` is what makes this one target instead of six,
+    # `pull --policy missing` is what keeps this to ONE build target instead of
+    # the six-way race described above,
     # and it is deliberately not a `config` + `docker image inspect` dance:
     # that needed `jq` to read the ref back, which would make `jq` a hard
     # requirement of the quickstart's very first command and it is not a
@@ -718,8 +712,20 @@ penca-up profile="dev" db="" build="" pull="": vm-gc
         # network, package still private), so it is the one a first-time
         # reader is most likely to hit.
         export PENCA_IMAGE="penca-rust-server:${CARGO_PROFILE:-release}"
-        docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1 \
-            || docker compose $compose_files $env_file $profiles build query
+        echo "note: could not pull the published image; using a local build ($PENCA_IMAGE)." >&2
+        if docker image inspect "$PENCA_IMAGE" >/dev/null 2>&1; then
+            # Reusing whatever is on the box. Say so with its age — offline,
+            # this can be arbitrarily stale, and on --pull=1 (whose whole
+            # point is to refresh) silence would be actively misleading.
+            # Read Created out of the JSON rather than via `-f`: a Go
+            # template's braces are just-interpolation syntax and wreck the
+            # parse, and escaping them is worse to read than this.
+            built=$(docker image inspect "$PENCA_IMAGE" | grep -m1 '"Created"' | cut -d'"' -f4)
+            echo "      reusing the existing $PENCA_IMAGE, built $built." >&2
+            echo "      run with --build=1 to rebuild it from the working tree." >&2
+        else
+            docker compose $compose_files $env_file $profiles build query
+        fi
     fi
     docker compose $compose_files $env_file $profiles up -d
 

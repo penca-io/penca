@@ -597,33 +597,45 @@ def test_penca_up_never_leaves_the_image_to_up():
     # --build=1 one. The pull-failure fallback is the default path whenever the
     # registry is unreachable, and a build stamped onto the published tag is
     # served forever by pull_policy: missing.
-    # Every build site must be redirected off the published ref by an export
-    # in its OWN branch, above it. Two things this has to get right, both
-    # learned the hard way: checking "an export appears earlier in the file"
-    # let the --build=1 arm's export vouch for the fallback's build site, and
-    # matching build lines by text collapses them — the two are byte-identical,
-    # so `code.index(line)` always resolved to the first. Iterate by position.
-    build_sites = [
-        i for i, ln in enumerate(code) if "docker compose" in ln and " build " in ln
-    ]
-    assert len(build_sites) >= 2, (
-        "expected a build site for both the --build=1 path and the "
-        f"pull-failure fallback, found {len(build_sites)}"
-    )
+    # Split the materialize chain into its top-level arms and require, per arm
+    # that builds, that a redirect precedes every build in it. Scope-aware on
+    # purpose: the export can sit at the arm's own level while the build is
+    # nested a block deeper, and it still dominates.
+    #
+    # Two earlier spellings of this guard were defeated: "an export appears
+    # earlier in the file" let the --build=1 arm vouch for the fallback's
+    # build site, and matching build lines by text collapsed the two, which
+    # are byte-identical, so index() always returned the first.
+    arms: list[list[str]] = []
+    for line in code:
+        if re.match(r"\s{4}(if|elif|else|fi)\b", line):
+            arms.append([])
 
-    for idx in build_sites:
-        boundary = max(
-            (
-                i
-                for i, ln in enumerate(code[:idx])
-                if re.match(r"\s*(if|elif|else|fi)\b", ln)
-            ),
-            default=0,
+        if arms:
+            arms[-1].append(line)
+
+    checked = 0
+    for arm in arms:
+        build_at = [
+            i for i, ln in enumerate(arm) if "docker compose" in ln and " build " in ln
+        ]
+        if not build_at:
+            continue
+
+        checked += 1
+        export_at = [i for i, ln in enumerate(arm) if "export PENCA_IMAGE=" in ln]
+        assert export_at, (
+            f"arm builds without redirecting off the published ref: {arm[0].strip()!r}"
         )
-        assert any("export PENCA_IMAGE=" in ln for ln in code[boundary:idx]), (
-            "build site has no PENCA_IMAGE redirect above it in its own "
-            f"branch: {code[idx].strip()!r}"
+        assert min(export_at) < min(build_at), (
+            "the redirect must precede the build in this arm, or compose stamps "
+            f"the build onto the published ref: {arm[0].strip()!r}"
         )
+
+    assert checked >= 2, (
+        "expected a build in both the --build=1 arm and the pull-failure "
+        f"fallback, found {checked}"
+    )
 
     redirects = [line for line in code if "export PENCA_IMAGE=" in line]
     assert len(redirects) >= 2, (
