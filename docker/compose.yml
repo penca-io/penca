@@ -152,6 +152,15 @@ services:
   # errors. Asserting the end state restores the fail-fast `mc mb` gave us.
   # `awk` on an exact field rather than `grep -w`, which treats `-` as a word
   # boundary and would accept a stray `penca-foo` as proof of `penca`. CHA-542.
+  #
+  # The bucket name comes from the same OBJECT_STORAGE_BUCKET the servicers
+  # read (see the x-object-storage anchor). Hardcoding `penca` here while they
+  # interpolate would let the gateway create one bucket and the servicers open
+  # another — and since the shell environment outranks `--env-file` for
+  # interpolation, a stray export was enough to cause it. That divergence
+  # surfaces as an empty table rather than an error, which is the failure mode
+  # the anchor exists to prevent; this is the fourth participant it has to
+  # cover.
   seaweedfs-init:
     image: chrislusf/seaweedfs:4.33
     profiles: [seaweedfs]
@@ -162,9 +171,9 @@ services:
       - /bin/sh
       - -c
       - |
-        echo 's3.bucket.create -name penca' | timeout 60 weed shell -master=seaweedfs:9333
+        echo 's3.bucket.create -name ${OBJECT_STORAGE_BUCKET:-penca}' | timeout 60 weed shell -master=seaweedfs:9333
         echo 's3.bucket.list' | timeout 60 weed shell -master=seaweedfs:9333 \
-          | awk '$1 == "penca" { found = 1 } END { exit !found }'
+          | awk -v want='${OBJECT_STORAGE_BUCKET:-penca}' '$1 == want { found = 1 } END { exit !found }'
 
   # One-shot init job: seeds global Penca tables + the default catalog
   # row that SQL_SERVER_DEFAULT_CATALOG resolves against. All runtime
@@ -197,11 +206,6 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
-        # `required: false` so the servicers still start when the `seaweedfs`
-        # profile is off (the `s3` profile points them at a real bucket, where
-        # the in-stack gateway has nothing to serve). When the profile IS on,
-        # this is still a hard wait on the bucket-create job.
-        required: false
       bootstrap-init:
         condition: service_completed_successfully
     environment:
@@ -247,11 +251,6 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
-        # `required: false` so the servicers still start when the `seaweedfs`
-        # profile is off (the `s3` profile points them at a real bucket, where
-        # the in-stack gateway has nothing to serve). When the profile IS on,
-        # this is still a hard wait on the bucket-create job.
-        required: false
       bootstrap-init:
         condition: service_completed_successfully
       # CHA-273 rework: the write path connects to the lifecycle service at
@@ -291,11 +290,6 @@ services:
         condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
-        # `required: false` so the servicers still start when the `seaweedfs`
-        # profile is off (the `s3` profile points them at a real bucket, where
-        # the in-stack gateway has nothing to serve). When the profile IS on,
-        # this is still a hard wait on the bucket-create job.
-        required: false
       bootstrap-init:
         condition: service_completed_successfully
     environment:

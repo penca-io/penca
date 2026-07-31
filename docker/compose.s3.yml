@@ -1,0 +1,40 @@
+# Override fragment for the `s3` stack profile, layered on docker/compose.yml:
+#
+#   docker compose -f docker/compose.yml -f docker/compose.s3.yml \
+#     --env-file docker/s3.env --profile infra --profile penca-backend up -d
+#
+# `just penca-up --profile s3` adds it automatically.
+#
+# Sole purpose: relax the servicers' dependency on `seaweedfs-init`. The `s3`
+# profile points the cold tier at a real bucket, so the `seaweedfs` compose
+# profile is off and that service is not part of the project at all — without
+# `required: false` compose refuses the whole project with `service "query"
+# depends on undefined service "seaweedfs-init": invalid compose project`.
+#
+# This lives here rather than in compose.yml because `required: false` is NOT
+# scoped to "the dependency is absent". It equally downgrades a dependency that
+# IS present but exited non-zero: compose logs a warning and starts the
+# dependents anyway, exiting 0. In the base file it would therefore delete the
+# fail-fast that seaweedfs-init's `s3.bucket.list` assertion exists to provide
+# (CHA-542) for the dev and test profiles, letting the servicers boot against a
+# nonexistent bucket and fail later as opaque NoSuchBucket errors.
+#
+# So the safe behavior is the default and the relaxation is opt-in, scoped to
+# the one profile that cannot have the dependency. dev/test, and any raw
+# `docker compose -f docker/compose.yml` invocation, keep the hard gate.
+services:
+  query:
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+        required: false
+  write:
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+        required: false
+  lifecycle:
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+        required: false
